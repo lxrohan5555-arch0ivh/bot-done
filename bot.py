@@ -11358,7 +11358,14 @@ async def _auto_apply_promo(bot, uid: int, code: str):
         await bot.send_message(uid, msg, parse_mode="Markdown")
         return
     _mark_dirty()
-    _bal_now = await asyncio.to_thread(get_bal, uid)
+    # DB থেকে fresh used_count নিন
+    def _db_ap_fresh():
+        with _c() as _fc:
+            _r = _fc.execute("SELECT used_count FROM promocodes WHERE id=%s", (promo["id"],)).fetchone()
+        return _r
+    _ap_fresh = await asyncio.to_thread(_db_ap_fresh)
+    new_used  = _ap_fresh["used_count"] if _ap_fresh else promo["used_count"] + 1
+    _bal_now  = await asyncio.to_thread(get_bal, uid)
     ok_msg = (
         f"🎉 *Promo Code সফলভাবে রিডিম হয়েছে!*\n\n"
         f"🔑 *Code:* `{code}`\n"
@@ -11371,6 +11378,39 @@ async def _auto_apply_promo(bot, uid: int, code: str):
         f"💼 *Current Balance:* `{_bal_now}$ USDT`"
     )
     await bot.send_message(uid, ok_msg, parse_mode="Markdown")
+
+    # ── Admin notification: কে নিল, কতজন নিল, কতটা বাকি ──────
+    _ap_remaining = max(0, promo["max_uses"] - new_used)
+    _ap_uname     = ""  # deep-link path-এ update নেই, uid শুধু আছে
+    _ap_uname_txt = f"ID:`{uid}`"
+    admin_notif = (
+        f"🎟 *Promo Code ব্যবহার হয়েছে!*\n\n"
+        f"🔑 *Code:* `{code}`\n"
+        f"👤 *User:* {_ap_uname_txt}\n"
+        f"💰 *Reward:* `{amount}$ USDT`\n\n"
+        f"📊 *ব্যবহার:* `{new_used}/{promo['max_uses']}`\n"
+        f"🔢 *বাকি আছে:* `{_ap_remaining}` জন নিতে পারবে\n"
+    )
+    if _ap_remaining == 0:
+        admin_notif += "\n❌ *Code সম্পূর্ণ শেষ হয়ে গেছে!*"
+        # News channel post edit করো
+        nc_msg_id  = promo.get("news_ch_msg_id")  or 0
+        nc_chat_id = promo.get("news_ch_chat_id") or 0
+        if nc_msg_id and nc_chat_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=nc_chat_id, message_id=nc_msg_id,
+                    text=_build_promo_post_used(
+                        code, promo["amount"], promo["max_uses"], promo.get("requirement", "")
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([]))
+            except Exception as _e:
+                log.warning(f"auto_promo news edit fail: {_e}")
+    else:
+        admin_notif += f"\n✅ *এখনো {_ap_remaining}টি ব্যবহারের সুযোগ আছে।*"
+    _ap_t = asyncio.create_task(notify_full_admins(bot, admin_notif))
+    _background_tasks.add(_ap_t); _ap_t.add_done_callback(_background_tasks.discard)
 
 
 def _build_promo_post_used(code: str, amount: float, max_uses: int, req_text: str) -> str:
