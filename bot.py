@@ -131,6 +131,17 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     print("[ERROR] DATABASE_URL সেট করা নেই! Render এ Environment Variable এ DATABASE_URL দিন।")
     raise SystemExit(1)
+
+# ── Render-এ CockroachDB SSL cert ফাইল থাকে না — sslmode=require দিয়ে fix ──
+# verify-full বা verify-ca mode certificate file খোঁজে যা Render-এ নেই।
+# require mode SSL encrypt করে কিন্তু cert verify করে না — Render-এ কাজ করে।
+if "sslmode=" not in DATABASE_URL:
+    DATABASE_URL += ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
+else:
+    import re as _re
+    DATABASE_URL = _re.sub(r"sslmode=(verify-full|verify-ca)", "sslmode=require", DATABASE_URL)
+# sslrootcert parameter থাকলে সরিয়ে দাও — require mode-এ দরকার নেই
+DATABASE_URL = _re.sub(r"[&?]sslrootcert=[^&]*", "", DATABASE_URL)
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
@@ -1214,6 +1225,16 @@ def get_referred_by(uid):
 def ban_user(uid, val):
     with _c() as c: c.execute("UPDATE users SET is_banned=%s WHERE user_id=%s", (val, uid))
     _invalidate_user_cache(uid)
+
+def delete_user_data(uid):
+    """User বট block করলে তার সব data DB থেকে মুছে দাও।"""
+    with _c() as c:
+        c.execute("DELETE FROM gmails       WHERE user_id=%s", (uid,))
+        c.execute("DELETE FROM withdrawals  WHERE user_id=%s", (uid,))
+        c.execute("DELETE FROM referrals    WHERE referrer_id=%s OR referred_id=%s", (uid, uid))
+        c.execute("DELETE FROM users        WHERE user_id=%s", (uid,))
+    _invalidate_user_cache(uid)
+    log.info(f"[BLOCK-DELETE] user {uid} বট block করেছে — সব data মুছে দেওয়া হয়েছে।")
 
 def all_users():
     with _c() as c:
@@ -2403,10 +2424,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     slots_txt = (f"👥 *Max:* `{mc} জন`" if mc > 0 else "👥 *Max:* `Unlimited`") if lang=='bn' else (f"👥 *Max:* `{mc}`" if mc > 0 else "👥 *Max:* `Unlimited`")
                     msg   = (f"{ticon} *{t['name']}*\n\n💰 *পুরস্কার:* `{t['price']}$ USDT`\n{slots_txt}\n\n📜 *নিয়মাবলী:*\n{t['rules']}" if lang=='bn'
                              else f"{ticon} *{t['name']}*\n\n💰 *Reward:* `{t['price']}$ USDT`\n{slots_txt}\n\n📜 *Rules:*\n{t['rules']}")
-                    kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("✅ Task শুরু করুন" if lang=='bn' else "✅ Start Task", callback_data=f"ctask_submit_{deep_task_id}")],
-                        [InlineKeyboardButton("❌ বাতিল" if lang=='bn' else "❌ Cancel", callback_data="task_cancel")],
-                    ])
+                    _dl_ct_vid = bool((_rget(t, 'demo_video_id', '') or '').strip())
+                    _dl_ct_rows = []
+                    if _dl_ct_vid:
+                        _dl_ct_vlbl = "📹 ভিডিও দেখুন" if lang == 'bn' else "📹 Watch Video"
+                        _dl_ct_rows.append([InlineKeyboardButton(_dl_ct_vlbl, callback_data=f"ctask_watch_video_{deep_task_id}")])
+                    _dl_ct_rows.append([InlineKeyboardButton("✅ Task শুরু করুন" if lang=='bn' else "✅ Start Task", callback_data=f"ctask_submit_{deep_task_id}")])
+                    _dl_ct_rows.append([InlineKeyboardButton("❌ বাতিল" if lang=='bn' else "❌ Cancel", callback_data="task_cancel")])
+                    kb = InlineKeyboardMarkup(_dl_ct_rows)
                     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
             else:
                 await update.message.reply_text("❌ এই Task পাওয়া যায়নি বা inactive।" if lang=='bn' else "❌ Task not found or inactive.", parse_mode="Markdown")
@@ -2562,12 +2587,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         f"{slots_txt}\n\n"
                         f"📜 *Rules:*\n{rules_text}"
                     )
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Task শুরু করুন" if lang=='bn' else "✅ Start Task",
-                                         callback_data=f"task_submit_{deep_task_id}")],
-                    [InlineKeyboardButton("❌ বাতিল" if lang=='bn' else "❌ Cancel",
-                                         callback_data="task_cancel")],
-                ])
+                _dl_t_vid = bool((_rget(task, 'demo_video_id', '') or '').strip())
+                _dl_t_rows = []
+                if _dl_t_vid:
+                    _dl_t_vlbl = "📹 ভিডিও দেখুন" if lang == 'bn' else "📹 Watch Video"
+                    _dl_t_rows.append([InlineKeyboardButton(_dl_t_vlbl, callback_data=f"task_watch_video_{deep_task_id}")])
+                _dl_t_rows.append([InlineKeyboardButton("✅ Task শুরু করুন" if lang=='bn' else "✅ Start Task", callback_data=f"task_submit_{deep_task_id}")])
+                _dl_t_rows.append([InlineKeyboardButton("❌ বাতিল" if lang=='bn' else "❌ Cancel", callback_data="task_cancel")])
+                kb = InlineKeyboardMarkup(_dl_t_rows)
                 await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
             else:
                 await update.message.reply_text(
@@ -8678,6 +8705,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
 
     # ── User: Watch Video — Regular Task ──────────────────────────
     if d.startswith("task_watch_video_"):
+        await q.answer()
         try:
             tid = int(d.split("_")[3])
         except (IndexError, ValueError):
@@ -8690,10 +8718,11 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             await q.message.reply_text("❌ ভিডিও পাওয়া যায়নি!" if lang == 'bn' else "❌ Video not found!")
             return
         try:
-            if vid.startswith("http"):
+            if vid.startswith("http") or vid.startswith("https"):
                 lbl = "🎬 ভিডিও দেখুন" if lang == 'bn' else "🎬 Watch Video"
+                txt = "👇 নিচের বাটনে চাপুন:" if lang == 'bn' else "👇 Tap the button below:"
                 await q.message.reply_text(
-                    lbl,
+                    txt,
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(lbl, url=vid)]]))
             else:
                 cap = "🎬 ডেমো ভিডিও" if lang == 'bn' else "🎬 Demo Video"
@@ -8705,6 +8734,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
 
     # ── User: Watch Video — Category Task ─────────────────────────
     if d.startswith("ctask_watch_video_"):
+        await q.answer()
         try:
             tid = int(d.split("_")[3])
         except (IndexError, ValueError):
@@ -8717,10 +8747,11 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             await q.message.reply_text("❌ ভিডিও পাওয়া যায়নি!" if lang == 'bn' else "❌ Video not found!")
             return
         try:
-            if vid.startswith("http"):
+            if vid.startswith("http") or vid.startswith("https"):
                 lbl = "🎬 ভিডিও দেখুন" if lang == 'bn' else "🎬 Watch Video"
+                txt = "👇 নিচের বাটনে চাপুন:" if lang == 'bn' else "👇 Tap the button below:"
                 await q.message.reply_text(
-                    lbl,
+                    txt,
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(lbl, url=vid)]]))
             else:
                 cap = "🎬 ডেমো ভিডিও" if lang == 'bn' else "🎬 Demo Video"
@@ -14036,6 +14067,16 @@ def main():
         .get_updates_pool_timeout(10)       # getUpdates pool
         .build()
     )
+    # ── User বট block করলে তার data মুছে দাও ────────────────────────
+    from telegram.ext import ChatMemberHandler as _CmH
+    async def _on_bot_blocked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not update.my_chat_member: return
+        new = update.my_chat_member.new_chat_member
+        if new and new.status in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT):
+            uid = update.my_chat_member.from_user.id
+            await asyncio.to_thread(delete_user_data, uid)
+    app.add_handler(_CmH(_on_bot_blocked))
+
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("admin",       cmd_admin))
     app.add_handler(CommandHandler("cancel",      cmd_cancel))
@@ -14052,10 +14093,13 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback_extra,       pattern=r"^(adm_task_done_\d+|adm_notif_send|adm_notif_edit|adm_notif_skip|adm_tp_.+)$"))
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
     app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, on_photo))
-    app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, on_video))
-    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, on_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    # ~filters.User(allow_bots=False) → অন্য বট থেকে আসা সব message ignore করো
+    # বট account গুলো message পাঠালে admin-এর কাছে যাবে না
+    _no_bot = filters.User(allow_bots=False)
+    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & _no_bot, on_photo))
+    app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND & _no_bot, on_video))
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND & _no_bot, on_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & _no_bot, on_message))
     app.add_error_handler(_smart_error_handler)
     log.info("✅ Task Earn Bot started!")
     app.run_polling(drop_pending_updates=True)
