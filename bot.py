@@ -2554,7 +2554,8 @@ async def guard(update, ctx):
         if update.message:
             await update.message.reply_text(T(uid, 'banned'), parse_mode="Markdown")
         elif update.callback_query:
-            await update.callback_query.answer("🚫 Banned!", show_alert=True)
+            try: await update.callback_query.answer("🚫 Banned!", show_alert=True)
+            except Exception: pass
         return False
     if missing:
         await join_prompt(update, uid)
@@ -2590,7 +2591,8 @@ async def bot_off_reply(update, uid=0):
     if update.message:
         await update.message.reply_text(msg, parse_mode="Markdown")
     elif update.callback_query:
-        await update.callback_query.answer("🔴 Bot is offline!", show_alert=True)
+        try: await update.callback_query.answer("🔴 Bot is offline!", show_alert=True)
+        except Exception: pass
 
 # ──────────────────────────── /cancel ────────────────────────────
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2900,7 +2902,8 @@ async def show_tg_tasks_list(update, ctx):
     """Show all active TG tasks as a list"""
     q   = update.callback_query
     uid = q.from_user.id
-    await q.answer()
+    try: await q.answer()
+    except Exception: pass
     lang, tg_tasks = await asyncio.gather(
         asyncio.to_thread(get_lang, uid),
         asyncio.to_thread(get_tg_tasks),
@@ -2934,7 +2937,8 @@ async def show_category_tasks(update, ctx, cat_id):
     """Show tasks inside a category"""
     q    = update.callback_query
     uid  = q.from_user.id
-    await q.answer()
+    try: await q.answer()
+    except Exception: pass
     lang, cat = await asyncio.gather(
         asyncio.to_thread(get_lang, uid),
         asyncio.to_thread(get_category, cat_id),
@@ -2994,12 +2998,17 @@ async def show_category_task_rules(update, ctx, task):
             done_msg = f"✅ You have already completed this task {user_count}/{lim_lbl} time(s). No more submissions allowed."
         else:
             done_msg = f"✅ আপনি এই Task ইতিমধ্যে {user_count}/{lim_lbl} বার সম্পন্ন করেছেন। আর জমা দেওয়া যাবে না।"
-        await update.callback_query.answer(done_msg, show_alert=True); return
+        try: await update.callback_query.answer(done_msg, show_alert=True)
+        except Exception: pass
+        return
     if slots == 0:
-        await update.callback_query.answer(
-            "❌ All slots for this task are filled!" if lang=='en' else "❌ এই Task এর সব জায়গা পূর্ণ!",
-            show_alert=True
-        ); return
+        try:
+            await update.callback_query.answer(
+                "❌ All slots for this task are filled!" if lang=='en' else "❌ এই Task এর সব জায়গা পূর্ণ!",
+                show_alert=True
+            )
+        except Exception: pass
+        return
 
     # ── Country restriction check ─────────────────────────────────
     _cat_allowed = (_rget(task, 'allowed_countries', '') or '').strip().upper()
@@ -3019,7 +3028,8 @@ async def show_category_task_rules(update, ctx, task):
                 "👆 Please select the country where you actually live.\n"
                 "🔒 *This cannot be changed once selected.*"
             )
-            await update.callback_query.answer()
+            try: await update.callback_query.answer()
+            except Exception: pass
             await update.callback_query.message.reply_text(_ask, parse_mode="Markdown", reply_markup=country_kb())
             return
         if _cat_u_country not in _cat_allowed_list:
@@ -3028,11 +3038,13 @@ async def show_category_task_rules(update, ctx, task):
                 if lang == 'bn' else
                 f"❌ *This task is not available in your country.*\n\n✅ Allowed countries: {fmt_allowed_countries(_cat_allowed)}"
             )
-            await update.callback_query.answer()
+            try: await update.callback_query.answer()
+            except Exception: pass
             await update.callback_query.message.reply_text(_deny, parse_mode="Markdown")
             return
 
-    await update.callback_query.answer()
+    try: await update.callback_query.answer()
+    except Exception: pass
 
     if lang == 'en':
         rules_text  = (task["rules_en"] if task["rules_en"] else await asyncio.to_thread(translate_to_en, task["rules"])) if task["rules"] else "No special rules."
@@ -3122,7 +3134,8 @@ async def start_category_task_collect(update, ctx, task_id):
     """Start collecting proof for a category task"""
     q      = update.callback_query
     uid    = q.from_user.id
-    await q.answer()
+    try: await q.answer()
+    except Exception: pass
     task, fields, lang = await asyncio.gather(
         asyncio.to_thread(get_category_task, task_id),
         asyncio.to_thread(get_category_task_fields, task_id),
@@ -3375,13 +3388,20 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
         await update.message.reply_text(T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
     else:
         await ctx.bot.send_message(uid, T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+    # ── Submit এর পর টাস্ক লিস্ট আবার দেখাও ────────────────────────────
+    try:
+        if update.message and not via_callback:
+            await show_tasks(update, ctx)
+    except Exception as _st_e:
+        log.warning(f"[CATEG_FINALIZE] show_tasks after submit failed: {_st_e}")
 
 
 async def show_tg_task(update, ctx, task):
     """Show TG Join task info with Join + Check buttons"""
     q   = update.callback_query
     uid = q.from_user.id
-    await q.answer()
+    try: await q.answer()
+    except Exception: pass
     tid = task['id']
     lang, slots, already_done = await asyncio.gather(
         asyncio.to_thread(get_lang, uid),
@@ -3468,7 +3488,8 @@ async def handle_tg_task_check(update, ctx, tid):
     """Auto-check channel membership and pay if joined"""
     q    = update.callback_query
     uid  = q.from_user.id
-    await q.answer("⏳ চেক করা হচ্ছে...", show_alert=False)
+    try: await q.answer("⏳ চেক করা হচ্ছে...", show_alert=False)
+    except Exception: pass
     lang, task = await asyncio.gather(
         asyncio.to_thread(get_lang, uid),
         asyncio.to_thread(get_tg_task, tid),
@@ -3746,7 +3767,8 @@ async def show_task_rules(update, ctx, task):
         _until_str = _blk_dt.astimezone(pytz.timezone("Asia/Dhaka")).strftime("%d %b %Y, %I:%M %p")
         _msg = T(uid, 'task_blocked_msg', until=_until_str)
         if update.callback_query:
-            await update.callback_query.answer(_msg[:200], show_alert=True)
+            try: await update.callback_query.answer(_msg[:200], show_alert=True)
+            except Exception: pass
         else:
             await update.effective_message.reply_text(_msg, parse_mode="Markdown")
         return
@@ -3761,7 +3783,8 @@ async def show_task_rules(update, ctx, task):
         else:
             msg = f"✅ আপনি এই Task ইতিমধ্যে {done_count}/{lim_lbl} বার সম্পন্ন করেছেন। আর জমা দেওয়া যাবে না।"
         if update.callback_query:
-            await update.callback_query.answer(msg, show_alert=True)
+            try: await update.callback_query.answer(msg, show_alert=True)
+            except Exception: pass
         else:
             await update.effective_message.reply_text(msg, parse_mode="Markdown")
         return
@@ -3820,19 +3843,14 @@ async def show_task_rules(update, ctx, task):
         f"{confirm_txt}",
         parse_mode="HTML", reply_markup=kb
     )
-    # ── Task Media (example image) ─────────────────────────────────
-    _ex_img = _rget(task, 'example_image_id', '') or ''
-    if _ex_img:
-        try:
-            _cap = "📷 Example Image — এইরকম ছবি দিন" if lang == 'bn' else "📷 Example Image — Submit a photo like this"
-            await update.effective_message.reply_photo(_ex_img, caption=_cap)
-        except Exception as _e:
-            log.warning(f"[show_task_rules] example_image send failed: {_e}")
+    # NOTE: example_image শুধু _ask_next_field এ দেখানো হয় (ছবি জমার সময়),
+    # এখানে দেখালে দ্বিতীয়বার দেখায় — তাই এখানে remove করা হয়েছে।
 
 async def start_task_collect(update, ctx, task_id):
     q      = update.callback_query
     uid    = q.from_user.id
-    await q.answer()
+    try: await q.answer()
+    except Exception: pass
     task   = await asyncio.to_thread(get_task, task_id)
     if not task:
         await q.message.reply_text("❌ Task পাওয়া যায়নি বা মুছে ফেলা হয়েছে।", parse_mode="Markdown"); return
@@ -3893,8 +3911,7 @@ async def _ask_next_field(update, ctx, uid, via_callback=False):
 
     if field["field_type"] == "photo":
         msg = T(uid, 'field_photo_ask', prompt=f"{prompt} {step_txt}")
-        skip_btn = T(uid, 'skip_btn')
-        kb = ReplyKeyboardMarkup([[skip_btn], [T(uid,'cancel_btn')]], resize_keyboard=True)
+        kb = ReplyKeyboardMarkup([[T(uid,'cancel_btn')]], resize_keyboard=True)
     else:
         msg = T(uid, 'field_ask', prompt=f"{prompt} {step_txt}")
         kb = ReplyKeyboardMarkup([[T(uid,'cancel_btn')]], resize_keyboard=True)
@@ -3946,18 +3963,10 @@ async def handle_task_collect_text(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
     field = fields[idx]
 
-    # Check skip for photo field
-    skip_bn = T(uid, 'skip_btn')
-    if txt in (skip_bn, "⏭ Skip করুন", "⏭ Skip") and field["field_type"] == "photo":
-        ctx.user_data["collected"].append({
-            "type": "photo", "prompt_bn": field["prompt_bn"],
-            "prompt_en": field["prompt_en"], "value": None
-        })
-    else:
-        ctx.user_data["collected"].append({
-            "type": "text", "prompt_bn": field["prompt_bn"],
-            "prompt_en": field["prompt_en"], "value": txt
-        })
+    ctx.user_data["collected"].append({
+        "type": "text", "prompt_bn": field["prompt_bn"],
+        "prompt_en": field["prompt_en"], "value": txt
+    })
 
     ctx.user_data["field_idx"] = idx + 1
     if idx + 1 < total:
@@ -3976,10 +3985,22 @@ async def handle_task_collect_photo(update: Update, ctx: ContextTypes.DEFAULT_TY
         if update.message.photo and tid:
             fid = update.message.photo[-1].file_id
             await asyncio.to_thread(update_category_task, tid, "example_image_id", fid)
+            # ── Panel re-show: task creation panel ফিরিয়ে দাও ──────
+            _ct = await asyncio.to_thread(get_category_task, tid)
+            _ct_has_img = bool((_rget(_ct, 'example_image_id', '') or '').strip()) if _ct else True
+            _ct_has_vid = bool((_rget(_ct, 'demo_video_id',   '') or '').strip()) if _ct else False
+            _ct_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📷 Photo Field যোগ",  callback_data=f"adm_cfield_add_photo_{tid}"),
+                 InlineKeyboardButton("📝 Text Field যোগ",   callback_data=f"adm_cfield_add_text_{tid}")],
+                [InlineKeyboardButton("🖼 Example Photo ✅" if _ct_has_img else "🖼 Example Photo যোগ", callback_data=f"adm_ctaste_sample_photo_{tid}"),
+                 InlineKeyboardButton("🎬 Demo Video ✅"    if _ct_has_vid else "🎬 Demo Video যোগ",    callback_data=f"adm_ctaste_video_{tid}")],
+                [InlineKeyboardButton("🚀 এখনই Live করুন", callback_data=f"adm_ctask_golive_{tid}")],
+            ])
             await update.message.reply_text(
                 "✅ *Example Photo সেট হয়েছে!*\n\n"
-                "এখন থেকে Photo Field এ user এই ছবি দেখে বুঝবে কেমন ছবি দিতে হবে।",
-                parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+                "ইউজার Photo Field এ এই ছবি দেখে বুঝবে কেমন ছবি দিতে হবে।\n\n"
+                "আরো কিছু যোগ করুন বা Live করুন:",
+                parse_mode="Markdown", reply_markup=_ct_kb)
         else:
             await update.message.reply_text("❌ ছবি পাওয়া যায়নি। আবার চেষ্টা করুন।", parse_mode="Markdown")
         return
@@ -3991,10 +4012,26 @@ async def handle_task_collect_photo(update: Update, ctx: ContextTypes.DEFAULT_TY
         if update.message.photo and tid:
             fid = update.message.photo[-1].file_id
             await asyncio.to_thread(update_task_field_val, tid, "example_image_id", fid)
+            # ── Panel re-show: task creation/edit panel ফিরিয়ে দাও ──
+            _rt, _rf = await asyncio.gather(
+                asyncio.to_thread(get_task, tid),
+                asyncio.to_thread(get_task_fields, tid),
+            )
+            _rt_has_img = bool((_rget(_rt, 'example_image_id', '') or '').strip()) if _rt else True
+            _rt_has_vid = bool((_rget(_rt, 'demo_video_id',   '') or '').strip()) if _rt else False
+            _rt_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Text Field যোগ",  callback_data=f"adm_field_add_text_{tid}"),
+                 InlineKeyboardButton("📷 Photo Field যোগ", callback_data=f"adm_field_add_photo_{tid}")],
+                [InlineKeyboardButton("🖼 Example Photo ✅" if _rt_has_img else "🖼 Example Photo যোগ", callback_data=f"adm_te_sample_photo_{tid}"),
+                 InlineKeyboardButton("🎬 Demo Video ✅"    if _rt_has_vid else "🎬 Demo Video যোগ",    callback_data=f"adm_te_video_{tid}")],
+                [InlineKeyboardButton("✅ Done — Task সেভ করুন", callback_data=f"adm_task_done_{tid}")],
+            ])
             await update.message.reply_text(
-                "✅ *Example Photo সেট হয়েছে!*\n\n"
-                "এখন থেকে Photo Field এ user এই ছবি দেখে বুঝবে কেমন ছবি দিতে হবে।",
-                parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+                f"✅ *Example Photo সেট হয়েছে!* ({'✅' if _rt_has_img else ''})\n\n"
+                f"📋 Fields: {len(_rf)} টি\n\n"
+                "আরো fields যোগ করুন বা Done চাপুন:",
+                parse_mode="Markdown", reply_markup=_rt_kb)
+            ctx.user_data["state"] = "adm_task_fields"
         else:
             await update.message.reply_text("❌ ছবি পাওয়া যায়নি। আবার চেষ্টা করুন।", parse_mode="Markdown")
         return
@@ -4022,7 +4059,17 @@ async def handle_task_collect_photo(update: Update, ctx: ContextTypes.DEFAULT_TY
     idx    = ctx.user_data.get("field_idx", 0)
     total  = len(fields)
 
-    if not fields: return
+    if not fields:
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("task_id", None)
+        ctx.user_data.pop("task_fields", None)
+        ctx.user_data.pop("field_idx", None)
+        ctx.user_data.pop("collected", None)
+        lang = await asyncio.to_thread(get_lang, uid)
+        await update.message.reply_text(
+            "❌ Task এ কোনো field নেই।" if lang == 'bn' else "❌ This task has no fields.",
+            parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+        return
 
     field = fields[idx]
     if field["field_type"] != "photo":
@@ -4034,10 +4081,13 @@ async def handle_task_collect_photo(update: Update, ctx: ContextTypes.DEFAULT_TY
 
     file_id        = update.message.photo[-1].file_id
     file_unique_id = update.message.photo[-1].file_unique_id
+    # ── ছবির সাথে caption (লেখা) থাকলে সেটাও সংরক্ষণ করো ────────────
+    _photo_caption = (update.message.caption or "").strip()
     ctx.user_data["collected"].append({
         "type": "photo", "prompt_bn": field["prompt_bn"],
         "prompt_en": field["prompt_en"], "value": file_id,
-        "unique_id": file_unique_id
+        "unique_id": file_unique_id,
+        "caption": _photo_caption,          # ← নতুন: ছবির সাথে লেখা
     })
     ctx.user_data["field_idx"] = idx + 1
 
@@ -4068,7 +4118,15 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
                 photo_file_ids.append(item["value"])
                 if item.get("unique_id"):
                     _submitted_unique_ids.append(item["unique_id"])
-                summary_lines.append(f"📷 *{prompt_lbl}:* [Photo #{len(photo_file_ids)}]" if lang == 'en' else f"📷 *{prompt_lbl}:* [ছবি #{len(photo_file_ids)}]")
+                _cap_txt = item.get("caption", "").strip()
+                if _cap_txt:
+                    summary_lines.append(
+                        f"📷 *{prompt_lbl}:* [Photo #{len(photo_file_ids)}]\n💬 *Caption:* `{_cap_txt}`"
+                        if lang == 'en' else
+                        f"📷 *{prompt_lbl}:* [ছবি #{len(photo_file_ids)}]\n💬 *লেখা:* `{_cap_txt}`"
+                    )
+                else:
+                    summary_lines.append(f"📷 *{prompt_lbl}:* [Photo #{len(photo_file_ids)}]" if lang == 'en' else f"📷 *{prompt_lbl}:* [ছবি #{len(photo_file_ids)}]")
             else:
                 summary_lines.append(f"📷 *{prompt_lbl}:* (Skipped)" if lang == 'en' else f"📷 *{prompt_lbl}:* (Skip করা হয়েছে)")
         else:
@@ -4221,12 +4279,18 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
         await send_fn(T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
     else:
         await ctx.bot.send_message(uid, T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+    # ── Submit এর পর টাস্ক লিস্ট আবার দেখাও ────────────────────────────
+    try:
+        if update.message and not via_callback:
+            await show_tasks(update, ctx)
+    except Exception as _st_e:
+        log.warning(f"[FINALIZE] show_tasks after submit failed: {_st_e}")
 
 # ──────────────────────────── WITHDRAW FLOW ────────────────────────────
 async def wd_ask_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     uid = q.from_user.id
-    await q.answer()   # সাথে সাথে spinner dismiss করো — একবারই, পরে আর call নেই
+    # q.answer() ইতিমধ্যে _on_callback_inner এ হয়েছে — এখানে duplicate করলে TelegramError হবে
     # ── 100% double-submit guard ─────────────────────────────────
     def _wd_db_checks():
         already = None
@@ -5118,12 +5182,14 @@ async def _activate_task_and_notify(ctx, q, uid,
     """
     t = await asyncio.to_thread(get_fn, tid)
     if not t:
-        await q.answer("❌ Task পাওয়া যায়নি!", show_alert=True)
+        try: await q.answer("❌ Task পাওয়া যায়নি!", show_alert=True)
+        except Exception: pass
         return False
     new_val = 0 if t['is_active'] else 1
     await asyncio.to_thread(update_fn, tid, "is_active", new_val)
     _mark_dirty()
-    await q.answer("✅ চালু!" if new_val else "❌ বন্ধ!", show_alert=False)
+    try: await q.answer("✅ চালু!" if new_val else "❌ বন্ধ!", show_alert=False)
+    except Exception: pass
     try: await q.message.edit_reply_markup(reply_markup=None)
     except Exception: pass
     status_lbl = "✅ *Task Activated!*" if new_val else "❌ *Task Deactivated.*"
@@ -5340,10 +5406,18 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         vid = update.message.video
         if vid and tid:
             await asyncio.to_thread(update_category_task, tid, "demo_video_id", vid.file_id)
+            _ct2 = await asyncio.to_thread(get_category_task, tid)
+            _ct2_img = bool((_rget(_ct2, 'example_image_id', '') or '').strip()) if _ct2 else False
+            _ct2_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📷 Photo Field যোগ",  callback_data=f"adm_cfield_add_photo_{tid}"),
+                 InlineKeyboardButton("📝 Text Field যোগ",   callback_data=f"adm_cfield_add_text_{tid}")],
+                [InlineKeyboardButton("🖼 Example Photo ✅" if _ct2_img else "🖼 Example Photo যোগ", callback_data=f"adm_ctaste_sample_photo_{tid}"),
+                 InlineKeyboardButton("🎬 Demo Video ✅",    callback_data=f"adm_ctaste_video_{tid}")],
+                [InlineKeyboardButton("🚀 এখনই Live করুন", callback_data=f"adm_ctask_golive_{tid}")],
+            ])
             await update.message.reply_text(
-                "✅ *Demo Video সেট হয়েছে!*\n\n"
-                "Task এ এখন 'ভিডিও দেখুন' বাটন দেখা যাবে।",
-                parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+                "✅ *Demo Video সেট হয়েছে!*\n\nTask এ এখন 'ভিডিও দেখুন' বাটন দেখা যাবে।\n\nআরো কিছু যোগ করুন বা Live করুন:",
+                parse_mode="Markdown", reply_markup=_ct2_kb)
         else:
             await update.message.reply_text("❌ ভিডিও পাওয়া যায়নি।", parse_mode="Markdown")
         return
@@ -5355,12 +5429,57 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         vid = update.message.video
         if vid and tid:
             await asyncio.to_thread(update_task_field_val, tid, "demo_video_id", vid.file_id)
+            _rt2, _rf2 = await asyncio.gather(
+                asyncio.to_thread(get_task, tid),
+                asyncio.to_thread(get_task_fields, tid),
+            )
+            _rt2_img = bool((_rget(_rt2, 'example_image_id', '') or '').strip()) if _rt2 else False
+            _rt2_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Text Field যোগ",  callback_data=f"adm_field_add_text_{tid}"),
+                 InlineKeyboardButton("📷 Photo Field যোগ", callback_data=f"adm_field_add_photo_{tid}")],
+                [InlineKeyboardButton("🖼 Example Photo ✅" if _rt2_img else "🖼 Example Photo যোগ", callback_data=f"adm_te_sample_photo_{tid}"),
+                 InlineKeyboardButton("🎬 Demo Video ✅",    callback_data=f"adm_te_video_{tid}")],
+                [InlineKeyboardButton("✅ Done — Task সেভ করুন", callback_data=f"adm_task_done_{tid}")],
+            ])
             await update.message.reply_text(
-                "✅ *Demo Video সেট হয়েছে!*\n\n"
-                "Task এ এখন 'ভিডিও দেখুন' বাটন দেখা যাবে।",
-                parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+                f"✅ *Demo Video সেট হয়েছে!*\n\nTask এ এখন 'ভিডিও দেখুন' বাটন দেখা যাবে।\n\n📋 Fields: {len(_rf2)} টি\n\nআরো fields যোগ করুন বা Done চাপুন:",
+                parse_mode="Markdown", reply_markup=_rt2_kb)
+            ctx.user_data["state"] = "adm_task_fields"
         else:
             await update.message.reply_text("❌ ভিডিও পাওয়া যায়নি।", parse_mode="Markdown")
+        return
+
+    # ── User: Task proof — video পাঠালে (ছবির জায়গায় video) ─────
+    if st in ("task_collect", "categ_task_collect"):
+        fields = ctx.user_data.get("task_fields", [])
+        idx    = ctx.user_data.get("field_idx", 0)
+        lang   = await asyncio.to_thread(get_lang, uid)
+        if idx < len(fields) and fields[idx]["field_type"] == "photo":
+            vid = update.message.video
+            if vid:
+                _vid_cap = (update.message.caption or "").strip()
+                ctx.user_data.setdefault("collected", []).append({
+                    "type": "photo",
+                    "prompt_bn": fields[idx]["prompt_bn"],
+                    "prompt_en": fields[idx].get("prompt_en", ""),
+                    "value": vid.file_id,
+                    "unique_id": vid.file_unique_id,
+                    "caption": _vid_cap,
+                    "is_video": True,
+                })
+                ctx.user_data["field_idx"] = idx + 1
+                if idx + 1 < len(fields):
+                    await _ask_next_field(update, ctx, uid)
+                else:
+                    if st == "categ_task_collect":
+                        await _finalize_category_task_submission(update, ctx, uid)
+                    else:
+                        await _finalize_task_submission(update, ctx, uid)
+        else:
+            await update.message.reply_text(
+                "❌ এখন ভিডিও নয়, টেক্সট বা ছবি পাঠান।" if lang == 'bn'
+                else "❌ Please send text or photo, not a video.",
+                parse_mode="Markdown")
         return
 
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5590,7 +5709,12 @@ async def _on_callback_inner(update, ctx, q, uid, d):
     total_ref = None
     total_usr = None
     wds = None
-    await q.answer()
+    # ── q.answer() কে background-এ fire করো ─────────────────────
+    # Telegram network call (~200ms) আর handler DB logic একসাথে চলবে।
+    # spinner clear হবে WHILE reply তৈরি হচ্ছে — ~200ms দ্রুত।
+    _qa = asyncio.create_task(q.answer())
+    _background_tasks.add(_qa)
+    _qa.add_done_callback(_background_tasks.discard)
     if d in ("lang_bn", "lang_en"):
         lang = "bn" if d == "lang_bn" else "en"
         await asyncio.to_thread(set_lang, uid, lang)
@@ -5762,8 +5886,22 @@ async def _on_callback_inner(update, ctx, q, uid, d):
 
     # ── Task cancel ──────────────────────────────────────────────
     if d == "task_cancel":
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("task_id", None)
+        ctx.user_data.pop("task_name", None)
+        ctx.user_data.pop("task_price", None)
+        ctx.user_data.pop("task_fields", None)
+        ctx.user_data.pop("field_idx", None)
+        ctx.user_data.pop("collected", None)
+        ctx.user_data.pop("categ_task_id", None)
         try: await q.message.delete()
         except Exception: pass
+        try:
+            _tc_lang = await asyncio.to_thread(get_lang, uid)
+            _tc_note = "📋 নিচের মেনু থেকে Tasks চাপুন।" if _tc_lang == 'bn' else "📋 Press Tasks from the menu below."
+            await q.message.reply_text(_tc_note, reply_markup=await asyncio.to_thread(main_kb, uid))
+        except Exception:
+            pass
         return
 
     if d.startswith("adm_ctask_golive_"):
@@ -5892,7 +6030,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         return
 
     # ── Task selected → show rules ────────────────────────────────
-    if d.startswith("task_") and not d.startswith("task_submit_"):
+    if d.startswith("task_") and not d.startswith("task_submit_") and not d.startswith("task_watch_video_"):
         if not await _bot_accessible(uid):
             await bot_off_reply(update, uid); return
         if not await guard(update, ctx): return
@@ -6495,12 +6633,16 @@ async def _on_callback_inner(update, ctx, q, uid, d):
 
         bio_ok    = False
         user_bio  = ""
-        _MAX_WAIT = 60    # সর্বোচ্চ ৬০ সেকেন্ড চেষ্টা
-        _INTERVAL = 10    # প্রতি ১০ সেকেন্ড পর পর
-        _attempts = _MAX_WAIT // _INTERVAL  # = ৬ বার
+        _INTERVAL = 5     # প্রতি ৫ সেকেন্ড পর পর (ছিল ১০s — Telegram cache সাধারণত ১৫-৩০s এ clear হয়)
+        _attempts = 8     # ৮ বার চেষ্টা: t=0,5,10,15,20,25,30,35 → সর্বোচ্চ ৩৫s
 
         for _attempt in range(_attempts):
             try:
+                # ── Double-call trick: Telegram cache bypass ───────────────
+                # প্রথম call cache hit করতে পারে; দ্বিতীয় call fresh data দেওয়ার সম্ভাবনা বেশি
+                if _attempt > 0:
+                    try: await ctx.bot.get_chat(uid)   # cache warm-up call
+                    except Exception: pass
                 chat     = await ctx.bot.get_chat(uid)
                 user_bio = (chat.bio or "").strip()
                 log.info(f"[BIO-CHECK] uid={uid} attempt={_attempt+1}/{_attempts} bio='{user_bio[:80]}'")
@@ -6513,12 +6655,12 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             if _attempt < _attempts - 1:
                 # Progress update — user কে জানাও কত সেকেন্ড হলো
                 _elapsed = (_attempt + 1) * _INTERVAL
-                _remain  = _MAX_WAIT - _elapsed
+                _remain  = (_attempts - 1 - _attempt) * _INTERVAL
                 try:
                     _prog_text = (
-                        f"⏳ *Bio চেক হচ্ছে...* `{_elapsed}s`\n\nআর {_remain} সেকেন্ড অপেক্ষা করুন।"
+                        f"⏳ *Bio চেক হচ্ছে...* `{_elapsed}s`\n\nআর প্রায় {_remain} সেকেন্ড..."
                         if lang == 'bn' else
-                        f"⏳ *Checking Bio...* `{_elapsed}s`\n\nWaiting {_remain} more seconds."
+                        f"⏳ *Checking Bio...* `{_elapsed}s`\n\nAbout {_remain} more seconds..."
                     )
                     await _status_msg.edit_text(_prog_text, parse_mode="Markdown")
                 except Exception:
@@ -6672,7 +6814,8 @@ async def _on_callback_inner(update, ctx, q, uid, d):
     # (global + individual = BadRequest → handler code execute হত না)
 
     if d == "adm_panel":
-        await q.answer()
+        try: await q.answer()
+        except Exception: pass
         await send_admin_panel(q.message, uid)
         return
 
@@ -8411,7 +8554,11 @@ async def _on_callback_inner(update, ctx, q, uid, d):
 
     # ── User: Watch Video — Regular Task ──────────────────────────
     if d.startswith("task_watch_video_"):
-        tid = int(d.split("_")[3])
+        try:
+            tid = int(d.split("_")[3])
+        except (IndexError, ValueError):
+            await q.message.reply_text("❌ ভিডিও পাওয়া যায়নি!")
+            return
         t   = await asyncio.to_thread(get_task, tid)
         vid = (_rget(t, 'demo_video_id', '') or '').strip() if t else ''
         lang = await asyncio.to_thread(get_lang, uid)
@@ -8420,19 +8567,25 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             return
         try:
             if vid.startswith("http"):
+                lbl = "🎬 ভিডিও দেখুন" if lang == 'bn' else "🎬 Watch Video"
                 await q.message.reply_text(
-                    f"🎬 [ভিডিও দেখুন]({vid})" if lang == 'bn' else f"🎬 [Watch Video]({vid})",
-                    parse_mode="Markdown")
+                    lbl,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(lbl, url=vid)]]))
             else:
                 cap = "🎬 ডেমো ভিডিও" if lang == 'bn' else "🎬 Demo Video"
                 await q.message.reply_video(vid, caption=cap)
-        except Exception:
-            await q.message.reply_text("❌ ভিডিও পাঠাতে সমস্যা হয়েছে।", parse_mode="Markdown")
+        except Exception as _wve:
+            log.warning(f"[WATCH_VIDEO] tid={tid} err={_wve}")
+            await q.message.reply_text("❌ ভিডিও পাঠাতে সমস্যা হয়েছে।" if lang == 'bn' else "❌ Could not send video.")
         return
 
     # ── User: Watch Video — Category Task ─────────────────────────
     if d.startswith("ctask_watch_video_"):
-        tid = int(d.split("_")[3])
+        try:
+            tid = int(d.split("_")[3])
+        except (IndexError, ValueError):
+            await q.message.reply_text("❌ ভিডিও পাওয়া যায়নি!")
+            return
         t   = await asyncio.to_thread(get_category_task, tid)
         vid = (_rget(t, 'demo_video_id', '') or '').strip() if t else ''
         lang = await asyncio.to_thread(get_lang, uid)
@@ -8441,14 +8594,16 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             return
         try:
             if vid.startswith("http"):
+                lbl = "🎬 ভিডিও দেখুন" if lang == 'bn' else "🎬 Watch Video"
                 await q.message.reply_text(
-                    f"🎬 [ভিডিও দেখুন]({vid})" if lang == 'bn' else f"🎬 [Watch Video]({vid})",
-                    parse_mode="Markdown")
+                    lbl,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(lbl, url=vid)]]))
             else:
                 cap = "🎬 ডেমো ভিডিও" if lang == 'bn' else "🎬 Demo Video"
                 await q.message.reply_video(vid, caption=cap)
-        except Exception:
-            await q.message.reply_text("❌ ভিডিও পাঠাতে সমস্যা হয়েছে।", parse_mode="Markdown")
+        except Exception as _wve2:
+            log.warning(f"[WATCH_VIDEO_CT] tid={tid} err={_wve2}")
+            await q.message.reply_text("❌ ভিডিও পাঠাতে সমস্যা হয়েছে।" if lang == 'bn' else "❌ Could not send video.")
         return
 
     if d.startswith("adm_cfields_"):
@@ -9648,10 +9803,23 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             link = txt.strip()
             if tid and link:
                 await asyncio.to_thread(update_task_field_val, tid, "demo_video_id", link)
+                _rvl_t, _rvl_f = await asyncio.gather(
+                    asyncio.to_thread(get_task, tid),
+                    asyncio.to_thread(get_task_fields, tid),
+                )
+                _rvl_img = bool((_rget(_rvl_t, 'example_image_id', '') or '').strip()) if _rvl_t else False
+                _rvl_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Text Field যোগ",  callback_data=f"adm_field_add_text_{tid}"),
+                     InlineKeyboardButton("📷 Photo Field যোগ", callback_data=f"adm_field_add_photo_{tid}")],
+                    [InlineKeyboardButton("🖼 Example Photo ✅" if _rvl_img else "🖼 Example Photo যোগ", callback_data=f"adm_te_sample_photo_{tid}"),
+                     InlineKeyboardButton("🎬 Demo Video ✅",    callback_data=f"adm_te_video_{tid}")],
+                    [InlineKeyboardButton("✅ Done — Task সেভ করুন", callback_data=f"adm_task_done_{tid}")],
+                ])
                 await update.message.reply_text(
                     f"✅ *Video Link সেট হয়েছে।*\n\n🔗 `{link}`\n\n"
-                    "এখন Task এ 'ভিডিও দেখুন' বাটন দেখা যাবে।",
-                    parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+                    f"📋 Fields: {len(_rvl_f)} টি\n\nআরো fields যোগ করুন বা Done চাপুন:",
+                    parse_mode="Markdown", reply_markup=_rvl_kb)
+                ctx.user_data["state"] = "adm_task_fields"
             else:
                 await update.message.reply_text("❌ সঠিক Link দিন।", parse_mode="Markdown")
             return
@@ -10140,10 +10308,19 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             link = txt.strip()
             if tid and link:
                 await asyncio.to_thread(update_category_task, tid, "demo_video_id", link)
+                _cvl_t = await asyncio.to_thread(get_category_task, tid)
+                _cvl_img = bool((_rget(_cvl_t, 'example_image_id', '') or '').strip()) if _cvl_t else False
+                _cvl_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📷 Photo Field যোগ",  callback_data=f"adm_cfield_add_photo_{tid}"),
+                     InlineKeyboardButton("📝 Text Field যোগ",   callback_data=f"adm_cfield_add_text_{tid}")],
+                    [InlineKeyboardButton("🖼 Example Photo ✅" if _cvl_img else "🖼 Example Photo যোগ", callback_data=f"adm_ctaste_sample_photo_{tid}"),
+                     InlineKeyboardButton("🎬 Demo Video ✅",    callback_data=f"adm_ctaste_video_{tid}")],
+                    [InlineKeyboardButton("🚀 এখনই Live করুন", callback_data=f"adm_ctask_golive_{tid}")],
+                ])
                 await update.message.reply_text(
                     f"✅ *Video Link সেট হয়েছে।*\n\n🔗 `{link}`\n\n"
-                    "এখন Task এ 'ভিডিও দেখুন' বাটন দেখা যাবে।",
-                    parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+                    "আরো কিছু যোগ করুন বা Live করুন:",
+                    parse_mode="Markdown", reply_markup=_cvl_kb)
             else:
                 await update.message.reply_text("❌ সঠিক Link দিন।", parse_mode="Markdown")
             return
@@ -10192,15 +10369,28 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             code = txt.strip().upper().replace(" ", "")
             if not code:
                 await update.message.reply_text("❌ Code খালি রাখা যাবে না।", parse_mode="Markdown"); return
-            # duplicate check
+            # duplicate check — শুধু active (শেষ না হওয়া) code block করো
             def _db_9442():
-                exists = None
+                row = None
                 with _c() as c:
-                    exists = c.execute("SELECT id FROM promocodes WHERE code=%s", (code,)).fetchone()
-                return exists
-            exists = await asyncio.to_thread(_db_9442)
-            if exists:
-                await update.message.reply_text(f"❌ `{code}` Code আগেই আছে। অন্য Code দিন:", parse_mode="Markdown"); return
+                    row = c.execute("SELECT id, used_count, max_uses FROM promocodes WHERE code=%s", (code,)).fetchone()
+                return row
+            _existing = await asyncio.to_thread(_db_9442)
+            if _existing:
+                _used  = _existing["used_count"] if _existing["used_count"] is not None else 0
+                _maxu  = _existing["max_uses"]   if _existing["max_uses"]   is not None else 0
+                _active = (_maxu == 0) or (_used < _maxu)
+                if _active:
+                    await update.message.reply_text(
+                        f"❌ `{code}` Code এখনো *Active* আছে। অন্য Code দিন বা পুরনোটি শেষ হওয়ার পর ব্যবহার করুন:",
+                        parse_mode="Markdown"); return
+                else:
+                    # পুরনো exhausted code মুছে দাও — নতুন করে বানানো যাবে
+                    def _db_del_old():
+                        with _c() as c:
+                            c.execute("DELETE FROM promo_uses WHERE code_id=%s", (_existing["id"],))
+                            c.execute("DELETE FROM promocodes WHERE id=%s", (_existing["id"],))
+                    await asyncio.to_thread(_db_del_old)
             ctx.user_data["promo_code"] = code
             ctx.user_data["state"]      = "adm_promo_amount"
             await update.message.reply_text(
@@ -10557,7 +10747,8 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             photo          = update.message.photo[-1]
             file_id        = photo.file_id
             file_unique_id = photo.file_unique_id
-            collected.append({"type": "photo", "prompt_bn": fields[idx]["prompt_bn"], "prompt_en": fields[idx].get("prompt_en",""), "value": file_id, "unique_id": file_unique_id})
+            _ctask_cap = (update.message.caption or "").strip()
+            collected.append({"type": "photo", "prompt_bn": fields[idx]["prompt_bn"], "prompt_en": fields[idx].get("prompt_en",""), "value": file_id, "unique_id": file_unique_id, "caption": _ctask_cap})
             ctx.user_data["field_idx"] = idx + 1
             next_idx = idx + 1
             if next_idx < len(fields):
@@ -10575,6 +10766,8 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     uid = q.from_user.id
     d   = q.data
+    try: await q.answer()
+    except Exception: pass
 
     # ── Notification confirm / edit / skip ──────────────────────
     if d == "adm_notif_send":
@@ -10582,7 +10775,8 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try: await q.answer()
             except Exception: pass
             return
-        await q.answer()
+        try: await q.answer()
+        except Exception: pass
         notif_msg   = ctx.user_data.get("pending_notif_msg", "")
         notify_ch   = ctx.user_data.get("pending_notif_ch", "") or await asyncio.to_thread(get_task_notify_ch_id)
         bot_link    = ctx.user_data.get("pending_notif_bot_link", "")
@@ -10625,7 +10819,8 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try: await q.answer()
             except Exception: pass
             return
-        await q.answer()
+        try: await q.answer()
+        except Exception: pass
         ctx.user_data["state"] = "adm_notif_edit_txt"
         await q.message.reply_text(
             "✏️ *নতুন Notification Message লিখুন:*\n\n"
@@ -10650,7 +10845,8 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try: await q.answer()
             except Exception: pass
             return
-        await q.answer()
+        try: await q.answer()
+        except Exception: pass
         tid    = int(d.split("_")[3])
         task, fields = await asyncio.gather(
             asyncio.to_thread(get_task, tid),
@@ -10688,7 +10884,8 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try: await q.answer()
             except Exception: pass
             return
-        await q.answer()
+        try: await q.answer()
+        except Exception: pass
         parts = d.split("_")
         # format: adm_tp_<action>_<tid>_<type>
         action  = parts[2]          # n / p / m / ok / del
@@ -11189,14 +11386,16 @@ async def _handle_promo_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         return
 
     if d == "adm_promo_req_anyone":
-        await q.answer()
+        try: await q.answer()
+        except Exception: pass
         ctx.user_data["promo_min_tasks"] = 0
         ctx.user_data["promo_req_text"]  = "Anyone can use ✅"
         ctx.user_data["state"]           = "adm_promo_preview"
         await _show_promo_preview(q.message, ctx)
 
     elif d == "adm_promo_req_tasks":
-        await q.answer()
+        try: await q.answer()
+        except Exception: pass
         ctx.user_data["state"] = "adm_promo_min_tasks"
         await q.message.reply_text(
             "📋 *কতটি Task Approved থাকলে Code নিতে পারবে?*\n\n"
@@ -11204,7 +11403,8 @@ async def _handle_promo_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             parse_mode="Markdown")
 
     elif d == "adm_promo_post_news":
-        await q.answer()
+        try: await q.answer()
+        except Exception: pass
         code      = ctx.user_data.get("promo_code", "")
         amount    = ctx.user_data.get("promo_amount", 0)
         max_uses  = ctx.user_data.get("promo_max_uses", 0)
@@ -11251,7 +11451,8 @@ async def _handle_promo_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         _clear_promo_data(ctx)
 
     elif d == "adm_promo_save_only":
-        await q.answer()
+        try: await q.answer()
+        except Exception: pass
         code      = ctx.user_data.get("promo_code", "")
         amount    = ctx.user_data.get("promo_amount", 0)
         max_uses  = ctx.user_data.get("promo_max_uses", 0)
@@ -12299,6 +12500,8 @@ async def job_bio_realtime_monitor(context: ContextTypes.DEFAULT_TYPE):
                     return  # ৫ মিনিট হয়নি
 
                 try:
+                    try: await bot.get_chat(uid)  # cache warm-up
+                    except Exception: pass
                     chat   = await bot.get_chat(uid)
                     bio_ok = _bio_matches(chat.bio)
                 except Exception:
@@ -12345,6 +12548,8 @@ async def job_bio_realtime_monitor(context: ContextTypes.DEFAULT_TYPE):
                     return
 
                 try:
+                    try: await bot.get_chat(uid)  # cache warm-up
+                    except Exception: pass
                     chat   = await bot.get_chat(uid)
                     bio_ok = _bio_matches(chat.bio)
                 except Exception:
