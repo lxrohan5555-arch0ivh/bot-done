@@ -2270,7 +2270,9 @@ async def join_prompt(update: Update, uid=None):
     lang_uid = uid or (update.effective_user.id if update.effective_user else 0)
     channels = await asyncio.to_thread(get_req_channels)
     btns = [[InlineKeyboardButton(f"👉 {ch['ch_name']}", url=ch["ch_link"])] for ch in channels]
-    btns.append([InlineKeyboardButton("✅ জয়েন করেছি — চেক করুন", callback_data="check_join")])
+    _jp_lang = await asyncio.to_thread(get_lang, lang_uid)
+    _jp_btn_lbl = "✅ জয়েন করেছি — চেক করুন" if _jp_lang == 'bn' else "✅ I've Joined — Check Now"
+    btns.append([InlineKeyboardButton(_jp_btn_lbl, callback_data="check_join")])
     # Callback query থেকে ডাকা হলে spinner বন্ধ করো — না হলে loading চলতেই থাকবে
     if update.callback_query:
         try:
@@ -3909,10 +3911,13 @@ async def show_task_rules(update, ctx, task):
 async def start_task_collect(update, ctx, task_id):
     q      = update.callback_query
     uid    = q.from_user.id
-    task   = await asyncio.to_thread(get_task, task_id)
+    task, lang = await asyncio.gather(
+        asyncio.to_thread(get_task, task_id),
+        asyncio.to_thread(get_lang, uid),
+    )
     if not task:
-        await q.message.reply_text("❌ Task পাওয়া যায়নি বা মুছে ফেলা হয়েছে।", parse_mode="Markdown"); return
-    lang = await asyncio.to_thread(get_lang, uid)
+        _err = "❌ Task পাওয়া যায়নি বা মুছে ফেলা হয়েছে।" if lang == 'bn' else "❌ Task not found or removed."
+        await q.message.reply_text(_err, parse_mode="Markdown"); return
     # ── is_active guard — পুরানো button replay করে inactive task এ submit রোধ করো ──
     if not task["is_active"]:
         msg = "❌ এই Task টি এখন আর সক্রিয় নেই।" if lang == 'bn' else "❌ This task is no longer active."
@@ -4385,15 +4390,6 @@ async def wd_ask_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         await q.message.reply_text(_wmsg, parse_mode="Markdown")
         return
-    # ── Lifetime 1-withdrawal limit ───────────────────────────────
-    if _already_wd:
-        _lmsg = (
-            "❌ *আপনি আগেই একবার Withdraw করেছেন।*\n\nপ্রতিটি account সর্বোচ্চ *১ বার* Withdraw করতে পারে।"
-            if lang == 'bn' else
-            "❌ *You have already made a withdrawal.*\n\nEach account is allowed only *1 withdrawal* in total."
-        )
-        await q.message.reply_text(_lmsg, parse_mode="Markdown")
-        return
     # ── Saved wallet check ───────────────────────────────────────
     _saved_w = (_rget(_sw_row, "saved_wallet", "") or "").strip() if _sw_row else ""
     if _saved_w:
@@ -4595,25 +4591,6 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fee     = await asyncio.to_thread(get_wd_fee)
     net_amt = round(amt - fee, 4)
     lang    = await asyncio.to_thread(get_lang, uid)
-
-    # ── Security Check 1b: Lifetime 1-withdrawal limit ──────────────
-    def _check_prev_wd():
-        with _c() as c:
-            return c.execute(
-                "SELECT id FROM withdrawals WHERE user_id=%s AND status IN ('approved','processing','completed')",
-                (uid,)
-            ).fetchone()
-    _prev_wd = await asyncio.to_thread(_check_prev_wd)
-    if _prev_wd:
-        err_msg = (
-            "❌ *আপনি আগেই একবার Withdraw করেছেন।*\n\nপ্রতিটি account সর্বোচ্চ *১ বার* Withdraw করতে পারে।"
-            if lang == 'bn' else
-            "❌ *You have already made a withdrawal.*\n\nEach account is allowed only *1 withdrawal* in total."
-        )
-        for k in ("state", "wd_addr", "wd_amt"):
-            ctx.user_data.pop(k, None)
-        await ctx.bot.send_message(uid, err_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
-        return
 
     # ── Security Check 2: Atomic balance deduction — balance না থাকলে block ──
     if not await asyncio.to_thread(safe_ded_bal, uid, amt):
@@ -5811,12 +5788,12 @@ async def _on_callback_inner(update, ctx, q, uid, d):
     if d.startswith("set_country_"):
         code = d[len("set_country_"):]
         valid_codes = {c[0] for c in COUNTRY_LIST}
-        if code not in valid_codes:
-            await q.message.reply_text("❌ অজানা দেশ!"); return
         _lk, _existing_country = await asyncio.gather(
             asyncio.to_thread(get_lang, uid),
             asyncio.to_thread(get_user_country, uid),
         )
+        if code not in valid_codes:
+            await q.message.reply_text("❌ অজানা দেশ!" if _lk == 'bn' else "❌ Unknown country!"); return
         # ── One-time lock: already set + not first-time flow → block ──
         if _existing_country and ctx.user_data.get("state") != "first_country":
             _ex_flag, _ex_name = COUNTRY_MAP.get(_existing_country.upper(), ("🌍", _existing_country))
@@ -5829,7 +5806,6 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 f"Your country is already set to: {_ex_flag} *{_ex_name}*\n\n"
                 f"Contact Support if you need to change it."
             )
-            await q.message.reply_text("🔒 দেশ পরিবর্তন করা যাবে না!")
             try: await q.message.edit_reply_markup(reply_markup=None)
             except Exception: pass
             await ctx.bot.send_message(uid, _lock_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
@@ -6044,12 +6020,13 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         if not await _bot_accessible(uid):
             await bot_off_reply(update, uid); return
         if not await guard(update, ctx): return
+        _cl = await asyncio.to_thread(get_lang, uid)
         try:
             cid = int(d.split("_")[1])
             await show_category_tasks(update, ctx, cid)
         except Exception as e:
             log.warning(f"categ error: {e}")
-            await q.message.reply_text("❌ সমস্যা হয়েছে!")
+            await q.message.reply_text("❌ সমস্যা হয়েছে!" if _cl == 'bn' else "❌ Something went wrong!")
         return
 
     # ── Category task selected → show rules ──────────────────────
@@ -6057,15 +6034,16 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         if not await _bot_accessible(uid):
             await bot_off_reply(update, uid); return
         if not await guard(update, ctx): return
+        _ctl = await asyncio.to_thread(get_lang, uid)
         try:
             tid  = int(d.split("_")[1])
             task = await asyncio.to_thread(get_category_task, tid)
             if not task or not task['is_active']:
-                await q.message.reply_text("❌ Task পাওয়া যায়নি!"); return
+                await q.message.reply_text("❌ Task পাওয়া যায়নি!" if _ctl == 'bn' else "❌ Task not found!"); return
             await show_category_task_rules(update, ctx, task)
         except Exception as e:
             log.warning(f"ctask error: {e}")
-            await q.message.reply_text("❌ সমস্যা হয়েছে!")
+            await q.message.reply_text("❌ সমস্যা হয়েছে!" if _ctl == 'bn' else "❌ Something went wrong!")
         return
 
     # ── Category task submit ──────────────────────────────────────
@@ -6073,12 +6051,13 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         if not await _bot_accessible(uid):
             await bot_off_reply(update, uid); return
         if not await guard(update, ctx): return
+        _csl = await asyncio.to_thread(get_lang, uid)
         try:
             tid = int(d.split("_")[2])
             await start_category_task_collect(update, ctx, tid)
         except Exception as e:
             log.warning(f"ctask_submit error: {e}")
-            await q.message.reply_text("❌ সমস্যা হয়েছে!")
+            await q.message.reply_text("❌ সমস্যা হয়েছে!" if _csl == 'bn' else "❌ Something went wrong!")
         return
 
     # ── TG Task separator (dummy) ─────────────────────────────────
@@ -6090,15 +6069,16 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         if not await _bot_accessible(uid):
             await bot_off_reply(update, uid); return
         if not await guard(update, ctx): return
+        _tgl = await asyncio.to_thread(get_lang, uid)
         try:
             tid  = int(d.split("_")[1])
             task = await asyncio.to_thread(get_tg_task, tid)
             if not task or not task['is_active']:
-                await q.message.reply_text("❌ Task পাওয়া যায়নি!"); return
+                await q.message.reply_text("❌ Task পাওয়া যায়নি!" if _tgl == 'bn' else "❌ Task not found!"); return
             await show_tg_task(update, ctx, task)
         except Exception as e:
             log.warning(f"tgt task error: {e}")
-            await q.message.reply_text("❌ সমস্যা হয়েছে!")
+            await q.message.reply_text("❌ সমস্যা হয়েছে!" if _tgl == 'bn' else "❌ Something went wrong!")
         return
 
     # ── TG Task check membership ──────────────────────────────────
@@ -6111,12 +6091,13 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             _until_tg = _blk_tg_dt.astimezone(pytz.timezone("Asia/Dhaka")).strftime("%d %b %Y, %I:%M %p")
             await q.message.reply_text(T(uid, 'task_blocked_msg', until=_until_tg)[:4000], parse_mode="Markdown")
             return
+        _tckl = await asyncio.to_thread(get_lang, uid)
         try:
             tid = int(d.split("_")[2])
             await handle_tg_task_check(update, ctx, tid)
         except Exception as e:
             log.warning(f"tgt check error: {e}")
-            await q.message.reply_text("❌ সমস্যা হয়েছে! আবার চেষ্টা করুন।")
+            await q.message.reply_text("❌ সমস্যা হয়েছে! আবার চেষ্টা করুন।" if _tckl == 'bn' else "❌ Something went wrong! Please try again.")
         return
 
     # ── Task selected → show rules ────────────────────────────────
@@ -6124,21 +6105,22 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         if not await _bot_accessible(uid):
             await bot_off_reply(update, uid); return
         if not await guard(update, ctx): return
+        _tsl = await asyncio.to_thread(get_lang, uid)
         _answered = False
         try:
             tid  = int(d.split("_")[1])
             task = await asyncio.to_thread(get_task, tid)
             if not task:
-                await q.message.reply_text("❌ Task পাওয়া যায়নি!"); return
+                await q.message.reply_text("❌ Task পাওয়া যায়নি!" if _tsl == 'bn' else "❌ Task not found!"); return
             _answered = True
             await show_task_rules(update, ctx, task)
         except Exception as _te:
             log.warning(f"[TASK_CLICK] tid={d} error: {_te}")
             if not _answered:
-                try: await q.message.reply_text("❌ সমস্যা হয়েছে!")
+                try: await q.message.reply_text("❌ সমস্যা হয়েছে!" if _tsl == 'bn' else "❌ Something went wrong!")
                 except Exception: pass
             else:
-                try: await q.message.reply_text("❌ Task দেখাতে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
+                try: await q.message.reply_text("❌ Task দেখাতে সমস্যা হয়েছে। আবার চেষ্টা করুন।" if _tsl == 'bn' else "❌ Could not load task. Please try again.")
                 except Exception: pass
         return
 
@@ -6147,12 +6129,13 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         if not await _bot_accessible(uid):
             await bot_off_reply(update, uid); return
         if not await guard(update, ctx): return
+        _tsubl = await asyncio.to_thread(get_lang, uid)
         try:
             tid = int(d.split("_")[2])
             await start_task_collect(update, ctx, tid)
         except Exception as e:
             log.warning(f"task_submit error: {e}")
-            await q.message.reply_text("❌ সমস্যা হয়েছে!")
+            await q.message.reply_text("❌ সমস্যা হয়েছে!" if _tsubl == 'bn' else "❌ Something went wrong!")
         return
 
     # ── Withdraw ──────────────────────────────────────────────────
@@ -6655,9 +6638,11 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             )
         kb_rows = []
         if not add_done:
-            kb_rows.append([InlineKeyboardButton("✅ Check করুন", callback_data="bio_task_check")])
+            _bio_check_lbl = "✅ Check করুন" if lang == 'bn' else "✅ Check Now"
+            kb_rows.append([InlineKeyboardButton(_bio_check_lbl, callback_data="bio_task_check")])
         elif not actively_track:
-            kb_rows.append([InlineKeyboardButton("🔄 Bio সেট করে Check করুন", callback_data="bio_task_check")])
+            _bio_reset_lbl = "🔄 Bio সেট করে Check করুন" if lang == 'bn' else "🔄 Set Bio & Check"
+            kb_rows.append([InlineKeyboardButton(_bio_reset_lbl, callback_data="bio_task_check")])
         kb_rows.append([InlineKeyboardButton("🔙 Tasks", callback_data="task_cancel")])
         kb = InlineKeyboardMarkup(kb_rows)
         await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
@@ -6784,9 +6769,10 @@ async def _bio_task_check_inner(update, ctx, q, uid):
                 f"📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
                 f"✅ After setting, press Check again."
             )
+        _bio_chk_lbl2 = "✅ Check করুন" if lang == 'bn' else "✅ Check Again"
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Check করুন", callback_data="bio_task_check")],
-            [InlineKeyboardButton("🔙 Tasks",      callback_data="task_cancel")],
+            [InlineKeyboardButton(_bio_chk_lbl2, callback_data="bio_task_check")],
+            [InlineKeyboardButton("🔙 Tasks",     callback_data="task_cancel")],
         ])
         await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb,
                                    disable_web_page_preview=True)
@@ -8705,7 +8691,6 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
 
     # ── User: Watch Video — Regular Task ──────────────────────────
     if d.startswith("task_watch_video_"):
-        await q.answer()
         try:
             tid = int(d.split("_")[3])
         except (IndexError, ValueError):
@@ -8734,7 +8719,6 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
 
     # ── User: Watch Video — Category Task ─────────────────────────
     if d.startswith("ctask_watch_video_"):
-        await q.answer()
         try:
             tid = int(d.split("_")[3])
         except (IndexError, ValueError):
