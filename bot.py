@@ -14093,13 +14093,11 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback_extra,       pattern=r"^(adm_task_done_\d+|adm_notif_send|adm_notif_edit|adm_notif_skip|adm_tp_.+)$"))
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
     app.add_handler(CallbackQueryHandler(on_callback))
-    # ~filters.User(allow_bots=False) → অন্য বট থেকে আসা সব message ignore করো
-    # বট account গুলো message পাঠালে admin-এর কাছে যাবে না
-    _no_bot = filters.User(allow_bots=False)
-    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & _no_bot, on_photo))
-    app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND & _no_bot, on_video))
-    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND & _no_bot, on_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & _no_bot, on_message))
+    # ~filters.VIA_BOT → inline-bot দিয়ে পাঠানো message ignore করো
+    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & ~filters.VIA_BOT, on_photo))
+    app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND & ~filters.VIA_BOT, on_video))
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND & ~filters.VIA_BOT, on_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT, on_message))
     app.add_error_handler(_smart_error_handler)
     log.info("✅ Task Earn Bot started!")
     app.run_polling(drop_pending_updates=True)
