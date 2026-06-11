@@ -676,12 +676,13 @@ def init_db():
         """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS task_fields (
-                id          BIGSERIAL PRIMARY KEY,
-                task_id     BIGINT NOT NULL,
-                field_order INTEGER DEFAULT 0,
-                field_type  TEXT DEFAULT 'text',
-                prompt_bn   TEXT DEFAULT '',
-                prompt_en   TEXT DEFAULT ''
+                id               BIGSERIAL PRIMARY KEY,
+                task_id          BIGINT NOT NULL,
+                field_order      INTEGER DEFAULT 0,
+                field_type       TEXT DEFAULT 'text',
+                prompt_bn        TEXT DEFAULT '',
+                prompt_en        TEXT DEFAULT '',
+                example_image_id TEXT DEFAULT ''
             )
         """)
         c.execute("""
@@ -754,12 +755,13 @@ def init_db():
         """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS category_task_fields (
-                id          BIGSERIAL PRIMARY KEY,
-                task_id     BIGINT NOT NULL,
-                field_order INTEGER DEFAULT 0,
-                field_type  TEXT DEFAULT 'text',
-                prompt_bn   TEXT DEFAULT '',
-                prompt_en   TEXT DEFAULT ''
+                id               BIGSERIAL PRIMARY KEY,
+                task_id          BIGINT NOT NULL,
+                field_order      INTEGER DEFAULT 0,
+                field_type       TEXT DEFAULT 'text',
+                prompt_bn        TEXT DEFAULT '',
+                prompt_en        TEXT DEFAULT '',
+                example_image_id TEXT DEFAULT ''
             )
         """)
         c.execute("""
@@ -869,6 +871,14 @@ def init_db():
             pass
         try:
             c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS saved_wallet TEXT DEFAULT ''")
+        except Exception:
+            pass
+        try:
+            c.execute("ALTER TABLE task_fields ADD COLUMN IF NOT EXISTS example_image_id TEXT DEFAULT ''")
+        except Exception:
+            pass
+        try:
+            c.execute("ALTER TABLE category_task_fields ADD COLUMN IF NOT EXISTS example_image_id TEXT DEFAULT ''")
         except Exception:
             pass
         c.execute("""
@@ -1311,11 +1321,11 @@ def _perms_display(perms_str: str) -> str:
 
 # ── Settings Cache — প্রতি user action এ DB query কমাতে 60s TTL cache ──
 _settings_cache: "dict[str, tuple]" = {}   # key → (value, timestamp)
-_SETTINGS_TTL = 60.0   # সেকেন্ড
+_SETTINGS_TTL = 120.0  # সেকেন্ড (60→120: DB miss কমাও)
 
 # ── User Cache — guard() + handler দুইবার DB hit বন্ধ করে ──────────────
 _user_cache: "dict[int, tuple]" = {}   # uid → (user_dict, timestamp)
-_USER_CACHE_TTL = 30.0   # ৩০ সেকেন্ড (balance/ban পরিবর্তন হলে auto expire হবে)
+_USER_CACHE_TTL = 60.0   # ৬০ সেকেন্ড (30→60: DB miss অর্ধেক; ban হলে invalidate হয়)
 
 # ── Language Cache — T() প্রতি call-এ DB hit বন্ধ করে (সবচেয়ে বড় fix) ─
 _lang_cache: "dict[int, tuple]" = {}   # uid → (lang, timestamp)
@@ -1580,15 +1590,19 @@ def get_task_fields(task_id):
             "SELECT * FROM task_fields WHERE task_id=%s ORDER BY field_order", (task_id,)
         ).fetchall()
 
-def add_task_field(task_id, field_type, prompt_bn, prompt_en, order=None):
+def add_task_field(task_id, field_type, prompt_bn, prompt_en, order=None, example_image_id=''):
     with _c() as c:
         if order is None:
             r = c.execute("SELECT COUNT(*) FROM task_fields WHERE task_id=%s", (task_id,)).fetchone()
             order = _count(r)
         c.execute(
-            "INSERT INTO task_fields (task_id,field_order,field_type,prompt_bn,prompt_en) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-            (task_id, order, field_type, prompt_bn, prompt_en)
+            "INSERT INTO task_fields (task_id,field_order,field_type,prompt_bn,prompt_en,example_image_id) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+            (task_id, order, field_type, prompt_bn, prompt_en, example_image_id or '')
         )
+
+def update_task_field_example_img(field_id, image_id):
+    with _c() as c:
+        c.execute("UPDATE task_fields SET example_image_id=%s WHERE id=%s", (image_id, field_id))
 
 def delete_task_field(fid):
     with _c() as c:
@@ -1821,6 +1835,7 @@ def atomic_give_bio_add_reward(user_id, amount: float, date_str: str) -> bool:
                 "UPDATE users SET balance = balance + %s WHERE user_id=%s",
                 (amount, user_id)
             )
+            _invalidate_user_cache(user_id)
             # ── Step 3: payment record করো ─────────────────────────
             c.execute(
                 "INSERT INTO bio_task_completions (user_id, task_date, amount, paid_at) "
@@ -1914,15 +1929,31 @@ def get_category_task_fields(task_id):
     with _c() as c:
         return c.execute("SELECT * FROM category_task_fields WHERE task_id=%s ORDER BY field_order", (task_id,)).fetchall()
 
-def add_category_task_field(task_id, field_type, prompt_bn, prompt_en, order=None):
+def add_category_task_field(task_id, field_type, prompt_bn, prompt_en, order=None, example_image_id=''):
     with _c() as c:
         if order is None:
             r = c.execute("SELECT COUNT(*) FROM category_task_fields WHERE task_id=%s", (task_id,)).fetchone()
             order = _count(r)
         c.execute(
-            "INSERT INTO category_task_fields (task_id,field_order,field_type,prompt_bn,prompt_en) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-            (task_id, order, field_type, prompt_bn, prompt_en)
+            "INSERT INTO category_task_fields (task_id,field_order,field_type,prompt_bn,prompt_en,example_image_id) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+            (task_id, order, field_type, prompt_bn, prompt_en, example_image_id or '')
         )
+
+def update_category_task_field_example_img(field_id, image_id):
+    with _c() as c:
+        c.execute("UPDATE category_task_fields SET example_image_id=%s WHERE id=%s", (image_id, field_id))
+
+def get_last_task_field(task_id):
+    with _c() as c:
+        return c.execute(
+            "SELECT * FROM task_fields WHERE task_id=%s ORDER BY field_order DESC LIMIT 1", (task_id,)
+        ).fetchone()
+
+def get_last_category_task_field(task_id):
+    with _c() as c:
+        return c.execute(
+            "SELECT * FROM category_task_fields WHERE task_id=%s ORDER BY field_order DESC LIMIT 1", (task_id,)
+        ).fetchone()
 
 def delete_category_task_field(fid):
     with _c() as c:
@@ -2529,13 +2560,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _send_welcome(update, ctx, user.id)
 
 async def _send_welcome(update, ctx, uid):
-    lang_key = 'welcome_msg_bn' if await asyncio.to_thread(get_lang, uid) == 'bn' else 'welcome_msg_en'
+    # get_lang আর main_kb parallel-এ চালাও — দুটোই independent DB query
+    _lang_res, _kb = await asyncio.gather(
+        asyncio.to_thread(get_lang, uid),
+        asyncio.to_thread(main_kb, uid),
+    )
+    lang_key = 'welcome_msg_bn' if _lang_res == 'bn' else 'welcome_msg_en'
     custom_w = await asyncio.to_thread(get_setting, lang_key)
     welcome_text = custom_w if custom_w else T(uid, 'welcome')
     if update.message:
-        await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+        await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=_kb)
     else:
-        await ctx.bot.send_message(uid, welcome_text, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+        await ctx.bot.send_message(uid, welcome_text, parse_mode="Markdown", reply_markup=_kb)
     # Apply promo code from deep link (/start promo_CODE)
     _pp = ctx.user_data.pop("pending_promo", None)
     if _pp:
@@ -2554,7 +2590,7 @@ async def guard(update, ctx):
         if update.message:
             await update.message.reply_text(T(uid, 'banned'), parse_mode="Markdown")
         elif update.callback_query:
-            try: await update.callback_query.answer("🚫 Banned!", show_alert=True)
+            try: await update.callback_query.message.reply_text(T(uid, 'banned'), parse_mode="Markdown")
             except Exception: pass
         return False
     if missing:
@@ -2578,20 +2614,19 @@ def _update_last_seen_sync(uid, ts):
         c.execute("UPDATE users SET last_seen=%s WHERE user_id=%s", (ts, uid))
 
 async def _bot_accessible(uid: int) -> bool:
-    """is_admin + bot_is_on দুটো parallel চালিয়ে bot accessible কিনা জানাও।
-    এর আগে sequential await ছিল — এখন একসাথে চলে তাই কোনো অতিরিক্ত wait নেই।"""
-    _is_adm, _on = await asyncio.gather(
-        asyncio.to_thread(is_admin, uid),
-        asyncio.to_thread(bot_is_on),
-    )
-    return bool(_is_adm or _on)
+    """bot চালু থাকলে (common case) সবাই accessible — is_admin check দরকার নেই।
+    Bot বন্ধ থাকলেই শুধু is_admin check করো → 1 thread dispatch vs আগের 2।"""
+    _on = await asyncio.to_thread(bot_is_on)
+    if _on:
+        return True          # fast path: bot চালু → thread dispatch বাঁচাও
+    return await asyncio.to_thread(is_admin, uid)
 
 async def bot_off_reply(update, uid=0):
     msg = T(uid, 'bot_off')
     if update.message:
         await update.message.reply_text(msg, parse_mode="Markdown")
     elif update.callback_query:
-        try: await update.callback_query.answer("🔴 Bot is offline!", show_alert=True)
+        try: await update.callback_query.message.reply_text(msg, parse_mode="Markdown")
         except Exception: pass
 
 # ──────────────────────────── /cancel ────────────────────────────
@@ -2902,8 +2937,6 @@ async def show_tg_tasks_list(update, ctx):
     """Show all active TG tasks as a list"""
     q   = update.callback_query
     uid = q.from_user.id
-    try: await q.answer()
-    except Exception: pass
     lang, tg_tasks = await asyncio.gather(
         asyncio.to_thread(get_lang, uid),
         asyncio.to_thread(get_tg_tasks),
@@ -2937,8 +2970,6 @@ async def show_category_tasks(update, ctx, cat_id):
     """Show tasks inside a category"""
     q    = update.callback_query
     uid  = q.from_user.id
-    try: await q.answer()
-    except Exception: pass
     lang, cat = await asyncio.gather(
         asyncio.to_thread(get_lang, uid),
         asyncio.to_thread(get_category, cat_id),
@@ -2998,16 +3029,12 @@ async def show_category_task_rules(update, ctx, task):
             done_msg = f"✅ You have already completed this task {user_count}/{lim_lbl} time(s). No more submissions allowed."
         else:
             done_msg = f"✅ আপনি এই Task ইতিমধ্যে {user_count}/{lim_lbl} বার সম্পন্ন করেছেন। আর জমা দেওয়া যাবে না।"
-        try: await update.callback_query.answer(done_msg, show_alert=True)
-        except Exception: pass
+        # show_alert ব্যবহার না করে reply_text দাও — parent ইতিমধ্যে q.answer() fire করেছে
+        await update.callback_query.message.reply_text(done_msg, parse_mode="Markdown")
         return
     if slots == 0:
-        try:
-            await update.callback_query.answer(
-                "❌ All slots for this task are filled!" if lang=='en' else "❌ এই Task এর সব জায়গা পূর্ণ!",
-                show_alert=True
-            )
-        except Exception: pass
+        msg_full = "❌ All slots for this task are filled!" if lang=='en' else "❌ এই Task এর সব জায়গা পূর্ণ!"
+        await update.callback_query.message.reply_text(msg_full, parse_mode="Markdown")
         return
 
     # ── Country restriction check ─────────────────────────────────
@@ -3028,8 +3055,6 @@ async def show_category_task_rules(update, ctx, task):
                 "👆 Please select the country where you actually live.\n"
                 "🔒 *This cannot be changed once selected.*"
             )
-            try: await update.callback_query.answer()
-            except Exception: pass
             await update.callback_query.message.reply_text(_ask, parse_mode="Markdown", reply_markup=country_kb())
             return
         if _cat_u_country not in _cat_allowed_list:
@@ -3038,13 +3063,8 @@ async def show_category_task_rules(update, ctx, task):
                 if lang == 'bn' else
                 f"❌ *This task is not available in your country.*\n\n✅ Allowed countries: {fmt_allowed_countries(_cat_allowed)}"
             )
-            try: await update.callback_query.answer()
-            except Exception: pass
             await update.callback_query.message.reply_text(_deny, parse_mode="Markdown")
             return
-
-    try: await update.callback_query.answer()
-    except Exception: pass
 
     if lang == 'en':
         rules_text  = (task["rules_en"] if task["rules_en"] else await asyncio.to_thread(translate_to_en, task["rules"])) if task["rules"] else "No special rules."
@@ -3134,8 +3154,6 @@ async def start_category_task_collect(update, ctx, task_id):
     """Start collecting proof for a category task"""
     q      = update.callback_query
     uid    = q.from_user.id
-    try: await q.answer()
-    except Exception: pass
     task, fields, lang = await asyncio.gather(
         asyncio.to_thread(get_category_task, task_id),
         asyncio.to_thread(get_category_task_fields, task_id),
@@ -3400,8 +3418,6 @@ async def show_tg_task(update, ctx, task):
     """Show TG Join task info with Join + Check buttons"""
     q   = update.callback_query
     uid = q.from_user.id
-    try: await q.answer()
-    except Exception: pass
     tid = task['id']
     lang, slots, already_done = await asyncio.gather(
         asyncio.to_thread(get_lang, uid),
@@ -3488,8 +3504,6 @@ async def handle_tg_task_check(update, ctx, tid):
     """Auto-check channel membership and pay if joined"""
     q    = update.callback_query
     uid  = q.from_user.id
-    try: await q.answer("⏳ চেক করা হচ্ছে...", show_alert=False)
-    except Exception: pass
     lang, task = await asyncio.gather(
         asyncio.to_thread(get_lang, uid),
         asyncio.to_thread(get_tg_task, tid),
@@ -3602,6 +3616,7 @@ async def handle_tg_task_check(update, ctx, tid):
                 if t_row and t_row["max_completions"] > 0 and t_row["completed_count"] >= t_row["max_completions"]:
                     c.execute("UPDATE tg_tasks SET is_active=0 WHERE id=%s", (tid,))
                 c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (price, uid))
+                _invalidate_user_cache(uid)
         return _already_paid
     _already_paid = await asyncio.to_thread(_db_3273)
     if _already_paid:
@@ -3766,11 +3781,7 @@ async def show_task_rules(update, ctx, task):
     if _blk and _blk_dt:
         _until_str = _blk_dt.astimezone(pytz.timezone("Asia/Dhaka")).strftime("%d %b %Y, %I:%M %p")
         _msg = T(uid, 'task_blocked_msg', until=_until_str)
-        if update.callback_query:
-            try: await update.callback_query.answer(_msg[:200], show_alert=True)
-            except Exception: pass
-        else:
-            await update.effective_message.reply_text(_msg, parse_mode="Markdown")
+        await update.effective_message.reply_text(_msg, parse_mode="Markdown")
         return
     # ── Per-user limit check ─────────────────────────────────────
     per_user_limit = _rget(task, 'per_user_limit', 1)
@@ -3782,11 +3793,7 @@ async def show_task_rules(update, ctx, task):
             msg = f"✅ You have already completed this task {done_count}/{lim_lbl} time(s). No more submissions allowed."
         else:
             msg = f"✅ আপনি এই Task ইতিমধ্যে {done_count}/{lim_lbl} বার সম্পন্ন করেছেন। আর জমা দেওয়া যাবে না।"
-        if update.callback_query:
-            try: await update.callback_query.answer(msg, show_alert=True)
-            except Exception: pass
-        else:
-            await update.effective_message.reply_text(msg, parse_mode="Markdown")
+        await update.effective_message.reply_text(msg, parse_mode="Markdown")
         return
     fields   = await asyncio.to_thread(get_task_fields, task['id'])
     sub_btn  = T(uid, 'submit_btn')
@@ -3828,10 +3835,6 @@ async def show_task_rules(update, ctx, task):
     _task_name = _html_escape(str(task['name']))
     _price_val = _html_escape(str(task['price']))
     _rules_safe = _html_escape(str(rules_text))
-    # Normal path-এ spinner dismiss করো (error path এ 3470/3485 ইতিমধ্যে answer করেছে)
-    if update.callback_query:
-        try: await update.callback_query.answer()
-        except Exception: pass
     await update.effective_message.reply_text(
         f"📌 <b>{_task_name}</b>{_code_line}\n"
         f"{price_label} <code>{_price_val} USDT</code>\n\n"
@@ -3849,8 +3852,6 @@ async def show_task_rules(update, ctx, task):
 async def start_task_collect(update, ctx, task_id):
     q      = update.callback_query
     uid    = q.from_user.id
-    try: await q.answer()
-    except Exception: pass
     task   = await asyncio.to_thread(get_task, task_id)
     if not task:
         await q.message.reply_text("❌ Task পাওয়া যায়নি বা মুছে ফেলা হয়েছে।", parse_mode="Markdown"); return
@@ -3922,23 +3923,31 @@ async def _ask_next_field(update, ctx, uid, via_callback=False):
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
 
     # ── Sample photo: photo field হলে example image দেখাও ──────────
+    # প্রথমে field-এর নিজস্ব example_image_id চেক করো, না থাকলে task-level টা দেখো
     if field["field_type"] == "photo":
-        _categ_task_id = ctx.user_data.get("categ_task_id")
-        _reg_task_id   = ctx.user_data.get("task_id")
-        _task_id_for_sample = _categ_task_id or _reg_task_id
-        if _task_id_for_sample:
-            try:
-                if _categ_task_id:
-                    _sample_task = await asyncio.to_thread(get_category_task, _categ_task_id)
-                else:
-                    _sample_task = await asyncio.to_thread(get_task, _reg_task_id)
-                _samp_img = (_rget(_sample_task, 'example_image_id', '') or '').strip() if _sample_task else ''
-                if _samp_img:
-                    _samp_cap = "📷 নমুনা ছবি — এইরকম ছবি দিন" if lang == 'bn' else "📷 Sample — Submit a photo like this"
-                    if via_callback:
-                        await update.callback_query.message.reply_photo(_samp_img, caption=_samp_cap)
+        _field_img = (_rget(field, 'example_image_id', '') or '').strip()
+        _samp_img  = _field_img  # field-level first
+        if not _samp_img:
+            # fallback: task-level example image
+            _categ_task_id = ctx.user_data.get("categ_task_id")
+            _reg_task_id   = ctx.user_data.get("task_id")
+            _task_id_for_sample = _categ_task_id or _reg_task_id
+            if _task_id_for_sample:
+                try:
+                    if _categ_task_id:
+                        _sample_task = await asyncio.to_thread(get_category_task, _categ_task_id)
                     else:
-                        await update.message.reply_photo(_samp_img, caption=_samp_cap)
+                        _sample_task = await asyncio.to_thread(get_task, _reg_task_id)
+                    _samp_img = (_rget(_sample_task, 'example_image_id', '') or '').strip() if _sample_task else ''
+                except Exception:
+                    _samp_img = ''
+        if _samp_img:
+            _samp_cap = "📷 নমুনা ছবি — এইরকম ছবি দিন" if lang == 'bn' else "📷 Sample — Submit a photo like this"
+            try:
+                if via_callback:
+                    await update.callback_query.message.reply_photo(_samp_img, caption=_samp_cap)
+                else:
+                    await update.message.reply_photo(_samp_img, caption=_samp_cap)
             except Exception:
                 pass
 
@@ -5182,14 +5191,11 @@ async def _activate_task_and_notify(ctx, q, uid,
     """
     t = await asyncio.to_thread(get_fn, tid)
     if not t:
-        try: await q.answer("❌ Task পাওয়া যায়নি!", show_alert=True)
-        except Exception: pass
+        await q.message.reply_text("❌ Task পাওয়া যায়নি!", parse_mode="Markdown")
         return False
     new_val = 0 if t['is_active'] else 1
     await asyncio.to_thread(update_fn, tid, "is_active", new_val)
     _mark_dirty()
-    try: await q.answer("✅ চালু!" if new_val else "❌ বন্ধ!", show_alert=False)
-    except Exception: pass
     try: await q.message.edit_reply_markup(reply_markup=None)
     except Exception: pass
     status_lbl = "✅ *Task Activated!*" if new_val else "❌ *Task Deactivated.*"
@@ -5686,7 +5692,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception(f"[on_callback ERROR] data={d} uid={uid} error={e}")
         try:
-            await q.answer("❌ Error! Admin check logs.", show_alert=True)
+            await q.message.reply_text("❌ Error! Admin check logs.")
         except Exception: pass
     return
 
@@ -6191,6 +6197,8 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                     bal_ok = bool(c.execute(
                         "UPDATE users SET balance=balance+%s WHERE user_id=%s", (price, guser)
                     ).rowcount)
+                    if bal_ok:
+                        _invalidate_user_cache(guser)
             return _already_done, bal_ok
         _already_done, bal_ok = await asyncio.to_thread(_db_5622)
         if _already_done:
@@ -6370,6 +6378,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                         _already = True
                     else:
                         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (wamt, wuser))
+                        _invalidate_user_cache(wuser)
                 return _already
             _gc_already = await asyncio.to_thread(_db_5770)
             if _gc_already:
@@ -6439,6 +6448,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                         return True  # already processed
                     # শুধু এই transaction-ই reject করেছে — refund safe
                     c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (wamt, wuser))
+                    _invalidate_user_cache(wuser)
                 return False
             _wr_already = await asyncio.to_thread(_db_5828)
             if _wr_already:
@@ -6472,8 +6482,11 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         await q.message.reply_text("✅ Done!")
         return
 
-    # ── Bio Task user callbacks (সব user দেখতে পাবে) ────────────────
+    # ── Bio Task user callbacks ────────────────────────────────────
     if d == "bio_task_info":
+        if not await _bot_accessible(uid):
+            await bot_off_reply(update, uid); return
+        if not await guard(update, ctx): return
         bio_task, lang = await asyncio.gather(
             asyncio.to_thread(get_bio_task),
             asyncio.to_thread(get_lang, uid),
@@ -6567,8 +6580,11 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         return
 
     if d == "bio_task_check":
+        if not await _bot_accessible(uid):
+            await bot_off_reply(update, uid); return
+        if not await guard(update, ctx): return
         # ── Double-press protection ─────────────────────────────────────────
-        # user দুবার Check চাপলে দুটো ৬০s loop চলবে না — একটাই চলবে
+        # user দুবার Check চাপলে দুটো ৩৫s loop চলবে না — একটাই চলবে
         if ctx.user_data.get("bio_check_in_progress"):
             try:
                 lang_dp = await asyncio.to_thread(get_lang, uid)
@@ -6580,233 +6596,227 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 pass
             return
         ctx.user_data["bio_check_in_progress"] = True
-
         try:
-            bio_task, lang, bot_me = await asyncio.gather(
-                asyncio.to_thread(get_bio_task),
-                asyncio.to_thread(get_lang, uid),
-                ctx.bot.get_me(),
-            )
-        except Exception:
+            await _bio_task_check_inner(update, ctx, q, uid)
+        finally:
+            # যেকোনো exception বা normal return-এ flag সর্বদা clear হবে
             ctx.user_data["bio_check_in_progress"] = False
-            raise
+        return
+    # ── Admin panel callbacks (all adm_* callbacks handled here) ──
+    await _handle_admin_inner(update, ctx, q, uid, d)
 
-        if not bio_task or not bio_task['is_active']:
-            ctx.user_data["bio_check_in_progress"] = False
-            await q.message.reply_text(
-                "❌ Bio Task এখন সক্রিয় নেই।" if lang == 'bn'
-                else "❌ Bio Task is not active right now.",
-                parse_mode="Markdown")
-            return
 
-        add_reward   = (bio_task.get('add_reward', 0) or 0)
-        daily_reward = bio_task['reward']
-        bot_username = bot_me.username
-        ref_link     = f"https://t.me/{bot_username}?start=ref_{uid}"
-        required_bio = f"Free Task Earn bot {ref_link}"
+async def _bio_task_check_inner(update, ctx, q, uid):
+    bio_task, lang, bot_me = await asyncio.gather(
+        asyncio.to_thread(get_bio_task),
+        asyncio.to_thread(get_lang, uid),
+        ctx.bot.get_me(),
+    )
 
-        # ── Bio matching ─────────────────────────────────────────────────────
-        # শুধু ref_{uid} থাকলেই যথেষ্ট — এটাই unique identifier per user
-        def _bio_matches(bio_text: str) -> bool:
-            if not bio_text:
-                return False
-            t = bio_text.strip()
-            if f"ref_{uid}" in t:                              # সবচেয়ে reliable চেক
-                return True
-            if required_bio.lower() in t.lower():             # exact match (case-insensitive)
-                return True
-            if str(uid) in t and bot_username.lower() in t.lower():  # partial link match
-                return True
-            return False
-
-        # ── PERMANENT FIX: Telegram cache সম্পূর্ণভাবে bypass করার পদ্ধতি ─────
-        # Telegram get_chat() ১-২ মিনিট পুরনো data দিতে পারে।
-        # সমাধান: প্রথমে "চেক হচ্ছে..." দেখাও, তারপর ১০s পর পর ৬ বার চেষ্টা করো।
-        # মোট সময়: ৬০ সেকেন্ড — এতে Telegram এর যেকোনো cache শেষ হয়ে যায়।
-
-        _wait_msg_text = (
-            "⏳ *Bio চেক হচ্ছে...*\n\nঅনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন।"
-            if lang == 'bn' else
-            "⏳ *Checking Bio...*\n\nPlease wait a few seconds."
-        )
-        _status_msg = await q.message.reply_text(_wait_msg_text, parse_mode="Markdown")
-
-        bio_ok    = False
-        user_bio  = ""
-        _INTERVAL = 5     # প্রতি ৫ সেকেন্ড পর পর (ছিল ১০s — Telegram cache সাধারণত ১৫-৩০s এ clear হয়)
-        _attempts = 8     # ৮ বার চেষ্টা: t=0,5,10,15,20,25,30,35 → সর্বোচ্চ ৩৫s
-
-        for _attempt in range(_attempts):
-            try:
-                # ── Double-call trick: Telegram cache bypass ───────────────
-                # প্রথম call cache hit করতে পারে; দ্বিতীয় call fresh data দেওয়ার সম্ভাবনা বেশি
-                if _attempt > 0:
-                    try: await ctx.bot.get_chat(uid)   # cache warm-up call
-                    except Exception: pass
-                chat     = await ctx.bot.get_chat(uid)
-                user_bio = (chat.bio or "").strip()
-                log.info(f"[BIO-CHECK] uid={uid} attempt={_attempt+1}/{_attempts} bio='{user_bio[:80]}'")
-                if _bio_matches(user_bio):
-                    bio_ok = True
-                    break
-            except Exception as _e:
-                log.warning(f"[BIO-CHECK] uid={uid} attempt={_attempt+1} error: {_e}")
-
-            if _attempt < _attempts - 1:
-                # Progress update — user কে জানাও কত সেকেন্ড হলো
-                _elapsed = (_attempt + 1) * _INTERVAL
-                _remain  = (_attempts - 1 - _attempt) * _INTERVAL
-                try:
-                    _prog_text = (
-                        f"⏳ *Bio চেক হচ্ছে...* `{_elapsed}s`\n\nআর প্রায় {_remain} সেকেন্ড..."
-                        if lang == 'bn' else
-                        f"⏳ *Checking Bio...* `{_elapsed}s`\n\nAbout {_remain} more seconds..."
-                    )
-                    await _status_msg.edit_text(_prog_text, parse_mode="Markdown")
-                except Exception:
-                    pass
-                await asyncio.sleep(_INTERVAL)
-
-        # ── Status message মুছে ফেলো ─────────────────────────────────────────
-        try:
-            await _status_msg.delete()
-        except Exception:
-            pass
-
-        if not bio_ok:
-            if lang == 'bn':
-                msg = (
-                    f"❌ *Bio পাওয়া যায়নি!*\n\n"
-                    f"নিচের text টি হুবহু copy করে Telegram Bio তে বসান:\n\n"
-                    f"`Free Task Earn bot {ref_link}`\n\n"
-                    f"📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
-                    f"✅ সেট করার পর আবার Check বাটন চাপুন।"
-                )
-            else:
-                msg = (
-                    f"❌ *Bio not found!*\n\n"
-                    f"Copy the text below and paste it in your Telegram Bio:\n\n"
-                    f"`Free Task Earn bot {ref_link}`\n\n"
-                    f"📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
-                    f"✅ After setting, press Check again."
-                )
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Check করুন", callback_data="bio_task_check")],
-                [InlineKeyboardButton("🔙 Tasks",      callback_data="task_cancel")],
-            ])
-            await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb,
-                                       disable_web_page_preview=True)
-            ctx.user_data["bio_check_in_progress"] = False
-            return
-
-        # ── Atomic reward — mark + balance + record একটি DB transaction-এ ──
-        # বহু server থেকে একসাথে call আসলেও শুধু একটিই True পাবে।
-        today = datetime.now(BD_TZ).strftime("%Y-%m-%d")
-        _first_mark = await asyncio.to_thread(
-            atomic_give_bio_add_reward, uid, round(add_reward, 4) if add_reward > 0 else 0.0, today
-        )
-        if _first_mark:
-            await asyncio.to_thread(set_bio_tracking, uid)
-            if add_reward > 0:
-                mark_db_dirty()
-                _bio_ref = await asyncio.to_thread(get_referred_by, uid)
-                if _bio_ref:
-                    _bio_comm_pct = await asyncio.to_thread(get_commission_pct)
-                    _bio_comm = round(add_reward * _bio_comm_pct / 100.0, 4)
-                    await asyncio.gather(
-                        asyncio.to_thread(add_bal, _bio_ref, _bio_comm),
-                        asyncio.to_thread(record_commission, _bio_ref, uid, _bio_comm, 'Bio Task'),
-                    )
-                    try:
-                        _bio_ru = await asyncio.to_thread(get_user, uid)
-                        _bio_rname = (_bio_ru["full_name"] or _bio_ru["username"] or "Unknown") if _bio_ru else "Unknown"
-                        _bio_cpct_d = int(_bio_comm_pct) if _bio_comm_pct == int(_bio_comm_pct) else _bio_comm_pct
-                        await ctx.bot.send_message(_bio_ref,
-                            T(_bio_ref, 'commission_msg', name=_bio_rname, price=round(add_reward,4),
-                              comm=_bio_comm, comm_pct=_bio_cpct_d),
-                            parse_mode="Markdown")
-                    except Exception: pass
-                def _db_6018():
-                    _brow = None
-                    with _c() as _cb:
-                        _brow = _cb.execute("SELECT balance FROM users WHERE user_id=%s", (uid,)).fetchone()
-                    return _brow
-                _brow = await asyncio.to_thread(_db_6018)
-                new_bal = round((_brow['balance'] if _brow else 0), 4)
-                _bio_urow = await asyncio.to_thread(get_user, uid)
-                _bio_uname = (_bio_urow["full_name"] or _bio_urow["username"] or str(uid)) if _bio_urow else str(uid)
-                _bio_username = (_bio_urow.get("username") or "") if _bio_urow else ""
-                _cum_count, _cum_amount = await asyncio.to_thread(get_bio_task_cumulative)
-                _bio_admin_msg = (
-                    f"🆕 *Bio Task — New Add Reward*\n"
-                    f"━━━━━━━━━━━━━━━━━━━\n"
-                    f"👤 *User:* {_bio_uname}"
-                    + (f" (@{_bio_username})" if _bio_username else "") +
-                    f"\n🆔 *ID:* `{uid}`\n"
-                    f"💰 *Add Reward:* `{add_reward}$ USDT`\n"
-                    f"💳 *Balance:* `{round(new_bal,4)}$ USDT`\n"
-                    f"🗓️ *তারিখ:* `{today}`\n\n"
-                    f"📈 *সর্বমোট Cumulative:*\n"
-                    f"  👥 মোট পেয়েছে: `{_cum_count} জন`\n"
-                    f"  💵 মোট খরচ: `{round(float(_cum_amount),4)}$ USDT`"
-                )
-                _t1 = asyncio.create_task(notify_full_admins(ctx.bot, _bio_admin_msg))
-                _background_tasks.add(_t1); _t1.add_done_callback(_background_tasks.discard)
-                if lang == 'bn':
-                    msg = (
-                        f"🎉 *Bio Task — Add Reward পেয়েছেন!*\n\n"
-                        f"✅ Bio সঠিকভাবে সেট করা হয়েছে।\n"
-                        f"💰 *`{add_reward}$ USDT`* আপনার একাউন্টে যোগ হয়েছে!\n\n"
-                        f"💳 *নতুন ব্যালান্স:* `{round(new_bal,4)}$ USDT`\n\n"
-                        f"📅 Daily `{daily_reward}$` প্রতিদিন রাত ১২:০৫ এ অটো পাবেন।\n"
-                        f"⚠️ Bio সরালে daily payment বাতিল হবে!"
-                    )
-                else:
-                    msg = (
-                        f"🎉 *Bio Task — Add Reward received!*\n\n"
-                        f"✅ Bio set correctly.\n"
-                        f"💰 *`{add_reward}$ USDT`* added to your account!\n\n"
-                        f"💳 *New Balance:* `{round(new_bal,4)}$ USDT`\n\n"
-                        f"📅 Daily `{daily_reward}$` auto-credited every night at 12:05 AM.\n"
-                        f"⚠️ Removing your Bio will cancel daily payment!"
-                    )
-            else:
-                if lang == 'bn':
-                    msg = (
-                        f"✅ *Bio সঠিকভাবে সেট করা হয়েছে!*\n\n"
-                        f"📅 Daily `{daily_reward}$` প্রতিদিন রাত ১২:০৫ এ পাবেন।"
-                    )
-                else:
-                    msg = (
-                        f"✅ *Bio verified successfully!*\n\n"
-                        f"📅 Daily `{daily_reward}$` every night at 12:05 AM."
-                    )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Tasks", callback_data="task_cancel")]])
-            await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
-        else:
-            await asyncio.to_thread(set_bio_tracking, uid)
-            bt_done = await asyncio.to_thread(bio_task_paid_today, uid)
-            if lang == 'bn':
-                status = "✅ আজকের Daily Reward পেয়েছেন!" if bt_done else "🔄 Daily reward আজ রাত ১২:০৫ এ পাবেন।"
-                msg = (
-                    f"✅ *Bio সঠিক আছে — Tracking চালু হয়েছে!*\n\n"
-                    f"🆕 Add Reward আগেই নেওয়া হয়েছে (পুনরায় পাবেন না)।\n"
-                    f"{status}\n\n"
-                    f"⚠️ Bio ঠিক রাখুন — daily reward পেতে।"
-                )
-            else:
-                status = "✅ Today's daily reward received!" if bt_done else "🔄 Daily reward at 12:05 AM tonight."
-                msg = (
-                    f"✅ *Bio is correct!*\n\n"
-                    f"🆕 Add Reward already claimed.\n"
-                    f"{status}\n\n"
-                    f"⚠️ Keep your Bio — to keep receiving daily reward."
-                )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Tasks", callback_data="task_cancel")]])
-            await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
-        ctx.user_data["bio_check_in_progress"] = False
+    if not bio_task or not bio_task['is_active']:
+        await q.message.reply_text(
+            "❌ Bio Task এখন সক্রিয় নেই।" if lang == 'bn'
+            else "❌ Bio Task is not active right now.",
+            parse_mode="Markdown")
         return
 
+    add_reward   = (bio_task.get('add_reward', 0) or 0)
+    daily_reward = bio_task['reward']
+    bot_username = bot_me.username
+    ref_link     = f"https://t.me/{bot_username}?start=ref_{uid}"
+    required_bio = f"Free Task Earn bot {ref_link}"
+
+    def _bio_matches(bio_text: str) -> bool:
+        if not bio_text:
+            return False
+        t = bio_text.strip()
+        if f"ref_{uid}" in t:
+            return True
+        if required_bio.lower() in t.lower():
+            return True
+        if str(uid) in t and bot_username.lower() in t.lower():
+            return True
+        return False
+
+    _wait_msg_text = (
+        "⏳ *Bio চেক হচ্ছে...*\n\nঅনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন।"
+        if lang == 'bn' else
+        "⏳ *Checking Bio...*\n\nPlease wait a few seconds."
+    )
+    _status_msg = await q.message.reply_text(_wait_msg_text, parse_mode="Markdown")
+
+    bio_ok    = False
+    user_bio  = ""
+    _INTERVAL = 5
+    _attempts = 8
+
+    for _attempt in range(_attempts):
+        try:
+            if _attempt > 0:
+                try: await ctx.bot.get_chat(uid)
+                except Exception: pass
+            chat     = await ctx.bot.get_chat(uid)
+            user_bio = (chat.bio or "").strip()
+            log.info(f"[BIO-CHECK] uid={uid} attempt={_attempt+1}/{_attempts} bio='{user_bio[:80]}'")
+            if _bio_matches(user_bio):
+                bio_ok = True
+                break
+        except Exception as _e:
+            log.warning(f"[BIO-CHECK] uid={uid} attempt={_attempt+1} error: {_e}")
+
+        if _attempt < _attempts - 1:
+            _elapsed = (_attempt + 1) * _INTERVAL
+            _remain  = (_attempts - 1 - _attempt) * _INTERVAL
+            try:
+                _prog_text = (
+                    f"⏳ *Bio চেক হচ্ছে...* `{_elapsed}s`\n\nআর প্রায় {_remain} সেকেন্ড..."
+                    if lang == 'bn' else
+                    f"⏳ *Checking Bio...* `{_elapsed}s`\n\nAbout {_remain} more seconds..."
+                )
+                await _status_msg.edit_text(_prog_text, parse_mode="Markdown")
+            except Exception:
+                pass
+            await asyncio.sleep(_INTERVAL)
+
+    try:
+        await _status_msg.delete()
+    except Exception:
+        pass
+
+    if not bio_ok:
+        if lang == 'bn':
+            msg = (
+                f"❌ *Bio পাওয়া যায়নি!*\n\n"
+                f"নিচের text টি হুবহু copy করে Telegram Bio তে বসান:\n\n"
+                f"`Free Task Earn bot {ref_link}`\n\n"
+                f"📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
+                f"✅ সেট করার পর আবার Check বাটন চাপুন।"
+            )
+        else:
+            msg = (
+                f"❌ *Bio not found!*\n\n"
+                f"Copy the text below and paste it in your Telegram Bio:\n\n"
+                f"`Free Task Earn bot {ref_link}`\n\n"
+                f"📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
+                f"✅ After setting, press Check again."
+            )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Check করুন", callback_data="bio_task_check")],
+            [InlineKeyboardButton("🔙 Tasks",      callback_data="task_cancel")],
+        ])
+        await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb,
+                                   disable_web_page_preview=True)
+        return
+
+    # ── Atomic reward — mark + balance + record একটি DB transaction-এ ──
+    today = datetime.now(BD_TZ).strftime("%Y-%m-%d")
+    _first_mark = await asyncio.to_thread(
+        atomic_give_bio_add_reward, uid, round(add_reward, 4) if add_reward > 0 else 0.0, today
+    )
+    if _first_mark:
+        await asyncio.to_thread(set_bio_tracking, uid)
+        if add_reward > 0:
+            mark_db_dirty()
+            _bio_ref = await asyncio.to_thread(get_referred_by, uid)
+            if _bio_ref:
+                _bio_comm_pct = await asyncio.to_thread(get_commission_pct)
+                _bio_comm = round(add_reward * _bio_comm_pct / 100.0, 4)
+                await asyncio.gather(
+                    asyncio.to_thread(add_bal, _bio_ref, _bio_comm),
+                    asyncio.to_thread(record_commission, _bio_ref, uid, _bio_comm, 'Bio Task'),
+                )
+                try:
+                    _bio_ru = await asyncio.to_thread(get_user, uid)
+                    _bio_rname = (_bio_ru["full_name"] or _bio_ru["username"] or "Unknown") if _bio_ru else "Unknown"
+                    _bio_cpct_d = int(_bio_comm_pct) if _bio_comm_pct == int(_bio_comm_pct) else _bio_comm_pct
+                    await ctx.bot.send_message(_bio_ref,
+                        T(_bio_ref, 'commission_msg', name=_bio_rname, price=round(add_reward,4),
+                          comm=_bio_comm, comm_pct=_bio_cpct_d),
+                        parse_mode="Markdown")
+                except Exception: pass
+            def _db_6018():
+                _brow = None
+                with _c() as _cb:
+                    _brow = _cb.execute("SELECT balance FROM users WHERE user_id=%s", (uid,)).fetchone()
+                return _brow
+            _brow = await asyncio.to_thread(_db_6018)
+            new_bal = round((_brow['balance'] if _brow else 0), 4)
+            _bio_urow = await asyncio.to_thread(get_user, uid)
+            _bio_uname = (_bio_urow["full_name"] or _bio_urow["username"] or str(uid)) if _bio_urow else str(uid)
+            _bio_username = (_bio_urow.get("username") or "") if _bio_urow else ""
+            _cum_count, _cum_amount = await asyncio.to_thread(get_bio_task_cumulative)
+            _bio_admin_msg = (
+                f"🆕 *Bio Task — New Add Reward*\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 *User:* {_bio_uname}"
+                + (f" (@{_bio_username})" if _bio_username else "") +
+                f"\n🆔 *ID:* `{uid}`\n"
+                f"💰 *Add Reward:* `{add_reward}$ USDT`\n"
+                f"💳 *Balance:* `{round(new_bal,4)}$ USDT`\n"
+                f"🗓️ *তারিখ:* `{today}`\n\n"
+                f"📈 *সর্বমোট Cumulative:*\n"
+                f"  👥 মোট পেয়েছে: `{_cum_count} জন`\n"
+                f"  💵 মোট খরচ: `{round(float(_cum_amount),4)}$ USDT`"
+            )
+            _t1 = asyncio.create_task(notify_full_admins(ctx.bot, _bio_admin_msg))
+            _background_tasks.add(_t1); _t1.add_done_callback(_background_tasks.discard)
+            if lang == 'bn':
+                msg = (
+                    f"🎉 *Bio Task — Add Reward পেয়েছেন!*\n\n"
+                    f"✅ Bio সঠিকভাবে সেট করা হয়েছে।\n"
+                    f"💰 *`{add_reward}$ USDT`* আপনার একাউন্টে যোগ হয়েছে!\n\n"
+                    f"💳 *নতুন ব্যালান্স:* `{round(new_bal,4)}$ USDT`\n\n"
+                    f"📅 Daily `{daily_reward}$` প্রতিদিন রাত ১২:০৫ এ অটো পাবেন।\n"
+                    f"⚠️ Bio সরালে daily payment বাতিল হবে!"
+                )
+            else:
+                msg = (
+                    f"🎉 *Bio Task — Add Reward received!*\n\n"
+                    f"✅ Bio set correctly.\n"
+                    f"💰 *`{add_reward}$ USDT`* added to your account!\n\n"
+                    f"💳 *New Balance:* `{round(new_bal,4)}$ USDT`\n\n"
+                    f"📅 Daily `{daily_reward}$` auto-credited every night at 12:05 AM.\n"
+                    f"⚠️ Removing your Bio will cancel daily payment!"
+                )
+        else:
+            if lang == 'bn':
+                msg = (
+                    f"✅ *Bio সঠিকভাবে সেট করা হয়েছে!*\n\n"
+                    f"📅 Daily `{daily_reward}$` প্রতিদিন রাত ১২:০৫ এ পাবেন।"
+                )
+            else:
+                msg = (
+                    f"✅ *Bio verified successfully!*\n\n"
+                    f"📅 Daily `{daily_reward}$` every night at 12:05 AM."
+                )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Tasks", callback_data="task_cancel")]])
+        await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await asyncio.to_thread(set_bio_tracking, uid)
+        bt_done = await asyncio.to_thread(bio_task_paid_today, uid)
+        if lang == 'bn':
+            status = "✅ আজকের Daily Reward পেয়েছেন!" if bt_done else "🔄 Daily reward আজ রাত ১২:০৫ এ পাবেন।"
+            msg = (
+                f"✅ *Bio সঠিক আছে — Tracking চালু হয়েছে!*\n\n"
+                f"🆕 Add Reward আগেই নেওয়া হয়েছে (পুনরায় পাবেন না)।\n"
+                f"{status}\n\n"
+                f"⚠️ Bio ঠিক রাখুন — daily reward পেতে।"
+            )
+        else:
+            status = "✅ Today's daily reward received!" if bt_done else "🔄 Daily reward at 12:05 AM tonight."
+            msg = (
+                f"✅ *Bio is correct!*\n\n"
+                f"🆕 Add Reward already claimed.\n"
+                f"{status}\n\n"
+                f"⚠️ Keep your Bio — to keep receiving daily reward."
+            )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Tasks", callback_data="task_cancel")]])
+        await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+        # _bio_task_check_inner ends here — admin handling is in _handle_admin_inner
+
+
+async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q, uid: int, d: str):
+    """All adm_* callback handling — called from _on_callback_inner for non-bio callbacks."""
     # ── Admin-only callbacks ──────────────────────────────────────
     if not await asyncio.to_thread(is_admin, uid):
         await q.message.reply_text("❌ আপনি এডমিন না!"); return
@@ -8081,11 +8091,14 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         tasks = await asyncio.to_thread(get_all_tasks)
         if not tasks:
             await q.message.reply_text("📋 *কোনো Task নেই।*", parse_mode="Markdown"); return
+        # সব task-এর fields একসাথে parallel-এ fetch করো — sequential loop বন্ধ
+        all_fields = await asyncio.gather(
+            *[asyncio.to_thread(get_task_fields, t['id']) for t in tasks]
+        )
         text = "📋 *Task তালিকা:*\n\n"
         btns = []
-        for t in tasks:
+        for t, fields in zip(tasks, all_fields):
             s  = "✅" if t["is_active"] else "❌"
-            fields = await asyncio.to_thread(get_task_fields, t['id'])
             field_count = len(fields)
             text += f"{s} *{t['name']}* — `{t['price']}$ USDT` | {field_count} field(s)\n"
             btns.append([
@@ -8223,11 +8236,18 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         btns   = []
         if fields:
             for i, f in enumerate(fields, 1):
-                icon = "📷" if f["field_type"] == "photo" else "📝"
-                text += f"{i}. {icon} {f['prompt_bn']}\n"
-                btns.append([InlineKeyboardButton(
-                    f"🗑 {i}. {(f['prompt_bn'] or '')[:20]}", callback_data=f"adm_field_del_{f['id']}_{tid}"
-                )])
+                icon    = "📷" if f["field_type"] == "photo" else "📝"
+                has_img = bool((_rget(f, 'example_image_id', '') or '').strip())
+                img_tag = " 🖼✅" if has_img else ""
+                text += f"{i}. {icon} {f['prompt_bn']}{img_tag}\n"
+                row = [InlineKeyboardButton(
+                    f"🗑 {i}. {(f['prompt_bn'] or '')[:18]}", callback_data=f"adm_field_del_{f['id']}_{tid}"
+                )]
+                if f["field_type"] == "photo":
+                    row.append(InlineKeyboardButton(
+                        f"🖼{'✅' if has_img else '+'} Example", callback_data=f"adm_field_ex_img_{f['id']}_{tid}"
+                    ))
+                btns.append(row)
         else:
             text += "_কোনো field নেই — ইউজার থেকে generic তথ্য চাওয়া হবে।_\n"
 
@@ -8249,6 +8269,53 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         tid   = int(parts[4])
         await asyncio.to_thread(delete_task_field, fid)
         await q.message.reply_text("✅ *Field মুছে ফেলা হয়েছে।*", parse_mode="Markdown"); return
+
+    # ── Regular Task: existing Photo Field এর Example Image সেট/পরিবর্তন ──
+    if d.startswith("adm_field_ex_img_"):
+        parts = d.split("_")
+        fid   = int(parts[4])
+        tid   = int(parts[5])
+        ctx.user_data["state"]               = "adm_field_set_example_photo"
+        ctx.user_data["edit_field_id"]        = fid
+        ctx.user_data["edit_field_task_id"]   = tid
+        ctx.user_data["edit_field_is_categ"]  = False
+        await q.message.reply_text(
+            "🖼 *এই Photo Field-এর Example Photo পাঠান:*\n\n"
+            "_(ইউজার এই ছবি দেখে বুঝবে কেমন ছবি পাঠাতে হবে)_\n\n"
+            "📤 এখন একটি ছবি পাঠান।\n/cancel — বাতিল",
+            parse_mode="Markdown"); return
+
+    # ── Per-field Example Photo: Skip (Regular Task) ─────────────
+    if d.startswith("adm_field_skip_example_"):
+        tid = int(d.split("_")[4])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Text Field যোগ",  callback_data=f"adm_field_add_text_{tid}"),
+             InlineKeyboardButton("📷 Photo Field যোগ", callback_data=f"adm_field_add_photo_{tid}")],
+            [InlineKeyboardButton("✅ Done — Task সেভ করুন", callback_data=f"adm_task_done_{tid}")],
+        ])
+        fields = await asyncio.to_thread(get_task_fields, tid)
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("edit_field_id", None)
+        ctx.user_data.pop("edit_field_task_id", None)
+        ctx.user_data.pop("edit_field_is_categ", None)
+        await q.message.reply_text(
+            f"⏭ *Example Photo Skip করা হয়েছে।*\n\nমোট fields: {len(fields)} টি\n\nআরো field যোগ করুন বা Done চাপুন:",
+            parse_mode="Markdown", reply_markup=kb); return
+
+    # ── Per-field Example Photo: Skip (Category Task) ────────────
+    if d.startswith("adm_cfield_skip_example_"):
+        tid = int(d.split("_")[4])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ আরো Field যোগ করুন", callback_data=f"adm_cfields_{tid}")],
+            [InlineKeyboardButton("🚀 সম্পন্ন — Task Live করুন", callback_data=f"adm_ctask_golive_{tid}")],
+        ])
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("edit_field_id", None)
+        ctx.user_data.pop("edit_field_task_id", None)
+        ctx.user_data.pop("edit_field_is_categ", None)
+        await q.message.reply_text(
+            "⏭ *Example Photo Skip করা হয়েছে।*\n\nআরো field যোগ করুন বা Live করুন:",
+            parse_mode="Markdown", reply_markup=kb); return
 
     if d.startswith("adm_field_add_text_") or d.startswith("adm_field_add_photo_"):
         ftype = "text" if "add_text" in d else "photo"
@@ -8616,11 +8683,18 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         btns   = []
         if fields:
             for i, f in enumerate(fields, 1):
-                icon = "📷" if f["field_type"] == "photo" else "📝"
-                text += f"{i}. {icon} {f['prompt_bn']}\n"
-                btns.append([InlineKeyboardButton(
-                    f"🗑 {i}. {(f['prompt_bn'] or '')[:20]}", callback_data=f"adm_cfield_del_{f['id']}_{tid}"
-                )])
+                icon    = "📷" if f["field_type"] == "photo" else "📝"
+                has_img = bool((_rget(f, 'example_image_id', '') or '').strip())
+                img_tag = " 🖼✅" if has_img else ""
+                text += f"{i}. {icon} {f['prompt_bn']}{img_tag}\n"
+                row = [InlineKeyboardButton(
+                    f"🗑 {i}. {(f['prompt_bn'] or '')[:18]}", callback_data=f"adm_cfield_del_{f['id']}_{tid}"
+                )]
+                if f["field_type"] == "photo":
+                    row.append(InlineKeyboardButton(
+                        f"🖼{'✅' if has_img else '+'} Example", callback_data=f"adm_cfield_ex_img_{f['id']}_{tid}"
+                    ))
+                btns.append(row)
         else:
             text += "_কোনো field নেই।_\n"
         btns.append([
@@ -8640,6 +8714,21 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         fid   = int(parts[3])
         await asyncio.to_thread(delete_category_task_field, fid)
         await q.message.reply_text("✅ *Field মুছে ফেলা হয়েছে।*", parse_mode="Markdown"); return
+
+    # ── Category Task: existing Photo Field এর Example Image সেট/পরিবর্তন ──
+    if d.startswith("adm_cfield_ex_img_"):
+        parts = d.split("_")
+        fid   = int(parts[4])
+        tid   = int(parts[5])
+        ctx.user_data["state"]               = "adm_field_set_example_photo"
+        ctx.user_data["edit_field_id"]        = fid
+        ctx.user_data["edit_field_task_id"]   = tid
+        ctx.user_data["edit_field_is_categ"]  = True
+        await q.message.reply_text(
+            "🖼 *এই Photo Field-এর Example Photo পাঠান:*\n\n"
+            "_(ইউজার এই ছবি দেখে বুঝবে কেমন ছবি পাঠাতে হবে)_\n\n"
+            "📤 এখন একটি ছবি পাঠান।\n/cancel — বাতিল",
+            parse_mode="Markdown"); return
 
     if d.startswith("adm_cfield_add_text_") or d.startswith("adm_cfield_add_photo_"):
         ftype = "text" if "add_text" in d else "photo"
@@ -9472,6 +9561,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                             _aid_already = True
                         else:
                             c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (price, guser))
+                            _invalidate_user_cache(guser)
                     return _aid_already
                 _aid_already = await asyncio.to_thread(_db_8598)
                 if _aid_already:
@@ -9668,6 +9758,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         else:
                             # শুধু এই transaction-ই reject করেছে — refund safe
                             c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (wamt, wuser))
+                            _invalidate_user_cache(wuser)
                     return _wdr_already
                 _wdr_already = await asyncio.to_thread(_db_8766)
                 if _wdr_already:
@@ -9840,6 +9931,28 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await asyncio.to_thread(add_task_field, tid, ftype, prompt_bn, prompt_en)
             icon = "📝" if ftype == "text" else "📷"
             fields = await asyncio.to_thread(get_task_fields, tid)
+            for k in ("new_field_type","new_field_tid","new_field_prompt_bn","state"):
+                ctx.user_data.pop(k, None)
+            # Photo Field হলে per-field example photo সেট করার সুযোগ দাও
+            if ftype == "photo":
+                new_field = await asyncio.to_thread(get_last_task_field, tid)
+                fid = new_field["id"] if new_field else None
+                if fid:
+                    ctx.user_data["state"]               = "adm_field_set_example_photo"
+                    ctx.user_data["edit_field_id"]        = fid
+                    ctx.user_data["edit_field_task_id"]   = tid
+                    ctx.user_data["edit_field_is_categ"]  = False
+                    await update.message.reply_text(
+                        f"✅ *Photo Field যোগ হয়েছে!*\n📷 `{prompt_bn}` / `{prompt_en}`\n\n"
+                        f"এই field-এর জন্য *Example Photo* সেট করবেন?\n"
+                        f"_(ইউজার এই ছবি দেখে বুঝবে কেমন ছবি পাঠাতে হবে)_\n\n"
+                        f"📤 এখনই ছবি পাঠান, অথবা Skip করুন:",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("⏭ Skip — Example Photo ছাড়াই রাখুন", callback_data=f"adm_field_skip_example_{tid}")],
+                        ])
+                    )
+                    return
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Text Field যোগ",  callback_data=f"adm_field_add_text_{tid}"),
                  InlineKeyboardButton("📷 Photo Field যোগ", callback_data=f"adm_field_add_photo_{tid}")],
@@ -9849,8 +9962,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"✅ *Field যোগ হয়েছে!*\n{icon} `{prompt_bn}` / `{prompt_en}`\n\n"
                 f"মোট fields: {len(fields)} টি\n\nআরো field যোগ করুন বা Done চাপুন:",
                 parse_mode="Markdown", reply_markup=kb)
-            for k in ("new_field_type","new_field_tid","new_field_prompt_bn","state"):
-                ctx.user_data.pop(k, None)
             return
 
         # Channel add states
@@ -10329,8 +10440,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if st == "adm_bio_task_daily_reward":
             if not await asyncio.to_thread(is_admin, uid):
                 ctx.user_data.pop("state", None)
-                try: await q.answer()
-                except Exception: pass
                 return
             try:
                 val = float(txt.strip())
@@ -10348,8 +10457,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if st == "adm_bio_task_add_reward":
             if not await asyncio.to_thread(is_admin, uid):
                 ctx.user_data.pop("state", None)
-                try: await q.answer()
-                except Exception: pass
                 return
             try:
                 val = float(txt.strip())
@@ -10455,6 +10562,26 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if tid:
                 await asyncio.to_thread(add_category_task_field, tid, ftype, prompt_bn, prompt_en)
                 icon = "📝" if ftype == "text" else "📷"
+                # Photo Field হলে per-field example photo সেট করার সুযোগ দাও
+                if ftype == "photo":
+                    new_field = await asyncio.to_thread(get_last_category_task_field, tid)
+                    fid = new_field["id"] if new_field else None
+                    if fid:
+                        ctx.user_data["state"]               = "adm_field_set_example_photo"
+                        ctx.user_data["edit_field_id"]        = fid
+                        ctx.user_data["edit_field_task_id"]   = tid
+                        ctx.user_data["edit_field_is_categ"]  = True
+                        await update.message.reply_text(
+                            f"✅ *Photo Field যোগ হয়েছে!*\n📷 `{prompt_bn}` / `{prompt_en}`\n\n"
+                            f"এই field-এর জন্য *Example Photo* সেট করবেন?\n"
+                            f"_(ইউজার এই ছবি দেখে বুঝবে কেমন ছবি পাঠাতে হবে)_\n\n"
+                            f"📤 এখনই ছবি পাঠান, অথবা Skip করুন:",
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton("⏭ Skip — Example Photo ছাড়াই রাখুন", callback_data=f"adm_cfield_skip_example_{tid}")],
+                            ])
+                        )
+                        return
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("➕ আরো Field যোগ করুন", callback_data=f"adm_cfields_{tid}")],
                     [InlineKeyboardButton("🚀 সম্পন্ন — Task Live করুন", callback_data=f"adm_ctask_golive_{tid}")],
@@ -10599,6 +10726,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         _promo_exhausted = True
                     else:
                         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, uid))
+                        _invalidate_user_cache(uid)
             return _promo_already, _promo_exhausted
         _promo_already, _promo_exhausted = await asyncio.to_thread(_db_9595)
         if _promo_already:
@@ -10725,6 +10853,32 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_task_collect_photo(update, ctx)
         return
 
+    # ── Per-field Example Photo সেট করা ──────────────────────────
+    if st == "adm_field_set_example_photo" and await asyncio.to_thread(is_admin, uid):
+        fid        = ctx.user_data.pop("edit_field_id",       None)
+        tid        = ctx.user_data.pop("edit_field_task_id",  None)
+        is_categ   = ctx.user_data.pop("edit_field_is_categ", False)
+        ctx.user_data.pop("state", None)
+        if update.message.photo and fid:
+            img_fid = update.message.photo[-1].file_id
+            if is_categ:
+                await asyncio.to_thread(update_category_task_field_example_img, fid, img_fid)
+            else:
+                await asyncio.to_thread(update_task_field_example_img, fid, img_fid)
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Text Field যোগ", callback_data=f"adm_field_add_text_{tid}"),
+                 InlineKeyboardButton("📷 Photo Field যোগ", callback_data=f"adm_{'c' if is_categ else ''}field_add_photo_{tid}")],
+                [InlineKeyboardButton("✅ Done — Task সেভ করুন", callback_data=f"adm_{'ctask_golive' if is_categ else 'task_done'}_{tid}")],
+            ])
+            await update.message.reply_text(
+                "✅ *Example Photo সেট হয়েছে!*\n\n"
+                "এখন থেকে ইউজার এই Photo Field এ এই ছবি দেখে বুঝবে কেমন ছবি দিতে হবে।\n\n"
+                "আরো field যোগ করুন বা Done চাপুন:",
+                parse_mode="Markdown", reply_markup=kb)
+        else:
+            await update.message.reply_text("❌ ছবি পাওয়া যায়নি।", parse_mode="Markdown")
+        return
+
     if st == "task_collect":
         if not await guard(update, ctx): return
         fields = ctx.user_data.get("task_fields", [])
@@ -10766,17 +10920,15 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     uid = q.from_user.id
     d   = q.data
-    try: await q.answer()
-    except Exception: pass
+    # q.answer() background-এ fire করো — spinner আগে clear হয়, DB কাজ পরে চলে
+    _qa2 = asyncio.create_task(q.answer())
+    _background_tasks.add(_qa2)
+    _qa2.add_done_callback(_background_tasks.discard)
 
     # ── Notification confirm / edit / skip ──────────────────────
     if d == "adm_notif_send":
         if not await asyncio.to_thread(is_admin, uid):
-            try: await q.answer()
-            except Exception: pass
             return
-        try: await q.answer()
-        except Exception: pass
         notif_msg   = ctx.user_data.get("pending_notif_msg", "")
         notify_ch   = ctx.user_data.get("pending_notif_ch", "") or await asyncio.to_thread(get_task_notify_ch_id)
         bot_link    = ctx.user_data.get("pending_notif_bot_link", "")
@@ -10816,11 +10968,7 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if d == "adm_notif_edit":
         if not await asyncio.to_thread(is_admin, uid):
-            try: await q.answer()
-            except Exception: pass
             return
-        try: await q.answer()
-        except Exception: pass
         ctx.user_data["state"] = "adm_notif_edit_txt"
         await q.message.reply_text(
             "✏️ *নতুন Notification Message লিখুন:*\n\n"
@@ -10831,10 +10979,8 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if d == "adm_notif_skip":
         if not await asyncio.to_thread(is_admin, uid):
-            try: await q.answer()
-            except Exception: pass
             return
-        await q.answer("Notification skip করা হয়েছে।")
+        # spinner ইতিমধ্যে background task-এ clear হয়েছে; এখন message দেখাও
         for k in ("pending_notif_msg","pending_notif_ch","pending_notif_ch_link","pending_notif_bot_link"):
             ctx.user_data.pop(k, None)
         await q.message.edit_text("❌ *Notification skip করা হয়েছে।*", parse_mode="Markdown")
@@ -10842,11 +10988,7 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if d.startswith("adm_task_done_"):
         if not await asyncio.to_thread(is_admin, uid):
-            try: await q.answer()
-            except Exception: pass
             return
-        try: await q.answer()
-        except Exception: pass
         tid    = int(d.split("_")[3])
         task, fields = await asyncio.gather(
             asyncio.to_thread(get_task, tid),
@@ -10881,11 +11023,7 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Task Preview callbacks ────────────────────────────────────
     if d.startswith("adm_tp_"):
         if not await asyncio.to_thread(is_admin, uid):
-            try: await q.answer()
-            except Exception: pass
             return
-        try: await q.answer()
-        except Exception: pass
         parts = d.split("_")
         # format: adm_tp_<action>_<tid>_<type>
         action  = parts[2]          # n / p / m / ok / del
@@ -11155,6 +11293,7 @@ async def _auto_apply_promo(bot, uid: int, code: str):
                 else:
                     # Atomic: balance credit same transaction এ
                     c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, uid))
+                    _invalidate_user_cache(uid)
         return _already, _exhausted
     _ap_already, _ap_exhausted = await asyncio.to_thread(_db_10102)
     if _ap_already:
@@ -11299,6 +11438,7 @@ async def cmd_promo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     _exhausted = True
                 else:
                     c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amount, uid))
+                    _invalidate_user_cache(uid)
         return _already, _exhausted
     _promo_cmd_already, _promo_cmd_exhausted = await asyncio.to_thread(_db_10229)
     if _promo_cmd_already:
@@ -11380,22 +11520,20 @@ async def _handle_promo_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     q   = update.callback_query
     uid = q.from_user.id
     d   = q.data
+    # spinner background-এ clear করো — সব branch-এ আলাদা q.answer() দরকার নেই
+    _qa3 = asyncio.create_task(q.answer())
+    _background_tasks.add(_qa3)
+    _qa3.add_done_callback(_background_tasks.discard)
     if not await asyncio.to_thread(is_admin, uid):
-        try: await q.answer()
-        except Exception: pass
         return
 
     if d == "adm_promo_req_anyone":
-        try: await q.answer()
-        except Exception: pass
         ctx.user_data["promo_min_tasks"] = 0
         ctx.user_data["promo_req_text"]  = "Anyone can use ✅"
         ctx.user_data["state"]           = "adm_promo_preview"
         await _show_promo_preview(q.message, ctx)
 
     elif d == "adm_promo_req_tasks":
-        try: await q.answer()
-        except Exception: pass
         ctx.user_data["state"] = "adm_promo_min_tasks"
         await q.message.reply_text(
             "📋 *কতটি Task Approved থাকলে Code নিতে পারবে?*\n\n"
@@ -11403,8 +11541,6 @@ async def _handle_promo_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             parse_mode="Markdown")
 
     elif d == "adm_promo_post_news":
-        try: await q.answer()
-        except Exception: pass
         code      = ctx.user_data.get("promo_code", "")
         amount    = ctx.user_data.get("promo_amount", 0)
         max_uses  = ctx.user_data.get("promo_max_uses", 0)
@@ -11451,8 +11587,6 @@ async def _handle_promo_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         _clear_promo_data(ctx)
 
     elif d == "adm_promo_save_only":
-        try: await q.answer()
-        except Exception: pass
         code      = ctx.user_data.get("promo_code", "")
         amount    = ctx.user_data.get("promo_amount", 0)
         max_uses  = ctx.user_data.get("promo_max_uses", 0)
@@ -13284,6 +13418,7 @@ async def job_auto_withdraw(context):
                             log.warning(f"[AUTO-WD] #{wid}: status আর pending নেই — skip।")
                             return False
                         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amt, uid))
+                        _invalidate_user_cache(uid)
                     return True
                 _db_12114_ok = await asyncio.to_thread(_db_12114)
                 if not _db_12114_ok:
@@ -13474,6 +13609,7 @@ async def job_auto_withdraw(context):
                             log.warning(f"[AUTO-WD] #{wid}: TX fail কিন্তু status আর processing নেই — skip।")
                             return False
                         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amt, uid))
+                        _invalidate_user_cache(uid)
                     return True
                 _db_12286_ok = await asyncio.to_thread(_db_12286)
                 if not _db_12286_ok:
