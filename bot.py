@@ -406,6 +406,9 @@ def md_escape(text):
         text = text.replace(ch, f'\\{ch}')
     return text
 
+# ── নতুন ইউজার notification — bot restart এ ctx.user_data হারালেও কাজ করবে ──
+_notified_set: set = set()   # uid set — double-notification বন্ধ
+
 # ──────────────────────────── DATABASE ────────────────────────────
 # যখনই টাকা/ডাটা বদলায় → True হয় → background job Telegram এ backup পাঠায়
 _db_dirty = False
@@ -2173,11 +2176,12 @@ def w_kb_admin(wid):
     ]])
 
 # ──────────────────────────── CHANNEL CHECK ────────────────────────────
-# ── Channel membership cache — প্রতি user-এ 10 মিনিট TTL ──────────────
-# ছিল 300s (5 মিনিট) — বাড়িয়ে 600s (10 মিনিট) করা হয়েছে
-# প্রতি 5 মিনিটে 3টি Telegram API call → এখন 10 মিনিটে → অর্ধেক API load
+# ── Channel membership cache — স্মার্ট দুই-স্তরের TTL ──────────────────
+# সব চ্যানেলে থাকলে 15s cache → Task/অন্য বাটনে দ্রুত রিপ্লাই
+# কোনো চ্যানেল মিস হলে 0s cache → চ্যানেল ছাড়লে সাথে সাথে ধরা পড়বে
 _ch_cache: dict = {}          # uid → (timestamp, missing_list)
-_CH_CACHE_TTL = 600           # seconds (ছিল 300)
+_CH_CACHE_TTL_OK  = 15        # seconds — সব চ্যানেলে থাকলে এতক্ষণ cache
+_CH_CACHE_TTL_BAD = 0         # seconds — কোনো চ্যানেল মিস হলে cache নেই
 
 async def check_ch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user:
@@ -2190,8 +2194,11 @@ async def check_ch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Cache hit? ────────────────────────────────────────────────
     now_ts = _time.monotonic()
     cached = _ch_cache.get(uid)
-    if cached and (now_ts - cached[0]) < _CH_CACHE_TTL:
-        return cached[1]
+    if cached:
+        _cached_ts, _cached_missing = cached
+        _ttl = _CH_CACHE_TTL_OK if not _cached_missing else _CH_CACHE_TTL_BAD
+        if (now_ts - _cached_ts) < _ttl:
+            return _cached_missing
 
     # ── Parallel API calls (asyncio.gather) ───────────────────────
     async def _check_one(ch):
@@ -2219,7 +2226,8 @@ async def check_ch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Cache result ──────────────────────────────────────────────
     # Evict expired entries যখন cache বড় হয় (memory leak বন্ধ)
     if len(_ch_cache) > 2000:
-        _exp = [k for k, (t, _) in _ch_cache.items() if now_ts - t >= _CH_CACHE_TTL]
+        _exp = [k for k, (t, m) in _ch_cache.items()
+                if now_ts - t >= (_CH_CACHE_TTL_OK if not m else _CH_CACHE_TTL_BAD)]
         for _k in _exp:
             _ch_cache.pop(_k, None)
     _ch_cache[uid] = (now_ts, missing)
@@ -2349,6 +2357,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if deep_task_type and deep_task_id:
+        # ── Channel check — deep link এ আসলেও চ্যানেল জয়েন চেক করো ──
+        _dl_missing = await check_ch(update, ctx)
+        if _dl_missing:
+            await join_prompt(update, uid=user.id)
+            return
         await _send_welcome(update, ctx, user.id)
         if deep_task_type == "ct":
             uid2 = user.id
@@ -2555,6 +2568,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "❌ এই Task পাওয়া যায়নি বা inactive।" if lang=='bn' else "❌ Task not found or inactive.",
                     parse_mode="Markdown"
                 )
+        return
+
+    # ── Channel join check — language+country শেষে বট ব্যবহারের আগে চ্যানেল চেক ──
+    missing = await check_ch(update, ctx)
+    if missing:
+        await join_prompt(update, uid=user.id)
         return
 
     await _send_welcome(update, ctx, user.id)
@@ -2807,6 +2826,11 @@ async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str
 
 async def show_tasks(update, ctx):
     uid          = update.effective_user.id
+    # ইউজারকে জানাও বট কাজ করছে — "typing..." দেখা যাবে
+    try:
+        await ctx.bot.send_chat_action(chat_id=uid, action="typing")
+    except Exception:
+        pass
     # lang, tasks, tg_tasks, categories, bio_task — সব একসাথে parallel
     lang, tasks, tg_tasks, categories, bio_task = await asyncio.gather(
         asyncio.to_thread(get_lang, uid),
@@ -5788,10 +5812,13 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             if channels:
                 await join_prompt(update, uid)
             else:
+                # চ্যানেল নেই → সরাসরি welcome, কিন্তু notification পাঠাও
                 ctx.user_data.pop("state", None)
-                if ctx.user_data.get("pending_new"):
+                _no_ch_uid = ctx.user_data.get("pending_uid") or uid
+                if ctx.user_data.get("pending_new") and _no_ch_uid not in _notified_set:
+                    _notified_set.add(_no_ch_uid)
                     await fire_new_user_notify(ctx,
-                        ctx.user_data.get("pending_uid"),
+                        _no_ch_uid,
                         ctx.user_data.get("pending_name"),
                         ctx.user_data.get("pending_uname"),
                         ctx.user_data.get("pending_ref"))
@@ -5830,14 +5857,38 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             lang_cj = await asyncio.to_thread(get_lang, uid)
             try: await q.message.delete()
             except Exception: pass
-            if ctx.user_data.get("pending_new"):
-                await fire_new_user_notify(ctx,
-                    ctx.user_data.get("pending_uid"),
-                    ctx.user_data.get("pending_name"),
-                    ctx.user_data.get("pending_uname"),
-                    ctx.user_data.get("pending_ref"))
-                for k in ("pending_new","pending_uid","pending_name","pending_uname","pending_ref"):
-                    ctx.user_data.pop(k, None)
+            # ── Notification logic — ctx.user_data বা DB দুটো পথেই কাজ করবে ──────
+            _n_uid   = ctx.user_data.get("pending_uid")   or uid
+            _n_name  = ctx.user_data.get("pending_name")  or (q.from_user.full_name if q.from_user else str(uid))
+            _n_uname = ctx.user_data.get("pending_uname") or (q.from_user.username or "")
+            _n_ref   = ctx.user_data.get("pending_ref")
+            _should_notify = ctx.user_data.get("pending_new", False)
+
+            # bot restart এ ctx.user_data হারিয়ে গেলে DB থেকে চেক করো
+            if not _should_notify and _n_uid not in _notified_set:
+                def _db_check_fresh():
+                    u_row = get_user(_n_uid)
+                    if not u_row:
+                        return False, None
+                    jat = u_row.get("joined_at", "")
+                    try:
+                        from datetime import datetime, timedelta
+                        jdt = datetime.fromisoformat(jat)
+                        if datetime.now(tz=jdt.tzinfo) - jdt < timedelta(hours=2):
+                            return True, u_row.get("referred_by")
+                    except Exception:
+                        pass
+                    return False, None
+                _is_fresh, _db_ref = await asyncio.to_thread(_db_check_fresh)
+                if _is_fresh:
+                    _should_notify = True
+                    _n_ref = _n_ref or _db_ref
+
+            if _should_notify and _n_uid not in _notified_set:
+                _notified_set.add(_n_uid)
+                await fire_new_user_notify(ctx, _n_uid, _n_name, _n_uname, _n_ref)
+            for k in ("pending_new","pending_uid","pending_name","pending_uname","pending_ref"):
+                ctx.user_data.pop(k, None)
             ctx.user_data.pop("state", None)
             # ভাষা না থাকলে আগে ভাষা বাছাই করাও (fallback)
             if not await asyncio.to_thread(user_has_lang, uid):
