@@ -407,7 +407,14 @@ def md_escape(text):
     return text
 
 # ── নতুন ইউজার notification — bot restart এ ctx.user_data হারালেও কাজ করবে ──
-_notified_set: set = set()   # uid set — double-notification বন্ধ
+_notified_set: set = set()   # uid set — double-notification বন্ধ (max 10,000 — পুরনো clear হয়)
+
+def _notified_set_add(uid: int):
+    """_notified_set এ uid যোগ করো। ১০,০০০ পার হলে পুরো set মুছে নতুন শুরু।"""
+    global _notified_set
+    if len(_notified_set) >= 10_000:
+        _notified_set = set()
+    _notified_set.add(uid)
 
 # ──────────────────────────── DATABASE ────────────────────────────
 # যখনই টাকা/ডাটা বদলায় → True হয় → background job Telegram এ backup পাঠায়
@@ -2327,7 +2334,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # New user or no language set → ask language first
     if not await asyncio.to_thread(user_has_lang, user.id):
         ctx.user_data["state"] = "first_lang"
-        if ref_by: ctx.user_data["start_ref"] = ref_by
         if deep_task_type:
             ctx.user_data["pending_deep_task_type"] = deep_task_type
             ctx.user_data["pending_deep_task_id"]   = deep_task_id
@@ -5816,7 +5822,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 ctx.user_data.pop("state", None)
                 _no_ch_uid = ctx.user_data.get("pending_uid") or uid
                 if ctx.user_data.get("pending_new") and _no_ch_uid not in _notified_set:
-                    _notified_set.add(_no_ch_uid)
+                    _notified_set_add(_no_ch_uid)
                     await fire_new_user_notify(ctx,
                         _no_ch_uid,
                         ctx.user_data.get("pending_name"),
@@ -5885,7 +5891,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                     _n_ref = _n_ref or _db_ref
 
             if _should_notify and _n_uid not in _notified_set:
-                _notified_set.add(_n_uid)
+                _notified_set_add(_n_uid)
                 await fire_new_user_notify(ctx, _n_uid, _n_name, _n_uname, _n_ref)
             for k in ("pending_new","pending_uid","pending_name","pending_uname","pending_ref"):
                 ctx.user_data.pop(k, None)
@@ -9849,9 +9855,17 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if st == "adm_task_rules":
             ctx.user_data["new_task_rules"] = txt
+            ctx.user_data["state"] = "adm_task_rules_en"
+            await update.message.reply_text(
+                "✅ *বাংলা নিয়মাবলী সেভ হয়েছে।*\n\n"
+                "📜 *এখন ইংরেজিতে Rules লিখুন* (English users-দের দেখানো হবে):\n/cancel — বাতিল",
+                parse_mode="Markdown"); return
+
+        if st == "adm_task_rules_en":
+            ctx.user_data["new_task_rules_en"] = txt
             ctx.user_data["state"] = "adm_task_max"
             await update.message.reply_text(
-                "✅ *নিয়মাবলী সেভ হয়েছে।*\n\n"
+                "✅ *ইংরেজি Rules সেভ হয়েছে।*\n\n"
                 "👥 *সর্বোচ্চ কতজন এই Task করতে পারবে?*\n"
                 "_(0 লিখলে Unlimited — যেকোনো সংখ্যা দিন)_\n\n/cancel — বাতিল",
                 parse_mode="Markdown"); return
@@ -9893,9 +9907,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             price     = ctx.user_data.get("new_task_price", 0.10)
             ttype     = ctx.user_data.pop("new_task_type", "other")
             rules     = ctx.user_data.pop("new_task_rules", "")
+            rules_en_val = ctx.user_data.pop("new_task_rules_en", "")
             max_c     = ctx.user_data.pop("new_task_max", 0)
             per_user_limit = ctx.user_data.pop("new_task_per_user", 1)
-            rules_en_val = await asyncio.to_thread(translate_to_en, rules)
             task_id = await asyncio.to_thread(add_task, name, price, rules, rules_en_val, task_type=ttype, per_user_limit=per_user_limit, max_completions=max_c, allowed_countries=allowed_c)
             ctx.user_data["new_task_id"] = task_id
             ctx.user_data["state"] = "adm_task_fields"
@@ -9931,10 +9945,18 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception: await update.message.reply_text("❌ সঠিক দাম দিন।", parse_mode="Markdown")
             ctx.user_data.pop("state", None); ctx.user_data.pop("edit_tid", None); return
         if st == "adm_edit_rules":
-            tid = ctx.user_data.get("edit_tid")
-            await asyncio.to_thread(update_task_field_val, tid, "rules", txt)
-            rules_en_val = await asyncio.to_thread(translate_to_en, txt)
-            await asyncio.to_thread(update_task_field_val, tid, "rules_en", rules_en_val)
+            ctx.user_data["edit_rules_bn"] = txt
+            ctx.user_data["state"] = "adm_edit_rules_en"
+            await update.message.reply_text(
+                "✅ *বাংলা নিয়মাবলী সেভ হয়েছে।*\n\n"
+                "📜 *এখন ইংরেজিতে Rules লিখুন:*\n/cancel — বাতিল",
+                parse_mode="Markdown"); return
+
+        if st == "adm_edit_rules_en":
+            tid      = ctx.user_data.get("edit_tid")
+            rules_bn = ctx.user_data.pop("edit_rules_bn", "")
+            await asyncio.to_thread(update_task_field_val, tid, "rules",    rules_bn)
+            await asyncio.to_thread(update_task_field_val, tid, "rules_en", txt.strip())
             await update.message.reply_text("✅ *নিয়মাবলী আপডেট হয়েছে।*", parse_mode="Markdown")
             ctx.user_data.pop("state", None); ctx.user_data.pop("edit_tid", None); return
 
@@ -10386,6 +10408,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"); return
 
         if st == "adm_cate_task_rules":
+            ctx.user_data["new_cate_task_rules"] = txt.strip()
+            ctx.user_data["state"] = "adm_cate_task_rules_en"
+            await update.message.reply_text(
+                "✅ *বাংলা নিয়মাবলী সেভ হয়েছে।*\n\n"
+                "📜 *এখন ইংরেজিতে Rules লিখুন* (English users-দের দেখানো হবে):\n/cancel — বাতিল",
+                parse_mode="Markdown"); return
+
+        if st == "adm_cate_task_rules_en":
             cid   = ctx.user_data.pop("new_cate_cat_id", None)
             name  = ctx.user_data.pop("new_cate_task_name", "")
             price = ctx.user_data.pop("new_cate_task_price", 0.05)
@@ -10393,9 +10423,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ttype = ctx.user_data.pop("new_cate_task_type", "other")
             per_user_limit = ctx.user_data.pop("new_cate_task_per_user", 1)
             allowed_c = ctx.user_data.pop("new_cate_task_countries", "")
+            rules = ctx.user_data.pop("new_cate_task_rules", "")
             ctx.user_data.pop("state", None)
-            rules = txt.strip()
-            rules_en_cate = await asyncio.to_thread(translate_to_en, rules)
+            rules_en_cate = txt.strip()
             tid   = await asyncio.to_thread(add_category_task, cid, name, price, rules, rules_en=rules_en_cate, max_comp=max_c, task_type=ttype, per_user_limit=per_user_limit, allowed_countries=allowed_c)
             country_lbl = fmt_allowed_countries(allowed_c)
             kb = InlineKeyboardMarkup([
@@ -10433,12 +10463,20 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         if st == "adm_ctask_edit_rules":
-            tid = ctx.user_data.pop("edit_ctask_id", None)
+            ctx.user_data["edit_ct_rules_bn"] = txt.strip()
+            ctx.user_data["state"] = "adm_ctask_edit_rules_en"
+            await update.message.reply_text(
+                "✅ *বাংলা নিয়মাবলী সেভ হয়েছে।*\n\n"
+                "📜 *এখন ইংরেজিতে Rules লিখুন:*\n/cancel — বাতিল",
+                parse_mode="Markdown"); return
+
+        if st == "adm_ctask_edit_rules_en":
+            tid      = ctx.user_data.pop("edit_ctask_id", None)
+            rules_bn = ctx.user_data.pop("edit_ct_rules_bn", "")
             ctx.user_data.pop("state", None)
             if tid:
-                await asyncio.to_thread(update_category_task, tid, "rules", txt.strip())
-                _ctask_rules_en = await asyncio.to_thread(translate_to_en, txt.strip())
-                await asyncio.to_thread(update_category_task, tid, "rules_en", _ctask_rules_en)
+                await asyncio.to_thread(update_category_task, tid, "rules",    rules_bn)
+                await asyncio.to_thread(update_category_task, tid, "rules_en", txt.strip())
             await update.message.reply_text("✅ *নিয়মাবলী আপডেট হয়েছে।*", parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid)); return
 
         if st == "adm_ctask_edit_max":
