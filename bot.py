@@ -3589,20 +3589,21 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
     # ── Duplicate photo detection ──────────────────────────────────
     if _cat_submitted_uids:
         def _db_2921():
-            _cat_existing_rows = None
+            # SQL-এ LIKE দিয়ে check করো — Python-এ সব rows fetch করার দরকার নেই
             with _c() as c:
-                _cat_existing_rows = c.execute(
-                    "SELECT photo_unique_ids FROM gmails WHERE user_id != %s AND photo_unique_ids IS NOT NULL AND photo_unique_ids != ''",
-                    (uid,)
-                ).fetchall()
-            return _cat_existing_rows
-        _cat_existing_rows = await asyncio.to_thread(_db_2921)
-        _cat_all_existing = set()
-        for _r in _cat_existing_rows:
-            for _s in ((_r.get("photo_unique_ids") if hasattr(_r, "get") else "") or "").split(","):
-                _s = _s.strip()
-                if _s: _cat_all_existing.add(_s)
-        if any(_u in _cat_all_existing for _u in _cat_submitted_uids):
+                for _uid_val in _cat_submitted_uids:
+                    if not _uid_val:
+                        continue
+                    hit = c.execute(
+                        "SELECT 1 FROM gmails WHERE user_id != %s AND photo_unique_ids IS NOT NULL "
+                        "AND photo_unique_ids != '' AND photo_unique_ids LIKE %s LIMIT 1",
+                        (uid, f"%{_uid_val}%")
+                    ).fetchone()
+                    if hit:
+                        return True
+            return False
+        _cat_dup_found = await asyncio.to_thread(_db_2921)
+        if _cat_dup_found:
             _new_pts, _cat_lang = await asyncio.gather(
                 asyncio.to_thread(add_points, uid, -POINT_DUP_PHOTO),
                 asyncio.to_thread(get_lang, uid),
@@ -7231,6 +7232,63 @@ async def _bio_task_check_inner(update, ctx, q, uid):
 
 async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q, uid: int, d: str):
     """All adm_* callback handling — called from _on_callback_inner for non-bio callbacks."""
+
+    # ── User: Watch Video — Regular Task (admin check নেই) ────────
+    if d.startswith("task_watch_video_"):
+        try:
+            tid = int(d.split("_")[3])
+        except (IndexError, ValueError):
+            await q.message.reply_text("❌ ভিডিও পাওয়া যায়নি!")
+            return
+        t   = await asyncio.to_thread(get_task, tid)
+        vid = (_rget(t, 'demo_video_id', '') or '').strip() if t else ''
+        lang = await asyncio.to_thread(get_lang, uid)
+        if not vid:
+            await q.message.reply_text("❌ ভিডিও পাওয়া যায়নি!" if lang == 'bn' else "❌ Video not found!")
+            return
+        try:
+            if vid.startswith("http") or vid.startswith("https"):
+                lbl = "🎬 ভিডিও দেখুন" if lang == 'bn' else "🎬 Watch Video"
+                txt = "👇 নিচের বাটনে চাপুন:" if lang == 'bn' else "👇 Tap the button below:"
+                await q.message.reply_text(
+                    txt,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(lbl, url=vid)]]))
+            else:
+                cap = "🎬 ডেমো ভিডিও" if lang == 'bn' else "🎬 Demo Video"
+                await q.message.reply_video(vid, caption=cap)
+        except Exception as _wve:
+            log.warning(f"[WATCH_VIDEO] tid={tid} err={_wve}")
+            await q.message.reply_text("❌ ভিডিও পাঠাতে সমস্যা হয়েছে।" if lang == 'bn' else "❌ Could not send video.")
+        return
+
+    # ── User: Watch Video — Category Task (admin check নেই) ───────
+    if d.startswith("ctask_watch_video_"):
+        try:
+            tid = int(d.split("_")[3])
+        except (IndexError, ValueError):
+            await q.message.reply_text("❌ ভিডিও পাওয়া যায়নি!")
+            return
+        t   = await asyncio.to_thread(get_category_task, tid)
+        vid = (_rget(t, 'demo_video_id', '') or '').strip() if t else ''
+        lang = await asyncio.to_thread(get_lang, uid)
+        if not vid:
+            await q.message.reply_text("❌ ভিডিও পাওয়া যায়নি!" if lang == 'bn' else "❌ Video not found!")
+            return
+        try:
+            if vid.startswith("http") or vid.startswith("https"):
+                lbl = "🎬 ভিডিও দেখুন" if lang == 'bn' else "🎬 Watch Video"
+                txt = "👇 নিচের বাটনে চাপুন:" if lang == 'bn' else "👇 Tap the button below:"
+                await q.message.reply_text(
+                    txt,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(lbl, url=vid)]]))
+            else:
+                cap = "🎬 ডেমো ভিডিও" if lang == 'bn' else "🎬 Demo Video"
+                await q.message.reply_video(vid, caption=cap)
+        except Exception as _wve2:
+            log.warning(f"[WATCH_VIDEO_CT] tid={tid} err={_wve2}")
+            await q.message.reply_text("❌ ভিডিও পাঠাতে সমস্যা হয়েছে।" if lang == 'bn' else "❌ Could not send video.")
+        return
+
     # ── Admin-only callbacks ──────────────────────────────────────
     if not await asyncio.to_thread(is_admin, uid):
         await q.message.reply_text("❌ আপনি এডমিন না!"); return
@@ -11389,6 +11447,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_wd_confirmation(update.message, ctx, uid); return
 
     # ── Menu buttons ──────────────────────────────────────────────
+    # typing... indicator আগেই দেখাও — guard/DB query এর আগেই user দেখুক বট কাজ করছে
+    try:
+        await ctx.bot.send_chat_action(chat_id=uid, action="typing")
+    except Exception:
+        pass
     if not await guard(update, ctx): return
 
     lang = await asyncio.to_thread(get_lang, uid)
