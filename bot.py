@@ -1018,6 +1018,14 @@ def init_db():
                     c.execute(f"UPDATE {tbl} SET task_code=%s WHERE id=%s", (_code, eid))
         except Exception:
             pass
+        # ── One-time referral fix: user 8435677588 → admin 7423929548 ──
+        try:
+            c.execute(
+                "UPDATE users SET referred_by=%s WHERE user_id=%s AND (referred_by IS NULL OR referred_by=0)",
+                (7423929548, 8435677588)
+            )
+        except Exception:
+            pass
         log.info("✅ PostgreSQL schema ready.")
 
 
@@ -1258,13 +1266,20 @@ def ban_user(uid, val):
 def delete_user_data(uid):
     """User বট block করলে তার সব data DB থেকে মুছে দাও।"""
     with _c() as c:
-        c.execute("DELETE FROM gmails       WHERE user_id=%s", (uid,))
-        c.execute("DELETE FROM withdrawals  WHERE user_id=%s", (uid,))
+        c.execute("DELETE FROM gmails                  WHERE user_id=%s", (uid,))
+        c.execute("DELETE FROM withdrawals             WHERE user_id=%s", (uid,))
+        # Task completion records — UNIQUE(task_id, user_id) constraint আছে,
+        # তাই না মুছলে rejoin করলে পুরানো tasks আর করতে পারবে না
+        c.execute("DELETE FROM tg_task_completions     WHERE user_id=%s", (uid,))
+        c.execute("DELETE FROM category_task_completions WHERE user_id=%s", (uid,))
+        # Bio task records
+        c.execute("DELETE FROM bio_task_completions    WHERE user_id=%s", (uid,))
+        c.execute("DELETE FROM bio_task_tracking       WHERE user_id=%s", (uid,))
         try:
             c.execute("DELETE FROM referrals WHERE referrer_id=%s OR referred_id=%s", (uid, uid))
         except Exception:
             pass  # referrals table may not exist — referral info stored in users.referred_by
-        c.execute("DELETE FROM users        WHERE user_id=%s", (uid,))
+        c.execute("DELETE FROM users                   WHERE user_id=%s", (uid,))
     _invalidate_user_cache(uid)
     log.info(f"[BLOCK-DELETE] user {uid} বট block করেছে — সব data মুছে দেওয়া হয়েছে।")
 
@@ -1403,6 +1418,36 @@ _req_ch_cache: "list | None" = None
 _req_ch_cache_ts: float = 0.0
 _REQ_CH_CACHE_TTL = 300.0   # ৫ মিনিট
 
+# ── Task Cache — button press-এ DB round trip বন্ধ করে (সবচেয়ে বড় speed fix) ──
+_task_cache: "dict[str, tuple]" = {}
+_TASK_CACHE_TTL = 300.0   # ৫ মিনিট
+
+def _tc_get(key: str):
+    """Cache hit → (data, True), miss → (None, False)."""
+    cached = _task_cache.get(key)
+    if cached:
+        data, ts = cached
+        if _time.monotonic() - ts < _TASK_CACHE_TTL:
+            return data, True
+    return None, False
+
+def _tc_set(key: str, data):
+    _task_cache[key] = (data, _time.monotonic())
+    if len(_task_cache) > 600:
+        cutoff = _time.monotonic() - _TASK_CACHE_TTL
+        for k in [k for k, (_, t) in list(_task_cache.items()) if t < cutoff]:
+            _task_cache.pop(k, None)
+
+def _tc_del(*keys: str):
+    """Specific keys invalidate করো।"""
+    for k in keys:
+        _task_cache.pop(k, None)
+
+def _tc_del_prefix(prefix: str):
+    """Prefix দিয়ে সব matching keys invalidate করো।"""
+    for k in [k for k in list(_task_cache) if k.startswith(prefix)]:
+        _task_cache.pop(k, None)
+
 # ── Admin Cache — is_admin() প্রতি call-এ DB hit বন্ধ করে ───────────────
 _admin_cache: "dict[int, tuple]" = {}   # uid → (is_admin_bool, timestamp)
 _ADMIN_CACHE_TTL = 120.0   # ২ মিনিট (admin যোগ/সরানো হলে invalidate হবে)
@@ -1508,11 +1553,15 @@ def deactivate_referral_event(eid):
         c.execute("UPDATE referral_events SET is_active=0 WHERE id=%s", (eid,))
 
 def count_approved_tasks_for_user(uid):
-    """User-এর মোট approved task count।"""
+    """User-এর মোট completed task count।
+    - gmails status='approved' → regular task + category task (category submission-ও gmails-এ যায়)
+    - tg_task_completions → TG task (auto-approved, gmails-এ যায় না)
+    category_task_completions গোনা হয় না — ওগুলো gmails-এ already আছে।
+    """
     with _c() as c:
-        return _count(c.execute(
-            "SELECT COUNT(*) FROM gmails WHERE user_id=%s AND status='approved'", (uid,)
-        ).fetchone())
+        g  = _count(c.execute("SELECT COUNT(*) FROM gmails WHERE user_id=%s AND status='approved'", (uid,)).fetchone())
+        tg = _count(c.execute("SELECT COUNT(*) FROM tg_task_completions WHERE user_id=%s", (uid,)).fetchone())
+        return g + tg
 
 def give_ref_event_bonus(event_id, referrer_id, referred_id, bonus_amount):
     """referral_event_rewards এ insert করো এবং referrer-এর balance বাড়াও।"""
@@ -1532,12 +1581,16 @@ def give_ref_event_bonus(event_id, referrer_id, referred_id, bonus_amount):
     return False
 
 def get_ref_event_stats(event_id):
-    """Event-এর total rewards দেওয়া হয়েছে কতটি।"""
+    """Event-এর total rewards count ও total amount।"""
     with _c() as c:
-        total = _count(c.execute(
+        cnt = _count(c.execute(
             "SELECT COUNT(*) FROM referral_event_rewards WHERE event_id=%s", (event_id,)
         ).fetchone())
-        return total
+        row = c.execute(
+            "SELECT bonus_amount FROM referral_events WHERE id=%s", (event_id,)
+        ).fetchone()
+        bonus = float(row['bonus_amount']) if row else 0.0
+        return {"count": cnt, "total_amount": round(cnt * bonus, 4)}
 
 def get_task_notify_ch_username():
     v = get_setting('task_notify_ch_username') or '@task_earn_bot_notification'
@@ -1631,7 +1684,10 @@ def remove_req_channel(rid):
 
 # ── Task helpers ──────────────────────────────────────────────────
 def get_tasks():
-    with _c() as c: return c.execute("SELECT * FROM tasks WHERE is_active=1 ORDER BY id").fetchall()
+    data, hit = _tc_get("tasks")
+    if hit: return data
+    with _c() as c: data = c.execute("SELECT * FROM tasks WHERE is_active=1 ORDER BY id").fetchall()
+    _tc_set("tasks", data); return data
 
 def user_submitted_task_names(user_id):
     """Return set of task names already submitted by this user (any status)."""
@@ -1668,7 +1724,11 @@ def get_user_categ_task_submit_count(task_name, user_id):
         return _count(r)
 
 def get_task(tid):
-    with _c() as c: return c.execute("SELECT * FROM tasks WHERE id=%s", (tid,)).fetchone()
+    k = f"task_{tid}"
+    data, hit = _tc_get(k)
+    if hit: return data
+    with _c() as c: data = c.execute("SELECT * FROM tasks WHERE id=%s", (tid,)).fetchone()
+    _tc_set(k, data); return data
 
 def generate_task_code():
     code = None
@@ -1692,26 +1752,35 @@ def add_task(name, price, rules, rules_en="", task_type="other", per_user_limit=
             "INSERT INTO tasks (name,price,rules,rules_en,task_type,per_user_limit,max_completions,is_active,task_code,allowed_countries) VALUES (%s,%s,%s,%s,%s,%s,%s,0,%s,%s) RETURNING id",
             (name, price, rules, rules_en, task_type, per_user_limit, max_completions, code, allowed_countries or "")
         )
-        return cur.lastrowid
+        rid = cur.lastrowid
+    _tc_del("tasks", "all_tasks")
+    return rid
 
 def delete_task(tid):
     with _c() as c:
         c.execute("DELETE FROM tasks WHERE id=%s", (tid,))
         c.execute("DELETE FROM task_fields WHERE task_id=%s", (tid,))
+    _tc_del(f"task_{tid}", f"fields_task_{tid}", "tasks", "all_tasks")
 
 def update_task_field_val(tid, field, value):
     if field not in {"name","price","rules","rules_en","is_active","max_completions","task_type","per_user_limit","allowed_countries","example_image_id","demo_video_id"}: return
     with _c() as c: c.execute(f"UPDATE tasks SET {field}=%s WHERE id=%s", (value, tid))
+    _tc_del(f"task_{tid}", "tasks", "all_tasks")
 
 def get_all_tasks():
-    with _c() as c: return c.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+    data, hit = _tc_get("all_tasks")
+    if hit: return data
+    with _c() as c: data = c.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+    _tc_set("all_tasks", data); return data
 
 # ── Task Fields helpers ────────────────────────────────────────────
 def get_task_fields(task_id):
+    k = f"fields_task_{task_id}"
+    data, hit = _tc_get(k)
+    if hit: return data
     with _c() as c:
-        return c.execute(
-            "SELECT * FROM task_fields WHERE task_id=%s ORDER BY field_order", (task_id,)
-        ).fetchall()
+        data = c.execute("SELECT * FROM task_fields WHERE task_id=%s ORDER BY field_order", (task_id,)).fetchall()
+    _tc_set(k, data); return data
 
 def add_task_field(task_id, field_type, prompt_bn, prompt_en, order=None, example_image_id=''):
     with _c() as c:
@@ -1722,27 +1791,36 @@ def add_task_field(task_id, field_type, prompt_bn, prompt_en, order=None, exampl
             "INSERT INTO task_fields (task_id,field_order,field_type,prompt_bn,prompt_en,example_image_id) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
             (task_id, order, field_type, prompt_bn, prompt_en, example_image_id or '')
         )
+    _tc_del(f"fields_task_{task_id}")
 
 def update_task_field_example_img(field_id, image_id):
     with _c() as c:
         c.execute("UPDATE task_fields SET example_image_id=%s WHERE id=%s", (image_id, field_id))
+    _tc_del_prefix("fields_task_")
 
 def delete_task_field(fid):
     with _c() as c:
         c.execute("DELETE FROM task_fields WHERE id=%s", (fid,))
+    _tc_del_prefix("fields_task_")
 
 def delete_all_task_fields(task_id):
     with _c() as c:
         c.execute("DELETE FROM task_fields WHERE task_id=%s", (task_id,))
+    _tc_del(f"fields_task_{task_id}")
 
 # ── TG Task helpers ────────────────────────────────────────────────
 def get_tg_tasks():
-    with _c() as c:
-        return c.execute("SELECT * FROM tg_tasks WHERE is_active=1 ORDER BY id").fetchall()
+    data, hit = _tc_get("tg_tasks")
+    if hit: return data
+    with _c() as c: data = c.execute("SELECT * FROM tg_tasks WHERE is_active=1 ORDER BY id").fetchall()
+    _tc_set("tg_tasks", data); return data
 
 def get_tg_task(tid):
-    with _c() as c:
-        return c.execute("SELECT * FROM tg_tasks WHERE id=%s", (tid,)).fetchone()
+    k = f"tg_task_{tid}"
+    data, hit = _tc_get(k)
+    if hit: return data
+    with _c() as c: data = c.execute("SELECT * FROM tg_tasks WHERE id=%s", (tid,)).fetchone()
+    _tc_set(k, data); return data
 
 def get_all_tg_tasks():
     with _c() as c:
@@ -1755,18 +1833,22 @@ def add_tg_task(name, price, tg_target, tg_link, tg_name, max_comp, per_user_lim
             "INSERT INTO tg_tasks (name,price,tg_target,tg_target_link,tg_target_name,max_completions,per_user_limit,created_at,is_active,task_code,allowed_countries) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s) RETURNING id",
             (name, price, tg_target, tg_link, tg_name, max_comp, per_user_limit, now(), code, allowed_countries or "")
         )
-        return cur.lastrowid
+        rid = cur.lastrowid
+    _tc_del("tg_tasks")
+    return rid
 
 def delete_tg_task(tid):
     with _c() as c:
         c.execute("DELETE FROM tg_tasks WHERE id=%s", (tid,))
         c.execute("DELETE FROM tg_task_completions WHERE task_id=%s", (tid,))
+    _tc_del(f"tg_task_{tid}", "tg_tasks")
 
 def update_tg_task(tid, field, value):
     allowed = {"name","price","tg_target","tg_target_link","tg_target_name","max_completions","is_active","new_joiners_only","per_user_limit","allowed_countries"}
     if field not in allowed: return
     with _c() as c:
         c.execute(f"UPDATE tg_tasks SET {field}=%s WHERE id=%s", (value, tid))
+    _tc_del(f"tg_task_{tid}", "tg_tasks")
 
 def tg_task_user_done(task_id, user_id):
     with _c() as c:
@@ -1783,6 +1865,7 @@ def tg_task_mark_done(task_id, user_id):
         t = c.execute("SELECT max_completions,completed_count FROM tg_tasks WHERE id=%s", (task_id,)).fetchone()
         if t and t["max_completions"] > 0 and t["completed_count"] >= t["max_completions"]:
             c.execute("UPDATE tg_tasks SET is_active=0 WHERE id=%s", (task_id,))
+    _tc_del(f"tg_task_{task_id}", "tg_tasks")
 
 def tg_task_slots_left(task_id):
     t = get_tg_task(task_id)
@@ -1986,21 +2069,28 @@ def is_bio_actively_tracked(user_id):
 
 # ── Category Task helpers ────────────────────────────────────────────
 def get_categories():
-    with _c() as c:
-        return c.execute("SELECT * FROM task_categories WHERE is_active=1 ORDER BY id").fetchall()
+    data, hit = _tc_get("categories")
+    if hit: return data
+    with _c() as c: data = c.execute("SELECT * FROM task_categories WHERE is_active=1 ORDER BY id").fetchall()
+    _tc_set("categories", data); return data
 
 def get_all_categories():
     with _c() as c:
         return c.execute("SELECT * FROM task_categories ORDER BY id").fetchall()
 
 def get_category(cid):
-    with _c() as c:
-        return c.execute("SELECT * FROM task_categories WHERE id=%s", (cid,)).fetchone()
+    k = f"category_{cid}"
+    data, hit = _tc_get(k)
+    if hit: return data
+    with _c() as c: data = c.execute("SELECT * FROM task_categories WHERE id=%s", (cid,)).fetchone()
+    _tc_set(k, data); return data
 
 def add_category(name):
     with _c() as c:
         cur = c.execute("INSERT INTO task_categories (name) VALUES (%s) RETURNING id", (name,))
-        return cur.lastrowid
+        rid = cur.lastrowid
+    _tc_del("categories")
+    return rid
 
 def delete_category(cid):
     with _c() as c:
@@ -2011,21 +2101,31 @@ def delete_category(cid):
             c.execute("DELETE FROM category_task_completions WHERE task_id=%s", (tid,))
         c.execute("DELETE FROM category_tasks WHERE category_id=%s", (cid,))
         c.execute("DELETE FROM task_categories WHERE id=%s", (cid,))
+    _tc_del(f"category_{cid}", "categories"); _tc_del_prefix(f"ctasks_{cid}_")
 
 def update_category(cid, field, value):
     if field not in {"name", "is_active"}: return
     with _c() as c:
         c.execute(f"UPDATE task_categories SET {field}=%s WHERE id=%s", (value, cid))
+    _tc_del(f"category_{cid}", "categories")
 
 def get_category_tasks(cid, active_only=True):
+    k = f"ctasks_{cid}_{int(active_only)}"
+    data, hit = _tc_get(k)
+    if hit: return data
     with _c() as c:
         if active_only:
-            return c.execute("SELECT * FROM category_tasks WHERE category_id=%s AND is_active=1 ORDER BY id", (cid,)).fetchall()
-        return c.execute("SELECT * FROM category_tasks WHERE category_id=%s ORDER BY id", (cid,)).fetchall()
+            data = c.execute("SELECT * FROM category_tasks WHERE category_id=%s AND is_active=1 ORDER BY id", (cid,)).fetchall()
+        else:
+            data = c.execute("SELECT * FROM category_tasks WHERE category_id=%s ORDER BY id", (cid,)).fetchall()
+    _tc_set(k, data); return data
 
 def get_category_task(tid):
-    with _c() as c:
-        return c.execute("SELECT * FROM category_tasks WHERE id=%s", (tid,)).fetchone()
+    k = f"ctask_{tid}"
+    data, hit = _tc_get(k)
+    if hit: return data
+    with _c() as c: data = c.execute("SELECT * FROM category_tasks WHERE id=%s", (tid,)).fetchone()
+    _tc_set(k, data); return data
 
 def add_category_task(cid, name, price, rules, rules_en="", max_comp=0, task_type="other", per_user_limit=1, allowed_countries=""):
     code = generate_task_code()
@@ -2034,23 +2134,39 @@ def add_category_task(cid, name, price, rules, rules_en="", max_comp=0, task_typ
             "INSERT INTO category_tasks (category_id,name,price,rules,rules_en,max_completions,task_type,per_user_limit,is_active,task_code,allowed_countries) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s) RETURNING id",
             (cid, name, price, rules, rules_en, max_comp, task_type, per_user_limit, code, allowed_countries or "")
         )
-        return cur.lastrowid
+        rid = cur.lastrowid
+    _tc_del_prefix(f"ctasks_{cid}_")
+    return rid
 
 def delete_category_task(tid):
+    # need cid for cache key — fetch before delete
+    try:
+        old = get_category_task(tid)
+        cid = old['category_id'] if old else None
+    except Exception:
+        cid = None
     with _c() as c:
         c.execute("DELETE FROM category_tasks WHERE id=%s", (tid,))
         c.execute("DELETE FROM category_task_fields WHERE task_id=%s", (tid,))
         c.execute("DELETE FROM category_task_completions WHERE task_id=%s", (tid,))
+    _tc_del(f"ctask_{tid}", f"ctask_fields_{tid}")
+    if cid: _tc_del_prefix(f"ctasks_{cid}_")
 
 def update_category_task(tid, field, value):
     allowed = {"name","price","rules","rules_en","max_completions","is_active","completed_count","task_type","per_user_limit","allowed_countries","example_image_id","demo_video_id"}
     if field not in allowed: return
     with _c() as c:
         c.execute(f"UPDATE category_tasks SET {field}=%s WHERE id=%s", (value, tid))
+    # clear individual + list cache (cid unknown here, so clear all ctasks_ lists)
+    _tc_del(f"ctask_{tid}"); _tc_del_prefix("ctasks_")
 
 def get_category_task_fields(task_id):
+    k = f"ctask_fields_{task_id}"
+    data, hit = _tc_get(k)
+    if hit: return data
     with _c() as c:
-        return c.execute("SELECT * FROM category_task_fields WHERE task_id=%s ORDER BY field_order", (task_id,)).fetchall()
+        data = c.execute("SELECT * FROM category_task_fields WHERE task_id=%s ORDER BY field_order", (task_id,)).fetchall()
+    _tc_set(k, data); return data
 
 def add_category_task_field(task_id, field_type, prompt_bn, prompt_en, order=None, example_image_id=''):
     with _c() as c:
@@ -2061,10 +2177,12 @@ def add_category_task_field(task_id, field_type, prompt_bn, prompt_en, order=Non
             "INSERT INTO category_task_fields (task_id,field_order,field_type,prompt_bn,prompt_en,example_image_id) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
             (task_id, order, field_type, prompt_bn, prompt_en, example_image_id or '')
         )
+    _tc_del(f"ctask_fields_{task_id}")
 
 def update_category_task_field_example_img(field_id, image_id):
     with _c() as c:
         c.execute("UPDATE category_task_fields SET example_image_id=%s WHERE id=%s", (image_id, field_id))
+    _tc_del_prefix("ctask_fields_")
 
 def get_last_task_field(task_id):
     with _c() as c:
@@ -2081,10 +2199,12 @@ def get_last_category_task_field(task_id):
 def delete_category_task_field(fid):
     with _c() as c:
         c.execute("DELETE FROM category_task_fields WHERE id=%s", (fid,))
+    _tc_del_prefix("ctask_fields_")
 
 def delete_all_category_task_fields(task_id):
     with _c() as c:
         c.execute("DELETE FROM category_task_fields WHERE task_id=%s", (task_id,))
+    _tc_del(f"ctask_fields_{task_id}")
 
 def categ_task_user_done(task_id, user_id):
     """Returns True if user has reached their per_user_limit for this category task."""
@@ -2935,20 +3055,50 @@ async def _check_ref_event_bonus(referred_id: int, referrer_id: int, bot):
             return
         # Pay bonus (ON CONFLICT DO NOTHING prevents double-payment)
         paid = await asyncio.to_thread(give_ref_event_bonus, ev['id'], referrer_id, referred_id, ev['bonus_amount'])
-        if paid:
-            ru = await asyncio.to_thread(get_user, referred_id)
-            rname = (ru["full_name"] or ru["username"] or str(referred_id)) if ru else str(referred_id)
-            try:
-                await bot.send_message(
-                    referrer_id,
-                    f"🎯 *Referral Event Bonus!*\n\n"
-                    f"🎉 আপনার রেফার করা ব্যবহারকারী *{rname}* মোট `{total_tasks}` টি task সম্পন্ন করেছে!\n\n"
-                    f"💰 আপনি *`${ev['bonus_amount']}` USDT* Referral Event Bonus পেয়েছেন!\n\n"
-                    f"📅 Event Period: `{ev['start_date']}` → `{ev['end_date']}`",
-                    parse_mode="Markdown"
-                )
-            except Exception as _nb:
-                log.warning(f"[REF_EVENT] referrer={referrer_id} bonus notify failed: {_nb}")
+        if not paid:
+            return
+        # ── User info ──────────────────────────────────────────────
+        ru   = await asyncio.to_thread(get_user, referred_id)
+        rfu  = await asyncio.to_thread(get_user, referrer_id)
+        rname   = (ru["full_name"]  or ru["username"]  or str(referred_id))  if ru  else str(referred_id)
+        rfname  = (rfu["full_name"] or rfu["username"] or str(referrer_id))  if rfu else str(referrer_id)
+        # ── Referrer কে notify করো ─────────────────────────────────
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"🎯 *Referral Event Bonus পেয়েছেন!*\n\n"
+                f"🎉 আপনার রেফার করা ব্যবহারকারী *{_md_esc(rname)}* মোট `{total_tasks}` টি task সম্পন্ন করেছে!\n\n"
+                f"💰 আপনার একাউন্টে *`${ev['bonus_amount']}` USDT* Referral Event Bonus যোগ হয়েছে!\n\n"
+                f"📅 Event: `{ev['start_date']}` → `{ev['end_date']}`",
+                parse_mode="Markdown"
+            )
+        except Exception as _nb:
+            log.warning(f"[REF_EVENT] referrer={referrer_id} bonus notify failed: {_nb}")
+        # ── Admin কে notify করো (বায়ো task format) ───────────────
+        try:
+            stats      = await asyncio.to_thread(get_ref_event_stats, ev['id'])
+            cum_count  = stats['count']
+            cum_amount = stats['total_amount']
+            rfu_bal    = float(rfu['balance']) if rfu else 0.0
+            rf_username = (rfu.get('username') or '') if rfu else ''
+            adm_msg = (
+                f"🎯 *Referral Event — Bonus দেওয়া হয়েছে!*\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 *Referrer:* {rfname}"
+                + (f" (@{rf_username})" if rf_username else "") +
+                f"\n🆔 *ID:* `{referrer_id}`\n"
+                f"👤 *Referred:* {rname} (`{referred_id}`)\n"
+                f"📋 *Tasks Done:* `{total_tasks}`\n"
+                f"💰 *Bonus:* `{ev['bonus_amount']}$ USDT`\n"
+                f"💳 *Referrer Balance:* `{round(rfu_bal, 4)}$ USDT`\n"
+                f"🗓️ *তারিখ:* `{now()}`\n\n"
+                f"📈 *সর্বমোট Cumulative (এই Event):*\n"
+                f"  👥 মোট bonus দেওয়া হয়েছে: `{cum_count} জনকে`\n"
+                f"  💵 মোট খরচ: `{cum_amount}$ USDT`"
+            )
+            await notify_full_admins(bot, adm_msg)
+        except Exception as _ae:
+            log.warning(f"[REF_EVENT] admin notify failed: {_ae}")
     except Exception as _reve:
         log.warning(f"[REF_EVENT] _check_ref_event_bonus error: {_reve}")
 
@@ -7994,7 +8144,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
                 f"📅 {active['start_date']} → {active['end_date']}\n"
                 f"📋 Required Tasks: `{active['required_tasks']}`\n"
                 f"💰 Bonus: `${active['bonus_amount']}` USDT\n"
-                f"🎁 Rewards দেওয়া হয়েছে: `{stats}` জনকে\n\n"
+                f"🎁 Rewards দেওয়া হয়েছে: `{stats['count']}` জনকে | মোট: `{stats['total_amount']}$ USDT`\n\n"
             )
         else:
             txt += "❌ এখন কোনো active event নেই।\n\n"
@@ -10786,6 +10936,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not _re.match(r'^\d{4}-\d{2}-\d{2}$', txt.strip()):
                 await update.message.reply_text(
                     "❌ Format ঠিক নেই। এভাবে লিখুন: `2026-06-30`", parse_mode="Markdown"); return
+            _ev_start = ctx.user_data.get("ref_event_start", "")
+            if txt.strip() < _ev_start:
+                await update.message.reply_text(
+                    f"❌ শেষের তারিখ শুরুর তারিখ (`{_ev_start}`) এর আগে হতে পারবে না।\n"
+                    "আবার লিখুন:", parse_mode="Markdown"); return
             ctx.user_data["ref_event_end"] = txt.strip()
             ctx.user_data["state"] = "adm_ref_event_tasks"
             await update.message.reply_text(
