@@ -477,7 +477,18 @@ class _CursorWrapper:
           self._rowcount = 0
 
       def execute(self, sql, params=None):
-          self._cur.execute(sql, params)
+          try:
+              self._cur.execute(sql, params)
+          except psycopg2.errors.InFailedSqlTransaction:
+              # আগের query fail করেছিল, transaction aborted — rollback করে clean state ফিরিয়ে আনো
+              try: self._conn.rollback()
+              except Exception: pass
+              raise
+          except psycopg2.Error:
+              # যেকোনো DB error-এ transaction dirty হতে পারে — rollback করো
+              try: self._conn.rollback()
+              except Exception: pass
+              raise
           self._rowcount = self._cur.rowcount if self._cur.rowcount is not None else 0
           if "RETURNING" in sql.upper() and sql.strip().upper().startswith("INSERT"):
               try:
@@ -2420,7 +2431,7 @@ def w_kb_admin(wid):
 # সব চ্যানেলে থাকলে 15s cache → Task/অন্য বাটনে দ্রুত রিপ্লাই
 # কোনো চ্যানেল মিস হলে 0s cache → চ্যানেল ছাড়লে সাথে সাথে ধরা পড়বে
 _ch_cache: dict = {}          # uid → (timestamp, missing_list)
-_CH_CACHE_TTL_OK  = 15        # seconds — সব চ্যানেলে থাকলে এতক্ষণ cache
+_CH_CACHE_TTL_OK  = 120       # seconds — সব চ্যানেলে থাকলে এতক্ষণ cache (15→120: button দ্রুত হবে)
 _CH_CACHE_TTL_BAD = 0         # seconds — কোনো চ্যানেল মিস হলে cache নেই
 
 async def check_ch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2499,7 +2510,7 @@ async def join_prompt(update: Update, uid=None):
 
 # ──────────────────────────── REFERRAL NOTIFY ────────────────────────────
 async def fire_new_user_notify(ctx, uid, full_name, username, ref_by):
-    uname = f"@{username}" if username else _md_esc(full_name)
+    uname = f"@{_md_esc(username)}" if username else _md_esc(full_name)
     ref_txt = f"\n🔗 *রেফার:* {ref_by}" if ref_by else ""
     await notify_full_admins(
         ctx.bot,
@@ -2512,7 +2523,7 @@ async def fire_new_user_notify(ctx, uid, full_name, username, ref_by):
         try:
             comm_pct = await asyncio.to_thread(get_commission_pct)
             await ctx.bot.send_message(ref_by,
-                T(ref_by, 'new_user_ref', name=full_name, uname=uname, comm_pct=int(comm_pct) if comm_pct == int(comm_pct) else comm_pct),
+                T(ref_by, 'new_user_ref', name=_md_esc(full_name or ""), uname=uname, comm_pct=int(comm_pct) if comm_pct == int(comm_pct) else comm_pct),
                 parse_mode="Markdown")
         except Exception as _e:
             log.warning(f"[NOTIFY] ref_by={ref_by} new-user commission notify ব্যর্থ: {_e}")
@@ -2636,8 +2647,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     ticon = task_type_icon(_rget(t, 'task_type', 'other'))
                     mc    = t['max_completions']
                     slots_txt = (f"👥 *Max:* `{mc} জন`" if mc > 0 else "👥 *Max:* `Unlimited`") if lang=='bn' else (f"👥 *Max:* `{mc}`" if mc > 0 else "👥 *Max:* `Unlimited`")
-                    msg   = (f"{ticon} *{t['name']}*\n\n💰 *পুরস্কার:* `{t['price']}$ USDT`\n{slots_txt}\n\n📜 *নিয়মাবলী:*\n{t['rules']}" if lang=='bn'
-                             else f"{ticon} *{t['name']}*\n\n💰 *Reward:* `{t['price']}$ USDT`\n{slots_txt}\n\n📜 *Rules:*\n{t['rules']}")
+                    _ct_tn_esc = _md_esc(t['name'])
+                    msg   = (f"{ticon} *{_ct_tn_esc}*\n\n💰 *পুরস্কার:* `{t['price']}$ USDT`\n{slots_txt}\n\n📜 *নিয়মাবলী:*\n{t['rules']}" if lang=='bn'
+                             else f"{ticon} *{_ct_tn_esc}*\n\n💰 *Reward:* `{t['price']}$ USDT`\n{slots_txt}\n\n📜 *Rules:*\n{t['rules']}")
                     _dl_ct_vid = bool((_rget(t, 'demo_video_id', '') or '').strip())
                     _dl_ct_rows = []
                     if _dl_ct_vid:
@@ -2693,13 +2705,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                      else f"👥 *Total:* `{max_c}` | *Remaining:* `{max(0,max_c-done_c)}`")
                     else:
                         slots_txt = "👥 *মোট:* `Unlimited`" if lang=='bn' else "👥 *Total:* `Unlimited`"
+                    _tn_esc1 = _md_esc(task['name'])
                     if lang == 'bn':
-                        msg = (f"📡 *{task['name']}*\n\n💰 *পুরস্কার:* `{task['price']}$ USDT`\n"
+                        msg = (f"📡 *{_tn_esc1}*\n\n💰 *পুরস্কার:* `{task['price']}$ USDT`\n"
                                f"📢 *Channel/Group:* {tg_name}\n{slots_txt}\n\n"
                                f"*কীভাবে করবেন:*\n1️⃣ নিচের বাটনে চেপে Channel/Group জয়েন করুন\n"
                                f"2️⃣ জয়েন হলে ✅ Check বাটনে চাপুন\n3️⃣ বট চেক করবে — জয়েন থাকলে টাকা পাবেন!")
                     else:
-                        msg = (f"📡 *{task['name']}*\n\n💰 *Reward:* `{task['price']}$ USDT`\n"
+                        msg = (f"📡 *{_tn_esc1}*\n\n💰 *Reward:* `{task['price']}$ USDT`\n"
                                f"📢 *Channel/Group:* {tg_name}\n{slots_txt}\n\n"
                                f"*How to complete:*\n1️⃣ Press Join button below\n"
                                f"2️⃣ After joining press ✅ Check\n3️⃣ Bot will verify — you'll get paid instantly!")
@@ -2720,13 +2733,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                      else f"👥 *Total:* `{max_c}` | *Remaining:* `{max(0,max_c-done_c)}`")
                     else:
                         slots_txt = "👥 *মোট:* `Unlimited`" if lang=='bn' else "👥 *Total:* `Unlimited`"
+                    _tn_esc2 = _md_esc(task['name'])
                     if lang == 'bn':
-                        msg = (f"📡 *{task['name']}*\n\n💰 *পুরস্কার:* `{task['price']}$ USDT`\n"
+                        msg = (f"📡 *{_tn_esc2}*\n\n💰 *পুরস্কার:* `{task['price']}$ USDT`\n"
                                f"📢 *Channel/Group:* {tg_name}\n{slots_txt}\n\n"
                                f"*কীভাবে করবেন:*\n1️⃣ নিচের বাটনে চেপে Channel/Group জয়েন করুন\n"
                                f"2️⃣ জয়েন হলে ✅ Check বাটনে চাপুন\n3️⃣ বট চেক করবে — জয়েন থাকলে টাকা পাবেন!")
                     else:
-                        msg = (f"📡 *{task['name']}*\n\n💰 *Reward:* `{task['price']}$ USDT`\n"
+                        msg = (f"📡 *{_tn_esc2}*\n\n💰 *Reward:* `{task['price']}$ USDT`\n"
                                f"📢 *Channel/Group:* {tg_name}\n{slots_txt}\n\n"
                                f"*How to complete:*\n1️⃣ Press Join button below\n"
                                f"2️⃣ After joining press ✅ Check\n3️⃣ Bot will verify — you'll get paid instantly!")
@@ -2785,10 +2799,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     )
                 else:
                     slots_txt = "👥 *Max:* `Unlimited`"
+                _tn_esc3 = _md_esc(task['name'])
                 if lang == 'bn':
                     rules_text = task["rules"] if task["rules"] else "কোনো বিশেষ নিয়ম নেই।"
                     msg = (
-                        f"{ticon} *{task['name']}*{code_line}\n\n"
+                        f"{ticon} *{_tn_esc3}*{code_line}\n\n"
                         f"💰 *পুরস্কার:* `{task['price']}$ USDT`\n"
                         f"{slots_txt}\n\n"
                         f"📜 *নিয়মাবলী:*\n{rules_text}"
@@ -2796,7 +2811,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 else:
                     rules_text = (_rget(task, "rules_en") or task["rules"]) or "No special rules."
                     msg = (
-                        f"{ticon} *{task['name']}*{code_line}\n\n"
+                        f"{ticon} *{_tn_esc3}*{code_line}\n\n"
                         f"💰 *Reward:* `{task['price']}$ USDT`\n"
                         f"{slots_txt}\n\n"
                         f"📜 *Rules:*\n{rules_text}"
@@ -2822,6 +2837,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if missing:
         await join_prompt(update, uid=user.id)
         return
+
+    # নতুন user যদি lang/country step skip করে সরাসরি এখানে আসে (no channels path),
+    # fire_new_user_notify এখানেই পাঠাতে হবে — নইলে notification কখনোই যাবে না।
+    if ctx.user_data.pop("pending_new", False) and user.id not in _notified_set:
+        _notified_set_add(user.id)
+        _nn_name  = ctx.user_data.pop("pending_name", user.full_name)
+        _nn_uname = ctx.user_data.pop("pending_uname", user.username or "")
+        _nn_ref   = ctx.user_data.pop("pending_ref", None)
+        for _k in ("pending_uid",):
+            ctx.user_data.pop(_k, None)
+        _nt = asyncio.create_task(fire_new_user_notify(ctx, user.id, _nn_name, _nn_uname, _nn_ref))
+        _background_tasks.add(_nt); _nt.add_done_callback(_background_tasks.discard)
 
     await _send_welcome(update, ctx, user.id)
 
@@ -2908,7 +2935,7 @@ async def show_profile(update, ctx):
     user = update.effective_user
     uid  = user.id
     bal  = await asyncio.to_thread(get_bal, uid)
-    uname = f"@{user.username}" if user.username else user.full_name
+    uname = f"@{_md_esc(user.username)}" if user.username else _md_esc(user.full_name or "")
     await update.message.reply_text(
         f"{T(uid,'profile_title')}\n\n"
         f"👤 *USER* {uname}\n"
@@ -2929,7 +2956,7 @@ async def show_balance(update, ctx):
         asyncio.to_thread(get_lang, uid),
     )
     owner = owner or '@inkamxbd'
-    owner_e = owner.replace('_', '\\_')
+    owner_e = _md_esc(owner)
     if lang == 'en':
         task_promo = (
             "\n\n━━━━━━━━━━━━━━━━\n"
@@ -2959,8 +2986,8 @@ async def show_support(update, ctx):
     )
     owner = owner or '@inkamxbd'
     bot_u = bot_u or '@gmail_sell_help_bot'
-    owner_e = owner.replace('_', '\\_')
-    bot_e   = bot_u.replace('_', '\\_')
+    owner_e = _md_esc(owner)
+    bot_e   = _md_esc(bot_u)
     if lang == 'en':
         body = (
             "📞 *Customer Support Center*\n"
@@ -3084,10 +3111,10 @@ async def _check_ref_event_bonus(referred_id: int, referrer_id: int, bot):
             adm_msg = (
                 f"🎯 *Referral Event — Bonus দেওয়া হয়েছে!*\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 *Referrer:* {rfname}"
-                + (f" (@{rf_username})" if rf_username else "") +
+                f"👤 *Referrer:* {_md_esc(rfname)}"
+                + (f" (@{_md_esc(rf_username)})" if rf_username else "") +
                 f"\n🆔 *ID:* `{referrer_id}`\n"
-                f"👤 *Referred:* {rname} (`{referred_id}`)\n"
+                f"👤 *Referred:* {_md_esc(rname)} (`{referred_id}`)\n"
                 f"📋 *Tasks Done:* `{total_tasks}`\n"
                 f"💰 *Bonus:* `{ev['bonus_amount']}$ USDT`\n"
                 f"💳 *Referrer Balance:* `{round(rfu_bal, 4)}$ USDT`\n"
@@ -3104,10 +3131,10 @@ async def _check_ref_event_bonus(referred_id: int, referrer_id: int, bot):
 
 async def _notify_task_maxed(bot, name: str, code: str, type_label: str, done: int, max_c: int):
     """Admin-কে জানাও যে task-এর সব slot পূর্ণ হয়েছে এবং task বন্ধ হয়েছে।"""
-    code_line = f"\n🔑 *Code:* `{code}`" if code else ""
+    code_line = f"\n🔑 *Code:* `{_md_esc(code)}`" if code else ""
     msg = (
         f"🏁 *Task সম্পূর্ণ হয়েছে — Slot পূর্ণ!*\n\n"
-        f"📌 *Task:* {name}{code_line}\n"
+        f"📌 *Task:* {_md_esc(name)}{code_line}\n"
         f"🏷️ *Type:* {type_label}\n"
         f"👥 *Completed:* `{done}/{max_c}` জন\n\n"
         f"✅ Task স্বয়ংক্রিয়ভাবে বন্ধ করে দেওয়া হয়েছে।"
@@ -3118,14 +3145,14 @@ async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str
     """যেকোনো task complete/approve হলে TASK_DONE_NOTIFY_CH চ্যানেলে notification পাঠাও।"""
     try:
         u = await asyncio.to_thread(get_user, user_id)
-        full_name = (u["full_name"] or "Unknown") if u else "Unknown"
-        type_line = f"\n🏷️ *ধরন:* {task_type_label}" if task_type_label else ""
-        code_line = f"\n🔑 *Task Code:* `{task_code}`" if task_code else ""
+        full_name = _md_esc((u["full_name"] or "Unknown") if u else "Unknown")
+        type_line = f"\n🏷️ *ধরন:* {_md_esc(task_type_label)}" if task_type_label else ""
+        code_line = f"\n🔑 *Task Code:* `{_md_esc(task_code)}`" if task_code else ""
         msg = (
             f"✅ *Task সম্পন্ন হয়েছে!*\n\n"
             f"👤 *ইউজার:* {full_name}\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"📌 *Task:* {task_name}{code_line}{type_line}\n"
+            f"📌 *Task:* {_md_esc(task_name)}{code_line}{type_line}\n"
             f"💰 *আয়:* `{price}$ USDT`\n"
             f"🕐 *সময়:* {now()}"
         )
@@ -3336,10 +3363,11 @@ async def show_category_tasks(update, ctx, cat_id):
     btns.append([InlineKeyboardButton("🔙 Back" if lang=='en' else "🔙 ফিরে যান", callback_data="task_cancel")])
     total_tasks = len(tasks)
     avail = sum(1 for done, slots in zip(_task_done_list, _task_slots_list) if not done and slots != 0)
+    _cat_tn_esc = _md_esc(cat['name'])
     if lang == 'en':
-        title = f"🗂️ *{cat['name']}*\n\n📋 Total: `{total_tasks}` tasks  •  ✅ Available: `{avail}`\n\n👇 Choose a task below:"
+        title = f"🗂️ *{_cat_tn_esc}*\n\n📋 Total: `{total_tasks}` tasks  •  ✅ Available: `{avail}`\n\n👇 Choose a task below:"
     else:
-        title = f"🗂️ *{cat['name']}*\n\n📋 মোট: `{total_tasks}` টি Task  •  ✅ পাওয়া যাচ্ছে: `{avail}` টি\n\n👇 নিচে থেকে একটি Task বেছে নিন:"
+        title = f"🗂️ *{_cat_tn_esc}*\n\n📋 মোট: `{total_tasks}` টি Task  •  ✅ পাওয়া যাচ্ছে: `{avail}` টি\n\n👇 নিচে থেকে একটি Task বেছে নিন:"
     await q.message.reply_text(title, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
 
 
@@ -3461,7 +3489,7 @@ async def show_category_task_rules(update, ctx, task):
     _ctcode = _rget(task, 'task_code', '') or ''
     _ctcode_line = f"🔑 *Task Code:* `{_ctcode}`\n" if _ctcode else ""
     await update.effective_message.reply_text(
-        f"{ticon} *{task['name']}*\n"
+        f"{ticon} *{_md_esc(task['name'])}*\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
         f"{_ctcode_line}"
         f"🏷️ *Type:* `{ttype_lbl}`\n"
@@ -3532,8 +3560,8 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
     _cat_existing_rows = None
     """Finalize and send category task submission to admin"""
     user      = update.effective_user
-    uname     = f"@{user.username}" if user.username else user.full_name
-    task_name = ctx.user_data.get("task_name", "Task")
+    uname     = f"@{_md_esc(user.username)}" if user.username else _md_esc(user.full_name or "")
+    task_name = _md_esc(ctx.user_data.get("task_name", "Task"))
     try:
         price = float(ctx.user_data.get("task_price", 0.10))
     except (TypeError, ValueError):
@@ -3551,12 +3579,12 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
                 photo_file_ids.append(item["value"])
                 if item.get("unique_id"):
                     _cat_submitted_uids.append(item["unique_id"])
-                summary_lines.append(f"📷 *{item['prompt_bn']}:* [Photo #{len(photo_file_ids)}]")
+                summary_lines.append(f"📷 *{_md_esc(item['prompt_bn'])}:* [Photo #{len(photo_file_ids)}]")
             else:
-                summary_lines.append(f"📷 *{item['prompt_bn']}:* (Skipped)")
+                summary_lines.append(f"📷 *{_md_esc(item['prompt_bn'])}:* (Skipped)")
         else:
-            val = item["value"] or ""
-            summary_lines.append(f"📝 *{item['prompt_bn']}:*\n`{val}`")
+            val = _md_esc(item["value"] or "")
+            summary_lines.append(f"📝 *{_md_esc(item['prompt_bn'])}:*\n`{val}`")
 
     # ── Duplicate photo detection ──────────────────────────────────
     if _cat_submitted_uids:
@@ -3564,7 +3592,8 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
             _cat_existing_rows = None
             with _c() as c:
                 _cat_existing_rows = c.execute(
-                    "SELECT photo_unique_ids FROM gmails WHERE photo_unique_ids IS NOT NULL AND photo_unique_ids != ''"
+                    "SELECT photo_unique_ids FROM gmails WHERE user_id != %s AND photo_unique_ids IS NOT NULL AND photo_unique_ids != ''",
+                    (uid,)
                 ).fetchall()
             return _cat_existing_rows
         _cat_existing_rows = await asyncio.to_thread(_db_2921)
@@ -3602,8 +3631,12 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
     ttype_icon = task_type_icon(ttype_ins)
     _cat_tcode = _rget(ttype_obj, 'task_code', '') if ttype_obj else ''
 
-    # ── Atomic mark-done FIRST — race-safe: দুটো concurrent submit এলে একটাই gmail row তৈরি হবে
-    _cat_mark_ok = await asyncio.to_thread(categ_task_mark_done, task_id, uid)
+    # ── Atomic mark-done — per_user_limit=0 (unlimited) হলে UNIQUE constraint bypass করো
+    _cat_per_limit = _rget(ttype_obj, 'per_user_limit', 1) if ttype_obj else 1
+    if _cat_per_limit == 0:
+        _cat_mark_ok = True  # unlimited submissions — unique constraint skip, directly insert gmails row
+    else:
+        _cat_mark_ok = await asyncio.to_thread(categ_task_mark_done, task_id, uid)
     if not _cat_mark_ok:
         # ইতিমধ্যে অন্য request এ done mark হয়ে গেছে — duplicate submission block
         lang = await asyncio.to_thread(get_lang, uid)
@@ -3725,7 +3758,18 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
         c_mid = cm.message_id
         for fid in photo_file_ids:
             await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid}")
-    except Exception as e: log.warning(f"Channel fwd fail: {e}")
+    except Exception as e:
+        _e_str = str(e)
+        log.warning(f"Channel fwd fail (ch_id={_ch_id}): {_e_str}")
+        # inline keyboard ছাড়া আবার চেষ্টা করো
+        if c_mid == 0:
+            try:
+                cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown")
+                c_mid = cm.message_id
+                for fid in photo_file_ids:
+                    await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid}")
+            except Exception as e2:
+                log.warning(f"Channel fwd retry fail (ch_id={_ch_id}): {e2}")
 
     def _db_3071():
         with _c() as c:
@@ -3800,9 +3844,10 @@ async def show_tg_task(update, ctx, task):
     _tgtcode = _rget(task, 'task_code', '') or ''
     _tgtcode_line_bn = f"🔑 *Task Code:* `{_tgtcode}`\n" if _tgtcode else ""
     _tgtcode_line_en = f"🔑 *Task Code:* `{_tgtcode}`\n" if _tgtcode else ""
+    _tg_tn_esc = _md_esc(task['name'])
     if lang == 'bn':
         msg = (
-            f"📡 *{task['name']}*\n"
+            f"📡 *{_tg_tn_esc}*\n"
             f"{_tgtcode_line_bn}\n"
             f"💰 *পুরস্কার:* `{task['price']}$ USDT`\n"
             f"📢 *Channel/Group:* {tg_name}\n"
@@ -3814,7 +3859,7 @@ async def show_tg_task(update, ctx, task):
         )
     else:
         msg = (
-            f"📡 *{task['name']}*\n"
+            f"📡 *{_tg_tn_esc}*\n"
             f"{_tgtcode_line_en}\n"
             f"💰 *Reward:* `{task['price']}$ USDT`\n"
             f"📢 *Channel/Group:* {tg_name}\n"
@@ -3976,7 +4021,7 @@ async def handle_tg_task_check(update, ctx, tid):
         )
         try:
             ru = await asyncio.to_thread(get_user, uid)
-            rname = (ru["full_name"] or ru["username"] or "Unknown") if ru else "Unknown"
+            rname = _md_esc((ru["full_name"] or ru["username"] or "Unknown") if ru else "Unknown")
             comm_pct_d = int(comm_pct) if comm_pct == int(comm_pct) else comm_pct
             await ctx.bot.send_message(ref,
                 T(ref, 'commission_msg', name=rname, price=price, comm=comm, comm_pct=comm_pct_d),
@@ -3988,14 +4033,15 @@ async def handle_tg_task_check(update, ctx, tid):
         _background_tasks.add(_ref_ev_tg); _ref_ev_tg.add_done_callback(_background_tasks.discard)
 
     # Notify user
+    _tg_task_name_esc = _md_esc(task['name'])
     success_msg = (
         f"✅ *Task সম্পন্ন! অভিনন্দন!*\n\n"
-        f"📡 *Task:* {task['name']}\n"
+        f"📡 *Task:* {_tg_task_name_esc}\n"
         f"💰 *`{price}$ USDT` আপনার একাউন্টে যোগ হয়েছে!*\n\n"
         f"💎 ধন্যবাদ!"
         if lang=='bn' else
         f"✅ *Task completed! Congratulations!*\n\n"
-        f"📡 *Task:* {task['name']}\n"
+        f"📡 *Task:* {_tg_task_name_esc}\n"
         f"💰 *`{price}$ USDT` added to your account!*\n\n"
         f"💎 Thank you!"
     )
@@ -4032,7 +4078,7 @@ async def show_refer(update, ctx):
     link    = f"https://t.me/{bot_info.username}?start=ref_{uid}"
     comm_pct_display = int(comm_pct) if comm_pct == int(comm_pct) else comm_pct
     owner = owner or '@inkamxbd'
-    owner_e = owner.replace('_', '\\_')
+    owner_e = _md_esc(owner)
 
     if lang == 'en':
         task_promo = (
@@ -4446,8 +4492,8 @@ async def handle_task_collect_photo(update: Update, ctx: ContextTypes.DEFAULT_TY
 
 async def _finalize_task_submission(update, ctx, uid, via_callback=False):
     user      = update.effective_user
-    uname     = f"@{user.username}" if user.username else user.full_name
-    task_name = ctx.user_data.get("task_name", "Task")
+    uname     = f"@{_md_esc(user.username)}" if user.username else _md_esc(user.full_name or "")
+    task_name = _md_esc(ctx.user_data.get("task_name", "Task"))
     try:
         price = float(ctx.user_data.get("task_price", await asyncio.to_thread(get_setting, "gmail_price") or "0.10"))
     except (TypeError, ValueError):
@@ -4466,34 +4512,36 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
                 photo_file_ids.append(item["value"])
                 if item.get("unique_id"):
                     _submitted_unique_ids.append(item["unique_id"])
-                _cap_txt = item.get("caption", "").strip()
+                _cap_txt = _md_esc(item.get("caption", "").strip())
+                _plbl    = _md_esc(prompt_lbl or "")
                 if _cap_txt:
                     summary_lines.append(
-                        f"📷 *{prompt_lbl}:* [Photo #{len(photo_file_ids)}]\n💬 *Caption:* `{_cap_txt}`"
+                        f"📷 *{_plbl}:* [Photo #{len(photo_file_ids)}]\n💬 *Caption:* `{_cap_txt}`"
                         if lang == 'en' else
-                        f"📷 *{prompt_lbl}:* [ছবি #{len(photo_file_ids)}]\n💬 *লেখা:* `{_cap_txt}`"
+                        f"📷 *{_plbl}:* [ছবি #{len(photo_file_ids)}]\n💬 *লেখা:* `{_cap_txt}`"
                     )
                 else:
-                    summary_lines.append(f"📷 *{prompt_lbl}:* [Photo #{len(photo_file_ids)}]" if lang == 'en' else f"📷 *{prompt_lbl}:* [ছবি #{len(photo_file_ids)}]")
+                    summary_lines.append(f"📷 *{_plbl}:* [Photo #{len(photo_file_ids)}]" if lang == 'en' else f"📷 *{_plbl}:* [ছবি #{len(photo_file_ids)}]")
             else:
-                summary_lines.append(f"📷 *{prompt_lbl}:* (Skipped)" if lang == 'en' else f"📷 *{prompt_lbl}:* (Skip করা হয়েছে)")
+                summary_lines.append(f"📷 *{_md_esc(prompt_lbl or '')}:* (Skipped)" if lang == 'en' else f"📷 *{_md_esc(prompt_lbl or '')}:* (Skip করা হয়েছে)")
         else:
-            val = item["value"] or ""
-            summary_lines.append(f"📝 *{prompt_lbl}:*\n`{val}`")
+            val = _md_esc(item["value"] or "")
+            summary_lines.append(f"📝 *{_md_esc(prompt_lbl or '')}:*\n`{val}`")
 
     # ── Duplicate photo detection — DB-level query (fast, no full-table scan in Python) ──
     if _submitted_unique_ids:
         def _check_dup_photos(unique_ids):
-            """PostgreSQL LIKE check — comma-separated photo_unique_ids column."""
+            """PostgreSQL LIKE check — same user এর নিজের photo block করে না, শুধু অন্য user এর duplicate ধরে।"""
             with _c() as c:
                 for _puid in unique_ids:
                     row = c.execute(
-                        "SELECT id FROM gmails WHERE photo_unique_ids IS NOT NULL "
+                        "SELECT id FROM gmails WHERE user_id != %s AND photo_unique_ids IS NOT NULL "
                         "AND (photo_unique_ids = %s "
                         "OR photo_unique_ids LIKE %s "
                         "OR photo_unique_ids LIKE %s "
                         "OR photo_unique_ids LIKE %s) LIMIT 1",
-                        (_puid,
+                        (uid,
+                         _puid,
                          _puid + ',%',
                          '%,' + _puid,
                          '%,' + _puid + ',%')
@@ -4555,8 +4603,9 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
                 _gid = row['id'] if row else None
             return _gid
     gid = await asyncio.to_thread(_insert_gmail_row)
-    # নতুন submission হলে পুরানো approved/rejected মুছো — fire-and-forget, event loop block করে না
-    asyncio.ensure_future(asyncio.to_thread(_trim_table, "gmails", "user_id", uid, 20, "id", True))
+    # নতুন submission হলে পুরানো approved/rejected মুছো — fire-and-forget
+    _t_trim = asyncio.ensure_future(asyncio.to_thread(_trim_table, "gmails", "user_id", uid, 20, "id", True))
+    _background_tasks.add(_t_trim); _t_trim.add_done_callback(_background_tasks.discard)
     # ── photo unique_ids সেভ করো ──────────────────────────────────
     if _submitted_unique_ids and gid:
         try:
@@ -4612,12 +4661,24 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
         c_mid = cm.message_id
         for fid in photo_file_ids:
             await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
-    except Exception as e: log.warning(f"Channel fwd fail: {e}")
+    except Exception as e:
+        _e_str = str(e)
+        log.warning(f"Channel fwd fail (ch_id={_ch_id}): {_e_str}")
+        # inline keyboard ছাড়া আবার চেষ্টা করো
+        if c_mid == 0:
+            try:
+                cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown")
+                c_mid = cm.message_id
+                for fid in photo_file_ids:
+                    await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
+            except Exception as e2:
+                log.warning(f"Channel fwd retry fail (ch_id={_ch_id}): {e2}")
 
     def _save_gmail_msg_ids():
         with _c() as c:
             c.execute("UPDATE gmails SET admin_msg_id=%s,channel_msg_id=%s WHERE id=%s", (a_mid, c_mid, gid))
-    asyncio.ensure_future(asyncio.to_thread(_save_gmail_msg_ids))
+    _t_sgm = asyncio.ensure_future(asyncio.to_thread(_save_gmail_msg_ids))
+    _background_tasks.add(_t_sgm); _t_sgm.add_done_callback(_background_tasks.discard)
 
     for k in ("state","task_price","task_name","task_id","task_fields","field_idx","collected"):
         ctx.user_data.pop(k, None)
@@ -6004,6 +6065,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     d   = q.data
     try:
+        # ── FIRST: spinner তাৎক্ষণিক clear করো (~200ms) — তারপর বাকি কাজ ──
+        try: await q.answer()
+        except Exception: pass
         await _on_callback_inner(update, ctx, q, uid, d)
     except Exception as e:
         log.exception(f"[on_callback ERROR] data={d} uid={uid} error={e}")
@@ -6031,12 +6095,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
     total_ref = None
     total_usr = None
     wds = None
-    # ── q.answer() কে background-এ fire করো ─────────────────────
-    # Telegram network call (~200ms) আর handler DB logic একসাথে চলবে।
-    # spinner clear হবে WHILE reply তৈরি হচ্ছে — ~200ms দ্রুত।
-    _qa = asyncio.create_task(q.answer())
-    _background_tasks.add(_qa)
-    _qa.add_done_callback(_background_tasks.discard)
+    # q.answer() ইতিমধ্যে on_callback()-এ করা হয়েছে — এখানে আর দরকার নেই
     if d in ("lang_bn", "lang_en"):
         lang = "bn" if d == "lang_bn" else "en"
         await asyncio.to_thread(set_lang, uid, lang)
@@ -6571,7 +6630,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 ru    = await asyncio.to_thread(get_user, guser)
                 rname = (ru["full_name"] or ru["username"] or "Unknown") if ru else "Unknown"
                 await ctx.bot.send_message(ref,
-                    T(ref, 'commission_msg', name=rname, price=price, comm=comm, comm_pct=comm_pct_display),
+                    T(ref, 'commission_msg', name=_md_esc(rname), price=price, comm=comm, comm_pct=comm_pct_display),
                     parse_mode="Markdown")
             except Exception as _e:
                 log.warning(f"[APPROVE] ref={ref} commission notify ব্যর্থ: {_e}")
@@ -7085,7 +7144,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
                     _bio_rname = (_bio_ru["full_name"] or _bio_ru["username"] or "Unknown") if _bio_ru else "Unknown"
                     _bio_cpct_d = int(_bio_comm_pct) if _bio_comm_pct == int(_bio_comm_pct) else _bio_comm_pct
                     await ctx.bot.send_message(_bio_ref,
-                        T(_bio_ref, 'commission_msg', name=_bio_rname, price=round(add_reward,4),
+                        T(_bio_ref, 'commission_msg', name=_md_esc(_bio_rname), price=round(add_reward,4),
                           comm=_bio_comm, comm_pct=_bio_cpct_d),
                         parse_mode="Markdown")
                 except Exception: pass
@@ -7097,8 +7156,8 @@ async def _bio_task_check_inner(update, ctx, q, uid):
             _brow = await asyncio.to_thread(_db_6018)
             new_bal = round((_brow['balance'] if _brow else 0), 4)
             _bio_urow = await asyncio.to_thread(get_user, uid)
-            _bio_uname = (_bio_urow["full_name"] or _bio_urow["username"] or str(uid)) if _bio_urow else str(uid)
-            _bio_username = (_bio_urow.get("username") or "") if _bio_urow else ""
+            _bio_uname = _md_esc((_bio_urow["full_name"] or _bio_urow["username"] or str(uid)) if _bio_urow else str(uid))
+            _bio_username = _md_esc((_bio_urow.get("username") or "") if _bio_urow else "")
             _cum_count, _cum_amount = await asyncio.to_thread(get_bio_task_cumulative)
             _bio_admin_msg = (
                 f"🆕 *Bio Task — New Add Reward*\n"
@@ -8504,7 +8563,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         for t, fields in zip(tasks, all_fields):
             s  = "✅" if t["is_active"] else "❌"
             field_count = len(fields)
-            text += f"{s} *{t['name']}* — `{t['price']}$ USDT` | {field_count} field(s)\n"
+            text += f"{s} *{_md_esc(t['name'])}* — `{t['price']}$ USDT` | {field_count} field(s)\n"
             btns.append([
                 InlineKeyboardButton(f"✏️ {t['name']}", callback_data=f"adm_task_edit_{t['id']}"),
                 InlineKeyboardButton("🗑 Delete",        callback_data=f"adm_task_del_{t['id']}"),
@@ -8517,7 +8576,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         task = await asyncio.to_thread(get_task, tid)
         if task:
             await asyncio.to_thread(delete_task, tid)
-            await q.message.reply_text(f"🗑 *'{task['name']}' মুছে ফেলা হয়েছে।*", parse_mode="Markdown")
+            await q.message.reply_text(f"🗑 *'{_md_esc(task['name'])}' মুছে ফেলা হয়েছে।*", parse_mode="Markdown")
         else:
             await q.message.reply_text("❌ Task পাওয়া যায়নি!", parse_mode="Markdown")
         return
@@ -8781,7 +8840,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         for cat in cats:
             s = "✅" if cat["is_active"] else "❌"
             tasks = await asyncio.to_thread(get_category_tasks, cat['id'], active_only=False)
-            text += f"{s} *{cat['name']}* — {len(tasks)} task(s)\n"
+            text += f"{s} *{_md_esc(cat['name'])}* — {len(tasks)} task(s)\n"
             btns.append([
                 InlineKeyboardButton(f"✏️ {cat['name']}", callback_data=f"adm_cat_edit_{cat['id']}"),
                 InlineKeyboardButton("🗑 Delete",          callback_data=f"adm_cat_del_{cat['id']}"),
@@ -8795,7 +8854,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         cat = await asyncio.to_thread(get_category, cid)
         if cat:
             await asyncio.to_thread(delete_category, cid)
-            await q.message.reply_text(f"🗑 *'{cat['name']}' মুছে ফেলা হয়েছে।*", parse_mode="Markdown")
+            await q.message.reply_text(f"🗑 *'{_md_esc(cat['name'])}' মুছে ফেলা হয়েছে।*", parse_mode="Markdown")
         else:
             await q.message.reply_text("❌ Category পাওয়া যায়নি!", parse_mode="Markdown")
         return
@@ -8828,7 +8887,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         new_val = 0 if cat["is_active"] else 1
         await asyncio.to_thread(update_category, cid, "is_active", new_val)
         s = "✅ Active" if new_val else "❌ Inactive"
-        await q.message.reply_text(f"👁 *'{cat['name']}' Status: {s}*", parse_mode="Markdown"); return
+        await q.message.reply_text(f"👁 *'{_md_esc(cat['name'])}' Status: {s}*", parse_mode="Markdown"); return
 
     if d.startswith("adm_cate_name_"):
         cid = int(d.split("_")[3])
@@ -8841,7 +8900,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         ctx.user_data["new_cate_cat_id"] = cid
         cat = await asyncio.to_thread(get_category, cid)
         await q.message.reply_text(
-            f"➕ *'{cat['name']}' — নতুন Task যোগ করুন*\n\nTask নাম লিখুন:\n/cancel — বাতিল",
+            f"➕ *'{_md_esc(cat['name'])}' — নতুন Task যোগ করুন*\n\nTask নাম লিখুন:\n/cancel — বাতিল",
             parse_mode="Markdown"); return
 
     # ── Task type picker (category task) ──────────────────────────
@@ -8866,13 +8925,13 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             asyncio.to_thread(get_category_tasks, cid, active_only=False),
         )
         if not tasks:
-            await q.message.reply_text(f"📋 *'{cat['name']}' তে কোনো Task নেই।*", parse_mode="Markdown"); return
-        text = f"📋 *'{cat['name']}' Tasks:*\n\n"
+            await q.message.reply_text(f"📋 *'{_md_esc(cat['name'])}' তে কোনো Task নেই।*", parse_mode="Markdown"); return
+        text = f"📋 *'{_md_esc(cat['name'])}' Tasks:*\n\n"
         btns = []
         for t in tasks:
             s = "✅" if t["is_active"] else "❌"
             fields = await asyncio.to_thread(get_category_task_fields, t['id'])
-            text += f"{s} *{t['name']}* — `{t['price']}$` | {len(fields)} field(s)\n"
+            text += f"{s} *{_md_esc(t['name'])}* — `{t['price']}$` | {len(fields)} field(s)\n"
             btns.append([
                 InlineKeyboardButton(f"✏️ {t['name']}", callback_data=f"adm_ctask_edit_{t['id']}"),
                 InlineKeyboardButton("🗑 Delete",         callback_data=f"adm_ctask_del_{t['id']}"),
@@ -8885,7 +8944,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         t = await asyncio.to_thread(get_category_task, tid)
         if t:
             await asyncio.to_thread(delete_category_task, tid)
-            await q.message.reply_text(f"🗑 *'{t['name']}' মুছে ফেলা হয়েছে।*", parse_mode="Markdown")
+            await q.message.reply_text(f"🗑 *'{_md_esc(t['name'])}' মুছে ফেলা হয়েছে।*", parse_mode="Markdown")
         else:
             await q.message.reply_text("❌ Task পাওয়া যায়নি!", parse_mode="Markdown")
         return
@@ -9158,7 +9217,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         for t in tasks:
             s = "✅" if t["is_active"] else "❌"
             slots = f"{t['completed_count']}/{t['max_completions']}" if t['max_completions'] > 0 else f"{t['completed_count']}/∞"
-            text += f"{s} *{t['name']}* — `{t['price']}$` | {slots} done\n📢 `{t['tg_target']}`\n\n"
+            text += f"{s} *{_md_esc(t['name'])}* — `{t['price']}$` | {slots} done\n📢 `{t['tg_target']}`\n\n"
             btns.append([
                 InlineKeyboardButton(f"✏️ {t['name']}", callback_data=f"adm_tgt_edit_{t['id']}"),
                 InlineKeyboardButton("🗑 Delete",         callback_data=f"adm_tgt_del_{t['id']}"),
@@ -9181,7 +9240,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         t = await asyncio.to_thread(get_tg_task, tid)
         if t:
             await asyncio.to_thread(delete_tg_task, tid)
-            await q.message.reply_text(f"🗑 *'{t['name']}' মুছে ফেলা হয়েছে।*", parse_mode="Markdown")
+            await q.message.reply_text(f"🗑 *'{_md_esc(t['name'])}' মুছে ফেলা হয়েছে।*", parse_mode="Markdown")
         else:
             await q.message.reply_text("❌ Task পাওয়া যায়নি!", parse_mode="Markdown")
         return
@@ -9983,7 +10042,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         ru = await asyncio.to_thread(get_user, guser)
                         rname = (ru["full_name"] or ru["username"] or "Unknown") if ru else "Unknown"
                         comm_d = int(comm_pct) if comm_pct == int(comm_pct) else comm_pct
-                        await ctx.bot.send_message(ref, T(ref,'commission_msg',name=rname,price=price,comm=comm,comm_pct=comm_d), parse_mode="Markdown")
+                        await ctx.bot.send_message(ref, T(ref,'commission_msg',name=_md_esc(rname),price=price,comm=comm,comm_pct=comm_d), parse_mode="Markdown")
                     except Exception as _e:
                         log.warning(f"[PHOTO-APPROVE] ref={ref} commission notify ব্যর্থ: {_e}")
                     # ── Referral Event bonus check ──────────────────────────
@@ -11281,8 +11340,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # ── Admin notification: কে নিল, কতজন নিল, কতটা বাকি ──────
         remaining = max(0, promo["max_uses"] - new_used)
         uname = update.effective_user.username or ""
-        uname_txt = f"@{uname}" if uname else f"ID:`{uid}`"
-        full_name = (update.effective_user.full_name or "").strip() or "—"
+        uname_txt = f"@{_md_esc(uname)}" if uname else f"ID:`{uid}`"
+        full_name = _md_esc((update.effective_user.full_name or "").strip() or "—")
         admin_notif = (
             f"🎟 *Promo Code ব্যবহার হয়েছে!*\n\n"
             f"🔑 *Code:* `{code}`\n"
@@ -11440,10 +11499,9 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     uid = q.from_user.id
     d   = q.data
-    # q.answer() background-এ fire করো — spinner আগে clear হয়, DB কাজ পরে চলে
-    _qa2 = asyncio.create_task(q.answer())
-    _background_tasks.add(_qa2)
-    _qa2.add_done_callback(_background_tasks.discard)
+    # spinner তাৎক্ষণিক clear করো
+    try: await q.answer()
+    except Exception: pass
 
     # ── Notification confirm / edit / skip ──────────────────────
     if d == "adm_notif_send":
@@ -12039,7 +12097,7 @@ async def cmd_promo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Admin notification: কে নিল, কতজন নিল, কতটা বাকি ──────
     remaining = max(0, promo["max_uses"] - new_used)
     uname     = update.effective_user.username or ""
-    uname_txt = f"@{uname}" if uname else f"ID:`{uid}`"
+    uname_txt = f"@{_md_esc(uname)}" if uname else f"ID:`{uid}`"
     full_name = _md_esc((update.effective_user.full_name or "").strip() or "—")
     admin_notif = (
         f"🎟 *Promo Code ব্যবহার হয়েছে!*\n\n"
@@ -12080,10 +12138,9 @@ async def _handle_promo_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     q   = update.callback_query
     uid = q.from_user.id
     d   = q.data
-    # spinner background-এ clear করো — সব branch-এ আলাদা q.answer() দরকার নেই
-    _qa3 = asyncio.create_task(q.answer())
-    _background_tasks.add(_qa3)
-    _qa3.add_done_callback(_background_tasks.discard)
+    # spinner তাৎক্ষণিক clear করো
+    try: await q.answer()
+    except Exception: pass
     if not await asyncio.to_thread(is_admin, uid):
         return
 
@@ -12503,38 +12560,42 @@ async def _smart_error_handler(update, context):
         if update:
             u = update.effective_user
             if u:
-                ctx_parts.append(f"👤 User: `{u.id}` (@{u.username or 'নেই'})")
+                ctx_parts.append(f"👤 User: <code>{u.id}</code> (@{html.escape(u.username or 'নেই')})")
             if update.effective_message:
-                txt = (update.effective_message.text or "")[:60]
-                ctx_parts.append(f"💬 Message: `{txt}`")
+                txt = html.escape((update.effective_message.text or "")[:60])
+                ctx_parts.append(f"💬 Message: <code>{txt}</code>")
             if update.callback_query:
-                ctx_parts.append(f"🔘 Callback: `{update.callback_query.data}`")
+                ctx_parts.append(f"🔘 Callback: <code>{html.escape(str(update.callback_query.data))}</code>")
     except Exception:
         pass
 
-    # ── 5. admin কে রিপোর্ট পাঠাও ────────────────────────────────
+    # ── 5. admin কে রিপোর্ট পাঠাও — HTML parse_mode যাতে dynamic content parse error না করে ──
     log.exception(f"[SMART-ERROR] {err_type}: {err_str[:200]}")
+    _h_err_type   = html.escape(str(err_type))
+    _h_reason     = html.escape(str(reason))
+    _h_fix_result = html.escape(str(fix_result))
+    _h_err_str    = html.escape(err_str[:300])
     report_lines = [
-        "🚨 *Bot Error Detected & Auto-Fixed*",
+        "🚨 <b>Bot Error Detected &amp; Auto-Fixed</b>",
         "",
-        f"❌ *Error:* `{err_type}`",
-        f"📋 *কারণ:* {reason}",
-        f"🕐 *সময়:* `{now()}`",
+        f"❌ <b>Error:</b> <code>{_h_err_type}</code>",
+        f"📋 <b>কারণ:</b> {_h_reason}",
+        f"🕐 <b>সময়:</b> <code>{html.escape(now())}</code>",
     ]
     if ctx_parts:
         report_lines.append("")
         report_lines.extend(ctx_parts)
     report_lines += [
         "",
-        f"{fix_result}",
+        _h_fix_result,
         "",
-        f"```\n{err_str[:300]}\n```",
+        f"<pre>{_h_err_str}</pre>",
     ]
     _network_errs = ("ProxyError", "NetworkError", "TimedOut", "ConnectionError", "503", "502")
     for _attempt in range(2):
         try:
             await context.bot.send_message(
-                ADMIN_ID, "\n".join(report_lines), parse_mode="Markdown"
+                ADMIN_ID, "\n".join(report_lines), parse_mode="HTML"
             )
             break
         except Exception as notify_err:
@@ -12920,7 +12981,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                         _jrname = (_jru["full_name"] or _jru["username"] or "Unknown") if _jru else "Unknown"
                         _jcpd = int(_jcpct) if _jcpct == int(_jcpct) else _jcpct
                         await bot.send_message(_jref,
-                            T(_jref, 'commission_msg', name=_jrname, price=amt, comm=_jcomm, comm_pct=_jcpd),
+                            T(_jref, 'commission_msg', name=_md_esc(_jrname), price=amt, comm=_jcomm, comm_pct=_jcpd),
                             parse_mode="Markdown")
                     except Exception: pass
             else:
@@ -12942,7 +13003,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                             _jarname = (_jaru["full_name"] or _jaru["username"] or "Unknown") if _jaru else "Unknown"
                             _jacpd = int(_jacpct) if _jacpct == int(_jacpct) else _jacpct
                             await bot.send_message(_jaref,
-                                T(_jaref, 'commission_msg', name=_jarname, price=amt, comm=_jacomm, comm_pct=_jacpd),
+                                T(_jaref, 'commission_msg', name=_md_esc(_jarname), price=amt, comm=_jacomm, comm_pct=_jacpd),
                                 parse_mode="Markdown")
                         except Exception: pass
         else:
@@ -13010,7 +13071,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                     _grname = (_gru["full_name"] or _gru["username"] or "Unknown") if _gru else "Unknown"
                     _gcpd = int(_gcpct) if _gcpct == int(_gcpct) else _gcpct
                     await bot.send_message(_gref,
-                        T(_gref, 'commission_msg', name=_grname, price=amt, comm=_gcomm, comm_pct=_gcpd),
+                        T(_gref, 'commission_msg', name=_md_esc(_grname), price=amt, comm=_gcomm, comm_pct=_gcpd),
                         parse_mode="Markdown")
                 except Exception: pass
             try:
