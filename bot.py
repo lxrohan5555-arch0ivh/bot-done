@@ -2246,7 +2246,15 @@ def categ_task_mark_done(task_id, user_id):
     return True  # Bug #6 fix: এই call-ই প্রথমবার mark করেছে — True return করো
 
 # ── Stats helper ──────────────────────────────────────────────────
+_stats_cache_val = None
+_stats_cache_ts  = 0.0
+_STATS_CACHE_TTL = 20.0  # ২০ সেকেন্ড — admin panel দ্রুত খুলবে
+
 def get_stats():
+    global _stats_cache_val, _stats_cache_ts
+    now_ts = _time.monotonic()
+    if _stats_cache_val is not None and (now_ts - _stats_cache_ts) < _STATS_CACHE_TTL:
+        return _stats_cache_val
     ag = None
     aw = None
     pg = None
@@ -2260,7 +2268,9 @@ def get_stats():
         pw = _count(c.execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'").fetchone())
         ag = _count(c.execute("SELECT COUNT(*) FROM gmails WHERE status='approved'").fetchone())
         aw = _count(c.execute("SELECT COUNT(*) FROM withdrawals WHERE status='approved'").fetchone())
-    return total, tot_bal, pg, pw, ag, aw
+    _stats_cache_val = (total, tot_bal, pg, pw, ag, aw)
+    _stats_cache_ts  = now_ts
+    return _stats_cache_val
 
 def display_name(u_row):
     if u_row and u_row["username"]: return f"@{u_row['username']}"
@@ -2431,8 +2441,8 @@ def w_kb_admin(wid):
 # সব চ্যানেলে থাকলে 15s cache → Task/অন্য বাটনে দ্রুত রিপ্লাই
 # কোনো চ্যানেল মিস হলে 0s cache → চ্যানেল ছাড়লে সাথে সাথে ধরা পড়বে
 _ch_cache: dict = {}          # uid → (timestamp, missing_list)
-_CH_CACHE_TTL_OK  = 120       # seconds — সব চ্যানেলে থাকলে এতক্ষণ cache (15→120: button দ্রুত হবে)
-_CH_CACHE_TTL_BAD = 0         # seconds — কোনো চ্যানেল মিস হলে cache নেই
+_CH_CACHE_TTL_OK  = 120       # seconds — সব চ্যানেলে থাকলে এতক্ষণ cache
+_CH_CACHE_TTL_BAD = 30        # seconds — channel মিস হলে ৩০s cache (0→30: প্রতি বাটনে API call বন্ধ)
 
 async def check_ch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user:
@@ -7290,10 +7300,11 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         return
 
     # ── Admin-only callbacks ──────────────────────────────────────
+    # q.answer() আগেই করো — is_admin DB query এর আগে, নইলে spinner দেরিতে যায়
+    try: await q.answer()
+    except Exception: pass
     if not await asyncio.to_thread(is_admin, uid):
         await q.message.reply_text("❌ আপনি এডমিন না!"); return
-    # NOTE: global q.answer() সরানো হয়েছে — প্রতিটি admin handler নিজেই call করে
-    # (global + individual = BadRequest → handler code execute হত না)
 
     if d == "adm_panel":
         try: await q.answer()
@@ -11447,14 +11458,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_wd_confirmation(update.message, ctx, uid); return
 
     # ── Menu buttons ──────────────────────────────────────────────
-    # typing... indicator আগেই দেখাও — guard/DB query এর আগেই user দেখুক বট কাজ করছে
+    # typing indicator + guard + get_lang সবই parallel — একটার জন্য অন্যটা wait না করে
     try:
         await ctx.bot.send_chat_action(chat_id=uid, action="typing")
     except Exception:
         pass
-    if not await guard(update, ctx): return
-
-    lang = await asyncio.to_thread(get_lang, uid)
+    _guard_ok, lang = await asyncio.gather(
+        guard(update, ctx),
+        asyncio.to_thread(get_lang, uid),
+    )
+    if not _guard_ok: return
     btns = get_all_btns(lang)
 
     if   txt == btns['tasks']:    await show_tasks(update, ctx)
@@ -13902,11 +13915,6 @@ def send_usdt_bep20(to_address: str, net_usd: float):
             return None, "BSC_PRIVATE_KEY সেট নেই", None, None  # Bug #7 fix: 4-tuple
         if not get_bsc_wallet_addr():
             return None, "BSC_WALLET_ADDRESS সেট নেই", None, None  # Bug #7 fix: 4-tuple
-        # ── BNB balance চেক — কম হলে Admin কে alert যাবে ────────────────
-        _bnb_ok, _bnb_bal = check_bnb_sufficient()
-        if not _bnb_ok:
-            _bnb_bal_str = f"{_bnb_bal:.6f}" if _bnb_bal is not None else "অজানা"
-            return None, f"BNB_LOW: Wallet এ BNB কম ({_bnb_bal_str} BNB) — Gas fee দেওয়া সম্ভব নয়।", None, None
         contract  = w3.eth.contract(
             address=Web3.to_checksum_address(USDT_BEP20_CA),
             abi=USDT_BEP20_ABI
@@ -14158,27 +14166,15 @@ async def job_auto_withdraw(context):
 
             if tx_hash:
                 # ── সফল ────────────────────────────────────────────────
-                # tx_hash আগে save করো — যাতে DB fail হলেও recovery দ্বিতীয়বার USDT না পাঠায়
-                try:
-                    def _db_12171():
-                        with _c() as c:
-                            c.execute(
-                                "UPDATE withdrawals SET tx_hash=%s WHERE id=%s AND status='processing'",
-                                (tx_hash, wid)
-                            )
-                        return
-                    await asyncio.to_thread(_db_12171)
-                except Exception as _txe:
-                    log.error(f"[AUTO-WD] #{wid}: tx_hash save failed: {_txe}")
-                # এখন approved করো
-                def _db_12179():
+                # tx_hash + status একসাথে atomic update — দুটো আলাদা query = crash gap ছিল
+                def _db_12171():
                     with _c() as c:
                         c.execute(
-                            "UPDATE withdrawals SET status='approved' WHERE id=%s AND status='processing'",
-                            (wid,)
+                            "UPDATE withdrawals SET tx_hash=%s, status='approved' WHERE id=%s AND status='processing'",
+                            (tx_hash, wid)
                         )
                     return
-                await asyncio.to_thread(_db_12179)
+                await asyncio.to_thread(_db_12171)
                 _mark_dirty()
                 bscscan_url  = f"https://bscscan.com/tx/{tx_hash}"
                 # Gas fee — BNB + USD দুটোই দেখাবে
@@ -14213,7 +14209,8 @@ async def job_auto_withdraw(context):
                 try:
                     masked = address[:6] + "..." + address[-4:]
                     _urow  = await asyncio.to_thread(get_user, uid)
-                    _uname = (_urow["full_name"] or _urow["username"] or str(uid)) if _urow else str(uid)
+                    _uname_raw = (_urow["full_name"] or _urow["username"] or "Unknown") if _urow else "Unknown"
+                    _uname = _uname_raw.split('@')[0].strip() or _uname_raw.lstrip('@').split()[0] if _uname_raw else "Unknown"
                     ch_msg = (
                         f"👤 *{_uname}*\n\n"
                         f"✅ *Withdrawal Successful!*\n\n"
@@ -14226,7 +14223,8 @@ async def job_auto_withdraw(context):
                     log.warning(f"[AUTO-WD] #{wid}: withdraw channel notify ব্যর্থ: {_e}")
                 try:
                     _urow  = await asyncio.to_thread(get_user, uid)
-                    _uname = (_urow["full_name"] or _urow["username"] or str(uid)) if _urow else str(uid)
+                    _uname_raw2 = (_urow["full_name"] or _urow["username"] or str(uid)) if _urow else str(uid)
+                    _uname = _uname_raw2.split('@')[0].strip() or str(uid)
                     _uhandle = (f"@{_urow['username']}" if _urow and _urow["username"] else "_(username নেই)_")
                     admin_ch_msg = (
                         f"👤 *{_uname}*\n"
@@ -14250,8 +14248,8 @@ async def job_auto_withdraw(context):
                     log.warning(f"[AUTO-WD] #{wid}: Admin detail channel পাঠানো যায়নি — {_e}")
                 log.info(f"[AUTO-WD] #{wid}: ✅ Approved — tx={tx_hash} | gas={gas_paid_str}")
             else:
-                # ── BNB কম হলে — reject নয়, pending রাখো + Admin কে alert ────
-                if err and err.startswith("BNB_LOW:"):
+                # ── TX fail হয়েছে — BNB gas সমস্যা হলে সব Admin কে notify ──
+                if err and ("insufficient funds" in err.lower() or "out of gas" in err.lower() or "gas" in err.lower()):
                     # Withdrawal টা pending এ ফেরত দাও — user এর টাকা যাবে না
                     def _db_12258():
                         with _c() as c:
@@ -14262,35 +14260,34 @@ async def job_auto_withdraw(context):
                         return
                     await asyncio.to_thread(_db_12258)
                     _mark_dirty()
-                    log.warning(f"[AUTO-WD] #{wid}: BNB কম — pending এ রাখা হয়েছে, BNB যোগ করুন।")
-                    # Admin কে alert পাঠাও
+                    log.warning(f"[AUTO-WD] #{wid}: BNB/Gas সমস্যা — pending এ রাখা হয়েছে।")
+                    # সব Admin কে alert পাঠাও
                     try:
                         _bnb_now = await asyncio.to_thread(get_bsc_bnb_balance)
                         _bnb_str = f"{_bnb_now:.6f}" if _bnb_now is not None else "অজানা"
-                        await context.bot.send_message(
-                            ADMIN_ID,
-                            f"⚠️ *Wallet এ BNB কম! Withdrawal আটকে আছে।*\n\n"
-                            f"🔋 *BNB Balance:* `{_bnb_str} BNB`\n"
-                            f"⚠️ *Minimum দরকার:* `{BNB_ALERT_THRESHOLD} BNB`\n\n"
+                        _wallet  = await asyncio.to_thread(get_bsc_wallet_addr)
+                        await notify_full_admins(
+                            context.bot,
+                            f"⚠️ *Wallet এ BNB শেষ! Withdrawal আটকে আছে।*\n\n"
+                            f"🔋 *BNB Balance:* `{_bnb_str} BNB`\n\n"
                             f"📌 *আটকে থাকা WD:* `#{wid}`\n"
                             f"👤 *User:* `{uid}`\n"
                             f"💰 *Amount:* `${amt:.4f} USDT`\n\n"
                             f"👉 *Wallet এ BNB যোগ করুন, তারপর Withdrawal আপনা-আপনি process হবে।*\n"
-                            f"🔗 *Wallet:* `{await asyncio.to_thread(get_bsc_wallet_addr)}`",
-                            parse_mode="Markdown"
+                            f"🔗 *Wallet:* `{_wallet}`"
                         )
                     except Exception as _e:
                         log.error(f"[AUTO-WD] BNB alert পাঠানো যায়নি — {_e}")
-                    break   # BNB নেই — বাকি সব withdrawal ও হবে না, loop বন্ধ
+                    continue   # এই withdrawal pending — পরেরটা try করো
 
-                # ── অন্য error — Atomic: AND status='processing' guard — double-refund প্রতিরোধ করে
+                # ── অন্য error — tx_hash IS NULL নিশ্চিত করো — TX গেলে refund করবো না
                 def _db_12286():
                     with _c() as c:
                         _awd_fail_cur = c.execute(
-                            "UPDATE withdrawals SET status='rejected' WHERE id=%s AND status='processing'", (wid,)
+                            "UPDATE withdrawals SET status='rejected' WHERE id=%s AND status='processing' AND tx_hash IS NULL", (wid,)
                         )
                         if _awd_fail_cur.rowcount == 0:
-                            log.warning(f"[AUTO-WD] #{wid}: TX fail কিন্তু status আর processing নেই — skip।")
+                            log.warning(f"[AUTO-WD] #{wid}: TX fail কিন্তু tx_hash আছে বা processing নেই — refund skip (double-spend guard)।")
                             return False
                         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amt, uid))
                         _invalidate_user_cache(uid)
