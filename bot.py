@@ -6753,8 +6753,6 @@ async def _on_callback_inner(update, ctx, q, uid, d):
 
     # ── Gmail approve ─────────────────────────────────────────────
     if d.startswith("ga_"):
-        if not await asyncio.to_thread(is_admin, uid):
-            await q.message.reply_text("❌ আপনি এডমিন না!"); return
         gid = int(d.split("_")[1])
         def _db_5610():
             row = None
@@ -6762,6 +6760,11 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             return row
         row = await asyncio.to_thread(_db_5610)
         if not row: return await q.message.reply_text("❌ পাওয়া যায়নি!")
+        # admin অথবা এই submission এর task owner — দুজনেই approve করতে পারবে
+        _is_adm = await asyncio.to_thread(is_admin, uid)
+        _row_owner = int(_rget(row, 'owner_id', 0) or 0)
+        if not _is_adm and uid != _row_owner:
+            await q.message.reply_text("❌ আপনি এই submission approve করতে পারবেন না!"); return
         if row["status"] != "pending":
             return await q.message.reply_text(f"⚠️ ইতিমধ্যে {row['status']}!")
         guser, price = row["user_id"], row["amount"]
@@ -6879,8 +6882,6 @@ async def _on_callback_inner(update, ctx, q, uid, d):
 
     # ── Gmail reject — কারণ জিজ্ঞেস করো আগে ────────────────────────
     if d.startswith("gr_"):
-        if not await asyncio.to_thread(is_admin, uid):
-            await q.message.reply_text("❌ আপনি এডমিন না!"); return
         gid = int(d.split("_")[1])
         def _db_5706():
             row = None
@@ -6888,6 +6889,11 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             return row
         row = await asyncio.to_thread(_db_5706)
         if not row: return await q.message.reply_text("❌ পাওয়া যায়নি!")
+        # admin অথবা এই submission এর task owner — দুজনেই reject করতে পারবে
+        _is_adm_r = await asyncio.to_thread(is_admin, uid)
+        _row_owner_r = int(_rget(row, 'owner_id', 0) or 0)
+        if not _is_adm_r and uid != _row_owner_r:
+            await q.message.reply_text("❌ আপনি এই submission reject করতে পারবেন না!"); return
         if row["status"] != "pending":
             return await q.message.reply_text(f"⚠️ ইতিমধ্যে {row['status']}!")
         ctx.user_data["state"]              = "adm_reject_reason"
