@@ -1439,7 +1439,7 @@ _SETTINGS_TTL = 120.0  # সেকেন্ড (60→120: DB miss কমাও)
 
 # ── User Cache — guard() + handler দুইবার DB hit বন্ধ করে ──────────────
 _user_cache: "dict[int, tuple]" = {}   # uid → (user_dict, timestamp)
-_USER_CACHE_TTL = 60.0   # ৬০ সেকেন্ড (30→60: DB miss অর্ধেক; ban হলে invalidate হয়)
+_USER_CACHE_TTL = 300.0  # ৫ মিনিট (ban হলে _invalidate_user_cache দিয়ে সাথে সাথে মুছে যায়)
 
 # ── Language Cache — T() প্রতি call-এ DB hit বন্ধ করে (সবচেয়ে বড় fix) ─
 _lang_cache: "dict[int, tuple]" = {}   # uid → (lang, timestamp)
@@ -1513,11 +1513,11 @@ def set_setting(key, val):
     _settings_cache.pop(key, None)   # stale cache সরিয়ে দাও
 
 def bot_is_on():
-    """bot_status সরাসরি DB থেকে — cache bypass (emergency off তাৎক্ষণিক কাজ করে)।"""
+    """bot_status — get_setting cache ব্যবহার করে (60s TTL, set_setting এ invalidate হয়)।
+    Admin bot off করলে সাথে সাথে cache invalidate হয় — কোনো delay নেই।"""
     try:
-        with _c() as c:
-            r = c.execute("SELECT value FROM settings WHERE key='bot_status'").fetchone()
-            return (r["value"] if r else "on") != "off"
+        val = get_setting('bot_status')
+        return (val or 'on') != 'off'
     except Exception:
         return True  # DB fail হলে safe default: bot চালু থাকুক
 
@@ -2500,8 +2500,8 @@ def w_kb_admin(wid):
 # সব চ্যানেলে থাকলে 15s cache → Task/অন্য বাটনে দ্রুত রিপ্লাই
 # কোনো চ্যানেল মিস হলে 0s cache → চ্যানেল ছাড়লে সাথে সাথে ধরা পড়বে
 _ch_cache: dict = {}          # uid → (timestamp, missing_list)
-_CH_CACHE_TTL_OK  = 120       # seconds — সব চ্যানেলে থাকলে এতক্ষণ cache
-_CH_CACHE_TTL_BAD = 30        # seconds — channel মিস হলে ৩০s cache (0→30: প্রতি বাটনে API call বন্ধ)
+_CH_CACHE_TTL_OK  = 600       # seconds — সব চ্যানেলে থাকলে ১০ মিনিট cache (১২০→৬০০: Telegram API call ৫ গুণ কম)
+_CH_CACHE_TTL_BAD = 30        # seconds — channel মিস হলে ৩০s cache (frequent check চাই)
 
 async def check_ch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user:
@@ -3817,98 +3817,95 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
         f"🔖 *Sub ID:* `#{gid}`"
     )
 
-    a_mid, c_mid = 0, 0
-    try:
-        am = await ctx.bot.send_message(ADMIN_ID, msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
-        a_mid = am.message_id
-        for fid in photo_file_ids:
-            await ctx.bot.send_photo(ADMIN_ID, fid, caption=f"📷 Sub #{gid}")
-    except Exception as e: log.warning(f"Admin fwd fail: {e}")
-
-    # Sub-admins
-    for adm_row in await asyncio.to_thread(get_all_admins):
-        try:
-            await ctx.bot.send_message(adm_row["user_id"], msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
-            for fid in photo_file_ids:
-                await ctx.bot.send_photo(adm_row["user_id"], fid, caption=f"📷 Sub #{gid}")
-        except Exception as e: log.warning(f"Sub-admin fwd fail {adm_row['user_id']}: {e}")
-
-    _ch_id = await asyncio.to_thread(get_gmail_ch_id)
-    try:
-        cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
-        c_mid = cm.message_id
-        for fid in photo_file_ids:
-            await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid}")
-    except Exception as e:
-        log.warning(f"Channel fwd fail (ch_id={_ch_id}): {e}")
-    if c_mid == 0:
-        try:
-            cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown")
-            c_mid = cm.message_id
-            for fid in photo_file_ids:
-                await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid}")
-        except Exception as e2:
-            log.warning(f"Channel fwd no-kb fail (ch_id={_ch_id}): {e2}")
-    if c_mid == 0:
-        # plain text fallback — Markdown parse error হলেও চ্যানেলে যাবে
-        try:
-            _plain = msg_txt.replace("*","").replace("`","").replace("_","")
-            cm = await ctx.bot.send_message(_ch_id, _plain, reply_markup=g_kb(gid))
-            c_mid = cm.message_id
-            for fid in photo_file_ids:
-                await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid}")
-        except Exception as e3:
-            log.warning(f"Channel fwd plain fail (ch_id={_ch_id}): {e3}")
-
-    # সব tier fail হলে admin কে alert করো
-    if c_mid == 0:
-        try:
-            await notify_full_admins(ctx.bot,
-                f"⚠️ *Admin Channel এ Submission পাঠানো যাচ্ছে না!*\n\n"
-                f"📋 *Sub ID:* `#{gid}`\n🔗 *Channel ID:* `{_ch_id}`\n\n"
-                f"Bot কে channel এ Admin করুন অথবা Channel ID ঠিক করুন।")
-        except Exception as _ct_ch_ae:
-            log.error(f"[CAT-CHANNEL-FAIL] admin alert ব্যর্থ: {_ct_ch_ae}")
-
-    def _db_3071():
-        with _c() as c:
-            c.execute("UPDATE gmails SET admin_msg_id=%s,channel_msg_id=%s WHERE id=%s", (a_mid, c_mid, gid))
-    await asyncio.to_thread(_db_3071)
-
+    # ── ইউজারকে তাৎক্ষণিক reply — সব notification background এ ──────
     for k in ("state","task_price","task_name","categ_task_id","task_fields","field_idx","collected"):
         ctx.user_data.pop(k, None)
-
-    # ── Task Owner notification — user info ছাড়া, শুধু Approve/Reject ──
-    _cat_owner_id = int(_rget(_ct_after, 'owner_id', 0) or 0) if _ct_after else 0
-    if _cat_owner_id and _cat_owner_id != ADMIN_ID:
-        try:
-            _cat_ow_msg = (
-                f"📬 *নতুন Submission পেয়েছেন!*\n\n"
-                f"📁 *Task:* {ttype_icon} {task_name}\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"📋 *Proof:*\n{summary_txt}\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"💵 *মূল্য:* `{price}$ USDT`\n"
-                f"🔖 *Sub ID:* `#{gid}`"
-            )
-            _cat_owner_kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Approve", callback_data=f"ga_{gid}"),
-                InlineKeyboardButton("❌ Reject",  callback_data=f"gr_{gid}"),
-            ]])
-            await ctx.bot.send_message(_cat_owner_id, _cat_ow_msg, parse_mode="Markdown", reply_markup=_cat_owner_kb)
-        except Exception as _ow_e2:
-            log.warning(f"[OWNER_NOTIFY_CAT] owner={_cat_owner_id} gid={gid}: {_ow_e2}")
-
     if update.message and not via_callback:
         await update.message.reply_text(T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
     else:
         await ctx.bot.send_message(uid, T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
-    # ── Submit এর পর টাস্ক লিস্ট আবার দেখাও ────────────────────────────
     try:
         if update.message and not via_callback:
             await show_tasks(update, ctx)
     except Exception as _st_e:
         log.warning(f"[CATEG_FINALIZE] show_tasks after submit failed: {_st_e}")
+
+    # ── Background: admin + sub-admin + channel + owner notify ───────
+    _cat_owner_id = int(_rget(_ct_after, 'owner_id', 0) or 0) if _ct_after else 0
+    async def _cat_notify_bg():
+        a_mid, c_mid = 0, 0
+        try:
+            am = await ctx.bot.send_message(ADMIN_ID, msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
+            a_mid = am.message_id
+            for fid in photo_file_ids:
+                await ctx.bot.send_photo(ADMIN_ID, fid, caption=f"📷 Sub #{gid}")
+        except Exception as e: log.warning(f"Admin fwd fail: {e}")
+        for adm_row in await asyncio.to_thread(get_all_admins):
+            try:
+                await ctx.bot.send_message(adm_row["user_id"], msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
+                for fid in photo_file_ids:
+                    await ctx.bot.send_photo(adm_row["user_id"], fid, caption=f"📷 Sub #{gid}")
+            except Exception as e: log.warning(f"Sub-admin fwd fail {adm_row['user_id']}: {e}")
+        _ch_id = await asyncio.to_thread(get_gmail_ch_id)
+        try:
+            cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
+            c_mid = cm.message_id
+            for fid in photo_file_ids:
+                await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid}")
+        except Exception as e:
+            log.warning(f"Channel fwd fail (ch_id={_ch_id}): {e}")
+        if c_mid == 0:
+            try:
+                cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown")
+                c_mid = cm.message_id
+                for fid in photo_file_ids:
+                    await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid}")
+            except Exception as e2:
+                log.warning(f"Channel fwd no-kb fail (ch_id={_ch_id}): {e2}")
+        if c_mid == 0:
+            try:
+                _plain = msg_txt.replace("*","").replace("`","").replace("_","")
+                cm = await ctx.bot.send_message(_ch_id, _plain, reply_markup=g_kb(gid))
+                c_mid = cm.message_id
+                for fid in photo_file_ids:
+                    await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid}")
+            except Exception as e3:
+                log.warning(f"Channel fwd plain fail (ch_id={_ch_id}): {e3}")
+        if c_mid == 0:
+            try:
+                await notify_full_admins(ctx.bot,
+                    f"⚠️ *Admin Channel এ Submission পাঠানো যাচ্ছে না!*\n\n"
+                    f"📋 *Sub ID:* `#{gid}`\n🔗 *Channel ID:* `{_ch_id}`\n\n"
+                    f"Bot কে channel এ Admin করুন অথবা Channel ID ঠিক করুন।")
+            except Exception as _ct_ch_ae:
+                log.error(f"[CAT-CHANNEL-FAIL] admin alert ব্যর্থ: {_ct_ch_ae}")
+        try:
+            with _c() as _dbc:
+                _dbc.execute("UPDATE gmails SET admin_msg_id=%s,channel_msg_id=%s WHERE id=%s", (a_mid, c_mid, gid))
+        except Exception as _dbe: log.warning(f"[CAT-NOTIFY-BG] msg_id save fail: {_dbe}")
+        if _cat_owner_id and _cat_owner_id != ADMIN_ID:
+            try:
+                _cat_ow_msg = (
+                    f"📬 *নতুন Submission পেয়েছেন!*\n\n"
+                    f"📁 *Task:* {ttype_icon} {task_name}\n"
+                    f"👤 *User:* {uname}\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"📋 *Proof:*\n{summary_txt}\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"💵 *মূল্য:* `{price}$ USDT`\n"
+                    f"🔖 *Sub ID:* `#{gid}`"
+                )
+                _cat_owner_kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Approve", callback_data=f"ga_{gid}"),
+                    InlineKeyboardButton("❌ Reject",  callback_data=f"gr_{gid}"),
+                ]])
+                await ctx.bot.send_message(_cat_owner_id, _cat_ow_msg, parse_mode="Markdown", reply_markup=_cat_owner_kb)
+                for fid in photo_file_ids:
+                    await ctx.bot.send_photo(_cat_owner_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
+            except Exception as _ow_e2:
+                log.warning(f"[OWNER_NOTIFY_CAT] owner={_cat_owner_id} gid={gid}: {_ow_e2}")
+    _t_cat_bg = asyncio.create_task(_cat_notify_bg())
+    _background_tasks.add(_t_cat_bg); _t_cat_bg.add_done_callback(_background_tasks.discard)
 
 
 async def show_tg_task(update, ctx, task):
@@ -4757,91 +4754,9 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
         f"🔖 *Sub ID:* `#{gid}`"
     )
 
-    a_mid, c_mid = 0, 0
-    # Send to main admin
-    try:
-        am = await ctx.bot.send_message(ADMIN_ID, msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
-        a_mid = am.message_id
-        for fid in photo_file_ids:
-            await ctx.bot.send_photo(ADMIN_ID, fid, caption=f"📷 Sub #{gid} এর ছবি")
-    except Exception as e: log.warning(f"Admin fwd fail: {e}")
-
-    # Send to sub-admins
-    for adm_row in await asyncio.to_thread(get_all_admins):
-        try:
-            await ctx.bot.send_message(adm_row["user_id"], msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
-            for fid in photo_file_ids:
-                await ctx.bot.send_photo(adm_row["user_id"], fid, caption=f"📷 Sub #{gid} এর ছবি")
-        except Exception as e: log.warning(f"Sub-admin fwd fail {adm_row['user_id']}: {e}")
-
-    # Send to channel — 3-tier fallback: keyboard→no keyboard→plain text
-    _ch_id = await asyncio.to_thread(get_gmail_ch_id)
-    try:
-        cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
-        c_mid = cm.message_id
-        for fid in photo_file_ids:
-            await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
-    except Exception as e:
-        log.warning(f"Channel fwd fail (ch_id={_ch_id}): {e}")
-    if c_mid == 0:
-        try:
-            cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown")
-            c_mid = cm.message_id
-            for fid in photo_file_ids:
-                await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
-        except Exception as e2:
-            log.warning(f"Channel fwd no-kb fail (ch_id={_ch_id}): {e2}")
-    if c_mid == 0:
-        # plain text fallback — Markdown parse error হলেও চ্যানেলে যাবে
-        try:
-            _plain = msg_txt.replace("*","").replace("`","").replace("_","")
-            cm = await ctx.bot.send_message(_ch_id, _plain, reply_markup=g_kb(gid))
-            c_mid = cm.message_id
-            for fid in photo_file_ids:
-                await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
-        except Exception as e3:
-            log.warning(f"Channel fwd plain fail (ch_id={_ch_id}): {e3}")
-
-    # সব tier fail হলে admin কে alert করো
-    if c_mid == 0:
-        try:
-            await notify_full_admins(ctx.bot,
-                f"⚠️ *Admin Channel এ Submission পাঠানো যাচ্ছে না!*\n\n"
-                f"📋 *Sub ID:* `#{gid}`\n🔗 *Channel ID:* `{_ch_id}`\n\n"
-                f"Bot কে channel এ Admin করুন অথবা Channel ID ঠিক করুন।")
-        except Exception as _ch_ae:
-            log.error(f"[CHANNEL-FAIL] admin alert ব্যর্থ: {_ch_ae}")
-
-    def _save_gmail_msg_ids():
-        with _c() as c:
-            c.execute("UPDATE gmails SET admin_msg_id=%s,channel_msg_id=%s WHERE id=%s", (a_mid, c_mid, gid))
-    _t_sgm = asyncio.ensure_future(asyncio.to_thread(_save_gmail_msg_ids))
-    _background_tasks.add(_t_sgm); _t_sgm.add_done_callback(_background_tasks.discard)
-
+    # ── ইউজারকে তাৎক্ষণিক reply — সব notification background এ ──────
     for k in ("state","task_price","task_name","task_id","task_fields","field_idx","collected"):
         ctx.user_data.pop(k, None)
-
-    # ── Task Owner notification — user info ছাড়া, শুধু Approve/Reject ──
-    _reg_owner_id = int(_rget(_t_obj, 'owner_id', 0) or 0) if _t_obj else 0
-    if _reg_owner_id and _reg_owner_id != ADMIN_ID:
-        try:
-            _reg_ow_msg = (
-                f"📬 *নতুন Submission পেয়েছেন!*\n\n"
-                f"📌 *Task:* {_t_icon} {task_name}\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"📋 *Proof:*\n{summary_txt}\n"
-                f"━━━━━━━━━━━━━━━━\n"
-                f"💵 *মূল্য:* `{price}$ USDT`\n"
-                f"🔖 *Sub ID:* `#{gid}`"
-            )
-            _owner_kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Approve", callback_data=f"ga_{gid}"),
-                InlineKeyboardButton("❌ Reject",  callback_data=f"gr_{gid}"),
-            ]])
-            await ctx.bot.send_message(_reg_owner_id, _reg_ow_msg, parse_mode="Markdown", reply_markup=_owner_kb)
-        except Exception as _ow_e:
-            log.warning(f"[OWNER_NOTIFY] owner={_reg_owner_id} gid={gid}: {_ow_e}")
-
     send_fn = update.message.reply_text if (update.message and not via_callback) else None
     if send_fn:
         await send_fn(T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
@@ -4853,6 +4768,83 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
             await show_tasks(update, ctx)
     except Exception as _st_e:
         log.warning(f"[FINALIZE] show_tasks after submit failed: {_st_e}")
+
+    # ── Background: admin + sub-admin + channel + owner notify ───────
+    _reg_owner_id = int(_rget(_t_obj, 'owner_id', 0) or 0) if _t_obj else 0
+    async def _reg_notify_bg():
+        a_mid, c_mid = 0, 0
+        try:
+            am = await ctx.bot.send_message(ADMIN_ID, msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
+            a_mid = am.message_id
+            for fid in photo_file_ids:
+                await ctx.bot.send_photo(ADMIN_ID, fid, caption=f"📷 Sub #{gid} এর ছবি")
+        except Exception as e: log.warning(f"Admin fwd fail: {e}")
+        for adm_row in await asyncio.to_thread(get_all_admins):
+            try:
+                await ctx.bot.send_message(adm_row["user_id"], msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
+                for fid in photo_file_ids:
+                    await ctx.bot.send_photo(adm_row["user_id"], fid, caption=f"📷 Sub #{gid} এর ছবি")
+            except Exception as e: log.warning(f"Sub-admin fwd fail {adm_row['user_id']}: {e}")
+        _ch_id = await asyncio.to_thread(get_gmail_ch_id)
+        try:
+            cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
+            c_mid = cm.message_id
+            for fid in photo_file_ids:
+                await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
+        except Exception as e:
+            log.warning(f"Channel fwd fail (ch_id={_ch_id}): {e}")
+        if c_mid == 0:
+            try:
+                cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown")
+                c_mid = cm.message_id
+                for fid in photo_file_ids:
+                    await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
+            except Exception as e2:
+                log.warning(f"Channel fwd no-kb fail (ch_id={_ch_id}): {e2}")
+        if c_mid == 0:
+            try:
+                _plain = msg_txt.replace("*","").replace("`","").replace("_","")
+                cm = await ctx.bot.send_message(_ch_id, _plain, reply_markup=g_kb(gid))
+                c_mid = cm.message_id
+                for fid in photo_file_ids:
+                    await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
+            except Exception as e3:
+                log.warning(f"Channel fwd plain fail (ch_id={_ch_id}): {e3}")
+        if c_mid == 0:
+            try:
+                await notify_full_admins(ctx.bot,
+                    f"⚠️ *Admin Channel এ Submission পাঠানো যাচ্ছে না!*\n\n"
+                    f"📋 *Sub ID:* `#{gid}`\n🔗 *Channel ID:* `{_ch_id}`\n\n"
+                    f"Bot কে channel এ Admin করুন অথবা Channel ID ঠিক করুন।")
+            except Exception as _ch_ae:
+                log.error(f"[CHANNEL-FAIL] admin alert ব্যর্থ: {_ch_ae}")
+        try:
+            with _c() as _dbc:
+                _dbc.execute("UPDATE gmails SET admin_msg_id=%s,channel_msg_id=%s WHERE id=%s", (a_mid, c_mid, gid))
+        except Exception as _dbe: log.warning(f"[REG-NOTIFY-BG] msg_id save fail: {_dbe}")
+        if _reg_owner_id and _reg_owner_id != ADMIN_ID:
+            try:
+                _reg_ow_msg = (
+                    f"📬 *নতুন Submission পেয়েছেন!*\n\n"
+                    f"📌 *Task:* {_t_icon} {task_name}\n"
+                    f"👤 *User:* {uname}\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"📋 *Proof:*\n{summary_txt}\n"
+                    f"━━━━━━━━━━━━━━━━\n"
+                    f"💵 *মূল্য:* `{price}$ USDT`\n"
+                    f"🔖 *Sub ID:* `#{gid}`"
+                )
+                _owner_kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Approve", callback_data=f"ga_{gid}"),
+                    InlineKeyboardButton("❌ Reject",  callback_data=f"gr_{gid}"),
+                ]])
+                await ctx.bot.send_message(_reg_owner_id, _reg_ow_msg, parse_mode="Markdown", reply_markup=_owner_kb)
+                for fid in photo_file_ids:
+                    await ctx.bot.send_photo(_reg_owner_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
+            except Exception as _ow_e:
+                log.warning(f"[OWNER_NOTIFY] owner={_reg_owner_id} gid={gid}: {_ow_e}")
+    _t_reg_bg = asyncio.create_task(_reg_notify_bg())
+    _background_tasks.add(_t_reg_bg); _t_reg_bg.add_done_callback(_background_tasks.discard)
 
 # ──────────────────────────── WITHDRAW FLOW ────────────────────────────
 async def wd_ask_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -6055,7 +6047,7 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     uid = update.effective_user.id
     if not await asyncio.to_thread(is_admin, uid):
-        await update.message.reply_text("❌ *আপনি এডমিন না!*", parse_mode="Markdown"); return
+        return  # non-admin কে কোনো reply নেই — command সম্পূর্ণ invisible
     await send_admin_panel(update.message, uid)
 
 async def _show_perm_picker(msg, tgt_uid: int, ctx):
