@@ -39,7 +39,7 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes
 )
 from telegram.constants import ChatMemberStatus
-from telegram.error import TelegramError
+from telegram.error import TelegramError, RetryAfter as TgRetryAfter
 
 # ──────────────────────────── CONFIG ────────────────────────────
 # প্রথমে Environment Variable থেকে নেওয়ার চেষ্টা করো,
@@ -161,6 +161,8 @@ _background_tasks: set = set()
 
 # Withdraw job lock — একসাথে একটাই cycle, nonce conflict বন্ধ
 _wd_job_lock = asyncio.Lock()
+_bnb_alert_last_sent: float = 0.0   # BNB low alert cooldown — প্রতি ঘন্টায় সর্বোচ্চ একবার
+_BNB_ALERT_COOLDOWN = 3600          # seconds (1 ঘন্টা)
 
 
 # ── Default menu button labels ──────────────────────────────────
@@ -255,7 +257,7 @@ MSGS = {
         'new_joiners_only_reject': "❌ *এই Task শুধুমাত্র নতুন জয়েনারদের জন্য।*\n\nআপনি আগে থেকেই এই চ্যানেলে জয়েন আছেন, তাই এই Task করতে পারবেন না।\n\n📢 শুধু নতুন ইউজার যারা এই Task এর মাধ্যমে জয়েন করবে তারাই পুরস্কার পাবে।",
         'task_blocked_msg': (
             "⛔ *Task করা সাময়িকভাবে বন্ধ!*\n\n"
-            "আপনার পয়েন্ট ৩০ বা তার নিচে নেমে গেছে।\n\n"
+            "আপনার পয়েন্ট ৫০ বা তার নিচে নেমে গেছে।\n\n"
             "🔓 *Block উঠবে:* {until}\n\n"
             "💡 */point* লিখে পয়েন্ট দেখুন।"
         ),
@@ -270,7 +272,7 @@ MSGS = {
             "• শুরুতে সবার পয়েন্ট: `100`\n"
             "• Task *reject* হলে: `-{reject_pts}` পয়েন্ট\n"
             "• Task *approve* হলে: `+{approve_pts}` পয়েন্ট\n"
-            "• পয়েন্ট `30` বা নিচে গেলে: `{block_days}` দিন Task বন্ধ\n"
+            "• পয়েন্ট `50` বা নিচে গেলে: `{block_days}` দিন Task বন্ধ\n"
             "• পয়েন্ট সর্বোচ্চ `100` পর্যন্ত যাবে\n\n"
             "💡 সঠিক নিয়মে Task করলে পয়েন্ট বাড়বে!"
         ),
@@ -353,7 +355,7 @@ MSGS = {
         'new_joiners_only_reject': "❌ *This Task is for new joiners only.*\n\nYou are already a member of this channel, so you cannot complete this task.\n\n📢 Only users who join the channel through this Task will receive the reward.",
         'task_blocked_msg': (
             "⛔ *Task submissions are temporarily blocked!*\n\n"
-            "Your trust points dropped to 30 or below.\n\n"
+            "Your trust points dropped to 50 or below.\n\n"
             "🔓 *Block lifts on:* {until}\n\n"
             "💡 Type */point* to view your points."
         ),
@@ -1037,6 +1039,12 @@ def init_db():
             )
         except Exception:
             pass
+        # ── owner_id column backfill (idempotent) ────────────────────
+        for _tbl in ("tasks", "tg_tasks", "category_tasks"):
+            try:
+                c.execute(f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS owner_id BIGINT DEFAULT 0")
+            except Exception:
+                pass
         log.info("✅ PostgreSQL schema ready.")
 
 
@@ -1170,7 +1178,7 @@ POINT_START       = 100
 POINT_PER_REJECT  = 10   # reject হলে কমবে
 POINT_PER_APPROVE = 3    # approve হলে বাড়বে (ধীরে ধীরে)
 POINT_DUP_PHOTO   = 15   # duplicate ছবি submit করলে কমবে
-POINT_BLOCK_AT    = 30   # এর সমান বা নিচে গেলে block
+POINT_BLOCK_AT    = 50   # এর সমান বা নিচে গেলে block
 POINT_BLOCK_DAYS  = 3    # কতদিন task বন্ধ থাকবে
 
 def get_points(uid):
@@ -1201,23 +1209,22 @@ def is_task_blocked(uid):
         return False, None
 
 def add_points(uid, delta):
-    new_pts = None
-    """Points বাড়াও/কমাও। 0–100 clamp। ≤ POINT_BLOCK_AT হলে block করো।"""
+    """Points বাড়াও/কমাও। 0–100 clamp। ≤ POINT_BLOCK_AT হলে block করো।
+    Atomic single-statement UPDATE — race condition নেই।"""
     with _c() as c:
-        r = c.execute("SELECT points FROM users WHERE user_id=%s", (uid,)).fetchone()
-        current  = (r["points"] if r and r["points"] is not None else POINT_START)
-        new_pts  = max(0, min(POINT_START, current + delta))
+        r = c.execute(
+            "UPDATE users SET points=GREATEST(0, LEAST(%s, COALESCE(points,%s)+%s)) "
+            "WHERE user_id=%s RETURNING points",
+            (POINT_START, POINT_START, delta, uid)
+        ).fetchone()
+        new_pts = r["points"] if r else POINT_START
         if delta < 0 and new_pts <= POINT_BLOCK_AT:
-            block_dt     = datetime.now(timezone.utc) + timedelta(days=POINT_BLOCK_DAYS)
-            blocked_until = block_dt.isoformat()
-            c.execute("UPDATE users SET points=%s, blocked_until=%s WHERE user_id=%s",
-                      (new_pts, blocked_until, uid))
+            block_dt      = datetime.now(timezone.utc) + timedelta(days=POINT_BLOCK_DAYS)
+            c.execute("UPDATE users SET blocked_until=%s WHERE user_id=%s",
+                      (block_dt.isoformat(), uid))
         elif new_pts > POINT_BLOCK_AT:
-            c.execute("UPDATE users SET points=%s, blocked_until=NULL WHERE user_id=%s",
-                      (new_pts, uid))
-        else:
-            c.execute("UPDATE users SET points=%s WHERE user_id=%s", (new_pts, uid))
-    _mark_dirty()   # points পরিবর্তন হলে সাথে সাথে backup নেও
+            c.execute("UPDATE users SET blocked_until=NULL WHERE user_id=%s", (uid,))
+    _mark_dirty()
     return new_pts
 
 def get_bal(uid):
@@ -1383,6 +1390,24 @@ async def notify_full_admins(bot, msg: str, parse_mode: str = "Markdown", reply_
         except Exception as e:
             log.warning(f"notify_full_admins sub-admin {adm['user_id']} fail: {e}")
 
+async def notify_all_admins(bot, msg: str, parse_mode: str = "Markdown", reply_markup=None):
+    """Main admin + সব sub-admin কে notification পাঠায় (permission নির্বিশেষে)।
+    Critical system alerts যেমন BNB low, server error ইত্যাদির জন্য।"""
+    kwargs = {"parse_mode": parse_mode}
+    if reply_markup:
+        kwargs["reply_markup"] = reply_markup
+    try:
+        await bot.send_message(ADMIN_ID, msg, **kwargs)
+    except Exception as e:
+        log.warning(f"notify_all_admins main admin fail: {e}")
+    for adm in await asyncio.to_thread(get_all_admins):
+        if adm["user_id"] == ADMIN_ID:
+            continue  # main admin কে দুইবার না
+        try:
+            await bot.send_message(adm["user_id"], msg, **kwargs)
+        except Exception as e:
+            log.warning(f"notify_all_admins sub-admin {adm['user_id']} fail: {e}")
+
 def get_admin_perms(uid) -> set:
     """Return set of permissions for this admin. Main admin = all perms."""
     if uid == ADMIN_ID:
@@ -1488,7 +1513,13 @@ def set_setting(key, val):
     _settings_cache.pop(key, None)   # stale cache সরিয়ে দাও
 
 def bot_is_on():
-    return get_setting("bot_status") != "off"
+    """bot_status সরাসরি DB থেকে — cache bypass (emergency off তাৎক্ষণিক কাজ করে)।"""
+    try:
+        with _c() as c:
+            r = c.execute("SELECT value FROM settings WHERE key='bot_status'").fetchone()
+            return (r["value"] if r else "on") != "off"
+    except Exception:
+        return True  # DB fail হলে safe default: bot চালু থাকুক
 
 def get_gmail_ch_id():
     v = get_setting('gmail_ch_id')
@@ -1774,7 +1805,7 @@ def delete_task(tid):
     _tc_del(f"task_{tid}", f"fields_task_{tid}", "tasks", "all_tasks")
 
 def update_task_field_val(tid, field, value):
-    if field not in {"name","price","rules","rules_en","is_active","max_completions","task_type","per_user_limit","allowed_countries","example_image_id","demo_video_id"}: return
+    if field not in {"name","price","rules","rules_en","is_active","max_completions","task_type","per_user_limit","allowed_countries","example_image_id","demo_video_id","owner_id"}: return
     with _c() as c: c.execute(f"UPDATE tasks SET {field}=%s WHERE id=%s", (value, tid))
     _tc_del(f"task_{tid}", "tasks", "all_tasks")
 
@@ -2164,7 +2195,7 @@ def delete_category_task(tid):
     if cid: _tc_del_prefix(f"ctasks_{cid}_")
 
 def update_category_task(tid, field, value):
-    allowed = {"name","price","rules","rules_en","max_completions","is_active","completed_count","task_type","per_user_limit","allowed_countries","example_image_id","demo_video_id"}
+    allowed = {"name","price","rules","rules_en","max_completions","is_active","completed_count","task_type","per_user_limit","allowed_countries","example_image_id","demo_video_id","owner_id"}
     if field not in allowed: return
     with _c() as c:
         c.execute(f"UPDATE category_tasks SET {field}=%s WHERE id=%s", (value, tid))
@@ -2189,6 +2220,34 @@ def add_category_task_field(task_id, field_type, prompt_bn, prompt_en, order=Non
             (task_id, order, field_type, prompt_bn, prompt_en, example_image_id or '')
         )
     _tc_del(f"ctask_fields_{task_id}")
+
+def get_task_by_code_any(code):
+    """Task code দিয়ে tasks/tg_tasks/category_tasks থেকে খোঁজো।"""
+    code = (code or "").strip().upper()
+    with _c() as c:
+        t = c.execute("SELECT * FROM tasks WHERE task_code=%s", (code,)).fetchone()
+        if t: return "tasks", t
+        tg = c.execute("SELECT * FROM tg_tasks WHERE task_code=%s", (code,)).fetchone()
+        if tg: return "tg_tasks", tg
+        ct = c.execute("SELECT * FROM category_tasks WHERE task_code=%s", (code,)).fetchone()
+        if ct: return "category_tasks", ct
+    return None, None
+
+def set_task_owner_by_code(code, owner_id):
+    """Task code দিয়ে owner_id সেট করো। Returns (task_name, table) or (None, None)"""
+    tbl, row = get_task_by_code_any(code)
+    if not tbl or not row:
+        return None, None
+    tid = row["id"]
+    with _c() as c:
+        c.execute(f"UPDATE {tbl} SET owner_id=%s WHERE id=%s", (owner_id, tid))
+    if tbl == "tasks":
+        _tc_del(f"task_{tid}", "tasks", "all_tasks")
+    elif tbl == "category_tasks":
+        _tc_del(f"ctask_{tid}"); _tc_del_prefix("ctasks_")
+    else:
+        _tc_del(f"tgtask_{tid}", "tg_tasks")
+    return row["name"], tbl
 
 def update_category_task_field_example_img(field_id, image_id):
     with _c() as c:
@@ -2944,7 +3003,11 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def show_profile(update, ctx):
     user = update.effective_user
     uid  = user.id
-    bal  = await asyncio.to_thread(get_bal, uid)
+    # get_bal + get_user parallel — sequential call বাদ
+    bal, _u = await asyncio.gather(
+        asyncio.to_thread(get_bal, uid),
+        asyncio.to_thread(get_user, uid),
+    )
     uname = f"@{_md_esc(user.username)}" if user.username else _md_esc(user.full_name or "")
     await update.message.reply_text(
         f"{T(uid,'profile_title')}\n\n"
@@ -3087,6 +3150,15 @@ async def _check_ref_event_bonus(referred_id: int, referrer_id: int, bot):
         ev = await asyncio.to_thread(get_active_referral_event)
         if not ev:
             return
+        # ── শুধু event চলাকালীন যারা রেফার হয়েছে তাদের জন্য bonus ────────
+        _ref_user = await asyncio.to_thread(get_user, referred_id)
+        if not _ref_user:
+            return
+        _joined = (_ref_user.get('joined_at') or '')[:10]   # "YYYY-MM-DD"
+        _ev_start = str(ev.get('start_date') or '')[:10]
+        _ev_end   = str(ev.get('end_date')   or '')[:10]
+        if not _joined or _joined < _ev_start or _joined > _ev_end:
+            return  # event এর আগে বা পরে join করেছে — bonus নেই
         total_tasks = await asyncio.to_thread(count_approved_tasks_for_user, referred_id)
         if total_tasks < ev['required_tasks']:
             return
@@ -3172,11 +3244,9 @@ async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str
 
 async def show_tasks(update, ctx):
     uid          = update.effective_user.id
-    # ইউজারকে জানাও বট কাজ করছে — "typing..." দেখা যাবে
-    try:
-        await ctx.bot.send_chat_action(chat_id=uid, action="typing")
-    except Exception:
-        pass
+    # send_chat_action background — main path block করে না
+    _act = asyncio.create_task(ctx.bot.send_chat_action(chat_id=uid, action="typing"))
+    _background_tasks.add(_act); _act.add_done_callback(_background_tasks.discard)
     # lang, tasks, tg_tasks, categories, bio_task — সব একসাথে parallel
     lang, tasks, tg_tasks, categories, bio_task = await asyncio.gather(
         asyncio.to_thread(get_lang, uid),
@@ -3770,17 +3840,35 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
         for fid in photo_file_ids:
             await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid}")
     except Exception as e:
-        _e_str = str(e)
-        log.warning(f"Channel fwd fail (ch_id={_ch_id}): {_e_str}")
-        # inline keyboard ছাড়া আবার চেষ্টা করো
-        if c_mid == 0:
-            try:
-                cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown")
-                c_mid = cm.message_id
-                for fid in photo_file_ids:
-                    await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid}")
-            except Exception as e2:
-                log.warning(f"Channel fwd retry fail (ch_id={_ch_id}): {e2}")
+        log.warning(f"Channel fwd fail (ch_id={_ch_id}): {e}")
+    if c_mid == 0:
+        try:
+            cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown")
+            c_mid = cm.message_id
+            for fid in photo_file_ids:
+                await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid}")
+        except Exception as e2:
+            log.warning(f"Channel fwd no-kb fail (ch_id={_ch_id}): {e2}")
+    if c_mid == 0:
+        # plain text fallback — Markdown parse error হলেও চ্যানেলে যাবে
+        try:
+            _plain = msg_txt.replace("*","").replace("`","").replace("_","")
+            cm = await ctx.bot.send_message(_ch_id, _plain, reply_markup=g_kb(gid))
+            c_mid = cm.message_id
+            for fid in photo_file_ids:
+                await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid}")
+        except Exception as e3:
+            log.warning(f"Channel fwd plain fail (ch_id={_ch_id}): {e3}")
+
+    # সব tier fail হলে admin কে alert করো
+    if c_mid == 0:
+        try:
+            await notify_full_admins(ctx.bot,
+                f"⚠️ *Admin Channel এ Submission পাঠানো যাচ্ছে না!*\n\n"
+                f"📋 *Sub ID:* `#{gid}`\n🔗 *Channel ID:* `{_ch_id}`\n\n"
+                f"Bot কে channel এ Admin করুন অথবা Channel ID ঠিক করুন।")
+        except Exception as _ct_ch_ae:
+            log.error(f"[CAT-CHANNEL-FAIL] admin alert ব্যর্থ: {_ct_ch_ae}")
 
     def _db_3071():
         with _c() as c:
@@ -3789,6 +3877,27 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
 
     for k in ("state","task_price","task_name","categ_task_id","task_fields","field_idx","collected"):
         ctx.user_data.pop(k, None)
+
+    # ── Task Owner notification — user info ছাড়া, শুধু Approve/Reject ──
+    _cat_owner_id = int(_rget(_ct_after, 'owner_id', 0) or 0) if _ct_after else 0
+    if _cat_owner_id and _cat_owner_id != ADMIN_ID:
+        try:
+            _cat_ow_msg = (
+                f"📬 *নতুন Submission পেয়েছেন!*\n\n"
+                f"📁 *Task:* {ttype_icon} {task_name}\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"📋 *Proof:*\n{summary_txt}\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"💵 *মূল্য:* `{price}$ USDT`\n"
+                f"🔖 *Sub ID:* `#{gid}`"
+            )
+            _cat_owner_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"ga_{gid}"),
+                InlineKeyboardButton("❌ Reject",  callback_data=f"gr_{gid}"),
+            ]])
+            await ctx.bot.send_message(_cat_owner_id, _cat_ow_msg, parse_mode="Markdown", reply_markup=_cat_owner_kb)
+        except Exception as _ow_e2:
+            log.warning(f"[OWNER_NOTIFY_CAT] owner={_cat_owner_id} gid={gid}: {_ow_e2}")
 
     if update.message and not via_callback:
         await update.message.reply_text(T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
@@ -4665,7 +4774,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
                 await ctx.bot.send_photo(adm_row["user_id"], fid, caption=f"📷 Sub #{gid} এর ছবি")
         except Exception as e: log.warning(f"Sub-admin fwd fail {adm_row['user_id']}: {e}")
 
-    # Send to channel
+    # Send to channel — 3-tier fallback: keyboard→no keyboard→plain text
     _ch_id = await asyncio.to_thread(get_gmail_ch_id)
     try:
         cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown", reply_markup=g_kb(gid))
@@ -4673,17 +4782,35 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
         for fid in photo_file_ids:
             await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
     except Exception as e:
-        _e_str = str(e)
-        log.warning(f"Channel fwd fail (ch_id={_ch_id}): {_e_str}")
-        # inline keyboard ছাড়া আবার চেষ্টা করো
-        if c_mid == 0:
-            try:
-                cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown")
-                c_mid = cm.message_id
-                for fid in photo_file_ids:
-                    await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
-            except Exception as e2:
-                log.warning(f"Channel fwd retry fail (ch_id={_ch_id}): {e2}")
+        log.warning(f"Channel fwd fail (ch_id={_ch_id}): {e}")
+    if c_mid == 0:
+        try:
+            cm = await ctx.bot.send_message(_ch_id, msg_txt, parse_mode="Markdown")
+            c_mid = cm.message_id
+            for fid in photo_file_ids:
+                await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
+        except Exception as e2:
+            log.warning(f"Channel fwd no-kb fail (ch_id={_ch_id}): {e2}")
+    if c_mid == 0:
+        # plain text fallback — Markdown parse error হলেও চ্যানেলে যাবে
+        try:
+            _plain = msg_txt.replace("*","").replace("`","").replace("_","")
+            cm = await ctx.bot.send_message(_ch_id, _plain, reply_markup=g_kb(gid))
+            c_mid = cm.message_id
+            for fid in photo_file_ids:
+                await ctx.bot.send_photo(_ch_id, fid, caption=f"📷 Sub #{gid} এর ছবি")
+        except Exception as e3:
+            log.warning(f"Channel fwd plain fail (ch_id={_ch_id}): {e3}")
+
+    # সব tier fail হলে admin কে alert করো
+    if c_mid == 0:
+        try:
+            await notify_full_admins(ctx.bot,
+                f"⚠️ *Admin Channel এ Submission পাঠানো যাচ্ছে না!*\n\n"
+                f"📋 *Sub ID:* `#{gid}`\n🔗 *Channel ID:* `{_ch_id}`\n\n"
+                f"Bot কে channel এ Admin করুন অথবা Channel ID ঠিক করুন।")
+        except Exception as _ch_ae:
+            log.error(f"[CHANNEL-FAIL] admin alert ব্যর্থ: {_ch_ae}")
 
     def _save_gmail_msg_ids():
         with _c() as c:
@@ -4693,6 +4820,27 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
 
     for k in ("state","task_price","task_name","task_id","task_fields","field_idx","collected"):
         ctx.user_data.pop(k, None)
+
+    # ── Task Owner notification — user info ছাড়া, শুধু Approve/Reject ──
+    _reg_owner_id = int(_rget(_t_obj, 'owner_id', 0) or 0) if _t_obj else 0
+    if _reg_owner_id and _reg_owner_id != ADMIN_ID:
+        try:
+            _reg_ow_msg = (
+                f"📬 *নতুন Submission পেয়েছেন!*\n\n"
+                f"📌 *Task:* {_t_icon} {task_name}\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"📋 *Proof:*\n{summary_txt}\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"💵 *মূল্য:* `{price}$ USDT`\n"
+                f"🔖 *Sub ID:* `#{gid}`"
+            )
+            _owner_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"ga_{gid}"),
+                InlineKeyboardButton("❌ Reject",  callback_data=f"gr_{gid}"),
+            ]])
+            await ctx.bot.send_message(_reg_owner_id, _reg_ow_msg, parse_mode="Markdown", reply_markup=_owner_kb)
+        except Exception as _ow_e:
+            log.warning(f"[OWNER_NOTIFY] owner={_reg_owner_id} gid={gid}: {_ow_e}")
 
     send_fn = update.message.reply_text if (update.message and not via_callback) else None
     if send_fn:
@@ -4935,8 +5083,20 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Actual withdrawal DB insert + confirmation message — wd_confirm callback calls this."""
     user = update.effective_user
     uid  = user.id
+    # ── Local এ save করো, তারপরেই state clear — double-click guard ──────
     address = ctx.user_data.get("wd_addr", "")
     amt     = ctx.user_data.get("wd_amt", 0.0)
+    for k in ("state", "wd_addr", "wd_amt"):
+        ctx.user_data.pop(k, None)
+    # ── Missing state guard — amt=0 বা address নেই হলে abort ────────────
+    if not address or not amt or amt <= 0:
+        lang0 = await asyncio.to_thread(get_lang, uid)
+        await ctx.bot.send_message(
+            uid,
+            ("❌ *Withdrawal session expired. Please start again.*" if lang0 == 'en'
+             else "❌ *Withdrawal session মেয়াদ শেষ। আবার শুরু করুন।*"),
+            parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+        return
     fee     = await asyncio.to_thread(get_wd_fee)
     net_amt = round(amt - fee, 4)
     lang    = await asyncio.to_thread(get_lang, uid)
@@ -4949,8 +5109,6 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if lang == 'en' else
             f"❌ *পর্যাপ্ত ব্যালান্স নেই!*\n\n💰 *আপনার ব্যালান্স:* `${_bal_now:.4f} USDT`\n💸 *চাইছেন:* `${amt:.4f} USDT`"
         )
-        for k in ("state", "wd_addr", "wd_amt"):
-            ctx.user_data.pop(k, None)
         await ctx.bot.send_message(uid, err_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
         return
 
@@ -4981,31 +5139,38 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await asyncio.to_thread(_trim_table, "withdrawals", "user_id", uid, keep=10, only_done=True)
         # admin_msg_id=0 এবং channel_msg_id=0 ইতিমধ্যেই DDL DEFAULT — আলাদা UPDATE দরকার নেই।
     except _DuplicatePendingError:
-        await asyncio.to_thread(add_bal, uid, amt)  # balance refund
+        try:
+            await asyncio.to_thread(add_bal, uid, amt)  # balance refund
+        except Exception as _dup_rb_err:
+            log.critical(f"[WD-SUBMIT] ⚠️ DUPLICATE REFUND FAILED uid={uid} amt={amt}: {_dup_rb_err}")
+            await notify_full_admins(ctx.bot,
+                f"🚨 *CRITICAL: Withdrawal Refund ব্যর্থ!*\n\n"
+                f"👤 *User ID:* `{uid}`\n💰 *Amount:* `{amt}$ USDT`\n"
+                f"⚠️ *ম্যানুয়ালি balance ফেরত দিন!*\n\nError: `{_dup_rb_err}`")
         err_msg = (
             "⚠️ *You already have a pending withdrawal.*\n\nPlease wait for it to be processed before submitting a new one."
             if lang == 'en' else
             "⚠️ *আপনার একটি Withdraw ইতিমধ্যে প্রক্রিয়াধীন আছে।*\n\nনতুন Withdraw করার আগে এটি সম্পন্ন হতে দিন।"
         )
-        for k in ("state", "wd_addr", "wd_amt"):
-            ctx.user_data.pop(k, None)
         await ctx.bot.send_message(uid, err_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
         return
     except Exception as _db_err:
         log.error(f"[WD-SUBMIT] DB error uid={uid} amt={amt}: {_db_err}")
-        await asyncio.to_thread(add_bal, uid, amt)  # balance refund — কাটা টাকা ফেরত
-        for k in ("state", "wd_addr", "wd_amt"):
-            ctx.user_data.pop(k, None)
+        # balance refund — কাটা টাকা ফেরত; failure হলে critical alert
+        try:
+            await asyncio.to_thread(add_bal, uid, amt)
+        except Exception as _rb_err:
+            log.critical(f"[WD-SUBMIT] ⚠️ REFUND FAILED uid={uid} amt={amt}: {_rb_err} — MANUAL FIX NEEDED")
+            await notify_full_admins(ctx.bot,
+                f"🚨 *CRITICAL: Withdrawal Refund ব্যর্থ!*\n\n"
+                f"👤 *User ID:* `{uid}`\n💰 *Amount:* `{amt}$ USDT`\n"
+                f"⚠️ *ম্যানুয়ালি balance ফেরত দিন!*\n\nError: `{_rb_err}`")
         _err_msg = ("❌ *Server error. Your balance has been refunded. Please try again.*"
                     if lang == 'en' else
                     "❌ *সার্ভার সমস্যা। ব্যালান্স ফেরত দেওয়া হয়েছে। আবার চেষ্টা করুন।*")
         await ctx.bot.send_message(uid, _err_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
         return
 
-    for k in ("state","wd_addr","wd_amt"):
-        ctx.user_data.pop(k, None)
-
-    lang = await asyncio.to_thread(get_lang, uid)
     if lang == 'en':
         confirm_msg = (
             f"✅ *Withdrawal Request Submitted!*\n\n"
@@ -5037,6 +5202,8 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     gmails = None
     wds = None
     uid = update.effective_user.id
+    # ban check — /history command সরাসরি call হলেও safe থাকবে
+    # menu handler থেকে আসলে check_ch cache hit হয় (120s TTL) — overhead minimal
     if not await guard(update, ctx): return
     def _db_4230():
         gmails = None
@@ -5431,6 +5598,18 @@ async def _send_task_notify_to_users(
         try:
             await bot.send_message(uid_u, msg, parse_mode="HTML", reply_markup=user_kb)
             sent += 1
+        except TgRetryAfter as _ra_e:
+            _wait = int(getattr(_ra_e, 'retry_after', 30) or 30) + 1
+            log.warning(f"[NOTIFY] FloodWait {_wait}s — retrying user {uid_u}")
+            await asyncio.sleep(_wait)
+            try:
+                await bot.send_message(uid_u, msg, parse_mode="HTML", reply_markup=user_kb)
+                sent += 1
+            except Exception as _re2:
+                log.warning(f"[NOTIFY] retry fail user {uid_u}: {_re2}")
+                fail += 1
+                if len(fail_reasons) < 3:
+                    fail_reasons.append(f"RetryAfter+retry: {_re2}")
         except Exception as e:
             err_str = f"{type(e).__name__}: {e}"
             log.warning(f"[NOTIFY] user {uid_u} send fail: {err_str}")
@@ -5928,27 +6107,25 @@ async def _show_perm_picker(msg, tgt_uid: int, ctx):
 async def send_admin_panel(msg, uid):
     is_main = (uid == ADMIN_ID)
     # সব independent lookups একসাথে parallel — admin panel-এর সবচেয়ে বড় bottleneck
+    # get_admin_perms — ১টি DB query, তারপর locally check (sub-admin-এর 6 query → 1)
     (
         (total, tot_bal, pg, pw, ag, aw),
         status,
         notify_on_val,
-        has_tasks,
-        has_withdraw,
-        has_users,
-        has_broadcast,
-        has_finance,
-        has_settings,
+        _uid_perms,
     ) = await asyncio.gather(
         asyncio.to_thread(get_stats),
         asyncio.to_thread(get_setting, "bot_status"),
         asyncio.to_thread(task_notify_on),
-        asyncio.to_thread(admin_has_perm, uid, PERM_TASKS),
-        asyncio.to_thread(admin_has_perm, uid, PERM_WITHDRAW),
-        asyncio.to_thread(admin_has_perm, uid, PERM_USERS),
-        asyncio.to_thread(admin_has_perm, uid, PERM_BROADCAST),
-        asyncio.to_thread(admin_has_perm, uid, PERM_FINANCE),
-        asyncio.to_thread(admin_has_perm, uid, PERM_SETTINGS),
+        asyncio.to_thread(get_admin_perms, uid),
     )
+    def _hp(perm): return PERM_FULL in _uid_perms or perm in _uid_perms or uid == ADMIN_ID
+    has_tasks     = _hp(PERM_TASKS)
+    has_withdraw  = _hp(PERM_WITHDRAW)
+    has_users     = _hp(PERM_USERS)
+    has_broadcast = _hp(PERM_BROADCAST)
+    has_finance   = _hp(PERM_FINANCE)
+    has_settings  = _hp(PERM_SETTINGS)
     status   = status or "on"
     bot_btn  = "🔴 Bot বন্ধ করুন" if status == "on" else "🟢 Bot চালু করুন"
     bot_s    = "🟢 চালু" if status == "on" else "🔴 বন্ধ"
@@ -5997,6 +6174,7 @@ async def send_admin_panel(msg, uid):
     # Task Code search
     if has_tasks:
         rows.append([InlineKeyboardButton("🔍 Task Code খুঁজুন", callback_data="adm_task_code_search")])
+        rows.append([InlineKeyboardButton("👤 Task Owner সেট করুন", callback_data="adm_set_task_owner")])
     # Pending tasks & withdraws
     if has_tasks or has_withdraw:
         r = []
@@ -6726,14 +6904,22 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         ctx.user_data["adm_reject_chat_id"] = q.message.chat_id
         ctx.user_data["adm_reject_has_photo"] = bool(q.message.photo)
         ctx.user_data["adm_reject_orig_txt"]  = q.message.text or q.message.caption or ""
-        await q.message.reply_text(
+        _rej_prompt = (
             f"❌ *Sub #{gid} Reject করছেন।*\n\n"
-            f"📌 *Task:* {row['task_name']}\n"
+            f"📌 *Task:* {_md_esc(str(row['task_name']))}\n"
             f"👤 *User ID:* `{row['user_id']}`\n\n"
             f"📝 *Reject এর কারণ লিখুন* (ইউজারকে পাঠানো হবে):\n\n"
-            f"_/cancel — বাতিল করতে_",
-            parse_mode="Markdown"
+            f"_/cancel — বাতিল করতে_"
         )
+        # Channel থেকে reject চাপলে prompt channel-এ যায় — admin reply করতে পারে না
+        # DM-এ পাঠাও সবসময়, তাহলে admin সেখানে কারণ লিখতে পারবে
+        if q.message.chat_id != uid:
+            try:
+                await ctx.bot.send_message(uid, _rej_prompt, parse_mode="Markdown")
+            except Exception:
+                await q.message.reply_text(_rej_prompt, parse_mode="Markdown")
+        else:
+            await q.message.reply_text(_rej_prompt, parse_mode="Markdown")
         return
 
     # ── Show full address ─────────────────────────────────────────
@@ -7779,6 +7965,18 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         await q.message.reply_text(
             "🔍 *Task Code দিয়ে খুঁজুন*\n\n"
             "Task Code লিখুন (যেমন: `TK-AB3X7`):\n\n/cancel — বাতিল",
+            parse_mode="Markdown"); return
+
+    if d == "adm_set_task_owner":
+        if not await asyncio.to_thread(admin_has_perm, uid, PERM_TASKS):
+            await q.message.reply_text("❌ *এই কাজের পারমিশন নেই।*", parse_mode="Markdown"); return
+        ctx.user_data["state"] = "adm_set_owner_input"
+        await q.message.reply_text(
+            "👤 *Task Owner সেট করুন*\n\n"
+            "Task Code আর Owner-এর User ID একসাথে লিখুন:\n"
+            "_(যেমন: `TK-AB3X7 1234567890`)_\n\n"
+            "Owner সরাতে চাইলে: `TK-AB3X7 0`\n\n"
+            "/cancel — বাতিল",
             parse_mode="Markdown"); return
 
     if d == "adm_sub_approve":
@@ -9441,7 +9639,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Admin states ──────────────────────────────────────────────
-    if await asyncio.to_thread(is_admin, uid) and st and (st.startswith("adm_") or st == "adm_direct_msg"):
+    # st আগে চেক করো — regular user-এর জন্য is_admin DB call বাদ যাবে (short-circuit)
+    if st and (st.startswith("adm_") or st == "adm_direct_msg") and await asyncio.to_thread(is_admin, uid):
 
         if st == "adm_reject_reason":
             gid    = ctx.user_data.get("adm_reject_gid")
@@ -9492,7 +9691,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             u_lang = await asyncio.to_thread(get_lang, guser)
             if u_lang == 'bn':
                 pt_line  = f"🔴 *পয়েন্ট:* `{new_pts}/100` *(-{POINT_PER_REJECT})*"
-                blk_line = f"\n⛔ *পয়েন্ট ৩০ বা নিচে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*" if blocked else "\nℹ️ নিয়মগুলো পড়ে পুনরায় চেষ্টা করুন।"
+                blk_line = f"\n⛔ *পয়েন্ট ৫০ বা নিচে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*" if blocked else "\nℹ️ নিয়মগুলো পড়ে পুনরায় চেষ্টা করুন।"
                 rej_msg  = (
                     f"❌ *আপনার Submission Reject হয়েছে।*\n\n"
                     f"📌 *Task:* {_task_display}\n"
@@ -9501,7 +9700,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 pt_line  = f"🔴 *Points:* `{new_pts}/100` *(-{POINT_PER_REJECT})*"
-                blk_line = f"\n⛔ *Points at 30 or below! Tasks blocked for {POINT_BLOCK_DAYS} days.*" if blocked else "\nℹ️ Please re-read the rules and try again."
+                blk_line = f"\n⛔ *Points at 50 or below! Tasks blocked for {POINT_BLOCK_DAYS} days.*" if blocked else "\nℹ️ Please re-read the rules and try again."
                 rej_msg  = (
                     f"❌ *Your Submission has been Rejected.*\n\n"
                     f"📌 *Task:* {_task_display}\n"
@@ -9795,6 +9994,35 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e: await update.message.reply_text(f"❌ ব্যর্থ: {e}", parse_mode="Markdown")
             ctx.user_data.pop("state", None); ctx.user_data.pop("adm_tid", None); return
 
+        if st == "adm_set_owner_input":
+            _parts = txt.strip().split()
+            if len(_parts) != 2:
+                await update.message.reply_text(
+                    "❌ *ভুল format!*\n\nTask Code আর User ID আলাদা করে দিন:\n`TK-AB3X7 1234567890`",
+                    parse_mode="Markdown"); return
+            _ow_code, _ow_uid_s = _parts
+            try:
+                _ow_uid = int(_ow_uid_s)
+            except ValueError:
+                await update.message.reply_text("❌ *User ID সংখ্যা হতে হবে।*", parse_mode="Markdown"); return
+            _ow_tname, _ow_tbl = await asyncio.to_thread(set_task_owner_by_code, _ow_code, _ow_uid)
+            ctx.user_data.pop("state", None)
+            if not _ow_tname:
+                await update.message.reply_text(
+                    f"❌ `{_ow_code.upper()}` — এই কোড দিয়ে কোনো Task পাওয়া যায়নি।",
+                    parse_mode="Markdown"); return
+            if _ow_uid == 0:
+                await update.message.reply_text(
+                    f"✅ *Task Owner সরানো হয়েছে!*\n\n📌 *Task:* `{_ow_tname}`",
+                    parse_mode="Markdown"); return
+            await update.message.reply_text(
+                f"✅ *Task Owner সেট হয়েছে!*\n\n"
+                f"📌 *Task:* `{_ow_tname}`\n"
+                f"👤 *Owner ID:* `{_ow_uid}`\n\n"
+                f"এখন থেকে এই Task-এর প্রতিটি Submission ওই ইউজারের কাছেও যাবে\n"
+                f"_(user info ছাড়া — শুধু proof দেখবে)_",
+                parse_mode="Markdown"); return
+
         if st == "adm_task_code_input":
             code = txt.strip().upper()
             def _db_8342():
@@ -9945,20 +10173,25 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"{sub_lines}"
                 )
 
-            await update.message.reply_text(text2, parse_mode="Markdown")
+            await update.message.reply_text(text2, parse_mode="Markdown", reply_markup=kb2)
             ctx.user_data.pop("state", None); return
 
         if st == "adm_find_user_id":
             try:
                 tid = int(txt.strip())
+            except ValueError:
+                await update.message.reply_text("❌ সঠিক Telegram User ID দিন (শুধু সংখ্যা)।", parse_mode="Markdown")
+                ctx.user_data.pop("state", None); return
+            try:
                 u = await asyncio.to_thread(get_user, tid)
                 if not u:
                     await update.message.reply_text(f"❌ `{tid}` ID দিয়ে কোনো user পাওয়া যায়নি।", parse_mode="Markdown")
                 else:
                     text2, kb2 = await asyncio.to_thread(_build_user_profile, tid, u)
                     await update.message.reply_text(text2, parse_mode="Markdown", reply_markup=kb2)
-            except Exception:
-                await update.message.reply_text("❌ সঠিক Telegram User ID দিন।", parse_mode="Markdown")
+            except Exception as _fue:
+                log.warning(f"[ADM_FIND_USER] uid={tid}: {_fue}")
+                await update.message.reply_text(f"❌ User profile লোড করতে সমস্যা হয়েছে।\nError: `{_fue}`", parse_mode="Markdown")
             ctx.user_data.pop("state", None); return
 
         if st == "adm_uaddbal_amt":
@@ -10196,7 +10429,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         f"❌ *আপনার Submission Reject হয়েছে।*\n\n"
                         f"📌 *Task:* {_rid_task_display}\n\n"
                         f"🔴 *পয়েন্ট:* `{_rid_new_pts}/100` *(-{POINT_PER_REJECT})*"
-                        + (f"\n⛔ *পয়েন্ট ৩০ বা নিচে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*" if _rid_blocked
+                        + (f"\n⛔ *পয়েন্ট ৫০ বা নিচে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*" if _rid_blocked
                            else "\nℹ️ নিয়মগুলো পড়ে পুনরায় চেষ্টা করুন।")
                     )
                 else:
@@ -11458,11 +11691,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_wd_confirmation(update.message, ctx, uid); return
 
     # ── Menu buttons ──────────────────────────────────────────────
-    # typing indicator + guard + get_lang সবই parallel — একটার জন্য অন্যটা wait না করে
-    try:
-        await ctx.bot.send_chat_action(chat_id=uid, action="typing")
-    except Exception:
-        pass
+    # guard + get_lang parallel — sequential await নেই
+    # send_chat_action background-এ (fire & forget) — main path block করে না
+    _chat_act = asyncio.create_task(ctx.bot.send_chat_action(chat_id=uid, action="typing"))
+    _background_tasks.add(_chat_act); _chat_act.add_done_callback(_background_tasks.discard)
     _guard_ok, lang = await asyncio.gather(
         guard(update, ctx),
         asyncio.to_thread(get_lang, uid),
@@ -14222,30 +14454,43 @@ async def job_auto_withdraw(context):
                 except Exception as _e:
                     log.warning(f"[AUTO-WD] #{wid}: withdraw channel notify ব্যর্থ: {_e}")
                 try:
-                    _urow  = await asyncio.to_thread(get_user, uid)
-                    _uname_raw2 = (_urow["full_name"] or _urow["username"] or str(uid)) if _urow else str(uid)
-                    _uname = _uname_raw2.split('@')[0].strip() or str(uid)
-                    _uhandle = (f"@{_urow['username']}" if _urow and _urow["username"] else "_(username নেই)_")
+                    _urow       = await asyncio.to_thread(get_user, uid)
+                    _uname_plain = (_urow["full_name"] or _urow["username"] or str(uid)) if _urow else str(uid)
+                    _uname_plain = _uname_plain.split('@')[0].strip() or str(uid)
+                    _uhandle_plain = f"@{_urow['username']}" if (_urow and _urow.get("username")) else "নেই"
+                    # Plain text — no parse_mode — সবচেয়ে reliable, কোনো escape সমস্যা নেই
                     admin_ch_msg = (
-                        f"👤 *{_uname}*\n"
-                        f"📛 *Username:* {_uhandle}\n"
-                        f"🆔 *User ID:* `{uid}`\n\n"
-                        f"✅ *Withdraw সফল!*\n\n"
-                        f"💳 *Method:* USDT BEP-20 (BSC)\n"
-                        f"📋 *Address:* `{address}`\n"
-                        f"━━━━━━━━━━━━━━━━\n"
-                        f"💵 *Debit:* `${amt:.4f} USDT`\n"
-                        f"📉 *Fee:* `${fee:.4f} USDT`\n"
-                        f"💰 *Sent:* `${net_amt:.4f} USDT`\n"
-                        f"⛽ *Gas Fee:* `{gas_paid_str}`\n"
-                        f"━━━━━━━━━━━━━━━━\n"
-                        f"🔖 *WD ID:* `#{wid}`\n"
-                        f"🔗 *TX:* [BSCScan]({bscscan_url})\n"
-                        f"🕐 *সময়:* {now()}"
+                        f"✅ Withdraw সফল!\n\n"
+                        f"👤 User: {_uname_plain}\n"
+                        f"Username: {_uhandle_plain}\n"
+                        f"User ID: {uid}\n\n"
+                        f"Method: USDT BEP-20 (BSC)\n"
+                        f"Address: {address}\n"
+                        f"Debit: ${amt:.4f} USDT\n"
+                        f"Fee: ${fee:.4f} USDT\n"
+                        f"Sent: ${net_amt:.4f} USDT\n"
+                        f"Gas Fee: {gas_paid_str}\n"
+                        f"WD ID: #{wid}\n"
+                        f"TX: {bscscan_url}\n"
+                        f"সময়: {now()}"
                     )
-                    await context.bot.send_message(WD_DETAIL_CH_ID, admin_ch_msg, parse_mode="Markdown", disable_web_page_preview=True)
+                    await context.bot.send_message(WD_DETAIL_CH_ID, admin_ch_msg, disable_web_page_preview=True)
                 except Exception as _e:
                     log.warning(f"[AUTO-WD] #{wid}: Admin detail channel পাঠানো যায়নি — {_e}")
+                    # Channel fail হলে main admin কে সরাসরি জানাও (plain text)
+                    try:
+                        await context.bot.send_message(
+                            ADMIN_ID,
+                            f"⚠️ WD Detail Channel এ পাঠানো যায়নি!\n"
+                            f"Error: {str(_e)[:300]}\n\n"
+                            f"WD ID: #{wid} | User: {uid}\n"
+                            f"Amount: ${amt:.4f} | Sent: ${net_amt:.4f}\n"
+                            f"Address: {address}\n"
+                            f"TX: {bscscan_url}",
+                            disable_web_page_preview=True
+                        )
+                    except Exception:
+                        pass
                 log.info(f"[AUTO-WD] #{wid}: ✅ Approved — tx={tx_hash} | gas={gas_paid_str}")
             else:
                 # ── TX fail হয়েছে — BNB gas সমস্যা হলে সব Admin কে notify ──
@@ -14261,23 +14506,30 @@ async def job_auto_withdraw(context):
                     await asyncio.to_thread(_db_12258)
                     _mark_dirty()
                     log.warning(f"[AUTO-WD] #{wid}: BNB/Gas সমস্যা — pending এ রাখা হয়েছে।")
-                    # সব Admin কে alert পাঠাও
-                    try:
-                        _bnb_now = await asyncio.to_thread(get_bsc_bnb_balance)
-                        _bnb_str = f"{_bnb_now:.6f}" if _bnb_now is not None else "অজানা"
-                        _wallet  = await asyncio.to_thread(get_bsc_wallet_addr)
-                        await notify_full_admins(
-                            context.bot,
-                            f"⚠️ *Wallet এ BNB শেষ! Withdrawal আটকে আছে।*\n\n"
-                            f"🔋 *BNB Balance:* `{_bnb_str} BNB`\n\n"
-                            f"📌 *আটকে থাকা WD:* `#{wid}`\n"
-                            f"👤 *User:* `{uid}`\n"
-                            f"💰 *Amount:* `${amt:.4f} USDT`\n\n"
-                            f"👉 *Wallet এ BNB যোগ করুন, তারপর Withdrawal আপনা-আপনি process হবে।*\n"
-                            f"🔗 *Wallet:* `{_wallet}`"
-                        )
-                    except Exception as _e:
-                        log.error(f"[AUTO-WD] BNB alert পাঠানো যায়নি — {_e}")
+                    # Cooldown check — প্রতি ঘন্টায় সর্বোচ্চ একবার alert
+                    import time as _time_mod
+                    global _bnb_alert_last_sent
+                    _now_ts = _time_mod.monotonic()
+                    if _now_ts - _bnb_alert_last_sent >= _BNB_ALERT_COOLDOWN:
+                        _bnb_alert_last_sent = _now_ts
+                        try:
+                            _bnb_now = await asyncio.to_thread(get_bsc_bnb_balance)
+                            _bnb_str = f"{_bnb_now:.6f}" if _bnb_now is not None else "অজানা"
+                            _wallet  = await asyncio.to_thread(get_bsc_wallet_addr)
+                            await notify_all_admins(
+                                context.bot,
+                                f"⚠️ *Wallet এ BNB শেষ! Withdrawal আটকে আছে।*\n\n"
+                                f"🔋 *BNB Balance:* `{_bnb_str} BNB`\n\n"
+                                f"📌 *আটকে থাকা WD:* `#{wid}`\n"
+                                f"👤 *User:* `{uid}`\n"
+                                f"💰 *Amount:* `${amt:.4f} USDT`\n\n"
+                                f"👉 *Wallet এ BNB যোগ করুন, তারপর Withdrawal আপনা-আপনি process হবে।*\n"
+                                f"🔗 *Wallet:* `{_wallet}`"
+                            )
+                        except Exception as _e:
+                            log.error(f"[AUTO-WD] BNB alert পাঠানো যায়নি — {_e}")
+                    else:
+                        log.warning(f"[AUTO-WD] BNB alert cooldown চলছে — skip করা হয়েছে")
                     continue   # এই withdrawal pending — পরেরটা try করো
 
                 # ── অন্য error — tx_hash IS NULL নিশ্চিত করো — TX গেলে refund করবো না
