@@ -2943,11 +2943,17 @@ async def _send_welcome(update, ctx, uid):
 async def guard(update, ctx):
     uid = update.effective_user.id if update.effective_user else None
     if not uid: return False
-    # get_user + check_ch parallel চালাও — উভয় independent তাই await করার দরকার নেই একে একে
-    u, missing = await asyncio.gather(
-        asyncio.to_thread(get_user, uid),
-        check_ch(update, ctx),
-    )
+    # Fast path: user cache sync check — thread dispatch ছাড়াই
+    _u_fast = _get_user_cached_fast(uid)
+    if _u_fast is not False:
+        # User cache hit — শুধু check_ch দরকার
+        u, missing = _u_fast, await check_ch(update, ctx)
+    else:
+        # Cache miss — get_user + check_ch parallel
+        u, missing = await asyncio.gather(
+            asyncio.to_thread(get_user, uid),
+            check_ch(update, ctx),
+        )
     if u and u["is_banned"]:
         if update.message:
             await update.message.reply_text(T(uid, 'banned'), parse_mode="Markdown")
@@ -2975,12 +2981,39 @@ def _update_last_seen_sync(uid, ts):
     with _c() as c:
         c.execute("UPDATE users SET last_seen=%s WHERE user_id=%s", (ts, uid))
 
+def _bot_is_on_cached_fast() -> "bool | None":
+    """Sync cache-only check — event loop এ চালানো safe (শুধু dict read, GIL protected)।
+    Returns: True/False if cache hit, None if cache miss (DB query দরকার)."""
+    entry = _settings_cache.get('bot_status')
+    if entry is not None:
+        val, ts = entry
+        if _time.monotonic() - ts < _SETTINGS_TTL:
+            return (val or 'on') != 'off'
+    return None  # cache miss → caller asyncio.to_thread করবে
+
+def _get_user_cached_fast(uid: int):
+    """Sync cache-only user read — event loop এ safe।
+    Returns: user dict if cache hit, False if cache miss."""
+    cached = _user_cache.get(uid)
+    if cached:
+        u, ts = cached
+        if _time.monotonic() - ts < _USER_CACHE_TTL:
+            return u
+    return False  # cache miss sentinel
+
 async def _bot_accessible(uid: int) -> bool:
-    """bot চালু থাকলে (common case) সবাই accessible — is_admin check দরকার নেই।
-    Bot বন্ধ থাকলেই শুধু is_admin check করো → 1 thread dispatch vs আগের 2।"""
-    _on = await asyncio.to_thread(bot_is_on)
-    if _on:
-        return True          # fast path: bot চালু → thread dispatch বাঁচাও
+    """bot চালু থাকলে (common case) সবাই accessible।
+    Fast path: cache থেকে sync পড়ো — thread dispatch নেই।
+    Cache miss হলে তবেই asyncio.to_thread করো।"""
+    _fast = _bot_is_on_cached_fast()
+    if _fast is True:
+        return True          # ✅ cache hit: bot চালু → zero thread dispatch
+    if _fast is None:
+        # Cache miss — thread dispatch করতে হবে
+        _fast = await asyncio.to_thread(bot_is_on)
+    if _fast:
+        return True
+    # Bot বন্ধ — admin কিনা check করো
     return await asyncio.to_thread(is_admin, uid)
 
 async def bot_off_reply(update, uid=0):
@@ -3734,14 +3767,15 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
         return
 
     # Mark done সফল — এখন gmails row তৈরি করো
+    _cat_owner_ins = int(_rget(ttype_obj, 'owner_id', 0) or 0) if ttype_obj else 0
     gid = None
     try:
         def _db_2977():
             gid = None
             with _c() as c:
                 cur = c.execute(
-                    "INSERT INTO gmails (user_id,gmail_text,task_name,amount,submitted_at,task_type,task_code) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                    (uid, gmail_text, f"[CAT] {task_name}", price, now(), ttype_ins, _cat_tcode)
+                    "INSERT INTO gmails (user_id,gmail_text,task_name,amount,submitted_at,task_type,task_code,owner_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (uid, gmail_text, f"[CAT] {task_name}", price, now(), ttype_ins, _cat_tcode, _cat_owner_ins)
                 )
                 gid = cur.lastrowid
             return gid
@@ -4704,12 +4738,13 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
     _ttype_ins   = _rget(_t_obj, 'task_type', 'other') if _t_obj else 'other'
     _t_icon      = task_type_icon(_ttype_ins)
     _reg_tcode   = _rget(_t_obj, 'task_code', '') if _t_obj else ''
+    _reg_owner_ins = int(_rget(_t_obj, 'owner_id', 0) or 0) if _t_obj else 0
     def _insert_gmail_row():
         _gid = None
         with _c() as c:
             cur = c.execute(
-                "INSERT INTO gmails (user_id,gmail_text,task_name,amount,submitted_at,task_type,task_code) VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id",
-                (uid, gmail_text, task_name, price, now(), _ttype_ins, _reg_tcode)
+                "INSERT INTO gmails (user_id,gmail_text,task_name,amount,submitted_at,task_type,task_code,owner_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING id",
+                (uid, gmail_text, task_name, price, now(), _ttype_ins, _reg_tcode, _reg_owner_ins)
             )
             _gid = cur.lastrowid
             if _gid is None:
@@ -7133,7 +7168,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             if bt_done:
                 track_status = "✅ আজকের Daily Reward পেয়েছেন!"
             elif actively_track:
-                track_status = "🔄 Tracking চলছে — কাল রাত ১২:০৫ এ daily reward পাবেন"
+                track_status = "🔄 Tracking চলছে — কাল রাত ১২:০০ তে daily reward পাবেন"
             elif add_done:
                 track_status = "⚠️ Bio সরানো আছে — আবার সেট করুন (Add Reward পুনরায় পাবেন না)"
             else:
@@ -7156,7 +7191,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             if bt_done:
                 track_status = "✅ Today's Daily Reward received!"
             elif actively_track:
-                track_status = "🔄 Tracking active — daily reward at 12:05 AM tomorrow"
+                track_status = "🔄 Tracking active — daily reward at 12:00 AM tomorrow"
             elif add_done:
                 track_status = "⚠️ Bio removed — set it again (Add Reward won't be given again)"
             else:
@@ -7375,7 +7410,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
                     f"✅ Bio সঠিকভাবে সেট করা হয়েছে।\n"
                     f"💰 *`{add_reward}$ USDT`* আপনার একাউন্টে যোগ হয়েছে!\n\n"
                     f"💳 *নতুন ব্যালান্স:* `{round(new_bal,4)}$ USDT`\n\n"
-                    f"📅 Daily `{daily_reward}$` প্রতিদিন রাত ১২:০৫ এ অটো পাবেন।\n"
+                    f"📅 Daily `{daily_reward}$` প্রতিদিন রাত ১২:০০ তে অটো পাবেন।\n"
                     f"⚠️ Bio সরালে daily payment বাতিল হবে!"
                 )
             else:
@@ -7384,19 +7419,19 @@ async def _bio_task_check_inner(update, ctx, q, uid):
                     f"✅ Bio set correctly.\n"
                     f"💰 *`{add_reward}$ USDT`* added to your account!\n\n"
                     f"💳 *New Balance:* `{round(new_bal,4)}$ USDT`\n\n"
-                    f"📅 Daily `{daily_reward}$` auto-credited every night at 12:05 AM.\n"
+                    f"📅 Daily `{daily_reward}$` auto-credited every night at 12:00 AM.\n"
                     f"⚠️ Removing your Bio will cancel daily payment!"
                 )
         else:
             if lang == 'bn':
                 msg = (
                     f"✅ *Bio সঠিকভাবে সেট করা হয়েছে!*\n\n"
-                    f"📅 Daily `{daily_reward}$` প্রতিদিন রাত ১২:০৫ এ পাবেন।"
+                    f"📅 Daily `{daily_reward}$` প্রতিদিন রাত ১২:০০ তে পাবেন।"
                 )
             else:
                 msg = (
                     f"✅ *Bio verified successfully!*\n\n"
-                    f"📅 Daily `{daily_reward}$` every night at 12:05 AM."
+                    f"📅 Daily `{daily_reward}$` every night at 12:00 AM."
                 )
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Tasks", callback_data="task_cancel")]])
         await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
@@ -7404,7 +7439,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
         await asyncio.to_thread(set_bio_tracking, uid)
         bt_done = await asyncio.to_thread(bio_task_paid_today, uid)
         if lang == 'bn':
-            status = "✅ আজকের Daily Reward পেয়েছেন!" if bt_done else "🔄 Daily reward আজ রাত ১২:০৫ এ পাবেন।"
+            status = "✅ আজকের Daily Reward পেয়েছেন!" if bt_done else "🔄 Daily reward আজ রাত ১২:০০ তে পাবেন।"
             msg = (
                 f"✅ *Bio সঠিক আছে — Tracking চালু হয়েছে!*\n\n"
                 f"🆕 Add Reward আগেই নেওয়া হয়েছে (পুনরায় পাবেন না)।\n"
@@ -7412,7 +7447,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
                 f"⚠️ Bio ঠিক রাখুন — daily reward পেতে।"
             )
         else:
-            status = "✅ Today's daily reward received!" if bt_done else "🔄 Daily reward at 12:05 AM tonight."
+            status = "✅ Today's daily reward received!" if bt_done else "🔄 Daily reward at 12:00 AM tonight."
             msg = (
                 f"✅ *Bio is correct!*\n\n"
                 f"🆕 Add Reward already claimed.\n"
@@ -8365,7 +8400,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             f"📊 *Status:* {st}\n\n"
             f"📝 *Required Bio Text:*\n"
             f"`Free Task Earn bot https://t.me/BotUsername?start=ref_UserID`\n\n"
-            f"🕛 প্রতিদিন রাত ১২:০৫ BD এ automatic check হয়।\n"
+            f"🕛 প্রতিদিন রাত ১২:০০ BD তে automatic check হয়।\n"
             f"⏳ Bio সরালে ৫ মিনিট grace — তারপর tracking reset।"
         ), act
 
@@ -9636,132 +9671,134 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(T(uid,'cancelled'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
         return
 
-    # ── Admin states ──────────────────────────────────────────────
-    # st আগে চেক করো — regular user-এর জন্য is_admin DB call বাদ যাবে (short-circuit)
-    if st and (st.startswith("adm_") or st == "adm_direct_msg") and await asyncio.to_thread(is_admin, uid):
-
-        if st == "adm_reject_reason":
-            gid    = ctx.user_data.get("adm_reject_gid")
-            reason = txt.strip()
-            if not gid:
-                ctx.user_data.pop("state", None); return
-            def _db_8020():
-                row = None
-                with _c() as c:
-                    row = c.execute("SELECT * FROM gmails WHERE id=%s", (gid,)).fetchone()
-                return row
-            row = await asyncio.to_thread(_db_8020)
-            if not row or row["status"] != "pending":
-                await update.message.reply_text("⚠️ Sub আর pending নেই।", parse_mode="Markdown")
-                for k in ("state","adm_reject_gid","adm_reject_msg_id","adm_reject_chat_id",
-                          "adm_reject_has_photo","adm_reject_orig_txt"):
-                    ctx.user_data.pop(k, None)
-                return
-            # Atomic: AND status='pending' — admin reason টাইপ করার ফাঁকে approve হয়ে গেলে reject হবে না
-            _rreason_already = False
-            def _db_8030():
-                _rreason_already = None
-                with _c() as c:
-                    _rr_cur = c.execute(
-                        "UPDATE gmails SET status='rejected', reject_reason=%s WHERE id=%s AND status='pending'",
-                        (reason, gid)
-                    )
-                    if _rr_cur.rowcount == 0:
-                        _rreason_already = True
-                return _rreason_already
-            _rreason_already = await asyncio.to_thread(_db_8030)
-            if _rreason_already:
-                await update.message.reply_text(f"⚠️ Sub `#{gid}` ইতিমধ্যে approve/reject হয়েছে — reject বাতিল।", parse_mode="Markdown")
-                for k in ("state","adm_reject_gid","adm_reject_msg_id","adm_reject_chat_id",
-                          "adm_reject_has_photo","adm_reject_orig_txt"):
-                    ctx.user_data.pop(k, None)
-                return
-            # Category task হলে slot ফিরিয়ে দাও + task reactivate করো
-            await asyncio.to_thread(_reject_restore_task_slot, row)
-            guser = row["user_id"]
-            _row_ttype    = _rget(row, 'task_type', 'other')
-            _row_ticon    = task_type_icon(_row_ttype)
-            _task_display = f"{_row_ticon} {row['task_name']}"
-            # ── Point deduction ─────────────────────────────────────
-            new_pts  = await asyncio.to_thread(add_points, guser, -POINT_PER_REJECT)
-            blocked  = new_pts <= POINT_BLOCK_AT
-            # ── Notify user ─────────────────────────────────────────
-            u_lang = await asyncio.to_thread(get_lang, guser)
-            if u_lang == 'bn':
-                pt_line  = f"🔴 *পয়েন্ট:* `{new_pts}/100` *(-{POINT_PER_REJECT})*"
-                blk_line = f"\n⛔ *পয়েন্ট ৫০ বা নিচে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*" if blocked else "\nℹ️ নিয়মগুলো পড়ে পুনরায় চেষ্টা করুন।"
-                rej_msg  = (
-                    f"❌ *আপনার Submission Reject হয়েছে।*\n\n"
-                    f"📌 *Task:* {_task_display}\n"
-                    f"📝 *কারণ:* {reason}\n\n"
-                    f"{pt_line}{blk_line}"
-                )
-            else:
-                pt_line  = f"🔴 *Points:* `{new_pts}/100` *(-{POINT_PER_REJECT})*"
-                blk_line = f"\n⛔ *Points at 50 or below! Tasks blocked for {POINT_BLOCK_DAYS} days.*" if blocked else "\nℹ️ Please re-read the rules and try again."
-                rej_msg  = (
-                    f"❌ *Your Submission has been Rejected.*\n\n"
-                    f"📌 *Task:* {_task_display}\n"
-                    f"📝 *Reason:* {reason}\n\n"
-                    f"{pt_line}{blk_line}"
-                )
-            try:
-                await ctx.bot.send_message(guser, rej_msg, parse_mode="Markdown")
-            except Exception: pass
-            # ── Edit original submission message ─────────────────────
-            status_line  = f"\n\n❌ *REJECTED by Admin*\n📝 *Reason:* {reason}"
-            orig_txt     = ctx.user_data.get("adm_reject_orig_txt", "")
-            has_photo    = ctx.user_data.get("adm_reject_has_photo", False)
-            orig_msg_id  = ctx.user_data.get("adm_reject_msg_id")
-            orig_chat_id = ctx.user_data.get("adm_reject_chat_id")
-            new_txt = orig_txt + status_line
-            if orig_msg_id and orig_chat_id:
-                try:
-                    if has_photo:
-                        await ctx.bot.edit_message_caption(new_txt, chat_id=orig_chat_id,
-                                                           message_id=orig_msg_id, parse_mode="Markdown", reply_markup=None)
-                    else:
-                        await ctx.bot.edit_message_text(new_txt, chat_id=orig_chat_id,
-                                                        message_id=orig_msg_id, parse_mode="Markdown", reply_markup=None)
-                except Exception: pass
-            # ── Edit channel/other-side message ──────────────────────
-            def _db_8090():
-                row2 = None
-                with _c() as c: row2 = c.execute("SELECT * FROM gmails WHERE id=%s", (gid,)).fetchone()
-                return row2
-            row2 = await asyncio.to_thread(_db_8090)
-            if row2:
-                # Sub-admin reject করলেও admin + channel দুটো message-ই আপডেট করো
-                _rch_id = await asyncio.to_thread(get_gmail_ch_id)
-                _rmsgs_to_edit = []
-                if uid == ADMIN_ID:
-                    if row2["channel_msg_id"]: _rmsgs_to_edit.append((_rch_id, row2["channel_msg_id"]))
-                else:
-                    if row2["admin_msg_id"]:   _rmsgs_to_edit.append((ADMIN_ID, row2["admin_msg_id"]))
-                    if row2["channel_msg_id"]: _rmsgs_to_edit.append((_rch_id,  row2["channel_msg_id"]))
-                for _recid, _remid in _rmsgs_to_edit:
-                    try:
-                        if has_photo:
-                            await ctx.bot.edit_message_caption(new_txt, chat_id=_recid,
-                                                               message_id=_remid, parse_mode="Markdown", reply_markup=None)
-                        else:
-                            await ctx.bot.edit_message_text(new_txt, chat_id=_recid,
-                                                            message_id=_remid, parse_mode="Markdown", reply_markup=None)
-                    except Exception: pass
-            # ── Admin confirmation ────────────────────────────────────
-            await update.message.reply_text(
-                f"❌ *Sub `#{gid}` Rejected!*\n\n"
-                f"📌 *Task:* {row['task_name']}\n"
-                f"👤 *User:* `{guser}`\n"
-                f"📝 *কারণ:* {reason}\n"
-                f"🎯 *User এর পয়েন্ট:* `{new_pts}/100`"
-                + (f"\n⛔ *User {POINT_BLOCK_DAYS} দিন Block হয়েছে।*" if blocked else ""),
-                parse_mode="Markdown"
-            )
+    # ── adm_reject_reason: admin + task owner দুজনেই — is_admin check ছাড়া ──
+    # (state টা শুধু ঐ user এর ctx.user_data তে থাকে, তাই security ঠিক আছে)
+    if st == "adm_reject_reason":
+        gid    = ctx.user_data.get("adm_reject_gid")
+        reason = txt.strip()
+        if not gid:
+            ctx.user_data.pop("state", None); return
+        def _db_8020():
+            row = None
+            with _c() as c:
+                row = c.execute("SELECT * FROM gmails WHERE id=%s", (gid,)).fetchone()
+            return row
+        row = await asyncio.to_thread(_db_8020)
+        if not row or row["status"] != "pending":
+            await update.message.reply_text("⚠️ Sub আর pending নেই।", parse_mode="Markdown")
             for k in ("state","adm_reject_gid","adm_reject_msg_id","adm_reject_chat_id",
                       "adm_reject_has_photo","adm_reject_orig_txt"):
                 ctx.user_data.pop(k, None)
             return
+        # Atomic: AND status='pending' — admin reason টাইপ করার ফাঁকে approve হয়ে গেলে reject হবে না
+        _rreason_already = False
+        def _db_8030():
+            _rreason_already = None
+            with _c() as c:
+                _rr_cur = c.execute(
+                    "UPDATE gmails SET status='rejected', reject_reason=%s WHERE id=%s AND status='pending'",
+                    (reason, gid)
+                )
+                if _rr_cur.rowcount == 0:
+                    _rreason_already = True
+            return _rreason_already
+        _rreason_already = await asyncio.to_thread(_db_8030)
+        if _rreason_already:
+            await update.message.reply_text(f"⚠️ Sub `#{gid}` ইতিমধ্যে approve/reject হয়েছে — reject বাতিল।", parse_mode="Markdown")
+            for k in ("state","adm_reject_gid","adm_reject_msg_id","adm_reject_chat_id",
+                      "adm_reject_has_photo","adm_reject_orig_txt"):
+                ctx.user_data.pop(k, None)
+            return
+        # Category task হলে slot ফিরিয়ে দাও + task reactivate করো
+        await asyncio.to_thread(_reject_restore_task_slot, row)
+        guser = row["user_id"]
+        _row_ttype    = _rget(row, 'task_type', 'other')
+        _row_ticon    = task_type_icon(_row_ttype)
+        _task_display = f"{_row_ticon} {row['task_name']}"
+        # ── Point deduction ─────────────────────────────────────
+        new_pts  = await asyncio.to_thread(add_points, guser, -POINT_PER_REJECT)
+        blocked  = new_pts <= POINT_BLOCK_AT
+        # ── Notify user ─────────────────────────────────────────
+        u_lang = await asyncio.to_thread(get_lang, guser)
+        if u_lang == 'bn':
+            pt_line  = f"🔴 *পয়েন্ট:* `{new_pts}/100` *(-{POINT_PER_REJECT})*"
+            blk_line = f"\n⛔ *পয়েন্ট ৫০ বা নিচে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*" if blocked else "\nℹ️ নিয়মগুলো পড়ে পুনরায় চেষ্টা করুন।"
+            rej_msg  = (
+                f"❌ *আপনার Submission Reject হয়েছে।*\n\n"
+                f"📌 *Task:* {_task_display}\n"
+                f"📝 *কারণ:* {reason}\n\n"
+                f"{pt_line}{blk_line}"
+            )
+        else:
+            pt_line  = f"🔴 *Points:* `{new_pts}/100` *(-{POINT_PER_REJECT})*"
+            blk_line = f"\n⛔ *Points at 50 or below! Tasks blocked for {POINT_BLOCK_DAYS} days.*" if blocked else "\nℹ️ Please re-read the rules and try again."
+            rej_msg  = (
+                f"❌ *Your Submission has been Rejected.*\n\n"
+                f"📌 *Task:* {_task_display}\n"
+                f"📝 *Reason:* {reason}\n\n"
+                f"{pt_line}{blk_line}"
+            )
+        try:
+            await ctx.bot.send_message(guser, rej_msg, parse_mode="Markdown")
+        except Exception: pass
+        # ── Edit original submission message ─────────────────────
+        status_line  = f"\n\n❌ *REJECTED by Admin*\n📝 *Reason:* {reason}"
+        orig_txt     = ctx.user_data.get("adm_reject_orig_txt", "")
+        has_photo    = ctx.user_data.get("adm_reject_has_photo", False)
+        orig_msg_id  = ctx.user_data.get("adm_reject_msg_id")
+        orig_chat_id = ctx.user_data.get("adm_reject_chat_id")
+        new_txt = orig_txt + status_line
+        if orig_msg_id and orig_chat_id:
+            try:
+                if has_photo:
+                    await ctx.bot.edit_message_caption(new_txt, chat_id=orig_chat_id,
+                                                       message_id=orig_msg_id, parse_mode="Markdown", reply_markup=None)
+                else:
+                    await ctx.bot.edit_message_text(new_txt, chat_id=orig_chat_id,
+                                                    message_id=orig_msg_id, parse_mode="Markdown", reply_markup=None)
+            except Exception: pass
+        # ── Edit channel/other-side message ──────────────────────
+        def _db_8090():
+            row2 = None
+            with _c() as c: row2 = c.execute("SELECT * FROM gmails WHERE id=%s", (gid,)).fetchone()
+            return row2
+        row2 = await asyncio.to_thread(_db_8090)
+        if row2:
+            # Sub-admin reject করলেও admin + channel দুটো message-ই আপডেট করো
+            _rch_id = await asyncio.to_thread(get_gmail_ch_id)
+            _rmsgs_to_edit = []
+            if uid == ADMIN_ID:
+                if row2["channel_msg_id"]: _rmsgs_to_edit.append((_rch_id, row2["channel_msg_id"]))
+            else:
+                if row2["admin_msg_id"]:   _rmsgs_to_edit.append((ADMIN_ID, row2["admin_msg_id"]))
+                if row2["channel_msg_id"]: _rmsgs_to_edit.append((_rch_id,  row2["channel_msg_id"]))
+            for _recid, _remid in _rmsgs_to_edit:
+                try:
+                    if has_photo:
+                        await ctx.bot.edit_message_caption(new_txt, chat_id=_recid,
+                                                           message_id=_remid, parse_mode="Markdown", reply_markup=None)
+                    else:
+                        await ctx.bot.edit_message_text(new_txt, chat_id=_recid,
+                                                        message_id=_remid, parse_mode="Markdown", reply_markup=None)
+                except Exception: pass
+        # ── Admin confirmation ────────────────────────────────────
+        await update.message.reply_text(
+            f"❌ *Sub `#{gid}` Rejected!*\n\n"
+            f"📌 *Task:* {row['task_name']}\n"
+            f"👤 *User:* `{guser}`\n"
+            f"📝 *কারণ:* {reason}\n"
+            f"🎯 *User এর পয়েন্ট:* `{new_pts}/100`"
+            + (f"\n⛔ *User {POINT_BLOCK_DAYS} দিন Block হয়েছে।*" if blocked else ""),
+            parse_mode="Markdown"
+        )
+        for k in ("state","adm_reject_gid","adm_reject_msg_id","adm_reject_chat_id",
+                  "adm_reject_has_photo","adm_reject_orig_txt"):
+            ctx.user_data.pop(k, None)
+        return
+
+    # ── Admin states (admin only) ─────────────────────────────────────────
+    # st আগে চেক করো — regular user-এর জন্য is_admin DB call বাদ যাবে (short-circuit)
+    if st and (st.startswith("adm_") or st == "adm_direct_msg") and await asyncio.to_thread(is_admin, uid):
 
         if st == "adm_direct_msg":
             target = ctx.user_data.get("direct_msg_to")
@@ -13030,10 +13067,11 @@ def _hc_load_msg_id(ch_id) -> int | None:
 
 def _lb_get_user_full_rank(uid: int) -> tuple[int, int] | tuple[None, None]:
     """সব user এর মধ্যে এই user কত নম্বরে — rank ও task count ফেরত দেয়।
-    সব task type গণনা হয়: Gmail, TG, Regular, Category।
-    _lb_get_rows() এর মতো একই time window ব্যবহার করে (আজকের midnight BD)।"""
+    gmails (regular + category) + tg_task_completions — category_task_completions বাদ
+    (category tasks gmails-এ already আছে, double-count হয়)।
+    timestamps DB-তে BD local time হিসেবে stored → BD time দিয়ে compare করো।"""
     since = datetime.now(BD_TZ).replace(hour=0, minute=0, second=0, microsecond=0) \
-                .astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                .strftime("%Y-%m-%d %H:%M:%S")   # BD local — UTC convert করলে ৬ ঘণ্টা ভুল হয়
     with _c() as c:
         all_rows = c.execute("""
             SELECT user_id, COUNT(*) AS cnt
@@ -13043,14 +13081,10 @@ def _lb_get_user_full_rank(uid: int) -> tuple[int, int] | tuple[None, None]:
                 UNION ALL
                 SELECT user_id, done_at AS ts FROM tg_task_completions
                 WHERE done_at >= %s
-                UNION ALL
-                SELECT ctc.user_id, ctc.done_at AS ts FROM category_task_completions ctc
-                JOIN category_tasks ct ON ctc.task_id = ct.id
-                WHERE ctc.done_at >= %s
             ) combined
             GROUP BY user_id
             ORDER BY cnt DESC
-        """, (since, since, since)).fetchall()
+        """, (since, since)).fetchall()
     for i, row in enumerate(all_rows):
         if row['user_id'] == uid:
             return (i + 1, row['cnt'])
@@ -13058,18 +13092,18 @@ def _lb_get_user_full_rank(uid: int) -> tuple[int, int] | tuple[None, None]:
 
 
 def _lb_get_rows(yesterday: bool = False) -> list:
-    """Top 10 users — সব task type মিলিয়ে: Gmail, TG, Regular, Category।
+    """Top 10 users — gmails (regular+category) + tg_task_completions।
+    category_task_completions বাদ — category tasks gmails-এ already আছে (double-count ঠেকাতে)।
     yesterday=False → আজকের রাত ১২:০০ AM BD থেকে এখন পর্যন্ত।
     yesterday=True  → গতকাল রাত ১২:০০ AM থেকে আজ রাত ১২:০০ AM পর্যন্ত।
+    ⚠️  timestamps DB-তে BD local time string → BD time দিয়ে compare করো, UTC নয়।
     Returns list of (user_id, full_name, username, cnt) tuples."""
     today_midnight_bd = datetime.now(BD_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     if yesterday:
-        since_dt = today_midnight_bd - timedelta(days=1)
-        until_dt = today_midnight_bd
-        since = since_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        until = until_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        since = (today_midnight_bd - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        until = today_midnight_bd.strftime("%Y-%m-%d %H:%M:%S")
     else:
-        since = today_midnight_bd.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        since = today_midnight_bd.strftime("%Y-%m-%d %H:%M:%S")
         until = None
     with _c() as c:
         if until:
@@ -13081,15 +13115,12 @@ def _lb_get_rows(yesterday: bool = False) -> list:
                     UNION ALL
                     SELECT user_id, done_at AS ts FROM tg_task_completions
                     WHERE done_at >= %s AND done_at < %s
-                    UNION ALL
-                    SELECT user_id, done_at AS ts FROM category_task_completions
-                    WHERE done_at >= %s AND done_at < %s
                 ) combined
                 JOIN users u ON combined.user_id = u.user_id
                 GROUP BY u.user_id, u.full_name, u.username
                 ORDER BY cnt DESC
                 LIMIT 10
-            """, (since, until, since, until, since, until)).fetchall()
+            """, (since, until, since, until)).fetchall()
         else:
             raw = c.execute("""
                 SELECT u.user_id, u.full_name, u.username, COUNT(*) AS cnt
@@ -13099,15 +13130,12 @@ def _lb_get_rows(yesterday: bool = False) -> list:
                     UNION ALL
                     SELECT user_id, done_at AS ts FROM tg_task_completions
                     WHERE done_at >= %s
-                    UNION ALL
-                    SELECT user_id, done_at AS ts FROM category_task_completions
-                    WHERE done_at >= %s
                 ) combined
                 JOIN users u ON combined.user_id = u.user_id
                 GROUP BY u.user_id, u.full_name, u.username
                 ORDER BY cnt DESC
                 LIMIT 10
-            """, (since, since, since)).fetchall()
+            """, (since, since)).fetchall()
     # RealDictCursor rows → tuple list for backward-compatible callers
     return [(r['user_id'], r['full_name'], r['username'], r['cnt']) for r in raw]
 
@@ -13138,13 +13166,13 @@ def _lb_build_text_admin() -> str:
             name  = html.escape((full_name or "User").strip())
             uname = f"@{html.escape(username)}" if username else "—"
             lines.append(f"{medals[i]} {name} | {uname} | <code>{user_id}</code> — {cnt}টি Task")
-    lines.append("\n⏰ প্রতিদিন রাত ১২:০৫ BD তে আপডেট হয়")
+    lines.append("\n⏰ প্রতিদিন রাত ১২:০০ BD তে আপডেট হয়")
     return "\n".join(lines)
 
 
 def _lb_build_text(lang: str = "bn", yesterday: bool = False) -> str:
     """Channel/User leaderboard — HTML, শুধু নাম (@ হাইড)।
-    yesterday=True → গতকালের দিনের ফলাফল (১২:০৫ AM channel post এর জন্য)।"""
+    yesterday=True → গতকালের দিনের ফলাফল (১২:০০ AM channel post এর জন্য)।"""
     now_bd  = datetime.now(BD_TZ)
     ref_bd  = now_bd - timedelta(days=1) if yesterday else now_bd
     day     = ref_bd.day
@@ -13161,7 +13189,7 @@ def _lb_build_text(lang: str = "bn", yesterday: bool = False) -> str:
             for i, (user_id, full_name, username, cnt) in enumerate(rows):
                 name = _lb_mask_name(full_name, username)
                 lines.append(f"{medals[i]} {name} — {cnt} Task{'s' if cnt > 1 else ''}")
-        lines.append("\n⏰ Results calculated every day at 12:05 AM Bangladesh Time")
+        lines.append("\n⏰ Results calculated every day at 12:00 AM Bangladesh Time")
         lines.append("\nParticipate daily, rise on the leaderboard 🚀")
     else:
         month  = BN_MONTHS[ref_bd.month]
@@ -13174,7 +13202,7 @@ def _lb_build_text(lang: str = "bn", yesterday: bool = False) -> str:
             for i, (user_id, full_name, username, cnt) in enumerate(rows):
                 name = _lb_mask_name(full_name, username)
                 lines.append(f"{medals[i]} {name} — {cnt}টি Task")
-        lines.append("\n⏰ প্রতিদিন বাংলাদেশ সময় রাত ১২টা ৫ মিনিটে স্বয়ংক্রিয়ভাবে দিনের ফলাফল গণনা করা হয়")
+        lines.append("\n⏰ প্রতিদিন বাংলাদেশ সময় রাত ১২:০০ তে স্বয়ংক্রিয়ভাবে দিনের ফলাফল গণনা করা হয়")
         lines.append("\nপ্রতিদিন অংশ নিন, লিডারবোর্ডে উঠুন 🚀")
 
     return "\n".join(lines)
@@ -13213,7 +13241,7 @@ async def job_lb_adm_update(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
-    """প্রতিদিন রাত ১২:০৫ (BD) — 24h tracking + 5min grace period সহ bio চেক।
+    """প্রতিদিন রাত ১২:০০ (BD) — 24h tracking + 5min grace period সহ bio চেক।
     Parallel processing (Semaphore=10) + asyncio.to_thread for all DB calls.
     """
     bio_task = await asyncio.to_thread(get_bio_task)
@@ -13318,8 +13346,15 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
             else:
                 failed_list.append({'uid': uid, 'name': u.get('full_name', '')})
 
-    # ── প্রথম pass — সব user parallel ──────────────────────────────
-    await asyncio.gather(*[_process_one_user(u) for u in users], return_exceptions=True)
+    # ── প্রথম pass — ২০ জন করে chunked (DB pool + TG flood ঠেকাতে) ──
+    _CHUNK = 20
+    for _ci in range(0, len(users), _CHUNK):
+        await asyncio.gather(
+            *[_process_one_user(u) for u in users[_ci:_ci + _CHUNK]],
+            return_exceptions=True
+        )
+        if _ci + _CHUNK < len(users):
+            await asyncio.sleep(1)
 
     # ── Grace period — warning পাঠাও, ৫ মিনিট wait ─────────────────
     for g in grace_list:
@@ -13401,19 +13436,25 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                     f"৫ মিনিটের মধ্যে Bio সেট না করায় আজকের payment হয়নি।\n\n"
                     f"📝 আবার শুরু করতে Bio সেট করুন:\n"
                     f"`Free Task Earn bot https://t.me/{bot_username}?start=ref_{uid}`\n\n"
-                    f"কাল রাত ১২:০৫ এ আবার চেক হবে।"
+                    f"কাল রাত ১২:০০ তে আবার চেক হবে।"
                     if lang == 'bn' else
                     f"❌ *Today's Bio Task Payment cancelled.*\n\n"
                     f"Bio was not restored within 5 minutes.\n\n"
                     f"📝 To restart, set your Bio to:\n"
                     f"`Free Task Earn bot https://t.me/{bot_username}?start=ref_{uid}`\n\n"
-                    f"Next check tomorrow at 12:05 AM."
+                    f"Next check tomorrow at 12:00 AM."
                 )
                 await bot.send_message(uid, no_msg, parse_mode="Markdown")
             except Exception: pass
 
     if grace_list:
-        await asyncio.gather(*[_recheck_grace(g) for g in grace_list], return_exceptions=True)
+        for _ci in range(0, len(grace_list), _CHUNK):
+            await asyncio.gather(
+                *[_recheck_grace(g) for g in grace_list[_ci:_ci + _CHUNK]],
+                return_exceptions=True
+            )
+            if _ci + _CHUNK < len(grace_list):
+                await asyncio.sleep(1)
 
     # ── Daily reward পেলে user কে notify করো ────────────────────────
     for p in paid_list:
@@ -13425,16 +13466,17 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                 f"✅ *Daily Bio Task পুরস্কার!*\n\n"
                 f"💰 *`{p['amt']}$ USDT`* আপনার একাউন্টে যোগ হয়েছে!\n\n"
                 f"🗓️ তারিখ: `{today}`\n\n"
-                f"🔄 কাল রাত ১২:০৫ এ আবার চেক হবে — বায়ো ঠিক রাখুন!"
+                f"🔄 কাল রাত ১২:০০ তে আবার চেক হবে — বায়ো ঠিক রাখুন!"
                 if lang == 'bn' else
                 f"✅ *Daily Bio Task Reward!*\n\n"
                 f"💰 *`{p['amt']}$ USDT`* added to your account!\n\n"
                 f"🗓️ Date: `{today}`\n\n"
-                f"🔄 Next check tomorrow at 12:05 AM — keep your bio!"
+                f"🔄 Next check tomorrow at 12:00 AM — keep your bio!"
             )
             await bot.send_message(p['uid'], pay_msg, parse_mode="Markdown")
         except Exception:
             pass
+        await asyncio.sleep(0.05)  # flood control — ২০ msg/সেকেন্ড লিমিট
 
     # ── add_reward পেলে user কে notify করো ──────────────────────────
     for p in new_tracked_list:
@@ -13444,18 +13486,19 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                 f"🎉 *Bio Task শুরু হয়েছে!*\n\n"
                 f"✅ আপনার Bio সঠিকভাবে সেট করা হয়েছে।\n"
                 f"💰 *`{p['amt']}$ USDT`* আপনার একাউন্টে যোগ হয়েছে!\n\n"
-                f"🔄 এখন থেকে প্রতিদিন রাত ১২:০৫ এ bio check হবে।\n"
+                f"🔄 এখন থেকে প্রতিদিন রাত ১২:০০ তে bio check হবে।\n"
                 f"Bio ঠিক রাখলে প্রতিদিন `{daily_reward}$` পাবেন!"
                 if lang == 'bn' else
                 f"🎉 *Bio Task started!*\n\n"
                 f"✅ Your Bio has been set correctly.\n"
                 f"💰 *`{p['amt']}$ USDT`* added to your account!\n\n"
-                f"🔄 Bio will be checked daily at 12:05 AM.\n"
+                f"🔄 Bio will be checked daily at 12:00 AM.\n"
                 f"Keep your bio to earn `{daily_reward}$` every day!"
             )
             await bot.send_message(p['uid'], add_msg, parse_mode="Markdown")
         except Exception:
             pass
+        await asyncio.sleep(0.05)  # flood control
 
     # ── Admin summary notification ────────────────────────────────────
     today_daily   = len(paid_list)
@@ -13576,10 +13619,10 @@ async def job_bio_realtime_monitor(context: ContextTypes.DEFAULT_TYPE):
                     try:
                         ok_msg = (
                             f"✅ *Bio Task — Bio পুনরায় সেট করা হয়েছে!*\n\n"
-                            f"আজকের `{daily_reward}$ USDT` payment রাত ১২:০৫ এ পাবেন।"
+                            f"আজকের `{daily_reward}$ USDT` payment রাত ১২:০০ তে পাবেন।"
                             if lang == 'bn' else
                             f"✅ *Bio Task — Bio restored!*\n\n"
-                            f"Today's `{daily_reward}$ USDT` payment will be sent at 12:05 AM."
+                            f"Today's `{daily_reward}$ USDT` payment will be sent at 12:00 AM."
                         )
                         await bot.send_message(uid, ok_msg, parse_mode="Markdown")
                     except Exception:
@@ -13652,7 +13695,7 @@ async def job_bio_realtime_monitor(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def job_post_leaderboard(context: ContextTypes.DEFAULT_TYPE):
-    """প্রতিদিন রাত ১২:০৫ (BD) — শুধু Channel এ পাঠায় (bot DM নয়)"""
+    """প্রতিদিন রাত ১২:০০ (BD) — শুধু Channel এ পাঠায় (bot DM নয়)"""
     bot_username = (await context.bot.get_me()).username
     bot_link     = f"https://t.me/{bot_username}"
 
@@ -14738,7 +14781,7 @@ def main():
             )
             application.job_queue.run_daily(
                 job_post_leaderboard,
-                time=dt_time(hour=0, minute=5, tzinfo=BD_TZ),
+                time=dt_time(hour=0, minute=0, tzinfo=BD_TZ),
                 name="daily_leaderboard"
             )
             application.job_queue.run_repeating(
@@ -14762,7 +14805,7 @@ def main():
             log.info("✅ Health check job registered (প্রতি ১ ঘণ্টায় auto-check & fix)")
             log.info("✅ Stuck-state cleaner job registered (প্রতি ৩০ মিনিট)")
             log.info(f"✅ Scheduled report job registered (প্রতি {BACKUP_INTERVAL_HOURS} ঘণ্টায়)")
-            log.info("✅ Daily leaderboard job registered (রাত ১২:০৫ BD)")
+            log.info("✅ Daily leaderboard job registered (রাত ১২:০০ BD)")
             log.info("✅ Admin leaderboard auto-update job registered (প্রতি ১০ মিনিট)")
         else:
             # ── JobQueue নেই (APScheduler install নেই) — asyncio দিয়ে সব job চালাও ──
@@ -14811,7 +14854,7 @@ def main():
                 asyncio.create_task(_run_periodically(job_lb_adm_update,    600,  first_sec=600)),
                 asyncio.create_task(_run_periodically(job_bio_realtime_monitor, 60, first_sec=30)),
                 asyncio.create_task(_run_daily_at(job_bio_task_check,   0, 5, BD_TZ)),
-                asyncio.create_task(_run_daily_at(job_post_leaderboard, 0, 5, BD_TZ)),
+                asyncio.create_task(_run_daily_at(job_post_leaderboard, 0, 0, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_auto_cleanup,     3, 0, BD_TZ)),
             ]
             if BSC_PRIVATE_KEY:
