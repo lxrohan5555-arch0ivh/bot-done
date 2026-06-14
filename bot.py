@@ -3936,7 +3936,7 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
                 _cat_ow_msg = (
                     f"📬 *নতুন Submission পেয়েছেন!*\n\n"
                     f"📁 *Task:* {ttype_icon} {task_name}\n"
-                    f"👤 *User:* {uname}\n"
+                    f"👤 *নাম:* {_md_esc(user.full_name or user.first_name or 'User')}\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"📋 *Proof:*\n{summary_txt}\n"
                     f"━━━━━━━━━━━━━━━━\n"
@@ -4876,7 +4876,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
                 _reg_ow_msg = (
                     f"📬 *নতুন Submission পেয়েছেন!*\n\n"
                     f"📌 *Task:* {_t_icon} {task_name}\n"
-                    f"👤 *User:* {uname}\n"
+                    f"👤 *নাম:* {_md_esc(user.full_name or user.first_name or 'User')}\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"📋 *Proof:*\n{summary_txt}\n"
                     f"━━━━━━━━━━━━━━━━\n"
