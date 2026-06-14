@@ -159,8 +159,23 @@ except Exception as _log_ex:
 # Background tasks — strong reference রাখা হয় যাতে asyncio garbage collect না করে
 _background_tasks: set = set()
 
+
+def _bg_task_done(task):
+    """Background task done callback — exception retrieve করে 'Task exception was never retrieved' বন্ধ করে।"""
+    _background_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.warning(f"[BG-TASK] {task.get_name()} exception: {exc}")
+
+
 # Withdraw job lock — একসাথে একটাই cycle, nonce conflict বন্ধ
 _wd_job_lock = asyncio.Lock()
+# Bio monitor lock — প্রতি cycle এ একটাই instance, overlap বন্ধ
+_bio_monitor_lock = asyncio.Lock()
+# Dirty backup lock — প্রতি cycle এ একটাই instance, overlap বন্ধ
+_dirty_backup_lock = asyncio.Lock()
 _bnb_alert_last_sent: float = 0.0   # BNB low alert cooldown — প্রতি ঘন্টায় সর্বোচ্চ একবার
 _BNB_ALERT_COOLDOWN = 3600          # seconds (1 ঘন্টা)
 
@@ -452,7 +467,7 @@ def _mark_dirty():
                 if _app is not None:
                     await _run_dirty_backup_now(_app.bot)
             _dbt = loop.create_task(_delayed_backup())
-            _background_tasks.add(_dbt); _dbt.add_done_callback(_background_tasks.discard)
+            _background_tasks.add(_dbt); _dbt.add_done_callback(_bg_task_done)
         except RuntimeError:
             pass  # event loop নেই (e.g. init time) — Method 2 fallback নেবে
 
@@ -1242,6 +1257,12 @@ def add_points(uid, delta):
     return new_pts
 
 def get_bal(uid):
+    # Fast path: user cache hit — আলাদা DB query লাগে না
+    cached = _user_cache.get(uid)
+    if cached:
+        u, ts = cached
+        if _time.monotonic() - ts < _USER_CACHE_TTL:
+            return round(float(u.get("balance", 0) or 0), 4)
     with _c() as c:
         r = c.execute("SELECT balance FROM users WHERE user_id=%s", (uid,)).fetchone()
         return round(r["balance"], 4) if r else 0
@@ -1462,6 +1483,9 @@ _LANG_CACHE_TTL = 600.0   # ১০ মিনিট (ভাষা খুব ক�
 # ── Menu Button Cache — main_kb() প্রতি call-এ DB hit বন্ধ করে ─────────
 _btn_cache: "dict[str, tuple]" = {}   # lang → (buttons_dict, timestamp)
 _BTN_CACHE_TTL = 120.0   # ২ মিনিট
+
+# ── Bot Username Cache — get_me() প্রতি call করতে হবে না ────────────────
+_bot_username_cache: "str | None" = None
 
 # ── Required Channels Cache ──────────────────────────────────────────────
 _req_ch_cache: "list | None" = None
@@ -1779,6 +1803,82 @@ def get_user_categ_task_submit_count(task_name, user_id):
         ).fetchone()
         return _count(r)
 
+
+# ── Batch helpers — N queries → 1 query (show_tasks speed fix) ───────────
+
+def get_user_task_submit_counts_batch(user_id: int, task_codes: list, task_names_no_code: list = None) -> dict:
+    """Regular task-এর submit count একটি query তে আনো।
+    task_code আছে → code দিয়ে query।
+    task_code নেই (পুরনো task) → task_name দিয়ে query (fallback)।
+    Returns: dict key = task_code (if present) else task_name → count
+    """
+    result = {}
+    # ── Coded tasks: task_code দিয়ে batch query ──────────────────────────
+    clean_codes = [tc for tc in (task_codes or []) if tc]
+    if clean_codes:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT task_code, COUNT(*) AS cnt FROM gmails "
+                "WHERE user_id=%s AND task_code = ANY(%s) AND status != 'rejected' "
+                "GROUP BY task_code",
+                (user_id, clean_codes)
+            ).fetchall()
+        for r in (rows or []):
+            result[r['task_code']] = r['cnt']
+    # ── Codeless tasks: task_name দিয়ে fallback batch query ──────────────
+    clean_names = [n for n in (task_names_no_code or []) if n]
+    if clean_names:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT task_name, COUNT(*) AS cnt FROM gmails "
+                "WHERE user_id=%s AND task_name = ANY(%s) AND status != 'rejected' "
+                "GROUP BY task_name",
+                (user_id, clean_names)
+            ).fetchall()
+        for r in (rows or []):
+            result[r['task_name']] = r['cnt']
+    return result
+
+
+def tg_task_user_done_batch(user_id: int, task_ids: list) -> set:
+    """TG task done set একটি query তে আনো — done task_id গুলোর set।"""
+    if not task_ids:
+        return set()
+    with _c() as c:
+        rows = c.execute(
+            "SELECT task_id FROM tg_task_completions WHERE user_id=%s AND task_id = ANY(%s)",
+            (user_id, list(task_ids))
+        ).fetchall()
+    return {r['task_id'] for r in (rows or [])}
+
+
+def categ_tasks_user_done_batch(user_id: int, tasks_flat: list) -> dict:
+    """Category task done status একটি query তে আনো — task_id → bool।"""
+    if not tasks_flat:
+        return {}
+    result = {}
+    name_map = {}  # "[CAT] name" → (task_id, per_user_limit)
+    for t in tasks_flat:
+        pul = _rget(t, 'per_user_limit', 1)
+        if pul == 0:
+            result[t['id']] = False  # unlimited → never done
+            continue
+        cat_name = f"[CAT] {t['name']}"
+        name_map[cat_name] = (t['id'], pul)
+    if not name_map:
+        return result
+    with _c() as c:
+        rows = c.execute(
+            "SELECT task_name, COUNT(*) AS cnt FROM gmails "
+            "WHERE user_id=%s AND task_name = ANY(%s) AND status != 'rejected' "
+            "GROUP BY task_name",
+            (user_id, list(name_map.keys()))
+        ).fetchall()
+    counts = {r['task_name']: r['cnt'] for r in (rows or [])}
+    for cat_name, (task_id, pul) in name_map.items():
+        result[task_id] = counts.get(cat_name, 0) >= pul
+    return result
+
 def get_task(tid):
     k = f"task_{tid}"
     data, hit = _tc_get(k)
@@ -1948,8 +2048,11 @@ def is_pre_member(task_id, user_id):
 
 # ── Bio Task helpers ─────────────────────────────────────────────────
 def get_bio_task():
+    data, hit = _tc_get("bio_task")
+    if hit: return data
     with _c() as c:
-        return c.execute("SELECT * FROM bio_tasks WHERE id=1").fetchone()
+        data = c.execute("SELECT * FROM bio_tasks WHERE id=1").fetchone()
+    _tc_set("bio_task", data); return data
 
 def set_bio_task(reward=None, add_reward=None, is_active=None):
     with _c() as c:
@@ -1966,6 +2069,7 @@ def set_bio_task(reward=None, add_reward=None, is_active=None):
                 c.execute("UPDATE bio_tasks SET add_reward=%s WHERE id=1", (add_reward,))
             if is_active is not None:
                 c.execute("UPDATE bio_tasks SET is_active=%s WHERE id=1", (is_active,))
+    _tc_del("bio_task")
 
 def bio_task_paid_today(user_id):
     _tz = pytz.timezone("Asia/Dhaka")
@@ -2123,7 +2227,52 @@ def is_bio_actively_tracked(user_id):
         ).fetchone()
         return bool(row and row.get('first_correct_at', ''))
 
+def get_bio_task_tracking(user_id):
+    """is_bio_actively_tracked + is_add_reward_received — একটি query তে।
+    Returns: (actively_tracked: bool, add_reward_received: bool)"""
+    with _c() as c:
+        row = c.execute(
+            "SELECT first_correct_at, add_reward_received FROM bio_task_tracking WHERE user_id=%s",
+            (user_id,)
+        ).fetchone()
+    if not row:
+        return False, False
+    return bool(row.get('first_correct_at', '')), bool(row.get('add_reward_received', 0))
+
 # ── Category Task helpers ────────────────────────────────────────────
+def get_all_category_tasks_batch(cat_ids: list) -> dict:
+    """একাধিক category-র active tasks একটি query তে আনো।
+    Cache-aware: cached category → DB skip, uncached → একটি batch query।
+    Returns: dict of cat_id → [task rows]"""
+    if not cat_ids:
+        return {}
+    result = {}
+    uncached_ids = []
+    for cid in cat_ids:
+        k = f"ctasks_{cid}_1"
+        data, hit = _tc_get(k)
+        if hit:
+            result[cid] = data
+        else:
+            uncached_ids.append(cid)
+            result[cid] = []
+    if uncached_ids:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT * FROM category_tasks WHERE category_id = ANY(%s) AND is_active=1 ORDER BY id",
+                (uncached_ids,)
+            ).fetchall()
+        by_cat = {cid: [] for cid in uncached_ids}
+        for row in rows:
+            cid = row['category_id']
+            if cid in by_cat:
+                by_cat[cid].append(row)
+        for cid in uncached_ids:
+            k = f"ctasks_{cid}_1"
+            _tc_set(k, by_cat[cid])
+            result[cid] = by_cat[cid]
+    return result
+
 def get_categories():
     data, hit = _tc_get("categories")
     if hit: return data
@@ -2223,6 +2372,39 @@ def get_category_task_fields(task_id):
     with _c() as c:
         data = c.execute("SELECT * FROM category_task_fields WHERE task_id=%s ORDER BY field_order", (task_id,)).fetchall()
     _tc_set(k, data); return data
+
+def get_all_categ_task_fields_batch(task_ids: list) -> dict:
+    """Category task fields একটি batch query তে আনো।
+    Cache-aware: cached → skip, uncached → একটি batch query।
+    Returns: dict of task_id → [field rows]"""
+    if not task_ids:
+        return {}
+    result = {}
+    uncached_ids = []
+    for tid in task_ids:
+        k = f"ctask_fields_{tid}"
+        data, hit = _tc_get(k)
+        if hit:
+            result[tid] = data
+        else:
+            uncached_ids.append(tid)
+            result[tid] = []
+    if uncached_ids:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT * FROM category_task_fields WHERE task_id = ANY(%s) ORDER BY field_order",
+                (uncached_ids,)
+            ).fetchall()
+        by_task = {tid: [] for tid in uncached_ids}
+        for row in rows:
+            tid = row['task_id']
+            if tid in by_task:
+                by_task[tid].append(row)
+        for tid in uncached_ids:
+            k = f"ctask_fields_{tid}"
+            _tc_set(k, by_task[tid])
+            result[tid] = by_task[tid]
+    return result
 
 def add_category_task_field(task_id, field_type, prompt_bn, prompt_en, order=None, example_image_id=''):
     with _c() as c:
@@ -2931,7 +3113,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for _k in ("pending_uid",):
             ctx.user_data.pop(_k, None)
         _nt = asyncio.create_task(fire_new_user_notify(ctx, user.id, _nn_name, _nn_uname, _nn_ref))
-        _background_tasks.add(_nt); _nt.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(_nt); _nt.add_done_callback(_bg_task_done)
 
     await _send_welcome(update, ctx, user.id)
 
@@ -2986,7 +3168,7 @@ async def guard(update, ctx):
         except Exception as _e:
             log.debug(f"[LAST-SEEN] uid={uid} update ব্যর্থ: {_e}")
     t = asyncio.ensure_future(_update_last_seen())
-    _background_tasks.add(t); t.add_done_callback(_background_tasks.discard)
+    _background_tasks.add(t); t.add_done_callback(_bg_task_done)
     # ── _last_active: job_clean_stuck_states এর জন্য activity timestamp ──
     ctx.user_data["_last_active"] = _time.monotonic()
     return True
@@ -3014,6 +3196,15 @@ def _get_user_cached_fast(uid: int):
         if _time.monotonic() - ts < _USER_CACHE_TTL:
             return u
     return False  # cache miss sentinel
+
+async def _get_bot_username(bot) -> str:
+    """Bot username একবার fetch করে cache করো — প্রতি call-এ get_me() লাগে না।"""
+    global _bot_username_cache
+    if _bot_username_cache:
+        return _bot_username_cache
+    info = await bot.get_me()
+    _bot_username_cache = info.username
+    return _bot_username_cache
 
 async def _bot_accessible(uid: int) -> bool:
     """bot চালু থাকলে (common case) সবাই accessible।
@@ -3293,7 +3484,7 @@ async def show_tasks(update, ctx):
     uid          = update.effective_user.id
     # send_chat_action background — main path block করে না
     _act = asyncio.create_task(ctx.bot.send_chat_action(chat_id=uid, action="typing"))
-    _background_tasks.add(_act); _act.add_done_callback(_background_tasks.discard)
+    _background_tasks.add(_act); _act.add_done_callback(_bg_task_done)
     # lang, tasks, tg_tasks, categories, bio_task — সব একসাথে parallel
     lang, tasks, tg_tasks, categories, bio_task = await asyncio.gather(
         asyncio.to_thread(get_lang, uid),
@@ -3313,16 +3504,19 @@ async def show_tasks(update, ctx):
 
     # Regular tasks — per task one button
     if tasks:
-        # user_country + সব task-এর done_count একসাথে parallel fetch
-        _task_tcode_list = [_rget(t, 'task_code', '') or '' for t in tasks]
-        _task_results = await asyncio.gather(
+        # ── Batch: 2 queries (country + all submit counts) পূর্বে N+1 queries ──
+        _task_tcode_list   = [_rget(t, 'task_code', '') or '' for t in tasks]
+        # পুরনো task যাদের code নেই → name দিয়ে fallback query
+        _task_names_nocode = [t['name'] for t, tc in zip(tasks, _task_tcode_list) if not tc]
+        user_country, _submit_counts = await asyncio.gather(
             asyncio.to_thread(get_user_country, uid),
-            *[asyncio.to_thread(get_user_task_submit_count, t['name'], uid, tc)
-              for t, tc in zip(tasks, _task_tcode_list)]
+            asyncio.to_thread(get_user_task_submit_counts_batch, uid, _task_tcode_list, _task_names_nocode),
         )
-        user_country = (_task_results[0] or "").upper()
-        _done_counts = _task_results[1:]
-        for task, done_count in zip(tasks, _done_counts):
+        user_country = (user_country or "").upper()
+        for task in tasks:
+            tc = _rget(task, 'task_code', '') or ''
+            _lookup = tc if tc else task['name']
+            done_count = _submit_counts.get(_lookup, 0)
             per_user_limit = _rget(task, 'per_user_limit', 1)
             if per_user_limit != 0 and done_count >= per_user_limit:
                 continue
@@ -3342,18 +3536,18 @@ async def show_tasks(update, ctx):
             label = f"{ticon} {task['name']}  •  ${task['price']}{slots_info}"
             btns.append([InlineKeyboardButton(label, callback_data=f"task_{task['id']}")])
 
-    # Categories — সব category-র tasks একসাথে parallel fetch
+    # Categories — সব category-র tasks একটি batch query তে (N queries → 1)
     if categories:
-        _all_cat_tasks_list = await asyncio.gather(
-            *[asyncio.to_thread(get_category_tasks, cat['id']) for cat in categories]
-        )
+        _cat_ids = [cat['id'] for cat in categories]
+        _cat_tasks_map = await asyncio.to_thread(get_all_category_tasks_batch, _cat_ids)
+        _all_cat_tasks_list = [_cat_tasks_map.get(cat['id'], []) for cat in categories]
+        # ── Batch: সব category-র সব task done status — 1 query ──
+        _all_ctasks_flat = [t for ctasks in _all_cat_tasks_list for t in ctasks]
+        _done_map = await asyncio.to_thread(categ_tasks_user_done_batch, uid, _all_ctasks_flat)
         for cat, _all_ctasks in zip(categories, _all_cat_tasks_list):
             if not _all_ctasks:
                 continue
-            _done_flags = await asyncio.gather(
-                *[asyncio.to_thread(categ_task_user_done, t['id'], uid) for t in _all_ctasks]
-            )
-            cat_tasks = [t for t, done in zip(_all_ctasks, _done_flags) if not done]
+            cat_tasks = [t for t in _all_ctasks if not _done_map.get(t['id'], False)]
             if cat_tasks:
                 total_earn = sum(t['price'] for t in cat_tasks)
                 task_count = len(cat_tasks)
@@ -3366,11 +3560,8 @@ async def show_tasks(update, ctx):
     if bio_active:
         dr             = bio_task['reward']
         ar             = (bio_task.get('add_reward', 0) or 0)
-        # দুটো independent DB call parallel-এ চালাও
-        actively_track, add_done = await asyncio.gather(
-            asyncio.to_thread(is_bio_actively_tracked, uid),
-            asyncio.to_thread(is_add_reward_received, uid),
-        )
+        # দুটো column একটি query তে (পূর্বে 2 DB calls)
+        actively_track, add_done = await asyncio.to_thread(get_bio_task_tracking, uid)
         if lang == 'bn':
             if actively_track:
                 bt_label = f"🧬 Bio Task  •  ✅ Tracking চলছে  •  Daily {dr}$"
@@ -3389,14 +3580,18 @@ async def show_tasks(update, ctx):
 
     # Telegram tasks — ONE grouped button
     if tg_tasks:
-        # done flags এবং slots দুটো একসাথে parallel-এ fetch করো — sync call block করে না
-        _tgt_done_flags, _tgt_slots = await asyncio.gather(
-            asyncio.gather(*[asyncio.to_thread(tg_task_user_done,  t['id'], uid) for t in tg_tasks]),
-            asyncio.gather(*[asyncio.to_thread(tg_task_slots_left, t['id'])      for t in tg_tasks]),
-        )
+        # ── slots: tg_tasks data-তেই আছে — thread dispatch লাগে না ──
+        # ── done set: 1 batch query ──
+        _tg_ids = [t['id'] for t in tg_tasks]
+        _tgt_done_set = await asyncio.to_thread(tg_task_user_done_batch, uid, _tg_ids)
+        _tgt_slots = [
+            (-1 if t['max_completions'] == 0
+             else max(0, t['max_completions'] - t['completed_count']))
+            for t in tg_tasks
+        ]
         available_tgt = sum(
-            1 for _done, _slots in zip(_tgt_done_flags, _tgt_slots)
-            if not _done and _slots != 0
+            1 for t, _slots in zip(tg_tasks, _tgt_slots)
+            if t['id'] not in _tgt_done_set and _slots != 0
         )
         tgt_label = (
             f"📲 Telegram Tasks ({available_tgt} available)"
@@ -3431,13 +3626,18 @@ async def show_tg_tasks_list(update, ctx):
     if not tg_tasks:
         await q.message.reply_text("❌ No Telegram tasks available!" if lang=='en' else "❌ কোনো Telegram Task নেই!")
         return
-    # slots + done flag সব tasks-এর জন্য parallel-এ fetch করো — sequential call event loop block করে
-    _tgt_slots, _tgt_done = await asyncio.gather(
-        asyncio.gather(*[asyncio.to_thread(tg_task_slots_left, t['id'])      for t in tg_tasks]),
-        asyncio.gather(*[asyncio.to_thread(tg_task_user_done,  t['id'], uid) for t in tg_tasks]),
-    )
+    # ── slots: tg_tasks data-তেই আছে — thread dispatch লাগে না ──
+    # ── done set: 1 batch query ──
+    _tg_ids = [t['id'] for t in tg_tasks]
+    _tgt_done_set = await asyncio.to_thread(tg_task_user_done_batch, uid, _tg_ids)
+    _tgt_slots = [
+        (-1 if t['max_completions'] == 0
+         else max(0, t['max_completions'] - t['completed_count']))
+        for t in tg_tasks
+    ]
     btns = []
-    for t, slots, done in zip(tg_tasks, _tgt_slots, _tgt_done):
+    for t, slots in zip(tg_tasks, _tgt_slots):
+        done = t['id'] in _tgt_done_set
         if done:
             label = f"✅ {t['name']} — ${t['price']}"
         elif slots == 0:
@@ -3467,14 +3667,22 @@ async def show_category_tasks(update, ctx, cat_id):
     if not tasks:
         await q.message.reply_text("❌ No tasks in this category!" if lang=='en' else "❌ এই Category তে কোনো Task নেই!")
         return
-    # slots + done + fields সব tasks-এর জন্য একবারে parallel-এ fetch করো — sequential call bot slow করে
-    _task_slots_list, _task_done_list, _task_fields_list = await asyncio.gather(
-        asyncio.gather(*[asyncio.to_thread(categ_task_slots_left,    t['id'])      for t in tasks]),
-        asyncio.gather(*[asyncio.to_thread(categ_task_user_done,     t['id'], uid) for t in tasks]),
-        asyncio.gather(*[asyncio.to_thread(get_category_task_fields, t['id'])      for t in tasks]),
+    # ── slots: tasks data-তেই আছে — thread dispatch লাগে না ──
+    # ── done_map: 1 batch query ──
+    # ── fields: 1 batch query (পূর্বে N queries) ──
+    _task_done_map, _task_fields_map = await asyncio.gather(
+        asyncio.to_thread(categ_tasks_user_done_batch, uid, tasks),
+        asyncio.to_thread(get_all_categ_task_fields_batch, [t['id'] for t in tasks]),
     )
+    _task_slots_list = [
+        (-1 if t['max_completions'] == 0
+         else max(0, t['max_completions'] - t['completed_count']))
+        for t in tasks
+    ]
+    _task_fields_list = [_task_fields_map.get(t['id'], []) for t in tasks]
     btns = []
-    for t, slots, done, fields in zip(tasks, _task_slots_list, _task_done_list, _task_fields_list):
+    for t, slots, fields in zip(tasks, _task_slots_list, _task_fields_list):
+        done = _task_done_map.get(t['id'], False)
         proof_icons = "".join("📷" if f["field_type"]=="photo" else "📝" for f in fields)
         ticon = task_type_icon(_rget(t, 'task_type', 'other'))
         price_str = f"💵 ${t['price']}"
@@ -3489,7 +3697,7 @@ async def show_category_tasks(update, ctx, cat_id):
         btns.append([InlineKeyboardButton(label, callback_data=f"ctask_{t['id']}")])
     btns.append([InlineKeyboardButton("🔙 Back" if lang=='en' else "🔙 ফিরে যান", callback_data="task_cancel")])
     total_tasks = len(tasks)
-    avail = sum(1 for done, slots in zip(_task_done_list, _task_slots_list) if not done and slots != 0)
+    avail = sum(1 for t, slots in zip(tasks, _task_slots_list) if not _task_done_map.get(t['id'], False) and slots != 0)
     _cat_tn_esc = _md_esc(cat['name'])
     if lang == 'en':
         title = f"🗂️ *{_cat_tn_esc}*\n\n📋 Total: `{total_tasks}` tasks  •  ✅ Available: `{avail}`\n\n👇 Choose a task below:"
@@ -3843,7 +4051,7 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
             ctx.bot, _ct_after["name"], _rget(_ct_after,"task_code","") or "",
             "Category Task", _ct_after["completed_count"], _ct_after["max_completions"]
         ))
-        _background_tasks.add(_tct); _tct.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(_tct); _tct.add_done_callback(_bg_task_done)
     _u_ctry_raw = (await asyncio.to_thread(get_user_country, uid) or "").upper().strip()
     if _u_ctry_raw and _u_ctry_raw in COUNTRY_MAP:
         _u_ctry_flag, _u_ctry_name = COUNTRY_MAP[_u_ctry_raw]
@@ -3953,7 +4161,7 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
             except Exception as _ow_e2:
                 log.warning(f"[OWNER_NOTIFY_CAT] owner={_cat_owner_id} gid={gid}: {_ow_e2}")
     _t_cat_bg = asyncio.create_task(_cat_notify_bg())
-    _background_tasks.add(_t_cat_bg); _t_cat_bg.add_done_callback(_background_tasks.discard)
+    _background_tasks.add(_t_cat_bg); _t_cat_bg.add_done_callback(_bg_task_done)
 
 
 async def show_tg_task(update, ctx, task):
@@ -4173,7 +4381,7 @@ async def handle_tg_task_check(update, ctx, tid):
             ctx.bot, _tg_after["name"], _rget(_tg_after,"task_code","") or "",
             "TG Join Task", _tg_after["completed_count"], _tg_after["max_completions"]
         ))
-        _background_tasks.add(_ttg); _ttg.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(_ttg); _ttg.add_done_callback(_bg_task_done)
 
     # Commission to referrer
     ref = await asyncio.to_thread(get_referred_by, uid)
@@ -4195,7 +4403,7 @@ async def handle_tg_task_check(update, ctx, tid):
             log.warning(f"[TG-TASK] ref={ref} commission notify ব্যর্থ: {_e}")
         # ── Referral Event bonus check ──────────────────────────
         _ref_ev_tg = asyncio.create_task(_check_ref_event_bonus(uid, ref, ctx.bot))
-        _background_tasks.add(_ref_ev_tg); _ref_ev_tg.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(_ref_ev_tg); _ref_ev_tg.add_done_callback(_bg_task_done)
 
     # Notify user
     _tg_task_name_esc = _md_esc(task['name'])
@@ -4212,12 +4420,12 @@ async def handle_tg_task_check(update, ctx, tid):
     )
     await q.message.reply_text(success_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
     _tlb1 = asyncio.create_task(_lb_refresh_now(ctx.bot))
-    _background_tasks.add(_tlb1); _tlb1.add_done_callback(_background_tasks.discard)
+    _background_tasks.add(_tlb1); _tlb1.add_done_callback(_bg_task_done)
     _tdn1 = asyncio.create_task(_notify_task_done_ch(
         ctx.bot, uid, task['name'],
         _rget(task, 'task_code', '') or '', price, "📡 TG Join Task"
     ))
-    _background_tasks.add(_tdn1); _tdn1.add_done_callback(_background_tasks.discard)
+    _background_tasks.add(_tdn1); _tdn1.add_done_callback(_bg_task_done)
 
 async def show_refer(update, ctx):
     commission = None
@@ -4232,15 +4440,16 @@ async def show_refer(update, ctx):
                 "SELECT COALESCE(SUM(amount),0) FROM commissions WHERE user_id=%s", (uid,)
             ).fetchone(), 0) or 0, 4)
         return commission, referrals
-    # bot_info, DB stats, commission%, owner, lang — সব parallel চালাও
-    (commission, referrals), comm_pct, owner, lang, bot_info = await asyncio.gather(
+    # DB stats, commission%, owner, lang, bot_username — সব parallel চালাও
+    # bot_username: module-level cache — প্রতিবার get_me() call লাগে না
+    (commission, referrals), comm_pct, owner, lang, bot_uname = await asyncio.gather(
         asyncio.to_thread(_db_3344),
         asyncio.to_thread(get_commission_pct),
         asyncio.to_thread(get_setting, 'support_owner'),
         asyncio.to_thread(get_lang, uid),
-        ctx.bot.get_me(),
+        _get_bot_username(ctx.bot),
     )
-    link    = f"https://t.me/{bot_info.username}?start=ref_{uid}"
+    link    = f"https://t.me/{bot_uname}?start=ref_{uid}"
     comm_pct_display = int(comm_pct) if comm_pct == int(comm_pct) else comm_pct
     owner = owner or '@inkamxbd'
     owner_e = _md_esc(owner)
@@ -4771,7 +4980,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
     gid = await asyncio.to_thread(_insert_gmail_row)
     # নতুন submission হলে পুরানো approved/rejected মুছো — fire-and-forget
     _t_trim = asyncio.ensure_future(asyncio.to_thread(_trim_table, "gmails", "user_id", uid, 20, "id", True))
-    _background_tasks.add(_t_trim); _t_trim.add_done_callback(_background_tasks.discard)
+    _background_tasks.add(_t_trim); _t_trim.add_done_callback(_bg_task_done)
     # ── photo unique_ids সেভ করো ──────────────────────────────────
     if _submitted_unique_ids and gid:
         try:
@@ -4893,7 +5102,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
             except Exception as _ow_e:
                 log.warning(f"[OWNER_NOTIFY] owner={_reg_owner_id} gid={gid}: {_ow_e}")
     _t_reg_bg = asyncio.create_task(_reg_notify_bg())
-    _background_tasks.add(_t_reg_bg); _t_reg_bg.add_done_callback(_background_tasks.discard)
+    _background_tasks.add(_t_reg_bg); _t_reg_bg.add_done_callback(_bg_task_done)
 
 # ──────────────────────────── WITHDRAW FLOW ────────────────────────────
 async def wd_ask_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5079,9 +5288,11 @@ async def show_wd_confirmation(msg, ctx, uid):
     """Withdraw confirm/edit UI — address, amount, fee breakdown এখানে দেখা যাবে।"""
     addr    = ctx.user_data.get("wd_addr", "")
     amt     = ctx.user_data.get("wd_amt", 0.0)
-    fee     = await asyncio.to_thread(get_wd_fee)
+    fee, lang = await asyncio.gather(
+        asyncio.to_thread(get_wd_fee),
+        asyncio.to_thread(get_lang, uid),
+    )
     net_amt = round(amt - fee, 4)
-    lang    = await asyncio.to_thread(get_lang, uid)
     masked  = mask_addr_short(addr)
     if lang == 'en':
         txt = (
@@ -5138,9 +5349,11 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
              else "❌ *Withdrawal session মেয়াদ শেষ। আবার শুরু করুন।*"),
             parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
         return
-    fee     = await asyncio.to_thread(get_wd_fee)
+    fee, lang = await asyncio.gather(
+        asyncio.to_thread(get_wd_fee),
+        asyncio.to_thread(get_lang, uid),
+    )
     net_amt = round(amt - fee, 4)
-    lang    = await asyncio.to_thread(get_lang, uid)
 
     # ── Security Check 2 + INSERT: একই transaction এ balance কাটো ও withdrawal তৈরি করো ──
     # এটা atomic — মাঝে crash হলেও টাকা হারাবে না।
@@ -5760,14 +5973,14 @@ async def _broadcast_task_notify(ctx, reply_msg, sender_uid,
             _delayed_notify_runner(ctx.bot, dict(_kwargs), delay_min * 60, pn_id=_pn_id)
         )
         _background_tasks.add(_task)
-        _task.add_done_callback(_background_tasks.discard)
+        _task.add_done_callback(_bg_task_done)
     else:
         # ── সাথে সাথে পাঠাও ────────────────────────────────────────
         _task = asyncio.create_task(
             _delayed_notify_runner(ctx.bot, dict(_kwargs), 0)
         )
         _background_tasks.add(_task)
-        _task.add_done_callback(_background_tasks.discard)
+        _task.add_done_callback(_bg_task_done)
         log.info("[NOTIFY] Immediate broadcast task তৈরি হয়েছে।")
 
     return 0, 0
@@ -5804,9 +6017,9 @@ async def _activate_task_and_notify(ctx, q, uid,
     status_lbl = "✅ *Task Activated!*" if new_val else "❌ *Task Deactivated.*"
     await q.message.reply_text(status_lbl, parse_mode="Markdown")
     if new_val:
-        bot_info  = await ctx.bot.get_me()
-        task_link = (f"https://t.me/{bot_info.username}?start={link_prefix}{tid}"
-                     if link_prefix else f"https://t.me/{bot_info.username}")
+        _bun = await _get_bot_username(ctx.bot)
+        task_link = (f"https://t.me/{_bun}?start={link_prefix}{tid}"
+                     if link_prefix else f"https://t.me/{_bun}")
         mc       = _rget(t, 'max_completions', 0)
         slot_txt = f"{mc}" if mc > 0 else "Unlimited"
         njo      = _rget(t, njo_field, 0) if njo_field else 0
@@ -6569,8 +6782,8 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 InlineKeyboardButton("📁 Category তালিকা", callback_data="adm_cat_list")
             ]])
         )
-        bot_info  = await ctx.bot.get_me()
-        task_link = f"https://t.me/{bot_info.username}?start=ctask_{tid}"
+        _bun = await _get_bot_username(ctx.bot)
+        task_link = f"https://t.me/{_bun}?start=ctask_{tid}"
         slot_txt  = f"{max_c}" if max_c > 0 else "Unlimited"
         ttype     = _rget(t, 'task_type', 'other')
         await _broadcast_task_notify(ctx, q.message, uid,
@@ -6869,7 +7082,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 log.warning(f"[APPROVE] ref={ref} commission notify ব্যর্থ: {_e}")
             # ── Referral Event bonus check ──────────────────────────
             _ref_ev_task = asyncio.create_task(_check_ref_event_bonus(guser, ref, ctx.bot))
-            _background_tasks.add(_ref_ev_task); _ref_ev_task.add_done_callback(_background_tasks.discard)
+            _background_tasks.add(_ref_ev_task); _ref_ev_task.add_done_callback(_bg_task_done)
         try:
             await ctx.bot.send_message(guser,
                 T(guser, 'approved_msg', task=_task_display, price=price),
@@ -6877,7 +7090,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         except Exception as _e:
             log.warning(f"[APPROVE] guser={guser} approved notify ব্যর্থ: {_e}")
         _tlb2 = asyncio.create_task(_lb_refresh_now(ctx.bot))
-        _background_tasks.add(_tlb2); _tlb2.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(_tlb2); _tlb2.add_done_callback(_bg_task_done)
         _rw_code = _rget(row, 'task_code', '') or ''
         _rw_name = row['task_name']
         _rt, _maxed = await asyncio.to_thread(_regular_task_mark_done, _rw_code, _rw_name)
@@ -6886,12 +7099,12 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 ctx.bot, _rt["name"], _rt["task_code"] or "",
                 "Regular Task", _rt["completed_count"], _rt["max_completions"]
             ))
-            _background_tasks.add(_trm); _trm.add_done_callback(_background_tasks.discard)
+            _background_tasks.add(_trm); _trm.add_done_callback(_bg_task_done)
         _task_type_lbl = task_type_label(_rget(row, 'task_type', 'other'))
         _tdn2 = asyncio.create_task(_notify_task_done_ch(
             ctx.bot, guser, _rw_name, _rw_code, price, _task_type_lbl
         ))
-        _background_tasks.add(_tdn2); _tdn2.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(_tdn2); _tdn2.add_done_callback(_bg_task_done)
         status_line = "\n\n✅ *APPROVED by Admin*"
         orig = q.message.text or q.message.caption or ""
         new_txt = orig + status_line
@@ -7156,15 +7369,14 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         daily_reward = bio_task['reward']
         ar           = (bio_task.get('add_reward', 0) or 0)
         # সব independent DB calls + bot.get_me একসাথে parallel
-        bt_done, add_done, actively_track, history, bot_me = await asyncio.gather(
+        bt_done, add_done, actively_track, history, bot_username = await asyncio.gather(
             asyncio.to_thread(bio_task_paid_today, uid),
             asyncio.to_thread(is_add_reward_received, uid),
             asyncio.to_thread(is_bio_actively_tracked, uid),
             asyncio.to_thread(get_bio_task_history, uid),
-            ctx.bot.get_me(),
+            _get_bot_username(ctx.bot),
         )
-        bot_username = bot_me.username
-        ref_link     = f"https://t.me/{bot_username}?start=ref_{uid}"
+        ref_link = f"https://t.me/{bot_username}?start=ref_{uid}"
 
         if history:
             if lang == 'bn':
@@ -7225,12 +7437,8 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 f"{hist_lines}"
             )
         kb_rows = []
-        if not add_done:
-            _bio_check_lbl = "✅ Check করুন" if lang == 'bn' else "✅ Check Now"
-            kb_rows.append([InlineKeyboardButton(_bio_check_lbl, callback_data="bio_task_check")])
-        elif not actively_track:
-            _bio_reset_lbl = "🔄 Bio সেট করে Check করুন" if lang == 'bn' else "🔄 Set Bio & Check"
-            kb_rows.append([InlineKeyboardButton(_bio_reset_lbl, callback_data="bio_task_check")])
+        _bio_check_lbl = "✅ Check করুন" if lang == 'bn' else "✅ Check Now"
+        kb_rows.append([InlineKeyboardButton(_bio_check_lbl, callback_data="bio_task_check")])
         kb_rows.append([InlineKeyboardButton("🔙 Tasks", callback_data="task_cancel")])
         kb = InlineKeyboardMarkup(kb_rows)
         await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
@@ -7264,10 +7472,10 @@ async def _on_callback_inner(update, ctx, q, uid, d):
 
 
 async def _bio_task_check_inner(update, ctx, q, uid):
-    bio_task, lang, bot_me = await asyncio.gather(
+    bio_task, lang, bot_username = await asyncio.gather(
         asyncio.to_thread(get_bio_task),
         asyncio.to_thread(get_lang, uid),
-        ctx.bot.get_me(),
+        _get_bot_username(ctx.bot),
     )
 
     if not bio_task or not bio_task['is_active']:
@@ -7279,7 +7487,6 @@ async def _bio_task_check_inner(update, ctx, q, uid):
 
     add_reward   = (bio_task.get('add_reward', 0) or 0)
     daily_reward = bio_task['reward']
-    bot_username = bot_me.username
     ref_link     = f"https://t.me/{bot_username}?start=ref_{uid}"
     required_bio = f"Free Task Earn bot {ref_link}"
 
@@ -7417,7 +7624,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
                 f"  💵 মোট খরচ: `{round(float(_cum_amount),4)}$ USDT`"
             )
             _t1 = asyncio.create_task(notify_full_admins(ctx.bot, _bio_admin_msg))
-            _background_tasks.add(_t1); _t1.add_done_callback(_background_tasks.discard)
+            _background_tasks.add(_t1); _t1.add_done_callback(_bg_task_done)
             if lang == 'bn':
                 msg = (
                     f"🎉 *Bio Task — Add Reward পেয়েছেন!*\n\n"
@@ -10398,13 +10605,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         log.warning(f"[PHOTO-APPROVE] ref={ref} commission notify ব্যর্থ: {_e}")
                     # ── Referral Event bonus check ──────────────────────────
                     _ref_ev_task2 = asyncio.create_task(_check_ref_event_bonus(guser, ref, ctx.bot))
-                    _background_tasks.add(_ref_ev_task2); _ref_ev_task2.add_done_callback(_background_tasks.discard)
+                    _background_tasks.add(_ref_ev_task2); _ref_ev_task2.add_done_callback(_bg_task_done)
                 try:
                     await ctx.bot.send_message(guser, T(guser,'approved_msg',task=_aid_task_display,price=price), parse_mode="Markdown")
                 except Exception as _e:
                     log.warning(f"[PHOTO-APPROVE] guser={guser} approved notify ব্যর্থ: {_e}")
                 _tlb3 = asyncio.create_task(_lb_refresh_now(ctx.bot))
-                _background_tasks.add(_tlb3); _tlb3.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(_tlb3); _tlb3.add_done_callback(_bg_task_done)
                 # Regular task completed_count + max check
                 _mid_code = _rget(row, 'task_code', '') or ''
                 _mid_name = row['task_name']
@@ -10414,7 +10621,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         ctx.bot, _mt["name"], _mt["task_code"] or "",
                         "Regular Task", _mt["completed_count"], _mt["max_completions"]
                     ))
-                    _background_tasks.add(_tamm); _tamm.add_done_callback(_background_tasks.discard)
+                    _background_tasks.add(_tamm); _tamm.add_done_callback(_bg_task_done)
                 await update.message.reply_text(
                     f"✅ *Sub `#{gid}` Approved!*\n\n"
                     f"📌 *Task:* {row['task_name']}\n"
@@ -11706,7 +11913,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             admin_notif += f"\n✅ *এখনো {remaining}টি ব্যবহারের সুযোগ আছে।*"
         _t2 = asyncio.create_task(notify_full_admins(ctx.bot, admin_notif))
-        _background_tasks.add(_t2); _t2.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(_t2); _t2.add_done_callback(_bg_task_done)
 
         # ── News channel message edit করো (code শেষ হলে) ─────────
         if new_used >= promo["max_uses"]:
@@ -11743,7 +11950,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # guard + get_lang parallel — sequential await নেই
     # send_chat_action background-এ (fire & forget) — main path block করে না
     _chat_act = asyncio.create_task(ctx.bot.send_chat_action(chat_id=uid, action="typing"))
-    _background_tasks.add(_chat_act); _chat_act.add_done_callback(_background_tasks.discard)
+    _background_tasks.add(_chat_act); _chat_act.add_done_callback(_bg_task_done)
     _guard_ok, lang = await asyncio.gather(
         guard(update, ctx),
         asyncio.to_thread(get_lang, uid),
@@ -11869,8 +12076,7 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bot_link    = ctx.user_data.get("pending_notif_bot_link", "")
         if not bot_link:
             try:
-                _bme = await ctx.bot.get_me()
-                bot_link = f"https://t.me/{_bme.username}"
+                bot_link = f"https://t.me/{await _get_bot_username(ctx.bot)}"
             except Exception:
                 bot_link = ""
         if not notif_msg:
@@ -12294,7 +12500,7 @@ async def _auto_apply_promo(bot, uid: int, code: str):
     else:
         admin_notif += f"\n✅ *এখনো {_ap_remaining}টি ব্যবহারের সুযোগ আছে।*"
     _ap_t = asyncio.create_task(notify_full_admins(bot, admin_notif))
-    _background_tasks.add(_ap_t); _ap_t.add_done_callback(_background_tasks.discard)
+    _background_tasks.add(_ap_t); _ap_t.add_done_callback(_bg_task_done)
 
 
 def _build_promo_post_used(code: str, amount: float, max_uses: int, req_text: str) -> str:
@@ -12469,7 +12675,7 @@ async def cmd_promo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         admin_notif += f"\n✅ *এখনো {remaining}টি ব্যবহারের সুযোগ আছে।*"
     _t3 = asyncio.create_task(notify_full_admins(ctx.bot, admin_notif))
-    _background_tasks.add(_t3); _t3.add_done_callback(_background_tasks.discard)
+    _background_tasks.add(_t3); _t3.add_done_callback(_bg_task_done)
 
     # Fully used হলে news channel post edit করো
     if new_used >= promo["max_uses"]:
@@ -12537,8 +12743,7 @@ async def _handle_promo_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         # News channel এ post করো
         post_txt = _build_promo_post(code, amount, max_uses, req_text)
         try:
-            _bme_p = await ctx.bot.get_me()
-            _promo_url = f"https://t.me/{_bme_p.username}?start=promo_{code}"
+            _promo_url = f"https://t.me/{await _get_bot_username(ctx.bot)}?start=promo_{code}"
             _promo_kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🎁 প্রমো কোড নিন", url=_promo_url)]
             ])
@@ -13246,6 +13451,8 @@ async def _lb_refresh_now(bot):
             text=text, parse_mode="HTML", reply_markup=kb
         )
     except Exception as e:
+        if "Message is not modified" in str(e):
+            return  # content same — কোনো action দরকার নেই, error না
         log.warning(f"[Leaderboard] instant refresh ব্যর্থ: {e}")
 
 
@@ -13267,8 +13474,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
         return
 
     bot = context.bot
-    bot_me = await bot.get_me()
-    bot_username = bot_me.username
+    bot_username = await _get_bot_username(bot)
     today = datetime.now(BD_TZ).strftime("%Y-%m-%d")
     users = await asyncio.to_thread(all_users)
 
@@ -13557,6 +13763,14 @@ async def job_bio_realtime_monitor(context: ContextTypes.DEFAULT_TYPE):
          • Bio আছে → tracking active রাখো, last_warned_at clear করো
          • Bio নেই → tracking clear (আজ payment নেই), task list এ আবার দেখাবে
     """
+    if _bio_monitor_lock.locked():
+        log.info("[BIO-MONITOR] আগের cycle এখনো চলছে — এই cycle skip।")
+        return
+    async with _bio_monitor_lock:
+        await _job_bio_realtime_monitor_inner(context)
+
+
+async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
     bio_task = await asyncio.to_thread(get_bio_task)
     if not bio_task or not bio_task['is_active']:
         return
@@ -13565,8 +13779,7 @@ async def job_bio_realtime_monitor(context: ContextTypes.DEFAULT_TYPE):
         return
 
     bot = context.bot
-    bot_me = await bot.get_me()
-    bot_username = bot_me.username
+    bot_username = await _get_bot_username(bot)
     now_str = now()
     now_bd = datetime.now(BD_TZ)
 
@@ -13710,7 +13923,7 @@ async def job_bio_realtime_monitor(context: ContextTypes.DEFAULT_TYPE):
 
 async def job_post_leaderboard(context: ContextTypes.DEFAULT_TYPE):
     """প্রতিদিন রাত ১২:০০ (BD) — শুধু Channel এ পাঠায় (bot DM নয়)"""
-    bot_username = (await context.bot.get_me()).username
+    bot_username = await _get_bot_username(context.bot)
     bot_link     = f"https://t.me/{bot_username}"
 
     ch_id = LEADERBOARD_CH_ID
@@ -13805,7 +14018,11 @@ async def _run_dirty_backup_now(bot):
 
 async def job_dirty_backup(context):
     """প্রতি ৬০ সেকেন্ডে চেক করে — dirty হলে backup পাঠায় (job_queue safety net)।"""
-    await _run_dirty_backup_now(context.bot)
+    if _dirty_backup_lock.locked():
+        log.info("[DIRTY-BACKUP] আগের cycle এখনো চলছে — এই cycle skip।")
+        return
+    async with _dirty_backup_lock:
+        await _run_dirty_backup_now(context.bot)
 
 
 def _trim_user_records(c, table, uid, keep=50):
@@ -14152,17 +14369,51 @@ def check_bnb_sufficient() -> tuple:
     log.warning(f"[BNB] ⚠️ BNB কম: {bnb:.6f} BNB — Admin alert পাঠানো হবে।")
     return False, bnb       # কম আছে
 
-def get_bnb_price_usd():
-    """Binance থেকে BNB এর বর্তমান USD মূল্য নিয়ে আসো। ব্যর্থ হলে None।"""
-    try:
-        url = "https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            data = _json.loads(r.read())
-        return float(data["price"])
-    except Exception as e:
-        log.warning(f"[AUTO-WD] BNB price fetch failed: {e}")
-        return None
+_bnb_price_cache: "tuple[float, float] | None" = None   # (price, timestamp)
+_bnb_price_stale: "float | None" = None                 # সব API fail হলে শেষ সফল price
+_BNB_PRICE_CACHE_TTL = 60.0  # সেকেন্ড
+
+def get_bnb_price_usd() -> "float | None":
+    """BNB-এর বর্তমান USD মূল্য আনো।
+    Primary: Binance → Fallback: CoinGecko → Fallback: OKX।
+    সব API fail হলে last known (stale) price ব্যবহার করো।
+    60s cache — একই withdraw cycle-এ বারবার API hit হয় না।
+    """
+    global _bnb_price_cache, _bnb_price_stale
+    # ── Cache hit (fresh) ──────────────────────────────────────────────────
+    if _bnb_price_cache is not None:
+        _cached_price, _cached_ts = _bnb_price_cache
+        if _time.monotonic() - _cached_ts < _BNB_PRICE_CACHE_TTL:
+            return _cached_price
+
+    _sources = [
+        # Binance (primary)
+        ("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT",
+         lambda d: float(d["price"])),
+        # CoinGecko (fallback 1)
+        ("https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd",
+         lambda d: float(d["binancecoin"]["usd"])),
+        # OKX (fallback 2)
+        ("https://www.okx.com/api/v5/market/ticker?instId=BNB-USDT",
+         lambda d: float(d["data"][0]["last"])),
+    ]
+    for _url, _parse in _sources:
+        try:
+            _req = urllib.request.Request(_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(_req, timeout=6) as _r:
+                _data = _json.loads(_r.read())
+            _price = _parse(_data)
+            if _price and _price > 0:
+                _bnb_price_cache = (_price, _time.monotonic())
+                _bnb_price_stale = _price   # সফল হলে stale backup আপডেট
+                return _price
+        except Exception as _e:
+            log.warning(f"[BNB-PRICE] {_url[:40]}… ব্যর্থ: {_e}")
+    # ── সব API fail — last known price ব্যবহার করো (approximate) ──────────
+    if _bnb_price_stale:
+        log.warning(f"[BNB-PRICE] সব API fail — stale price ব্যবহার: ${_bnb_price_stale:.2f}")
+        return _bnb_price_stale
+    return None
 
 def estimate_gas_cost_usd():
     """USDT transfer এর জন্য gas fee USD-এ হিসাব করো।
@@ -14464,7 +14715,7 @@ async def job_auto_withdraw(context):
                 await asyncio.to_thread(_db_12171)
                 _mark_dirty()
                 bscscan_url  = f"https://bscscan.com/tx/{tx_hash}"
-                # Gas fee — BNB + USD দুটোই দেখাবে
+                # Gas fee — BNB + USD সবসময় দেখাবে (stale price হলেও)
                 if gas_bnb_actual is not None and gas_usd_paid is None:
                     try:
                         _bnb_p = await asyncio.to_thread(get_bnb_price_usd)
@@ -14472,6 +14723,9 @@ async def job_auto_withdraw(context):
                             gas_usd_paid = round(gas_bnb_actual * _bnb_p, 6)
                     except Exception as _e:
                         log.warning(f"[AUTO-WD] #{wid}: BNB price fetch (post-tx) ব্যর্থ: {_e}")
+                    # শেষ চেষ্টা — stale cache থেকে সরাসরি নাও
+                    if gas_usd_paid is None and _bnb_price_stale:
+                        gas_usd_paid = round(gas_bnb_actual * _bnb_price_stale, 6)
                 if gas_bnb_actual is not None:
                     if gas_usd_paid is not None:
                         gas_paid_str = f"{gas_bnb_actual:.6f} BNB (≈${gas_usd_paid:.4f})"
@@ -14749,7 +15003,7 @@ def main():
         # Bot restart হলেও DB থেকে pending notifications ধরবে।
         _watcher_task = asyncio.create_task(_pn_watcher(application.bot))
         _background_tasks.add(_watcher_task)
-        _watcher_task.add_done_callback(_background_tasks.discard)
+        _watcher_task.add_done_callback(_bg_task_done)
         log.info("✅ Pending-notification watcher started (প্রতি ৩০ সেকেন্ড চেক করবে)")
         # Fallback dirty-check: ৬০ সেকেন্ড পরপর (immediate scheduling ব্যর্থ হলে)
         if application.job_queue is not None:
@@ -14877,7 +15131,7 @@ def main():
                 )
             for _t in _async_jobs:
                 _background_tasks.add(_t)
-                _t.add_done_callback(_background_tasks.discard)
+                _t.add_done_callback(_bg_task_done)
             log.info("✅ Asyncio fallback: সব periodic job চালু হয়েছে (job_queue ছাড়াই)।")
 
     app = (
