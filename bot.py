@@ -584,11 +584,13 @@ class _ConnCtx:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         _broken = False
+        _commit_err = None
         if exc_type is None:
             try:
                 self._conn.commit()
-            except Exception:
+            except Exception as _ce:
                 _broken = True
+                _commit_err = _ce
                 try: self._conn.rollback()
                 except Exception: pass
         else:
@@ -606,6 +608,9 @@ class _ConnCtx:
         else:
             try: self._conn.close()
             except Exception: pass
+        # Commit fail হলে caller কে জানাও — silent failure বন্ধ
+        if _commit_err is not None:
+            raise _commit_err
         return False
 
 
@@ -649,18 +654,19 @@ def init_db():
         # ── Core tables ──────────────────────────────────────────
         c.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id     BIGINT PRIMARY KEY,
-                username    TEXT    DEFAULT '',
-                full_name   TEXT    DEFAULT '',
-                balance     REAL    DEFAULT 0,
-                referred_by BIGINT  DEFAULT NULL,
-                joined_at   TEXT    DEFAULT '',
-                is_banned   INTEGER DEFAULT 0,
-                lang        TEXT    DEFAULT '',
-                country     TEXT    DEFAULT 'BD',
-                points      INTEGER DEFAULT 100,
-                blocked_until TEXT  DEFAULT NULL,
-                last_seen   TEXT    DEFAULT ''
+                user_id       BIGINT  PRIMARY KEY,
+                username      TEXT    DEFAULT '',
+                full_name     TEXT    DEFAULT '',
+                balance       REAL    DEFAULT 0,
+                referred_by   BIGINT  DEFAULT NULL,
+                joined_at     TEXT    DEFAULT '',
+                is_banned     INTEGER DEFAULT 0,
+                lang          TEXT    DEFAULT '',
+                country       TEXT    DEFAULT 'BD',
+                points        INTEGER DEFAULT 100,
+                blocked_until TEXT    DEFAULT NULL,
+                last_seen     TEXT    DEFAULT '',
+                saved_wallet  TEXT    DEFAULT ''
             )
         """)
         c.execute("""
@@ -678,7 +684,8 @@ def init_db():
                 approved_at    TEXT    DEFAULT NULL,
                 task_code      TEXT    DEFAULT '',
                 reject_reason  TEXT    DEFAULT NULL,
-                photo_unique_ids TEXT  DEFAULT ''
+                photo_unique_ids TEXT  DEFAULT '',
+                owner_id       BIGINT  DEFAULT 0
             )
         """)
         c.execute("""
@@ -712,7 +719,8 @@ def init_db():
                 task_code        TEXT DEFAULT '',
                 allowed_countries TEXT DEFAULT '',
                 example_image_id TEXT DEFAULT '',
-                demo_video_id    TEXT DEFAULT ''
+                demo_video_id    TEXT DEFAULT '',
+                owner_id         BIGINT DEFAULT 0
             )
         """)
         c.execute("""
@@ -756,7 +764,8 @@ def init_db():
                 created_at       TEXT DEFAULT '',
                 per_user_limit   INTEGER DEFAULT 1,
                 task_code        TEXT DEFAULT '',
-                allowed_countries TEXT DEFAULT ''
+                allowed_countries TEXT DEFAULT '',
+                owner_id         BIGINT DEFAULT 0
             )
         """)
         c.execute("""
@@ -791,7 +800,8 @@ def init_db():
                 task_code        TEXT DEFAULT '',
                 allowed_countries TEXT DEFAULT '',
                 example_image_id TEXT DEFAULT '',
-                demo_video_id    TEXT DEFAULT ''
+                demo_video_id    TEXT DEFAULT '',
+                owner_id         BIGINT DEFAULT 0
             )
         """)
         c.execute("""
@@ -847,17 +857,19 @@ def init_db():
         """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS promocodes (
-                id          BIGSERIAL PRIMARY KEY,
-                code        TEXT    NOT NULL UNIQUE,
-                amount      REAL    NOT NULL DEFAULT 0,
-                max_uses    INTEGER NOT NULL DEFAULT 0,
-                used_count  INTEGER NOT NULL DEFAULT 0,
-                requirement TEXT    NOT NULL DEFAULT '',
-                min_tasks   INTEGER NOT NULL DEFAULT 0,
-                created_by  BIGINT  DEFAULT NULL,
-                created_at  TEXT    NOT NULL DEFAULT '',
-                expires_at  TEXT    NOT NULL DEFAULT '',
-                is_active   INTEGER NOT NULL DEFAULT 1
+                id              BIGSERIAL PRIMARY KEY,
+                code            TEXT    NOT NULL UNIQUE,
+                amount          REAL    NOT NULL DEFAULT 0,
+                max_uses        INTEGER NOT NULL DEFAULT 0,
+                used_count      INTEGER NOT NULL DEFAULT 0,
+                requirement     TEXT    NOT NULL DEFAULT '',
+                min_tasks       INTEGER NOT NULL DEFAULT 0,
+                created_by      BIGINT  DEFAULT NULL,
+                created_at      TEXT    NOT NULL DEFAULT '',
+                expires_at      TEXT    NOT NULL DEFAULT '',
+                is_active       INTEGER NOT NULL DEFAULT 1,
+                news_ch_msg_id  BIGINT  DEFAULT NULL,
+                news_ch_chat_id BIGINT  DEFAULT NULL
             )
         """)
         # Backfill missing columns for existing databases
@@ -934,9 +946,11 @@ def init_db():
         """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS bio_task_tracking (
-                user_id          BIGINT PRIMARY KEY,
-                first_correct_at TEXT DEFAULT '',
-                last_checked_at  TEXT DEFAULT ''
+                user_id              BIGINT PRIMARY KEY,
+                first_correct_at     TEXT    DEFAULT '',
+                last_checked_at      TEXT    DEFAULT '',
+                add_reward_received  INTEGER NOT NULL DEFAULT 0,
+                last_warned_at       TEXT    DEFAULT ''
             )
         """)
         c.execute("""
@@ -1040,7 +1054,7 @@ def init_db():
         except Exception:
             pass
         # ── owner_id column backfill (idempotent) ────────────────────
-        for _tbl in ("tasks", "tg_tasks", "category_tasks"):
+        for _tbl in ("tasks", "tg_tasks", "category_tasks", "gmails"):
             try:
                 c.execute(f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS owner_id BIGINT DEFAULT 0")
             except Exception:
@@ -5128,22 +5142,20 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     net_amt = round(amt - fee, 4)
     lang    = await asyncio.to_thread(get_lang, uid)
 
-    # ── Security Check 2: Atomic balance deduction — balance না থাকলে block ──
-    if not await asyncio.to_thread(safe_ded_bal, uid, amt):
-        _bal_now = await asyncio.to_thread(get_bal, uid)
-        err_msg = (
-            f"❌ *Insufficient balance!*\n\n💰 *Your balance:* `${_bal_now:.4f} USDT`\n💸 *Requested:* `${amt:.4f} USDT`"
-            if lang == 'en' else
-            f"❌ *পর্যাপ্ত ব্যালান্স নেই!*\n\n💰 *আপনার ব্যালান্স:* `${_bal_now:.4f} USDT`\n💸 *চাইছেন:* `${amt:.4f} USDT`"
-        )
-        await ctx.bot.send_message(uid, err_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
-        return
-
+    # ── Security Check 2 + INSERT: একই transaction এ balance কাটো ও withdrawal তৈরি করো ──
+    # এটা atomic — মাঝে crash হলেও টাকা হারাবে না।
     _sched_sec = random.randint(120, 300)   # ২ থেকে ৫ মিনিট (120–300 সেকেন্ড)
     _sched_at  = (datetime.now(pytz.timezone("Asia/Dhaka")) + timedelta(seconds=_sched_sec)).strftime("%Y-%m-%d %H:%M:%S")
-    def _insert_withdrawal():
-        _wid = None
+    def _atomic_ded_and_insert():
         with _c() as c:
+            # Step 1: balance check + deduct (atomic)
+            ded = c.execute(
+                "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
+                (amt, uid, amt)
+            )
+            if ded.rowcount == 0:
+                return None, "insufficient"
+            # Step 2: insert withdrawal (same connection/transaction)
             cur = c.execute(
                 """
                 INSERT INTO withdrawals (user_id, amount, fee, address, requested_at, scheduled_at)
@@ -5159,21 +5171,25 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _wid = cur.lastrowid
             if _wid is None:
                 raise _DuplicatePendingError()
-        return _wid
+        _invalidate_user_cache(uid)
+        _mark_dirty()
+        return _wid, "ok"
     try:
-        wid = await asyncio.to_thread(_insert_withdrawal)
+        wid, _wd_status = await asyncio.to_thread(_atomic_ded_and_insert)
+        if _wd_status == "insufficient":
+            _bal_now = await asyncio.to_thread(get_bal, uid)
+            err_msg = (
+                f"❌ *Insufficient balance!*\n\n💰 *Your balance:* `${_bal_now:.4f} USDT`\n💸 *Requested:* `${amt:.4f} USDT`"
+                if lang == 'en' else
+                f"❌ *পর্যাপ্ত ব্যালান্স নেই!*\n\n💰 *আপনার ব্যালান্স:* `${_bal_now:.4f} USDT`\n💸 *চাইছেন:* `${amt:.4f} USDT`"
+            )
+            await ctx.bot.send_message(uid, err_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+            return
         log.info(f"[WD-SUBMIT] uid={uid} wid={wid} amt={amt} addr={address[:10]}...")
         await asyncio.to_thread(_trim_table, "withdrawals", "user_id", uid, keep=10, only_done=True)
         # admin_msg_id=0 এবং channel_msg_id=0 ইতিমধ্যেই DDL DEFAULT — আলাদা UPDATE দরকার নেই।
     except _DuplicatePendingError:
-        try:
-            await asyncio.to_thread(add_bal, uid, amt)  # balance refund
-        except Exception as _dup_rb_err:
-            log.critical(f"[WD-SUBMIT] ⚠️ DUPLICATE REFUND FAILED uid={uid} amt={amt}: {_dup_rb_err}")
-            await notify_full_admins(ctx.bot,
-                f"🚨 *CRITICAL: Withdrawal Refund ব্যর্থ!*\n\n"
-                f"👤 *User ID:* `{uid}`\n💰 *Amount:* `{amt}$ USDT`\n"
-                f"⚠️ *ম্যানুয়ালি balance ফেরত দিন!*\n\nError: `{_dup_rb_err}`")
+        # Atomic transaction rollback হয়েছে — balance কাটা হয়নি, তাই refund দরকার নেই
         err_msg = (
             "⚠️ *You already have a pending withdrawal.*\n\nPlease wait for it to be processed before submitting a new one."
             if lang == 'en' else
@@ -5183,18 +5199,16 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     except Exception as _db_err:
         log.error(f"[WD-SUBMIT] DB error uid={uid} amt={amt}: {_db_err}")
-        # balance refund — কাটা টাকা ফেরত; failure হলে critical alert
+        # Atomic transaction rollback হয়েছে — balance কাটা হয়নি, তাই refund দরকার নেই
+        # তবে নিশ্চিত করতে current balance log করো
         try:
-            await asyncio.to_thread(add_bal, uid, amt)
-        except Exception as _rb_err:
-            log.critical(f"[WD-SUBMIT] ⚠️ REFUND FAILED uid={uid} amt={amt}: {_rb_err} — MANUAL FIX NEEDED")
-            await notify_full_admins(ctx.bot,
-                f"🚨 *CRITICAL: Withdrawal Refund ব্যর্থ!*\n\n"
-                f"👤 *User ID:* `{uid}`\n💰 *Amount:* `{amt}$ USDT`\n"
-                f"⚠️ *ম্যানুয়ালি balance ফেরত দিন!*\n\nError: `{_rb_err}`")
-        _err_msg = ("❌ *Server error. Your balance has been refunded. Please try again.*"
+            _cur_bal = await asyncio.to_thread(get_bal, uid)
+            log.info(f"[WD-SUBMIT] After DB error uid={uid} current_balance={_cur_bal}")
+        except Exception:
+            pass
+        _err_msg = ("❌ *Server error. Please try again.*"
                     if lang == 'en' else
-                    "❌ *সার্ভার সমস্যা। ব্যালান্স ফেরত দেওয়া হয়েছে। আবার চেষ্টা করুন।*")
+                    "❌ *সার্ভার সমস্যা। আবার চেষ্টা করুন।*")
         await ctx.bot.send_message(uid, _err_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
         return
 
