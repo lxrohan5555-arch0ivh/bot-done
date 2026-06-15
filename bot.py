@@ -564,7 +564,7 @@ def _get_pool() -> "_pg_pool.ThreadedConnectionPool":
     if _conn_pool is None or _conn_pool.closed:
         try:
             _conn_pool = _pg_pool.ThreadedConnectionPool(
-                minconn=5,
+                minconn=10,          # ব্যস্ত সময়ে cold connection কম হবে (5→10)
                 maxconn=30,          # concurrent updates বেশি হলেও pool exhaust হবে না
                 dsn=DATABASE_URL,
                 connect_timeout=10,
@@ -631,6 +631,23 @@ class _ConnCtx:
 
 def _c():
     return _ConnCtx()
+
+
+import time as _time
+_COCKROACH_RETRY_KEYS = ("SerializationFailure", "TransactionRetry", "restart transaction")
+
+def _db_with_retry(fn, max_tries=4):
+    """CockroachDB SerializationFailure auto-retry — nested _db_NNNN() function wrap করো।
+    Usage: result = await asyncio.to_thread(_db_with_retry, _db_func)
+    """
+    for _attempt in range(max_tries):
+        try:
+            return fn()
+        except Exception as _e:
+            if _attempt < max_tries - 1 and any(k in str(_e) for k in _COCKROACH_RETRY_KEYS):
+                _time.sleep(0.05 * (2 ** _attempt))  # 50ms, 100ms, 200ms backoff
+                continue
+            raise
 
 
 def _rget(row, key, default=None):
@@ -1164,6 +1181,26 @@ def get_lang(uid):
     _lang_cache[uid] = (lang, now_ts)
     return lang
 
+def _get_lang_fast(uid: int) -> "str | None":
+    """Sync cache-only lang read — event loop এ safe, thread dispatch নেই।
+    Returns: lang string if cache hit, None if cache miss (caller asyncio.to_thread করবে)."""
+    cached = _lang_cache.get(uid)
+    if cached:
+        lang, ts = cached
+        if _time.monotonic() - ts < _LANG_CACHE_TTL:
+            return lang
+    return None  # cache miss → caller asyncio.to_thread(get_lang, uid) করবে
+
+def _get_setting_fast(key: str) -> "tuple[str | None, bool]":
+    """Sync cache-only settings read — event loop এ safe, thread dispatch নেই।
+    Returns: (value, True) if cache hit, (None, False) if cache miss."""
+    entry = _settings_cache.get(key)
+    if entry is not None:
+        val, ts = entry
+        if _time.monotonic() - ts < _SETTINGS_TTL:
+            return val, True
+    return None, False
+
 def user_has_lang(uid):
     now_ts = _time.monotonic()
     cached = _lang_cache.get(uid)
@@ -1470,19 +1507,19 @@ def _perms_display(perms_str: str) -> str:
 
 # ── Settings Cache — প্রতি user action এ DB query কমাতে 60s TTL cache ──
 _settings_cache: "dict[str, tuple]" = {}   # key → (value, timestamp)
-_SETTINGS_TTL = 120.0  # সেকেন্ড (60→120: DB miss কমাও)
+_SETTINGS_TTL = 600.0  # ১০ মিনিট (120→600: admin খুব কম পরিবর্তন করে)
 
 # ── User Cache — guard() + handler দুইবার DB hit বন্ধ করে ──────────────
 _user_cache: "dict[int, tuple]" = {}   # uid → (user_dict, timestamp)
-_USER_CACHE_TTL = 300.0  # ৫ মিনিট (ban হলে _invalidate_user_cache দিয়ে সাথে সাথে মুছে যায়)
+_USER_CACHE_TTL = 600.0  # ১০ মিনিট (300→600: ban হলে _invalidate_user_cache দিয়ে সাথে সাথে মুছে যায়)
 
 # ── Language Cache — T() প্রতি call-এ DB hit বন্ধ করে (সবচেয়ে বড় fix) ─
 _lang_cache: "dict[int, tuple]" = {}   # uid → (lang, timestamp)
-_LANG_CACHE_TTL = 600.0   # ১০ মিনিট (ভাষা খুব কম পরিবর্তন হয়)
+_LANG_CACHE_TTL = 1800.0   # ৩০ মিনিট (ভাষা খুব কম পরিবর্তন হয়)
 
 # ── Menu Button Cache — main_kb() প্রতি call-এ DB hit বন্ধ করে ─────────
 _btn_cache: "dict[str, tuple]" = {}   # lang → (buttons_dict, timestamp)
-_BTN_CACHE_TTL = 120.0   # ২ মিনিট
+_BTN_CACHE_TTL = 600.0   # ১০ মিনিট (120→600: admin খুব কম পরিবর্তন করে)
 
 # ── Bot Username Cache — get_me() প্রতি call করতে হবে না ────────────────
 _bot_username_cache: "str | None" = None
@@ -1490,7 +1527,7 @@ _bot_username_cache: "str | None" = None
 # ── Required Channels Cache ──────────────────────────────────────────────
 _req_ch_cache: "list | None" = None
 _req_ch_cache_ts: float = 0.0
-_REQ_CH_CACHE_TTL = 300.0   # ৫ মিনিট
+_REQ_CH_CACHE_TTL = 900.0   # ১৫ মিনিট (300→900: channel list খুব কম পরিবর্তন হয়)
 
 # ── Task Cache — button press-এ DB round trip বন্ধ করে (সবচেয়ে বড় speed fix) ──
 _task_cache: "dict[str, tuple]" = {}
@@ -2703,12 +2740,17 @@ async def check_ch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user:
         return []
     uid = update.effective_user.id
-    channels = await asyncio.to_thread(get_req_channels)
+
+    # ── Sync fast-path: channel list cache গরম থাকলে thread dispatch বাদ ──
+    now_ts = _time.monotonic()
+    if _req_ch_cache is not None and (now_ts - _req_ch_cache_ts) < _REQ_CH_CACHE_TTL:
+        channels = _req_ch_cache
+    else:
+        channels = await asyncio.to_thread(get_req_channels)
     if not channels:
         return []
 
     # ── Cache hit? ────────────────────────────────────────────────
-    now_ts = _time.monotonic()
     cached = _ch_cache.get(uid)
     if cached:
         _cached_ts, _cached_missing = cached
@@ -3261,11 +3303,17 @@ async def show_profile(update, ctx):
 
 async def show_balance(update, ctx):
     uid   = update.effective_user.id
-    bal, owner, lang = await asyncio.gather(
-        asyncio.to_thread(get_bal, uid),
-        asyncio.to_thread(get_setting, 'support_owner'),
-        asyncio.to_thread(get_lang, uid),
-    )
+    # Sync fast-path: cache গরম থাকলে thread dispatch বাদ
+    _owner_fast, _owner_hit = _get_setting_fast('support_owner')
+    _lang_fast = _get_lang_fast(uid)
+    _coros = [asyncio.to_thread(get_bal, uid)]
+    if not _owner_hit: _coros.append(asyncio.to_thread(get_setting, 'support_owner'))
+    if _lang_fast is None: _coros.append(asyncio.to_thread(get_lang, uid))
+    _results = await asyncio.gather(*_coros)
+    _idx = 1
+    bal = _results[0]
+    owner = (_owner_fast if _owner_hit else _results[_idx]) or '@inkamxbd'; _idx += (0 if _owner_hit else 1)
+    lang  = (_lang_fast  if _lang_fast  else _results[_idx])
     owner = owner or '@inkamxbd'
     owner_e = _md_esc(owner)
     if lang == 'en':
@@ -3290,11 +3338,19 @@ async def show_balance(update, ctx):
 
 async def show_support(update, ctx):
     uid   = update.effective_user.id
-    owner, bot_u, lang = await asyncio.gather(
-        asyncio.to_thread(get_setting, 'support_owner'),
-        asyncio.to_thread(get_setting, 'support_bot'),
-        asyncio.to_thread(get_lang, uid),
-    )
+    # Sync fast-path: cache গরম থাকলে thread dispatch বাদ
+    _o_fast, _o_hit  = _get_setting_fast('support_owner')
+    _b_fast, _b_hit  = _get_setting_fast('support_bot')
+    _l_fast = _get_lang_fast(uid)
+    _coros = []
+    if not _o_hit: _coros.append(asyncio.to_thread(get_setting, 'support_owner'))
+    if not _b_hit: _coros.append(asyncio.to_thread(get_setting, 'support_bot'))
+    if _l_fast is None: _coros.append(asyncio.to_thread(get_lang, uid))
+    _results = await asyncio.gather(*_coros) if _coros else []
+    _ri = 0
+    owner = (_o_fast if _o_hit else _results[_ri]) ; _ri += (0 if _o_hit else 1)
+    bot_u = (_b_fast if _b_hit else _results[_ri]) ; _ri += (0 if _b_hit else 1)
+    lang  = (_l_fast if _l_fast else (_results[_ri] if _ri < len(_results) else 'bn'))
     owner = owner or '@inkamxbd'
     bot_u = bot_u or '@gmail_sell_help_bot'
     owner_e = _md_esc(owner)
@@ -7620,19 +7676,19 @@ async def _bio_task_check_inner(update, ctx, q, uid):
     if not bio_ok:
         if lang == 'bn':
             msg = (
-                f"❌ *Bio পাওয়া যায়নি!*\n\n"
-                f"নিচের text টি হুবহু copy করে Telegram Bio তে বসান:\n\n"
-                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
-                f"📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
-                f"✅ সেট করার পর আবার Check বাটন চাপুন।"
+                "❌ *Bio পাওয়া যায়নি!*\n\n"
+                "নিচের text টি হুবহু copy করে Telegram Bio তে বসান:\n\n"
+                "`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                "📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
+                "✅ সেট করার পর আবার Check বাটন চাপুন।"
             )
         else:
             msg = (
-                f"❌ *Bio not found!*\n\n"
-                f"Copy the text below and paste it in your Telegram Bio:\n\n"
-                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
-                f"📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
-                f"✅ After setting, press Check again."
+                "❌ *Bio not found!*\n\n"
+                "Copy the text below and paste it in your Telegram Bio:\n\n"
+                "`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                "📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
+                "✅ After setting, press Check again."
             )
         _bio_chk_lbl2 = "✅ Check করুন" if lang == 'bn' else "✅ Check Again"
         kb = InlineKeyboardMarkup([
@@ -8629,16 +8685,27 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             try:
                 u_lang  = (u.get("lang") or "bn")
                 msg_txt = bc_en if (u_lang == "en" and bc_en) else bc_bn
-                if bc_photo:
-                    sent_msg = await ctx.bot.send_photo(
-                        u["user_id"], bc_photo,
-                        caption=msg_txt, parse_mode="Markdown")
-                else:
-                    sent_msg = await ctx.bot.send_message(
-                        u["user_id"], msg_txt, parse_mode="Markdown")
+                _uid    = u["user_id"]
+                try:
+                    if bc_photo:
+                        sent_msg = await ctx.bot.send_photo(
+                            _uid, bc_photo, caption=msg_txt, parse_mode="Markdown")
+                    else:
+                        sent_msg = await ctx.bot.send_message(
+                            _uid, msg_txt, parse_mode="Markdown")
+                except Exception as _pme:
+                    # Markdown parse error → plain text fallback
+                    if "parse entities" in str(_pme).lower() or "can't find end" in str(_pme).lower():
+                        if bc_photo:
+                            sent_msg = await ctx.bot.send_photo(
+                                _uid, bc_photo, caption=msg_txt)
+                        else:
+                            sent_msg = await ctx.bot.send_message(_uid, msg_txt)
+                    else:
+                        raise
                 sent += 1
                 if do_pin:
-                    try: await ctx.bot.pin_chat_message(u["user_id"], sent_msg.message_id, disable_notification=True)
+                    try: await ctx.bot.pin_chat_message(_uid, sent_msg.message_id, disable_notification=True)
                     except Exception: pin_fail += 1
                 # Rate-limit: 25 msg/sec global cap — sleep 40ms normally, 1s every 25 msgs
                 if sent % 25 == 0:
@@ -10499,7 +10566,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"{sub_lines}"
                 )
 
-            await update.message.reply_text(text2, parse_mode="Markdown", reply_markup=kb2)
+            await update.message.reply_text(text2, parse_mode="Markdown", reply_markup=None)
             ctx.user_data.pop("state", None); return
 
         if st == "adm_find_user_id":
@@ -12021,10 +12088,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # send_chat_action background-এ (fire & forget) — main path block করে না
     _chat_act = asyncio.create_task(ctx.bot.send_chat_action(chat_id=uid, action="typing"))
     _background_tasks.add(_chat_act); _chat_act.add_done_callback(_bg_task_done)
-    _guard_ok, lang = await asyncio.gather(
-        guard(update, ctx),
-        asyncio.to_thread(get_lang, uid),
-    )
+    # Sync fast-path: lang cache গরম থাকলে thread dispatch বাদ দাও
+    _lang_cached = _get_lang_fast(uid)
+    if _lang_cached is not None:
+        _guard_ok = await guard(update, ctx)
+        lang = _lang_cached
+    else:
+        _guard_ok, lang = await asyncio.gather(
+            guard(update, ctx),
+            asyncio.to_thread(get_lang, uid),
+        )
     if not _guard_ok: return
     btns = get_all_btns(lang)
 
@@ -13716,17 +13789,17 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
             failed_list.append({'uid': uid, 'name': g['name']})
             try:
                 no_msg = (
-                    f"❌ *আজকের Bio Task Payment বাতিল হয়েছে।*\n\n"
-                    f"৫ মিনিটের মধ্যে Bio সেট না করায় আজকের payment হয়নি।\n\n"
-                    f"📝 আবার শুরু করতে Bio সেট করুন:\n"
-                    f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
-                    f"কাল রাত ১২:০০ তে আবার চেক হবে।"
+                    "❌ *আজকের Bio Task Payment বাতিল হয়েছে।*\n\n"
+                    "৫ মিনিটের মধ্যে Bio সেট না করায় আজকের payment হয়নি।\n\n"
+                    "📝 আবার শুরু করতে Bio সেট করুন:\n"
+                    "`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                    "কাল রাত ১২:০০ তে আবার চেক হবে।"
                     if lang == 'bn' else
-                    f"❌ *Today's Bio Task Payment cancelled.*\n\n"
-                    f"Bio was not restored within 5 minutes.\n\n"
-                    f"📝 To restart, set your Bio to:\n"
-                    f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
-                    f"Next check tomorrow at 12:00 AM."
+                    "❌ *Today's Bio Task Payment cancelled.*\n\n"
+                    "Bio was not restored within 5 minutes.\n\n"
+                    "📝 To restart, set your Bio to:\n"
+                    "`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                    "Next check tomorrow at 12:00 AM."
                 )
                 await bot.send_message(uid, no_msg, parse_mode="Markdown")
             except Exception: pass
@@ -13920,12 +13993,12 @@ async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
                             f"❌ *Bio Task — আজকের Payment বাতিল!*\n\n"
                             f"৫ মিনিটের মধ্যে Bio সেট না করায় আজকের `{daily_reward}$ USDT` payment পাবেন না।\n\n"
                             f"📝 Bio আবার সেট করে Tasks মেনু থেকে Bio Task → Check করলে কাল থেকে payment পাবেন।\n\n"
-                            f"Bio text:\n`{required}`"
+                            f"Bio text:\n`{_required}`"
                             if lang == 'bn' else
                             f"❌ *Bio Task — Today's Payment Cancelled!*\n\n"
                             f"Bio was not restored within 5 minutes. Today's `{daily_reward}$ USDT` is cancelled.\n\n"
                             f"📝 Set your Bio again and press Check in Tasks → Bio Task to resume from tomorrow.\n\n"
-                            f"Bio text:\n`{required}`"
+                            f"Bio text:\n`{_required}`"
                         )
                         await bot.send_message(uid, fail_msg, parse_mode="Markdown")
                     except Exception:
@@ -13952,7 +14025,7 @@ async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
                             f"⏳ *৫ মিনিটের মধ্যে* Bio আবার সেট করুন —\n"
                             f"না করলে আজকের `{daily_reward}$ USDT` payment *বাতিল হয়ে যাবে!*\n\n"
                             f"📝 Bio তে হুবহু এই text রাখুন:\n"
-                            f"`{required}`\n\n"
+                            f"`{_required}`\n\n"
                             f"_⚙️ Settings → Edit Profile → Bio_"
                             if lang == 'bn' else
                             "🚨 *Bio Task Warning!*\n\n"
@@ -13960,7 +14033,7 @@ async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
                             f"⏳ Restore your Bio within *5 minutes* —\n"
                             f"otherwise today's `{daily_reward}$ USDT` payment will be *cancelled!*\n\n"
                             f"📝 Set your Bio to exactly:\n"
-                            f"`{required}`\n\n"
+                            f"`{_required}`\n\n"
                             f"_⚙️ Settings → Edit Profile → Bio_"
                         )
                         await bot.send_message(uid, warn_msg, parse_mode="Markdown")
@@ -14896,7 +14969,7 @@ async def job_auto_withdraw(context):
                         except Exception as _e:
                             log.error(f"[AUTO-WD] BNB alert পাঠানো যায়নি — {_e}")
                     else:
-                        log.warning(f"[AUTO-WD] BNB alert cooldown চলছে — skip করা হয়েছে")
+                        log.warning("[AUTO-WD] BNB alert cooldown চলছে — skip করা হয়েছে")
                     continue   # এই withdrawal pending — পরেরটা try করো
 
                 # ── অন্য error — tx_hash IS NULL নিশ্চিত করো — TX গেলে refund করবো না
