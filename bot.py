@@ -7180,20 +7180,33 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 if _appr.rowcount == 0:
                     _already_done = True
                 else:
-                    bal_ok = bool(c.execute(
+                    # প্রথমে normal UPDATE চেষ্টা করো
+                    _upd = c.execute(
                         "UPDATE users SET balance=balance+%s WHERE user_id=%s", (price, guser)
-                    ).rowcount)
-                    if bal_ok:
+                    )
+                    if _upd.rowcount:
+                        bal_ok = True
+                        _invalidate_user_cache(guser)
+                    else:
+                        # User DB তে নেই — auto-create করো এবং balance দাও
+                        # (submitted task আছে কিন্তু users row নেই — edge case)
+                        log.warning(
+                            f"[APPROVE] user_id={guser} DB তে ছিল না — auto-creating with balance! gmails id={gid}"
+                        )
+                        c.execute(
+                            "INSERT INTO users (user_id, username, full_name, balance, joined_at, country) "
+                            "VALUES (%s, '', '', %s, %s, 'BD') "
+                            "ON CONFLICT (user_id) DO UPDATE SET balance = users.balance + EXCLUDED.balance",
+                            (guser, price, now())
+                        )
+                        bal_ok = True
                         _invalidate_user_cache(guser)
             return _already_done, bal_ok
         _already_done, bal_ok = await asyncio.to_thread(_db_5622)
         if _already_done:
             return await q.message.reply_text("⚠️ ইতিমধ্যে approve/reject হয়েছে!")
         _q_answered = False
-        if not bal_ok:
-            log.warning(f"[APPROVE] user_id={guser} DB তে নেই — balance add হয়নি! gmails id={gid}")
-            await q.message.reply_text(f"⚠️ Approved কিন্তু user {guser} DB তে নেই — balance যোগ হয়নি!")
-            _q_answered = True
+        # bal_ok সবসময় True — user না থাকলে auto-create হয়ে balance দেওয়া হয়
         _, ref = await asyncio.gather(
             asyncio.to_thread(add_points, guser, POINT_PER_APPROVE),
             asyncio.to_thread(get_referred_by, guser),
