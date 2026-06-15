@@ -2791,7 +2791,7 @@ async def fire_new_user_notify(ctx, uid, full_name, username, ref_by):
                 T(ref_by, 'new_user_ref', name=_md_esc(full_name or ""), uname=uname, comm_pct=int(comm_pct) if comm_pct == int(comm_pct) else comm_pct),
                 parse_mode="Markdown")
         except Exception as _e:
-            log.warning(f"[NOTIFY] ref_by={ref_by} new-user commission notify ব্যর্থ: {_e}")
+            log.debug(f"[NOTIFY] ref_by={ref_by} new-user commission notify ব্যর্থ: {_e}")
 
 # ──────────────────────────── /start ────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4400,7 +4400,7 @@ async def handle_tg_task_check(update, ctx, tid):
                 T(ref, 'commission_msg', name=rname, price=price, comm=comm, comm_pct=comm_pct_d),
                 parse_mode="Markdown")
         except Exception as _e:
-            log.warning(f"[TG-TASK] ref={ref} commission notify ব্যর্থ: {_e}")
+            log.debug(f"[TG-TASK] ref={ref} commission notify ব্যর্থ: {_e}")
         # ── Referral Event bonus check ──────────────────────────
         _ref_ev_tg = asyncio.create_task(_check_ref_event_bonus(uid, ref, ctx.bot))
         _background_tasks.add(_ref_ev_tg); _ref_ev_tg.add_done_callback(_bg_task_done)
@@ -5683,6 +5683,82 @@ async def _send_startup_report(bot):
 
 
 NEWS_CH_LINK = "https://t.me/task_earn_bot_news"
+
+
+async def _notify_bio_text_change(bot):
+    """Bot চালু হলে একবারই পুরানো bio-tracked users কে নতুন bio text জানায়।
+    settings table এ 'bio_change_notified' flag দিয়ে duplicate পাঠানো বন্ধ করে।"""
+    # ── ইতিমধ্যে পাঠানো হয়েছে কিনা চেক করো ─────────────────────────────
+    already = await asyncio.to_thread(get_setting, 'bio_change_notified')
+    if already == '1':
+        return
+
+    # ── Bot পুরোপুরি চালু হওয়ার জন্য ৬০ সেকেন্ড অপেক্ষা ────────────────
+    await asyncio.sleep(60)
+
+    bio_task = await asyncio.to_thread(get_bio_task)
+    if not bio_task or not bio_task['is_active']:
+        return
+
+    # ── Tracked users ফেচ করো ────────────────────────────────────────────
+    def _fetch_old_tracked():
+        with _c() as c:
+            return c.execute(
+                "SELECT bt.user_id FROM bio_task_tracking bt "
+                "WHERE bt.first_correct_at IS NOT NULL AND bt.first_correct_at != ''"
+            ).fetchall()
+
+    tracked = await asyncio.to_thread(_fetch_old_tracked)
+    if not tracked:
+        await asyncio.to_thread(set_setting, 'bio_change_notified', '1')
+        return
+
+    log.info(f"[BIO-NOTIFY] {len(tracked)} জন পুরানো bio user কে নোটিফিকেশন পাঠাচ্ছি…")
+
+    _new_bio = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
+    _sem = asyncio.Semaphore(5)   # Telegram rate limit এড়াতে
+
+    async def _send_one(row):
+        uid  = row['user_id']
+        lang = await asyncio.to_thread(get_lang, uid)
+        if lang == 'en':
+            msg = (
+                "🔔 *Bio Task — Text Changed!*\n\n"
+                "The required Bio text has been updated.\n\n"
+                "📝 *Set your Telegram Bio to exactly this:*\n\n"
+                f"`{_new_bio}`\n\n"
+                "📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
+                "⚠️ *Tonight at 12:00 AM (BD) your bio will be checked.*\n"
+                "If not set, you have *5 minutes* to update — otherwise today's payment will be cancelled."
+            )
+        else:
+            msg = (
+                "🔔 *Bio Task — Bio Text পরিবর্তন হয়েছে!*\n\n"
+                "Required Bio text আপডেট করা হয়েছে।\n\n"
+                "📝 *আপনার Telegram Bio তে হুবহু এই text রাখুন:*\n\n"
+                f"`{_new_bio}`\n\n"
+                "📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
+                "⚠️ *আজ রাত ১২:০০ (BD) তে bio চেক হবে।*\n"
+                "সেট না থাকলে ৫ মিনিটের মধ্যে সেট করুন — না হলে আজকের payment বাতিল হবে।"
+            )
+        async with _sem:
+            try:
+                await bot.send_message(uid, msg, parse_mode="Markdown")
+                await asyncio.sleep(0.1)   # rate-limit buffer
+            except Exception as _e:
+                log.debug(f"[BIO-NOTIFY] uid={uid} পাঠাতে ব্যর্থ: {_e}")
+
+    # ── ৫০টি chunk এ পাঠাও — টানা blast এড়াতে ────────────────────────
+    _CHUNK = 50
+    for i in range(0, len(tracked), _CHUNK):
+        chunk = tracked[i:i + _CHUNK]
+        await asyncio.gather(*[_send_one(r) for r in chunk], return_exceptions=True)
+        if i + _CHUNK < len(tracked):
+            await asyncio.sleep(2)   # chunk এর মাঝে ২ সেকেন্ড pause
+
+    # ── Flag সেট করো — পরের restart এ আর পাঠাবে না ──────────────────
+    await asyncio.to_thread(set_setting, 'bio_change_notified', '1')
+    log.info(f"[BIO-NOTIFY] ✅ {len(tracked)} জন কে নোটিফিকেশন পাঠানো হয়েছে।")
 
 
 # ── Pending notification DB helpers ───────────────────────────────────────────
@@ -7079,7 +7155,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                     T(ref, 'commission_msg', name=_md_esc(rname), price=price, comm=comm, comm_pct=comm_pct_display),
                     parse_mode="Markdown")
             except Exception as _e:
-                log.warning(f"[APPROVE] ref={ref} commission notify ব্যর্থ: {_e}")
+                log.debug(f"[APPROVE] ref={ref} commission notify ব্যর্থ: {_e}")
             # ── Referral Event bonus check ──────────────────────────
             _ref_ev_task = asyncio.create_task(_check_ref_event_bonus(guser, ref, ctx.bot))
             _background_tasks.add(_ref_ev_task); _ref_ev_task.add_done_callback(_bg_task_done)
@@ -7405,11 +7481,10 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 f"📅 *Daily Reward (প্রতিদিন, ২৪ঘন্টা):* `{daily_reward}$ USDT`\n\n"
                 f"{track_status}\n\n"
                 f"📝 *আপনার Bio তে হুবহু এই text রাখুন:*\n\n"
-                f"`Free Task Earn bot {ref_link}`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_⚙️ Settings → Edit Profile → Bio_\n\n"
                 f"▶️ *Bio সেট করার পর:*\n"
-                f"1️⃣ এই bot-কে /start পাঠান (একবার)\n"
-                f"2️⃣ তারপর ✅ Check করুন বাটন চাপুন\n\n"
+                f"1️⃣ ✅ Check করুন বাটন চাপুন\n\n"
                 f"⚠️ Bio সরালে ৫ মিনিটের মধ্যে ফিরিয়ে না দিলে daily payment বাতিল!"
                 f"{hist_lines}"
             )
@@ -7428,11 +7503,10 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 f"📅 *Daily Reward (every day, 24h):* `{daily_reward}$ USDT`\n\n"
                 f"{track_status}\n\n"
                 f"📝 *Set your Telegram Bio to exactly:*\n\n"
-                f"`Free Task Earn bot {ref_link}`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_⚙️ Settings → Edit Profile → Bio_\n\n"
                 f"▶️ *After setting bio:*\n"
-                f"1️⃣ Send /start to this bot (once)\n"
-                f"2️⃣ Then press ✅ Check button\n\n"
+                f"1️⃣ Press ✅ Check button\n\n"
                 f"⚠️ If you remove your Bio, restore within 5 min or daily payment is cancelled!"
                 f"{hist_lines}"
             )
@@ -7488,17 +7562,13 @@ async def _bio_task_check_inner(update, ctx, q, uid):
     add_reward   = (bio_task.get('add_reward', 0) or 0)
     daily_reward = bio_task['reward']
     ref_link     = f"https://t.me/{bot_username}?start=ref_{uid}"
-    required_bio = f"Free Task Earn bot {ref_link}"
+    required_bio = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
 
     def _bio_matches(bio_text: str) -> bool:
         if not bio_text:
             return False
         t = bio_text.strip()
-        if f"ref_{uid}" in t:
-            return True
         if required_bio.lower() in t.lower():
-            return True
-        if str(uid) in t and bot_username.lower() in t.lower():
             return True
         return False
 
@@ -7552,7 +7622,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
             msg = (
                 f"❌ *Bio পাওয়া যায়নি!*\n\n"
                 f"নিচের text টি হুবহু copy করে Telegram Bio তে বসান:\n\n"
-                f"`Free Task Earn bot {ref_link}`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
                 f"✅ সেট করার পর আবার Check বাটন চাপুন।"
             )
@@ -7560,7 +7630,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
             msg = (
                 f"❌ *Bio not found!*\n\n"
                 f"Copy the text below and paste it in your Telegram Bio:\n\n"
-                f"`Free Task Earn bot {ref_link}`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
                 f"✅ After setting, press Check again."
             )
@@ -8620,7 +8690,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             f"📅 *Daily Reward (রোজ):* `{dr}$ USDT`\n"
             f"📊 *Status:* {st}\n\n"
             f"📝 *Required Bio Text:*\n"
-            f"`Free Task Earn bot https://t.me/BotUsername?start=ref_UserID`\n\n"
+            f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
             f"🕛 প্রতিদিন রাত ১২:০০ BD তে automatic check হয়।\n"
             f"⏳ Bio সরালে ৫ মিনিট grace — তারপর tracking reset।"
         ), act
@@ -10602,7 +10672,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         comm_d = int(comm_pct) if comm_pct == int(comm_pct) else comm_pct
                         await ctx.bot.send_message(ref, T(ref,'commission_msg',name=_md_esc(rname),price=price,comm=comm,comm_pct=comm_d), parse_mode="Markdown")
                     except Exception as _e:
-                        log.warning(f"[PHOTO-APPROVE] ref={ref} commission notify ব্যর্থ: {_e}")
+                        log.debug(f"[PHOTO-APPROVE] ref={ref} commission notify ব্যর্থ: {_e}")
                     # ── Referral Event bonus check ──────────────────────────
                     _ref_ev_task2 = asyncio.create_task(_check_ref_event_bonus(guser, ref, ctx.bot))
                     _background_tasks.add(_ref_ev_task2); _ref_ev_task2.add_done_callback(_bg_task_done)
@@ -13293,7 +13363,7 @@ def _lb_get_user_full_rank(uid: int) -> tuple[int, int] | tuple[None, None]:
                 .strftime("%Y-%m-%d %H:%M:%S")   # BD local — UTC convert করলে ৬ ঘণ্টা ভুল হয়
     with _c() as c:
         all_rows = c.execute("""
-            SELECT user_id, COUNT(*) AS cnt
+            SELECT user_id, COUNT(*) AS cnt, MIN(combined.ts) AS first_ts
             FROM (
                 SELECT user_id, approved_at AS ts FROM gmails
                 WHERE status = 'approved' AND approved_at >= %s
@@ -13302,7 +13372,7 @@ def _lb_get_user_full_rank(uid: int) -> tuple[int, int] | tuple[None, None]:
                 WHERE done_at >= %s
             ) combined
             GROUP BY user_id
-            ORDER BY cnt DESC
+            ORDER BY cnt DESC, first_ts ASC
         """, (since, since)).fetchall()
     for i, row in enumerate(all_rows):
         if row['user_id'] == uid:
@@ -13327,7 +13397,7 @@ def _lb_get_rows(yesterday: bool = False) -> list:
     with _c() as c:
         if until:
             raw = c.execute("""
-                SELECT u.user_id, u.full_name, u.username, COUNT(*) AS cnt
+                SELECT u.user_id, u.full_name, u.username, COUNT(*) AS cnt, MIN(combined.ts) AS first_ts
                 FROM (
                     SELECT user_id, approved_at AS ts FROM gmails
                     WHERE status = 'approved' AND approved_at >= %s AND approved_at < %s
@@ -13337,12 +13407,12 @@ def _lb_get_rows(yesterday: bool = False) -> list:
                 ) combined
                 JOIN users u ON combined.user_id = u.user_id
                 GROUP BY u.user_id, u.full_name, u.username
-                ORDER BY cnt DESC
+                ORDER BY cnt DESC, first_ts ASC
                 LIMIT 10
             """, (since, until, since, until)).fetchall()
         else:
             raw = c.execute("""
-                SELECT u.user_id, u.full_name, u.username, COUNT(*) AS cnt
+                SELECT u.user_id, u.full_name, u.username, COUNT(*) AS cnt, MIN(combined.ts) AS first_ts
                 FROM (
                     SELECT user_id, approved_at AS ts FROM gmails
                     WHERE status = 'approved' AND approved_at >= %s
@@ -13352,7 +13422,7 @@ def _lb_get_rows(yesterday: bool = False) -> list:
                 ) combined
                 JOIN users u ON combined.user_id = u.user_id
                 GROUP BY u.user_id, u.full_name, u.username
-                ORDER BY cnt DESC
+                ORDER BY cnt DESC, first_ts ASC
                 LIMIT 10
             """, (since, since)).fetchall()
     # RealDictCursor rows → tuple list for backward-compatible callers
@@ -13485,17 +13555,11 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
     _sem = asyncio.Semaphore(10)   # max 10 parallel Telegram API calls
 
     async def _check_bio(uid, bot_uname):
-        ref_link = f"https://t.me/{bot_uname}?start=ref_{uid}"
-        required = f"Free Task Earn bot {ref_link}"
+        _required = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
         try:
             chat = await bot.get_chat(uid)
             user_bio = (chat.bio or "").strip()
-            # শুধু ref_{uid} থাকলেই যথেষ্ট — এটাই unique identifier per user
-            if f"ref_{uid}" in user_bio:
-                return True
-            if required.lower() in user_bio.lower():
-                return True
-            if str(uid) in user_bio and bot_uname.lower() in user_bio.lower():
+            if _required.lower() in user_bio.lower():
                 return True
             return False
         except Exception as e:
@@ -13587,7 +13651,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ *৫ মিনিটের মধ্যে* Bio আবার সেট করুন —\n"
                 f"নাহলে আজকের `{daily_reward}$ USDT` payment পাবেন না।\n\n"
                 f"📝 Bio তে হুবহু এই text রাখুন:\n"
-                f"`Free Task Earn bot https://t.me/{bot_username}?start=ref_{uid}`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_(Settings → Edit Profile → Bio)_"
                 if lang == 'bn' else
                 "⚠️ *Bio Task Warning!*\n\n"
@@ -13595,7 +13659,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ Set your Bio again within *5 minutes* —\n"
                 f"otherwise you won't receive today's `{daily_reward}$ USDT` payment.\n\n"
                 f"📝 Set your Bio to exactly:\n"
-                f"`Free Task Earn bot https://t.me/{bot_username}?start=ref_{uid}`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_(Settings → Edit Profile → Bio)_"
             )
             await bot.send_message(uid, warn_msg, parse_mode="Markdown")
@@ -13655,13 +13719,13 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                     f"❌ *আজকের Bio Task Payment বাতিল হয়েছে।*\n\n"
                     f"৫ মিনিটের মধ্যে Bio সেট না করায় আজকের payment হয়নি।\n\n"
                     f"📝 আবার শুরু করতে Bio সেট করুন:\n"
-                    f"`Free Task Earn bot https://t.me/{bot_username}?start=ref_{uid}`\n\n"
+                    f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                     f"কাল রাত ১২:০০ তে আবার চেক হবে।"
                     if lang == 'bn' else
                     f"❌ *Today's Bio Task Payment cancelled.*\n\n"
                     f"Bio was not restored within 5 minutes.\n\n"
                     f"📝 To restart, set your Bio to:\n"
-                    f"`Free Task Earn bot https://t.me/{bot_username}?start=ref_{uid}`\n\n"
+                    f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                     f"Next check tomorrow at 12:00 AM."
                 )
                 await bot.send_message(uid, no_msg, parse_mode="Markdown")
@@ -13802,20 +13866,14 @@ async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
     async def _process_user(row):
         uid         = row['user_id']
         last_warned = (row.get('last_warned_at') or '')
-        ref_link    = f"https://t.me/{bot_username}?start=ref_{uid}"
-        required    = f"Free Task Earn bot {ref_link}"
         lang        = await asyncio.to_thread(get_lang, uid)
+        _required   = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
 
         def _bio_matches(bio_text: str) -> bool:
             bio_text = (bio_text or "").strip()
             if not bio_text:
                 return False
-            # শুধু ref_{uid} থাকলেই যথেষ্ট — এটাই unique identifier per user
-            if f"ref_{uid}" in bio_text:
-                return True
-            if required.lower() in bio_text.lower():
-                return True
-            if str(uid) in bio_text and bot_username.lower() in bio_text.lower():
+            if _required.lower() in bio_text.lower():
                 return True
             return False
 
@@ -15005,11 +15063,15 @@ def main():
         _background_tasks.add(_watcher_task)
         _watcher_task.add_done_callback(_bg_task_done)
         log.info("✅ Pending-notification watcher started (প্রতি ৩০ সেকেন্ড চেক করবে)")
+        # ── Step 4: পুরানো bio users কে নতুন text জানাও (একবারই) ──
+        _bio_notify_task = asyncio.create_task(_notify_bio_text_change(application.bot))
+        _background_tasks.add(_bio_notify_task)
+        _bio_notify_task.add_done_callback(_bg_task_done)
         # Fallback dirty-check: ৬০ সেকেন্ড পরপর (immediate scheduling ব্যর্থ হলে)
         if application.job_queue is not None:
             application.job_queue.run_repeating(
                 job_dirty_backup,
-                interval=60,    # CockroachDB — original 60s interval
+                interval=120,   # 120s — _run_periodically(60s) already handles frequent checks
                 first=300,
                 name="dirty_backup"
             )
