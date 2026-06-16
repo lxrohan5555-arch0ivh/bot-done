@@ -2118,6 +2118,55 @@ def bio_task_paid_today(user_id):
         ).fetchone()
         return r is not None
 
+def find_duplicate_photo_submission(unique_ids, skip_gid=None):
+    """photo_unique_ids match করে আগের যেকোনো submission খোঁজো।
+    skip_gid: এই gmails id বাদ দাও (newly inserted submission এর নিজের row)।
+    Returns: dict row {id, user_id, status, task_name, submitted_at} or None.
+    """
+    with _c() as c:
+        for _puid in (unique_ids or []):
+            if not _puid:
+                continue
+            if skip_gid:
+                row = c.execute(
+                    "SELECT id, user_id, status, task_name, submitted_at "
+                    "FROM gmails WHERE id != %s AND photo_unique_ids IS NOT NULL "
+                    "AND (photo_unique_ids = %s OR photo_unique_ids LIKE %s "
+                    "OR photo_unique_ids LIKE %s OR photo_unique_ids LIKE %s) "
+                    "ORDER BY submitted_at DESC LIMIT 1",
+                    (skip_gid, _puid, _puid + ',%', '%,' + _puid, '%,' + _puid + ',%')
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT id, user_id, status, task_name, submitted_at "
+                    "FROM gmails WHERE photo_unique_ids IS NOT NULL "
+                    "AND (photo_unique_ids = %s OR photo_unique_ids LIKE %s "
+                    "OR photo_unique_ids LIKE %s OR photo_unique_ids LIKE %s) "
+                    "ORDER BY submitted_at DESC LIMIT 1",
+                    (_puid, _puid + ',%', '%,' + _puid, '%,' + _puid + ',%')
+                ).fetchone()
+            if row:
+                return dict(row)
+    return None
+
+def get_bio_paid_today_set():
+    """আজ bio payment পেয়েছে এমন সব user_id একটি set-এ return করো (batch)।"""
+    _tz = pytz.timezone("Asia/Dhaka")
+    today = datetime.now(_tz).strftime("%Y-%m-%d")
+    with _c() as c:
+        rows = c.execute(
+            "SELECT user_id FROM bio_task_completions WHERE task_date=%s", (today,)
+        ).fetchall()
+    return {r['user_id'] for r in rows}
+
+def get_bio_tracked_ids_set():
+    """bio_task_tracking এ actively tracked (first_correct_at সেট) user_id গুলো set-এ return করো (batch)।"""
+    with _c() as c:
+        rows = c.execute(
+            "SELECT user_id FROM bio_task_tracking WHERE first_correct_at IS NOT NULL AND first_correct_at != ''"
+        ).fetchall()
+    return {r['user_id'] for r in rows}
+
 def record_bio_payment(user_id, date_str, amount):
     with _c() as c:
         c.execute(
@@ -2582,12 +2631,12 @@ def _build_user_profile(uid, u=None):
         wd_app    = _count(c.execute("SELECT COUNT(*) FROM withdrawals WHERE user_id=%s AND status='approved'", (uid,)).fetchone())
         tg_done   = _count(c.execute("SELECT COUNT(*) FROM tg_task_completions WHERE user_id=%s",  (uid,)).fetchone())
         cat_done  = _count(c.execute("SELECT COUNT(*) FROM category_task_completions WHERE user_id=%s", (uid,)).fetchone())
-    name_str  = f"@{u['username']}" if u["username"] else (u["full_name"] or "Unknown")
+    name_str  = _md_esc(f"@{u['username']}" if u["username"] else (u["full_name"] or "Unknown"))
     ban_icon  = "🚫 Banned" if u["is_banned"] else "✅ Active"
     ref_by    = u["referred_by"]
     if ref_by:
         ref_u = get_user(ref_by)
-        rn = (f"@{ref_u['username']}" if ref_u and ref_u["username"] else
+        rn = _md_esc(f"@{ref_u['username']}" if ref_u and ref_u["username"] else
               (ref_u["full_name"] if ref_u and ref_u["full_name"] else str(ref_by)))
         ref_by_str = f"`{ref_by}` ({rn})"
     else:
@@ -2608,7 +2657,7 @@ def _build_user_profile(uid, u=None):
         f"👤 *User Profile*\n\n"
         f"🆔 *ID:* `{uid}`\n"
         f"📛 *নাম:* {name_str}\n"
-        f"📱 *Full Name:* {u['full_name'] or '_নেই_'}\n"
+        f"📱 *Full Name:* {_md_esc(u['full_name']) if u['full_name'] else '_নেই_'}\n"
         f"📅 *Join Date:* `{u['joined_at']}`\n"
         f"🌐 *Language:* `{u['lang'] or 'bn'}`\n"
         f"🌍 *দেশ:* {country_str}\n"
@@ -3977,43 +4026,7 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
             val = _md_esc(item["value"] or "")
             summary_lines.append(f"📝 *{_md_esc(item['prompt_bn'])}:*\n`{val}`")
 
-    # ── Duplicate photo detection ──────────────────────────────────
-    if _cat_submitted_uids:
-        def _db_2921():
-            # SQL-এ LIKE দিয়ে check করো — Python-এ সব rows fetch করার দরকার নেই
-            with _c() as c:
-                for _uid_val in _cat_submitted_uids:
-                    if not _uid_val:
-                        continue
-                    hit = c.execute(
-                        "SELECT 1 FROM gmails WHERE user_id != %s AND photo_unique_ids IS NOT NULL "
-                        "AND photo_unique_ids != '' AND photo_unique_ids LIKE %s LIMIT 1",
-                        (uid, f"%{_uid_val}%")
-                    ).fetchone()
-                    if hit:
-                        return True
-            return False
-        _cat_dup_found = await asyncio.to_thread(_db_2921)
-        if _cat_dup_found:
-            _new_pts, _cat_lang = await asyncio.gather(
-                asyncio.to_thread(add_points, uid, -POINT_DUP_PHOTO),
-                asyncio.to_thread(get_lang, uid),
-            )
-            _dup_notice = (
-                "⚠️ *Duplicate Photo Detected!*\n\n"
-                "🔴 This photo has been used in a previous submission.\n"
-                f"📉 *{POINT_DUP_PHOTO} points deducted.* Current: `{_new_pts}/100`"
-                if _cat_lang == 'en' else
-                "⚠️ *ডুপ্লিকেট ছবি শনাক্ত হয়েছে!*\n\n"
-                "🔴 এই ছবি আগে অন্য Submission এ ব্যবহার করা হয়েছে।\n"
-                f"📉 *{POINT_DUP_PHOTO} পয়েন্ট কাটা হয়েছে।* বর্তমান: `{_new_pts}/100`"
-            )
-            ctx.user_data.clear()
-            if update.message:
-                await update.message.reply_text(_dup_notice, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
-            else:
-                await ctx.bot.send_message(uid, _dup_notice, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
-            return
+    # duplicate check — ইউজার কিছু জানবে না, শুধু admin warning এ দেখাবে (msg_txt এ)
 
     summary_txt = "\n".join(summary_lines) if summary_lines else "_No data_"
     gmail_text  = _json.dumps(collected, ensure_ascii=False)
@@ -4100,6 +4113,27 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
             await asyncio.to_thread(_db_3014)
         except Exception as _e:
             log.warning(f"[CAT-TASK] gid={gid}: photo_unique_ids save ব্যর্থ — {_e}")
+    # ── Duplicate photo warning — admin message এ যোগ হবে ──────
+    _cat_admin_dup_warning = ""
+    if _cat_submitted_uids and gid:
+        try:
+            _cat_prev_sub = await asyncio.to_thread(find_duplicate_photo_submission, _cat_submitted_uids, gid)
+            if _cat_prev_sub:
+                _cps_status = str(_cat_prev_sub.get('status', 'pending') or 'pending').lower()
+                _cps_icon = {"approved": "✅", "rejected": "❌", "pending": "⏳"}.get(_cps_status, "❓")
+                _cps_label = {"approved": "Approved", "rejected": "Rejected", "pending": "Pending"}.get(_cps_status, _cps_status.upper())
+                _cat_same_user = _cat_prev_sub.get('user_id') == uid
+                _cat_warn_header = "⚠️ *SAME USER RESUBMIT*" if _cat_same_user else "⚠️ *DUPLICATE PHOTO — অন্য ID থেকে!*"
+                _cat_admin_dup_warning = (
+                    f"\n\n{_cat_warn_header}\n"
+                    f"┌ 🆔 Previous User: `{_cat_prev_sub['user_id']}`\n"
+                    f"├ 📌 Task: {_md_esc(str(_cat_prev_sub.get('task_name','') or ''))}\n"
+                    f"├ 🔖 Sub ID: `#{_cat_prev_sub['id']}`\n"
+                    f"├ {_cps_icon} Status: *{_cps_label}*\n"
+                    f"└ 🕐 Submitted: `{str(_cat_prev_sub.get('submitted_at',''))[:16]}`"
+                )
+        except Exception as _cdup_e:
+            log.warning(f"[CAT-TASK] dup warning check failed: {_cdup_e}")
     # Max completions check — notify admin if slot পূর্ণ হয়েছে
     _ct_after = await asyncio.to_thread(get_category_task, task_id)
     if _ct_after and _ct_after["max_completions"] > 0 and not _ct_after["is_active"]:
@@ -4127,6 +4161,7 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
         f"💵 *Price:* `{price}$ USDT`\n"
         f"🕐 *Time:* {now()}\n"
         f"🔖 *Sub ID:* `#{gid}`"
+        f"{_cat_admin_dup_warning}"
     )
 
     # ── ইউজারকে তাৎক্ষণিক reply — সব notification background এ ──────
@@ -4958,45 +4993,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
             val = _md_esc(item["value"] or "")
             summary_lines.append(f"📝 *{_md_esc(prompt_lbl or '')}:*\n`{val}`")
 
-    # ── Duplicate photo detection — DB-level query (fast, no full-table scan in Python) ──
-    if _submitted_unique_ids:
-        def _check_dup_photos(unique_ids):
-            """PostgreSQL LIKE check — same user এর নিজের photo block করে না, শুধু অন্য user এর duplicate ধরে।"""
-            with _c() as c:
-                for _puid in unique_ids:
-                    row = c.execute(
-                        "SELECT id FROM gmails WHERE user_id != %s AND photo_unique_ids IS NOT NULL "
-                        "AND (photo_unique_ids = %s "
-                        "OR photo_unique_ids LIKE %s "
-                        "OR photo_unique_ids LIKE %s "
-                        "OR photo_unique_ids LIKE %s) LIMIT 1",
-                        (uid,
-                         _puid,
-                         _puid + ',%',
-                         '%,' + _puid,
-                         '%,' + _puid + ',%')
-                    ).fetchone()
-                    if row:
-                        return True
-            return False
-        _is_dup = await asyncio.to_thread(_check_dup_photos, _submitted_unique_ids)
-        if _is_dup:
-            _new_pts = await asyncio.to_thread(add_points, uid, -POINT_DUP_PHOTO)
-            _dup_notice = (
-                "⚠️ *Duplicate Photo Detected!*\n\n"
-                "🔴 This photo has been used in a previous submission.\n"
-                f"📉 *{POINT_DUP_PHOTO} points deducted.* Current: `{_new_pts}/100`"
-                if lang == 'en' else
-                "⚠️ *ডুপ্লিকেট ছবি শনাক্ত হয়েছে!*\n\n"
-                "🔴 এই ছবি আগে অন্য Submission এ ব্যবহার করা হয়েছে।\n"
-                f"📉 *{POINT_DUP_PHOTO} পয়েন্ট কাটা হয়েছে।* বর্তমান: `{_new_pts}/100`"
-            )
-            ctx.user_data.clear()
-            if update.message:
-                await update.message.reply_text(_dup_notice, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
-            else:
-                await ctx.bot.send_message(uid, _dup_notice, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
-            return
+    # duplicate check — ইউজার কিছু জানবে না, শুধু admin warning এ দেখাবে (msg_txt এ)
 
     summary_txt = "\n".join(summary_lines) if summary_lines else ("_No data_" if lang == 'en' else "_কোনো তথ্য নেই_")
     gmail_text  = _json.dumps(collected, ensure_ascii=False)
@@ -5047,6 +5044,27 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
             await asyncio.to_thread(_save_photo_ids)
         except Exception as _e:
             log.warning(f"[TASK-PHOTO] gid={gid}: photo_unique_ids save ব্যর্থ — {_e}")
+    # ── Duplicate photo warning — admin message এ যোগ হবে (same-user + any match) ──
+    _admin_dup_warning = ""
+    if _submitted_unique_ids and gid:
+        try:
+            _prev_sub = await asyncio.to_thread(find_duplicate_photo_submission, _submitted_unique_ids, gid)
+            if _prev_sub:
+                _ps_status = str(_prev_sub.get('status', 'pending') or 'pending').lower()
+                _ps_icon = {"approved": "✅", "rejected": "❌", "pending": "⏳"}.get(_ps_icon_key := _ps_status, "❓")
+                _ps_label = {"approved": "Approved", "rejected": "Rejected", "pending": "Pending"}.get(_ps_status, _ps_status.upper())
+                _same_user = _prev_sub.get('user_id') == uid
+                _warn_header = "⚠️ *SAME USER RESUBMIT*" if _same_user else "⚠️ *DUPLICATE PHOTO — অন্য ID থেকে!*"
+                _admin_dup_warning = (
+                    f"\n\n{_warn_header}\n"
+                    f"┌ 🆔 Previous User: `{_prev_sub['user_id']}`\n"
+                    f"├ 📌 Task: {_md_esc(str(_prev_sub.get('task_name','') or ''))}\n"
+                    f"├ 🔖 Sub ID: `#{_prev_sub['id']}`\n"
+                    f"├ {_ps_icon} Status: *{_ps_label}*\n"
+                    f"└ 🕐 Submitted: `{str(_prev_sub.get('submitted_at',''))[:16]}`"
+                )
+        except Exception as _dup_e:
+            log.warning(f"[TASK-PHOTO] dup warning check failed: {_dup_e}")
     _u_ctry_raw2 = (await asyncio.to_thread(get_user_country, uid) or "").upper().strip()
     if _u_ctry_raw2 and _u_ctry_raw2 in COUNTRY_MAP:
         _u_ctry_flag2, _u_ctry_name2 = COUNTRY_MAP[_u_ctry_raw2]
@@ -5066,6 +5084,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
         f"💵 *মূল্য:* `{price}$ USDT`\n"
         f"🕐 *সময়:* {now()}\n"
         f"🔖 *Sub ID:* `#{gid}`"
+        f"{_admin_dup_warning}"
     )
 
     # ── ইউজারকে তাৎক্ষণিক reply — সব notification background এ ──────
@@ -7250,41 +7269,32 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             ctx.bot, guser, _rw_name, _rw_code, price, _task_type_lbl
         ))
         _background_tasks.add(_tdn2); _tdn2.add_done_callback(_bg_task_done)
-        status_line = "\n\n✅ *APPROVED by Admin*"
-        orig = q.message.text or q.message.caption or ""
-        new_txt = orig + status_line
+        # Approve হলে submission message delete করো (admin chat + channel)
+        _approve_chat_id = q.message.chat_id
         try:
-            if q.message.photo:
-                await q.message.edit_caption(new_txt, parse_mode="Markdown", reply_markup=None)
-            else:
-                await q.message.edit_text(new_txt, parse_mode="Markdown", reply_markup=None)
+            await q.message.delete()
         except Exception: pass
         def _db_5687():
             row2 = None
             with _c() as c: row2 = c.execute("SELECT * FROM gmails WHERE id=%s", (gid,)).fetchone()
             return row2
         row2 = await asyncio.to_thread(_db_5687)
-        if not row2:
-            return
-        # Sub-admin approve করলেও admin + channel দুটো message-ই আপডেট করো
         _ch_id = await asyncio.to_thread(get_gmail_ch_id)
-        _msgs_to_edit = []
-        if uid == ADMIN_ID:
-            # Main admin: channel message edit করো
-            if row2["channel_msg_id"]: _msgs_to_edit.append((_ch_id, row2["channel_msg_id"]))
-        else:
-            # Sub-admin: main admin-এর message + channel message দুটোই edit করো
-            if row2["admin_msg_id"]:   _msgs_to_edit.append((ADMIN_ID, row2["admin_msg_id"]))
-            if row2["channel_msg_id"]: _msgs_to_edit.append((_ch_id,  row2["channel_msg_id"]))
-        for _ecid, _emid in _msgs_to_edit:
+        _msgs_to_del = []
+        if row2:
+            if uid == ADMIN_ID:
+                if row2["channel_msg_id"]: _msgs_to_del.append((_ch_id, row2["channel_msg_id"]))
+            else:
+                if row2["admin_msg_id"]:   _msgs_to_del.append((ADMIN_ID, row2["admin_msg_id"]))
+                if row2["channel_msg_id"]: _msgs_to_del.append((_ch_id,  row2["channel_msg_id"]))
+        for _dcid, _dmid in _msgs_to_del:
             try:
-                if q.message.photo:
-                    await ctx.bot.edit_message_caption(new_txt, chat_id=_ecid, message_id=_emid, parse_mode="Markdown", reply_markup=None)
-                else:
-                    await ctx.bot.edit_message_text(new_txt, chat_id=_ecid, message_id=_emid, parse_mode="Markdown", reply_markup=None)
+                await ctx.bot.delete_message(chat_id=_dcid, message_id=_dmid)
             except Exception: pass
         if not _q_answered:
-            await q.message.reply_text("✅ Approved!")
+            try:
+                await ctx.bot.send_message(_approve_chat_id, "✅ Approved!")
+            except Exception: pass
         return
 
     # ── Gmail reject — কারণ জিজ্ঞেস করো আগে ────────────────────────
@@ -10118,39 +10128,28 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         has_photo    = ctx.user_data.get("adm_reject_has_photo", False)
         orig_msg_id  = ctx.user_data.get("adm_reject_msg_id")
         orig_chat_id = ctx.user_data.get("adm_reject_chat_id")
-        new_txt = orig_txt + status_line
+        # Reject হলে submission message delete করো (admin chat + channel)
         if orig_msg_id and orig_chat_id:
             try:
-                if has_photo:
-                    await ctx.bot.edit_message_caption(new_txt, chat_id=orig_chat_id,
-                                                       message_id=orig_msg_id, parse_mode="Markdown", reply_markup=None)
-                else:
-                    await ctx.bot.edit_message_text(new_txt, chat_id=orig_chat_id,
-                                                    message_id=orig_msg_id, parse_mode="Markdown", reply_markup=None)
+                await ctx.bot.delete_message(chat_id=orig_chat_id, message_id=orig_msg_id)
             except Exception: pass
-        # ── Edit channel/other-side message ──────────────────────
+        # ── Delete channel/other-side message ──────────────────────
         def _db_8090():
             row2 = None
             with _c() as c: row2 = c.execute("SELECT * FROM gmails WHERE id=%s", (gid,)).fetchone()
             return row2
         row2 = await asyncio.to_thread(_db_8090)
         if row2:
-            # Sub-admin reject করলেও admin + channel দুটো message-ই আপডেট করো
             _rch_id = await asyncio.to_thread(get_gmail_ch_id)
-            _rmsgs_to_edit = []
+            _rmsgs_to_del = []
             if uid == ADMIN_ID:
-                if row2["channel_msg_id"]: _rmsgs_to_edit.append((_rch_id, row2["channel_msg_id"]))
+                if row2["channel_msg_id"]: _rmsgs_to_del.append((_rch_id, row2["channel_msg_id"]))
             else:
-                if row2["admin_msg_id"]:   _rmsgs_to_edit.append((ADMIN_ID, row2["admin_msg_id"]))
-                if row2["channel_msg_id"]: _rmsgs_to_edit.append((_rch_id,  row2["channel_msg_id"]))
-            for _recid, _remid in _rmsgs_to_edit:
+                if row2["admin_msg_id"]:   _rmsgs_to_del.append((ADMIN_ID, row2["admin_msg_id"]))
+                if row2["channel_msg_id"]: _rmsgs_to_del.append((_rch_id,  row2["channel_msg_id"]))
+            for _rdcid, _rdmid in _rmsgs_to_del:
                 try:
-                    if has_photo:
-                        await ctx.bot.edit_message_caption(new_txt, chat_id=_recid,
-                                                           message_id=_remid, parse_mode="Markdown", reply_markup=None)
-                    else:
-                        await ctx.bot.edit_message_text(new_txt, chat_id=_recid,
-                                                        message_id=_remid, parse_mode="Markdown", reply_markup=None)
+                    await ctx.bot.delete_message(chat_id=_rdcid, message_id=_rdmid)
                 except Exception: pass
         # ── Admin confirmation ────────────────────────────────────
         await update.message.reply_text(
@@ -10597,7 +10596,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(text2, parse_mode="Markdown", reply_markup=kb2)
             except Exception as _fue:
                 log.warning(f"[ADM_FIND_USER] uid={tid}: {_fue}")
-                await update.message.reply_text(f"❌ User profile লোড করতে সমস্যা হয়েছে।\nError: `{_fue}`", parse_mode="Markdown")
+                try:
+                    await update.message.reply_text(
+                        f"❌ User profile লোড করতে সমস্যা হয়েছে।\nError: `{_md_esc(str(_fue))}`",
+                        parse_mode="Markdown")
+                except Exception:
+                    await update.message.reply_text(
+                        f"❌ User profile লোড করতে সমস্যা হয়েছে।\nError: {_fue}")
             ctx.user_data.pop("state", None); return
 
         if st == "adm_uaddbal_amt":
@@ -13634,11 +13639,15 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now(BD_TZ).strftime("%Y-%m-%d")
     users = await asyncio.to_thread(all_users)
 
+    # ── Batch pre-fetch — প্রতি user এ আলাদা DB call বাদ ────────────
+    paid_today_set  = await asyncio.to_thread(get_bio_paid_today_set)
+    tracked_ids_set = await asyncio.to_thread(get_bio_tracked_ids_set)
+
     paid_list        = []   # আজ pay হয়েছে
     new_tracked_list = []   # প্রথমবার bio সেট করেছে (add_reward পেয়েছে)
     grace_list       = []   # bio ভুল — 5 মিনিট grace দেওয়া হবে
     failed_list      = []   # grace এর পরেও ভুল / tracking নেই
-    _sem = asyncio.Semaphore(10)   # max 10 parallel Telegram API calls
+    _sem = asyncio.Semaphore(20)   # 10 → 20: বেশি parallel API call
 
     async def _check_bio(uid, bot_uname):
         _required = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
@@ -13657,13 +13666,15 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
         uid = u['user_id']
         if u.get('is_banned'):
             return
-        if await asyncio.to_thread(bio_task_paid_today, uid):
+        # Batch pre-fetched set দিয়ে — আলাদা DB call ছাড়াই
+        if uid in paid_today_set:
             return
 
         async with _sem:
             bio_ok = await _check_bio(uid, bot_username)
 
-        actively_track = await asyncio.to_thread(is_bio_actively_tracked, uid)
+        # Batch pre-fetched set দিয়ে — আলাদা DB call ছাড়াই
+        actively_track = uid in tracked_ids_set
 
         if bio_ok:
             if actively_track:
@@ -13716,15 +13727,16 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
             else:
                 failed_list.append({'uid': uid, 'name': u.get('full_name', '')})
 
-    # ── প্রথম pass — ২০ জন করে chunked (DB pool + TG flood ঠেকাতে) ──
-    _CHUNK = 20
+    # ── প্রথম pass — ৫০ জন করে chunked (DB pool + TG flood ঠেকাতে) ──
+    # Semaphore=20 দিয়ে max 20 parallel API call — chunk বড় হলেও safe
+    _CHUNK = 50
     for _ci in range(0, len(users), _CHUNK):
         await asyncio.gather(
             *[_process_one_user(u) for u in users[_ci:_ci + _CHUNK]],
             return_exceptions=True
         )
         if _ci + _CHUNK < len(users):
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # 1s → 0.5s: কম wait, দ্রুত শেষ
 
     # ── Grace period — warning পাঠাও, ৫ মিনিট wait ─────────────────
     for g in grace_list:
@@ -13826,49 +13838,66 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
             if _ci + _CHUNK < len(grace_list):
                 await asyncio.sleep(1)
 
-    # ── Daily reward পেলে user কে notify করো ────────────────────────
-    for p in paid_list:
-        if p['uid'] in grace_notified_uids:
-            continue   # এরা আগেই "bio restored" message পেয়েছে — duplicate skip
-        lang = await asyncio.to_thread(get_lang, p['uid'])
-        try:
-            pay_msg = (
-                f"✅ *Daily Bio Task পুরস্কার!*\n\n"
-                f"💰 *`{p['amt']}$ USDT`* আপনার একাউন্টে যোগ হয়েছে!\n\n"
-                f"🗓️ তারিখ: `{today}`\n\n"
-                f"🔄 কাল রাত ১২:০০ তে আবার চেক হবে — বায়ো ঠিক রাখুন!"
-                if lang == 'bn' else
-                f"✅ *Daily Bio Task Reward!*\n\n"
-                f"💰 *`{p['amt']}$ USDT`* added to your account!\n\n"
-                f"🗓️ Date: `{today}`\n\n"
-                f"🔄 Next check tomorrow at 12:00 AM — keep your bio!"
-            )
-            await bot.send_message(p['uid'], pay_msg, parse_mode="Markdown")
-        except Exception:
-            pass
-        await asyncio.sleep(0.05)  # flood control — ২০ msg/সেকেন্ড লিমিট
+    # ── Daily reward পেলে user কে notify করো (parallel chunks) ──────
+    _notify_sem = asyncio.Semaphore(15)  # TG flood limit: max 15 parallel sends
 
-    # ── add_reward পেলে user কে notify করো ──────────────────────────
-    for p in new_tracked_list:
+    async def _send_pay_notify(p):
+        if p['uid'] in grace_notified_uids:
+            return  # আগেই "bio restored" message পেয়েছে — skip
         lang = await asyncio.to_thread(get_lang, p['uid'])
-        try:
-            add_msg = (
-                f"🎉 *Bio Task শুরু হয়েছে!*\n\n"
-                f"✅ আপনার Bio সঠিকভাবে সেট করা হয়েছে।\n"
-                f"💰 *`{p['amt']}$ USDT`* আপনার একাউন্টে যোগ হয়েছে!\n\n"
-                f"🔄 এখন থেকে প্রতিদিন রাত ১২:০০ তে bio check হবে।\n"
-                f"Bio ঠিক রাখলে প্রতিদিন `{daily_reward}$` পাবেন!"
-                if lang == 'bn' else
-                f"🎉 *Bio Task started!*\n\n"
-                f"✅ Your Bio has been set correctly.\n"
-                f"💰 *`{p['amt']}$ USDT`* added to your account!\n\n"
-                f"🔄 Bio will be checked daily at 12:00 AM.\n"
-                f"Keep your bio to earn `{daily_reward}$` every day!"
-            )
-            await bot.send_message(p['uid'], add_msg, parse_mode="Markdown")
-        except Exception:
-            pass
-        await asyncio.sleep(0.05)  # flood control
+        pay_msg = (
+            f"✅ *Daily Bio Task পুরস্কার!*\n\n"
+            f"💰 *`{p['amt']}$ USDT`* আপনার একাউন্টে যোগ হয়েছে!\n\n"
+            f"🗓️ তারিখ: `{today}`\n\n"
+            f"🔄 কাল রাত ১২:০০ তে আবার চেক হবে — বায়ো ঠিক রাখুন!"
+            if lang == 'bn' else
+            f"✅ *Daily Bio Task Reward!*\n\n"
+            f"💰 *`{p['amt']}$ USDT`* added to your account!\n\n"
+            f"🗓️ Date: `{today}`\n\n"
+            f"🔄 Next check tomorrow at 12:00 AM — keep your bio!"
+        )
+        async with _notify_sem:
+            try:
+                await bot.send_message(p['uid'], pay_msg, parse_mode="Markdown")
+            except Exception:
+                pass
+
+    async def _send_add_notify(p):
+        lang = await asyncio.to_thread(get_lang, p['uid'])
+        add_msg = (
+            f"🎉 *Bio Task শুরু হয়েছে!*\n\n"
+            f"✅ আপনার Bio সঠিকভাবে সেট করা হয়েছে।\n"
+            f"💰 *`{p['amt']}$ USDT`* আপনার একাউন্টে যোগ হয়েছে!\n\n"
+            f"🔄 এখন থেকে প্রতিদিন রাত ১২:০০ তে bio check হবে।\n"
+            f"Bio ঠিক রাখলে প্রতিদিন `{daily_reward}$` পাবেন!"
+            if lang == 'bn' else
+            f"🎉 *Bio Task started!*\n\n"
+            f"✅ Your Bio has been set correctly.\n"
+            f"💰 *`{p['amt']}$ USDT`* added to your account!\n\n"
+            f"🔄 Bio will be checked daily at 12:00 AM.\n"
+            f"Keep your bio to earn `{daily_reward}$` every day!"
+        )
+        async with _notify_sem:
+            try:
+                await bot.send_message(p['uid'], add_msg, parse_mode="Markdown")
+            except Exception:
+                pass
+
+    # Paid + new_tracked notify — parallel (30 chunk, 0.3s sleep)
+    _notify_chunk = 30
+    _all_notifs = (
+        [('pay', p) for p in paid_list] +
+        [('add', p) for p in new_tracked_list]
+    )
+    for _ni in range(0, len(_all_notifs), _notify_chunk):
+        _batch = _all_notifs[_ni:_ni + _notify_chunk]
+        await asyncio.gather(
+            *[_send_pay_notify(p) if t == 'pay' else _send_add_notify(p)
+              for t, p in _batch],
+            return_exceptions=True
+        )
+        if _ni + _notify_chunk < len(_all_notifs):
+            await asyncio.sleep(0.3)  # sequential 50ms/msg → 0.3s/chunk(30)
 
     # ── Admin summary notification ────────────────────────────────────
     today_daily   = len(paid_list)
@@ -14059,7 +14088,12 @@ async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
                         await asyncio.to_thread(_set_warned)
                         log.info(f"[BIO-MONITOR] uid={uid} bio removed — warning sent, 5min grace started")
                     except Exception as _e:
+                        _e_str = str(_e)
                         log.warning(f"[BIO-MONITOR] uid={uid} send failed: {_e}")
+                        # User bot block করেছে — tracking clear করো, আর try করা হবে না
+                        if "Forbidden" in _e_str or "blocked" in _e_str.lower():
+                            await asyncio.to_thread(clear_bio_tracking, uid)
+                            log.info(f"[BIO-MONITOR] uid={uid} bot blocked by user — bio tracking auto-cleared")
 
     # ── সব users কে parallel এ process করো ──────────────────────
     await asyncio.gather(*[_process_user(row) for row in tracked_users])
