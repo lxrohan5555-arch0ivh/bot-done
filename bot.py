@@ -3004,8 +3004,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     mc    = t['max_completions']
                     slots_txt = (f"👥 *Max:* `{mc} জন`" if mc > 0 else "👥 *Max:* `Unlimited`") if lang=='bn' else (f"👥 *Max:* `{mc}`" if mc > 0 else "👥 *Max:* `Unlimited`")
                     _ct_tn_esc = _md_esc(t['name'])
-                    msg   = (f"{ticon} *{_ct_tn_esc}*\n\n💰 *পুরস্কার:* `{t['price']}$ USDT`\n{slots_txt}\n\n📜 *নিয়মাবলী:*\n{t['rules']}" if lang=='bn'
-                             else f"{ticon} *{_ct_tn_esc}*\n\n💰 *Reward:* `{t['price']}$ USDT`\n{slots_txt}\n\n📜 *Rules:*\n{t['rules']}")
+                    msg   = (f"{ticon} *{_ct_tn_esc}*\n\n💰 *পুরস্কার:* `{t['price']}$ USDT`\n{slots_txt}\n\n📜 *নিয়মাবলী:*\n{_md_esc(str(t['rules'] or ''))}" if lang=='bn'
+                             else f"{ticon} *{_ct_tn_esc}*\n\n💰 *Reward:* `{t['price']}$ USDT`\n{slots_txt}\n\n📜 *Rules:*\n{_md_esc(str(t['rules'] or ''))}")
                     _dl_ct_vid = bool((_rget(t, 'demo_video_id', '') or '').strip())
                     _dl_ct_rows = []
                     if _dl_ct_vid:
@@ -3053,7 +3053,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         await update.message.reply_text(T(uid2, 'new_joiners_only_reject'), parse_mode="Markdown")
                         return
                     tg_link = task['tg_target_link'] or f"https://t.me/{task['tg_target'].lstrip('@')}"
-                    tg_name = task['tg_target_name'] or task['tg_target']
+                    tg_name = _md_esc(task['tg_target_name'] or task['tg_target'])
                     max_c = _rget(task, 'max_completions', 0)
                     done_c = _rget(task, 'completed_count', 0)
                     if max_c > 0:
@@ -3081,7 +3081,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 else:
                     # new_joiners_only নয় — সরাসরি task দেখাও
                     tg_link = task['tg_target_link'] or f"https://t.me/{task['tg_target'].lstrip('@')}"
-                    tg_name = task['tg_target_name'] or task['tg_target']
+                    tg_name = _md_esc(task['tg_target_name'] or task['tg_target'])
                     max_c = _rget(task, 'max_completions', 0)
                     done_c = _rget(task, 'completed_count', 0)
                     if max_c > 0:
@@ -3162,7 +3162,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         f"{ticon} *{_tn_esc3}*{code_line}\n\n"
                         f"💰 *পুরস্কার:* `{task['price']}$ USDT`\n"
                         f"{slots_txt}\n\n"
-                        f"📜 *নিয়মাবলী:*\n{rules_text}"
+                        f"📜 *নিয়মাবলী:*\n{_md_esc(str(rules_text))}"
                     )
                 else:
                     rules_text = (_rget(task, "rules_en") or task["rules"]) or "No special rules."
@@ -3170,7 +3170,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         f"{ticon} *{_tn_esc3}*{code_line}\n\n"
                         f"💰 *Reward:* `{task['price']}$ USDT`\n"
                         f"{slots_txt}\n\n"
-                        f"📜 *Rules:*\n{rules_text}"
+                        f"📜 *Rules:*\n{_md_esc(str(rules_text))}"
                     )
                 _dl_t_vid = bool((_rget(task, 'demo_video_id', '') or '').strip())
                 _dl_t_rows = []
@@ -3886,7 +3886,7 @@ async def show_category_task_rules(update, ctx, task):
         for i, f in enumerate(fields, 1):
             prompt = f["prompt_en"] if lang == 'en' else f["prompt_bn"]
             icon   = "📷" if f["field_type"] == "photo" else "📝"
-            proof_lines.append(f"{i}. {icon} {prompt}")
+            proof_lines.append(f"{i}. {icon} {_md_esc(str(prompt))}")
         proof_text = f"\n\n{proof_label}\n" + "\n".join(proof_lines)
 
     sub_btn  = T(uid, 'submit_btn')
@@ -3937,7 +3937,7 @@ async def show_category_task_rules(update, ctx, task):
         f"{slots_line}\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
         f"{rules_label}\n"
-        f"{rules_text}\n"
+        f"{_md_esc(str(rules_text))}\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
         f"{proof_text}\n\n"
         f"💡 {confirm_txt}",
@@ -4293,7 +4293,7 @@ async def show_tg_task(update, ctx, task):
             return
 
     tg_link = task['tg_target_link'] or f"https://t.me/{task['tg_target'].lstrip('@')}"
-    tg_name = task['tg_target_name'] or task['tg_target']
+    tg_name = _md_esc(task['tg_target_name'] or task['tg_target'])
 
     max_c   = _rget(task, 'max_completions', 0)
     done_c  = _rget(task, 'completed_count', 0)
@@ -4423,7 +4423,7 @@ async def handle_tg_task_check(update, ctx, tid):
 
     if not is_member:
         tg_link = task['tg_target_link'] or f"https://t.me/{tg_target.lstrip('@')}"
-        tg_name = task['tg_target_name'] or tg_target
+        tg_name = _md_esc(task['tg_target_name'] or tg_target)
         not_joined_msg = (
             f"❌ *আপনি এখনো জয়েন করেননি!*\n\n"
             f"📢 {tg_name} এ জয়েন করুন, তারপর আবার Check চাপুন।"
@@ -4759,12 +4759,13 @@ async def _ask_next_field(update, ctx, uid, via_callback=False):
     lang  = await asyncio.to_thread(get_lang, uid)
     prompt = field["prompt_en"] if lang == 'en' else field["prompt_bn"]
     step_txt = f"({idx+1}/{total})" if total > 1 else ""
+    prompt_esc = _md_esc(str(prompt or ""))
 
     if field["field_type"] == "photo":
-        msg = T(uid, 'field_photo_ask', prompt=f"{prompt} {step_txt}")
+        msg = T(uid, 'field_photo_ask', prompt=f"{prompt_esc} {step_txt}".strip())
         kb = ReplyKeyboardMarkup([[T(uid,'cancel_btn')]], resize_keyboard=True)
     else:
-        msg = T(uid, 'field_ask', prompt=f"{prompt} {step_txt}")
+        msg = T(uid, 'field_ask', prompt=f"{prompt_esc} {step_txt}".strip())
         kb = ReplyKeyboardMarkup([[T(uid,'cancel_btn')]], resize_keyboard=True)
 
     if via_callback:
@@ -5293,7 +5294,7 @@ async def receive_wd_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                         reply_markup=ReplyKeyboardRemove())
         # ── Admin কে notify করো ──
         user = update.effective_user
-        uname_str = f"@{user.username}" if user.username else _md_esc(user.full_name or "")
+        uname_str = _md_esc(f"@{user.username}") if user.username else _md_esc(user.full_name or "")
         admin_msg = (
             f"🚨 *Duplicate Wallet — Auto Ban*\n\n"
             f"👤 *Banned User:* [{uname_str}](tg://user?id={uid}) (`{uid}`)\n"
@@ -6879,7 +6880,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             await q.message.reply_text(T(uid,'no_referrals'), parse_mode="Markdown"); return
         lines = []
         for i, r in enumerate(refs, 1):
-            n = r["full_name"] or r["username"] or "Unknown"
+            n = _md_esc(r["full_name"] or r["username"] or "Unknown")
             lines.append(f"`{i}.` {n} — {r['joined_at']}")
         text = f"{T(uid,'my_referrals_title')}\n\n" + "\n".join(lines)
         if len(text) > 4000: text = text[:4000] + "\n\n_(তালিকা কেটে দেওয়া হয়েছে)_"
@@ -7183,7 +7184,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         guser, price = row["user_id"], row["amount"]
         _row_ttype = _rget(row, 'task_type', 'other')
         _row_ticon = task_type_icon(_row_ttype)
-        _task_display = f"{_row_ticon} {row['task_name']}"
+        _task_display = f"{_row_ticon} {_md_esc(str(row['task_name'] or ''))}"
         # Atomic: gmails approved + balance credit একসাথে commit
         # AND status='pending' — double-approve race condition প্রতিরোধ করে
         bal_ok = False
@@ -7970,7 +7971,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             await q.message.reply_text("❌ *এই কাজের পারমিশন নেই।*", parse_mode="Markdown"); return
         (
             owner, bot_u, min_w, comm, g_ch, w_ch, notify_ch,
-            _wmbn, _wmen, bsc_w, _notify_delay_min,
+            _wmbn, _wmen, bsc_w, _notify_delay_min, _wd_fee,
         ) = await asyncio.gather(
             asyncio.to_thread(get_setting, 'support_owner'),
             asyncio.to_thread(get_setting, 'support_bot'),
@@ -7983,6 +7984,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             asyncio.to_thread(get_setting, 'welcome_msg_en'),
             asyncio.to_thread(get_bsc_wallet_addr),
             asyncio.to_thread(get_notify_delay_min),
+            asyncio.to_thread(get_setting, 'wd_fee'),
         )
         owner     = owner     or '@inkamxbd'
         bot_u     = bot_u     or '@gmail_sell_help_bot'
@@ -7994,10 +7996,12 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         has_wbn   = "✅ Custom" if _wmbn else "⬜ Default"
         has_wen   = "✅ Custom" if _wmen else "⬜ Default"
         bsc_short = bsc_w[:6] + "..." + bsc_w[-4:] if bsc_w else "N/A"
+        _wd_fee   = _wd_fee   or '0.01'
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("👨‍💼 Support Owner পরিবর্তন",          callback_data="adm_set_support_owner")],
             [InlineKeyboardButton("🤖 Support Bot পরিবর্তন",              callback_data="adm_set_support_bot")],
             [InlineKeyboardButton("💸 Min Withdraw পরিবর্তন",             callback_data="adm_set_min_withdraw")],
+            [InlineKeyboardButton("📉 Withdraw Fee পরিবর্তন",             callback_data="adm_set_wd_fee")],
             [InlineKeyboardButton("💹 Commission % পরিবর্তন",             callback_data="adm_set_commission_pct")],
             [InlineKeyboardButton("📢 Task Channel ID পরিবর্তন",          callback_data="adm_set_gmail_ch_id")],
             [InlineKeyboardButton("💳 Withdraw Channel ID পরিবর্তন",      callback_data="adm_set_withdraw_ch_id")],
@@ -8013,6 +8017,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             f"👨‍💼 *Support Owner:* `{owner}`\n"
             f"🤖 *Support Bot:* `{bot_u}`\n"
             f"💸 *Min Withdraw:* `{min_w}$ USDT`\n"
+            f"📉 *Withdraw Fee:* `{_wd_fee}$ USDT`\n"
             f"💹 *Commission:* `{comm}%`\n"
             f"📢 *Task Channel ID:* `{g_ch}`\n"
             f"💳 *Withdraw Channel ID:* `{w_ch}`\n"
@@ -8108,8 +8113,26 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         ctx.user_data["state"] = "adm_set_support_bot"
         await q.message.reply_text("🤖 *Support Bot username লিখুন:*\n/cancel — বাতিল", parse_mode="Markdown"); return
     if d == "adm_set_min_withdraw":
+        cur_min = await asyncio.to_thread(get_setting, 'min_withdraw') or '0.5'
         ctx.user_data["state"] = "adm_set_min_withdraw"
-        await q.message.reply_text("💸 *Minimum Withdraw পরিমাণ লিখুন:*\n_(যেমন: 0.05)_\n/cancel — বাতিল", parse_mode="Markdown"); return
+        await q.message.reply_text(
+            f"💵 *Minimum Withdraw পরিবর্তন করুন*\n\n"
+            f"⚙️ *বর্তমান সীমা:* `{cur_min}$ USDT`\n\n"
+            f"💡 নতুন সীমা লিখুন \\(যেমন: `0.5`, `1`, `2`\\)\n\n"
+            f"❌ বাতিল করতে /cancel লিখুন",
+            parse_mode="Markdown"
+        ); return
+    if d == "adm_set_wd_fee":
+        cur_fee = await asyncio.to_thread(get_setting, 'wd_fee') or '0.01'
+        ctx.user_data["state"] = "adm_set_wd_fee"
+        await q.message.reply_text(
+            f"📉 *Withdraw Fee পরিবর্তন করুন*\n\n"
+            f"⚙️ *বর্তমান ফি:* `{cur_fee}$ USDT`\n\n"
+            f"💡 নতুন ফি লিখুন \\(যেমন: `0.01`, `0.02`, `0`\\)\n"
+            f"0 দিলে কোনো ফি কাটা হবে না।\n\n"
+            f"❌ বাতিল করতে /cancel লিখুন",
+            parse_mode="Markdown"
+        ); return
     if d == "adm_set_commission_pct":
         ctx.user_data["state"] = "adm_set_commission_pct"
         await q.message.reply_text("💹 *Referral Commission % লিখুন:*\n_(যেমন: 10 মানে 10%)_\n/cancel — বাতিল", parse_mode="Markdown"); return
@@ -8227,7 +8250,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             lines = [title]
             medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
             for i, r in enumerate(rows):
-                name = (r["name"] or "")[:18] or "Unknown"
+                name = _md_esc((r["name"] or "")[:18] or "Unknown")
                 lines.append(f"{medals[i]} `{r['referred_by']}` — *{name}* → `{r['cnt']}` জন")
             return "\n".join(lines)
 
@@ -8292,7 +8315,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         text = f"⏳ *Pending Submissions ({len(rows)}টি):*\n\n"
         btns = []
         for r in rows:
-            text += f"🔖 `#{r['id']}` | *{r['task_name']}* | `{r['amount']}$` | 👤`{r['user_id']}`\n"
+            text += f"🔖 `#{r['id']}` | *{_md_esc(str(r['task_name'] or ''))}* | `{r['amount']}$` | 👤`{r['user_id']}`\n"
             btns.append([
                 InlineKeyboardButton(f"✅ #{r['id']} Approve", callback_data=f"ga_{r['id']}"),
                 InlineKeyboardButton(f"❌ #{r['id']} Reject",  callback_data=f"gr_{r['id']}"),
@@ -8431,7 +8454,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         lines = ["📋 *সর্বশেষ ২০ জন User:*\n"]
         for r in rows:
             icon = "🚫" if r["is_banned"] else "✅"
-            name = f"@{r['username']}" if r["username"] else (r["full_name"] or "Unknown")
+            name = _md_esc(f"@{r['username']}") if r["username"] else _md_esc(r["full_name"] or "Unknown")
             lines.append(f"{icon} `{r['user_id']}` — {name} | 💰`{round(r['balance'],4)}`")
         text = "\n".join(lines)
         if len(text) > 4000: text = text[:4000] + "\n\n_(তালিকা কেটে দেওয়া হয়েছে)_"
@@ -8494,7 +8517,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             await q.message.reply_text(f"👥 `{tid}` এর কোনো referral নেই।", parse_mode="Markdown"); return
         lines = [f"👥 *`{tid}` এর Referrals ({len(refs)}জন):*\n"]
         for r in refs:
-            name = f"@{r['username']}" if r["username"] else (r["full_name"] or "Unknown")
+            name = _md_esc(f"@{r['username']}") if r["username"] else _md_esc(r["full_name"] or "Unknown")
             lines.append(f"• `{r['user_id']}` — {name} | 💰`{round(r['balance'],4)}` | 📅{r['joined_at']}")
         text = "\n".join(lines)
         if len(text) > 4000: text = text[:4000] + "\n\n_(তালিকা কেটে দেওয়া হয়েছে)_"
@@ -8516,7 +8539,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         lines = [f"📋 *`{tid}` এর Submissions ({len(subs)}টি):*\n"]
         for r in subs:
             icon = "✅" if r["status"]=="approved" else ("❌" if r["status"]=="rejected" else "⏳")
-            lines.append(f"{icon} `#{r['id']}` | {r['task_name']} | 💰`{r['amount']}` | {r['submitted_at']}")
+            lines.append(f"{icon} `#{r['id']}` | {_md_esc(str(r['task_name'] or ''))} | 💰`{r['amount']}` | {r['submitted_at']}")
         await q.message.reply_text("\n".join(lines), parse_mode="Markdown"); return
 
     if d.startswith("adm_uwds_"):
@@ -9289,7 +9312,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             f"💵 *দাম:* `{task['price']}$ USDT`\n"
             f"👁 *Status:* {status_s}\n"
             f"📋 *Proof Fields:* {len(fields)} টি\n"
-            f"📜 *নিয়মাবলী:*\n{task['rules']}\n\nকী পরিবর্তন করবেন?",
+            f"📜 *নিয়মাবলী:*\n{_md_esc(str(task['rules'] or ''))}\n\nকী পরিবর্তন করবেন?",
             parse_mode="Markdown", reply_markup=kb); return
 
     # ── Regular Task: Example Photo ──────────────────────────────
@@ -9664,7 +9687,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             f"👥 *Completions:* {slots}\n"
             f"👤 *Per User Limit:* `{pu_limit}` বার\n"
             f"📋 *Proof Fields:* {len(fields)} টি\n"
-            f"📜 *নিয়মাবলী:*\n{t['rules']}\n\nকী পরিবর্তন করবেন?",
+            f"📜 *নিয়মাবলী:*\n{_md_esc(str(t['rules'] or ''))}\n\nকী পরিবর্তন করবেন?",
             parse_mode="Markdown", reply_markup=kb); return
 
     if d.startswith("adm_ctaste_toggle_"):
@@ -10095,7 +10118,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         guser = row["user_id"]
         _row_ttype    = _rget(row, 'task_type', 'other')
         _row_ticon    = task_type_icon(_row_ttype)
-        _task_display = f"{_row_ticon} {row['task_name']}"
+        _task_display = f"{_row_ticon} {_md_esc(str(row['task_name'] or ''))}"
         # ── Point deduction ─────────────────────────────────────
         new_pts  = await asyncio.to_thread(add_points, guser, -POINT_PER_REJECT)
         blocked  = new_pts <= POINT_BLOCK_AT
@@ -10107,7 +10130,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             rej_msg  = (
                 f"❌ *আপনার Submission Reject হয়েছে।*\n\n"
                 f"📌 *Task:* {_task_display}\n"
-                f"📝 *কারণ:* {reason}\n\n"
+                f"📝 *কারণ:* {_md_esc(str(reason))}\n\n"
                 f"{pt_line}{blk_line}"
             )
         else:
@@ -10116,14 +10139,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             rej_msg  = (
                 f"❌ *Your Submission has been Rejected.*\n\n"
                 f"📌 *Task:* {_task_display}\n"
-                f"📝 *Reason:* {reason}\n\n"
+                f"📝 *Reason:* {_md_esc(str(reason))}\n\n"
                 f"{pt_line}{blk_line}"
             )
         try:
             await ctx.bot.send_message(guser, rej_msg, parse_mode="Markdown")
         except Exception: pass
         # ── Edit original submission message ─────────────────────
-        status_line  = f"\n\n❌ *REJECTED by Admin*\n📝 *Reason:* {reason}"
+        status_line  = f"\n\n❌ *REJECTED by Admin*\n📝 *Reason:* {_md_esc(str(reason))}"
         orig_txt     = ctx.user_data.get("adm_reject_orig_txt", "")
         has_photo    = ctx.user_data.get("adm_reject_has_photo", False)
         orig_msg_id  = ctx.user_data.get("adm_reject_msg_id")
@@ -10154,9 +10177,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # ── Admin confirmation ────────────────────────────────────
         await update.message.reply_text(
             f"❌ *Sub `#{gid}` Rejected!*\n\n"
-            f"📌 *Task:* {row['task_name']}\n"
+            f"📌 *Task:* {_md_esc(str(row['task_name'] or ''))}\n"
             f"👤 *User:* `{guser}`\n"
-            f"📝 *কারণ:* {reason}\n"
+            f"📝 *কারণ:* {_md_esc(str(reason))}\n"
             f"🎯 *User এর পয়েন্ট:* `{new_pts}/100`"
             + (f"\n⛔ *User {POINT_BLOCK_DAYS} দিন Block হয়েছে।*" if blocked else ""),
             parse_mode="Markdown"
@@ -10724,7 +10747,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 guser, price = row["user_id"], row["amount"]
                 _aid_ttype = _rget(row, 'task_type', 'other')
                 _aid_ticon = task_type_icon(_aid_ttype)
-                _aid_task_display = f"{_aid_ticon} {row['task_name']}"
+                _aid_task_display = f"{_aid_ticon} {_md_esc(str(row['task_name'] or ''))}"
                 # Atomic: gmails approved + balance credit একসাথে commit
                 # AND status='pending' — double-approve race condition প্রতিরোধ করে
                 _aid_already = False
@@ -10779,7 +10802,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     _background_tasks.add(_tamm); _tamm.add_done_callback(_bg_task_done)
                 await update.message.reply_text(
                     f"✅ *Sub `#{gid}` Approved!*\n\n"
-                    f"📌 *Task:* {row['task_name']}\n"
+                    f"📌 *Task:* {_aid_task_display}\n"
                     f"👤 *User:* `{guser}`\n"
                     f"💰 *{price}$ USDT* balance-এ যোগ হয়েছে।",
                     parse_mode="Markdown")
@@ -10831,7 +10854,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 guser = row["user_id"]
                 _rid_ttype = _rget(row, 'task_type', 'other')
                 _rid_ticon = task_type_icon(_rid_ttype)
-                _rid_task_display = f"{_rid_ticon} {row['task_name']}"
+                _rid_task_display = f"{_rid_ticon} {_md_esc(str(row['task_name'] or ''))}"
                 _rid_new_pts = await asyncio.to_thread(add_points, guser, -POINT_PER_REJECT)
                 _rid_blocked = _rid_new_pts <= POINT_BLOCK_AT
                 u_lang = await asyncio.to_thread(get_lang, guser)
@@ -10856,7 +10879,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception: pass
                 await update.message.reply_text(
                     f"❌ *Sub `#{gid}` Rejected.*\n\n"
-                    f"📌 *Task:* {row['task_name']}\n"
+                    f"📌 *Task:* {_md_esc(str(row['task_name'] or ''))}\n"
                     f"👤 *User:* `{guser}`",
                     parse_mode="Markdown")
             except ValueError:
@@ -11218,6 +11241,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await asyncio.to_thread(set_setting, 'min_withdraw', str(val))
                 await update.message.reply_text(f"✅ *Min Withdraw আপডেট:* `{val}$ USDT`", parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
             except Exception: await update.message.reply_text("❌ সঠিক সংখ্যা দিন।", parse_mode="Markdown")
+            ctx.user_data.pop("state", None); return
+        if st == "adm_set_wd_fee":
+            try:
+                val = float(txt.strip())
+                if val < 0:
+                    raise ValueError("negative fee")
+                await asyncio.to_thread(set_setting, 'wd_fee', str(val))
+                fee_txt = f"`{val}$ USDT`" if val > 0 else "`ফ্রি (কোনো ফি নেই)`"
+                await update.message.reply_text(f"✅ *Withdraw Fee আপডেট:* {fee_txt}", parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+            except Exception: await update.message.reply_text("❌ সঠিক সংখ্যা দিন। যেমন: `0.01` বা `0`", parse_mode="Markdown")
             ctx.user_data.pop("state", None); return
         if st == "adm_set_commission_pct":
             try:
@@ -11943,7 +11976,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             lang = await asyncio.to_thread(get_lang, uid)
             icon = "📷" if nf["field_type"] == "photo" else "📝"
             prompt = nf.get("prompt_en") if lang == 'en' else nf["prompt_bn"]
-            await update.message.reply_text(f"{icon} *{prompt}*", parse_mode="Markdown")
+            await update.message.reply_text(f"{icon} *{_md_esc(str(prompt or ''))}*", parse_mode="Markdown")
         else:
             await _finalize_category_task_submission(update, ctx, uid)
         return
@@ -13924,7 +13957,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
     )
     all_paid = paid_list + new_tracked_list
     if all_paid:
-        lines = [f"  • `{p['uid']}` — {p['name']} — `{p['amt']}$`" for p in all_paid[:20]]
+        lines = [f"  • `{p['uid']}` — {_md_esc(str(p['name'] or ''))} — `{p['amt']}$`" for p in all_paid[:20]]
         if len(all_paid) > 20:
             lines.append(f"  _...আরো {len(all_paid)-20} জন_")
         summary += "\n✅ *আজ যারা পেয়েছে:*\n" + "\n".join(lines)
@@ -14929,7 +14962,8 @@ async def job_auto_withdraw(context):
                     masked = address[:6] + "..." + address[-4:]
                     _urow  = await asyncio.to_thread(get_user, uid)
                     _uname_raw = (_urow["full_name"] or _urow["username"] or "Unknown") if _urow else "Unknown"
-                    _uname = _uname_raw.split('@')[0].strip() or _uname_raw.lstrip('@').split()[0] if _uname_raw else "Unknown"
+                    _uname_clean = _uname_raw.split('@')[0].strip() or _uname_raw.lstrip('@').split()[0] if _uname_raw else "Unknown"
+                    _uname = _md_esc(str(_uname_clean or "Unknown"))
                     ch_msg = (
                         f"👤 *{_uname}*\n\n"
                         f"✅ *Withdrawal Successful!*\n\n"
