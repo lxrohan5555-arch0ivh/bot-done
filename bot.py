@@ -3556,7 +3556,7 @@ async def _check_ref_event_bonus(referred_id: int, referrer_id: int, bot):
 
 async def _notify_task_maxed(bot, name: str, code: str, type_label: str, done: int, max_c: int):
     """Admin-কে জানাও যে task-এর সব slot পূর্ণ হয়েছে এবং task বন্ধ হয়েছে।"""
-    code_line = f"\n🔑 *Code:* `{_md_esc(code)}`" if code else ""
+    code_line = f"\n🔑 *Code:* `{str(code).replace('`', \"'\")}`" if code else ""
     msg = (
         f"🏁 *Task সম্পূর্ণ হয়েছে — Slot পূর্ণ!*\n\n"
         f"📌 *Task:* {_md_esc(name)}{code_line}\n"
@@ -3572,7 +3572,7 @@ async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str
         u = await asyncio.to_thread(get_user, user_id)
         full_name = _md_esc((u["full_name"] or "Unknown") if u else "Unknown")
         type_line = f"\n🏷️ *ধরন:* {_md_esc(task_type_label)}" if task_type_label else ""
-        code_line = f"\n🔑 *Task Code:* `{_md_esc(task_code)}`" if task_code else ""
+        code_line = f"\n🔑 *Task Code:* `{str(task_code).replace('`', \"'\")}`" if task_code else ""
         msg = (
             f"✅ *Task সম্পন্ন হয়েছে!*\n\n"
             f"👤 *ইউজার:* {full_name}\n"
@@ -4023,7 +4023,7 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
             else:
                 summary_lines.append(f"📷 *{_md_esc(item['prompt_bn'])}:* (Skipped)")
         else:
-            val = _md_esc(item["value"] or "")
+            val = str(item["value"] or "").replace('`', "'")
             summary_lines.append(f"📝 *{_md_esc(item['prompt_bn'])}:*\n`{val}`")
 
     # duplicate check — ইউজার কিছু জানবে না, শুধু admin warning এ দেখাবে (msg_txt এ)
@@ -4978,7 +4978,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
                 photo_file_ids.append(item["value"])
                 if item.get("unique_id"):
                     _submitted_unique_ids.append(item["unique_id"])
-                _cap_txt = _md_esc(item.get("caption", "").strip())
+                _cap_txt = str(item.get("caption", "") or "").strip().replace('`', "'")
                 _plbl    = _md_esc(prompt_lbl or "")
                 if _cap_txt:
                     summary_lines.append(
@@ -4991,7 +4991,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
             else:
                 summary_lines.append(f"📷 *{_md_esc(prompt_lbl or '')}:* (Skipped)" if lang == 'en' else f"📷 *{_md_esc(prompt_lbl or '')}:* (Skip করা হয়েছে)")
         else:
-            val = _md_esc(item["value"] or "")
+            val = str(item["value"] or "").replace('`', "'")
             summary_lines.append(f"📝 *{_md_esc(prompt_lbl or '')}:*\n`{val}`")
 
     # duplicate check — ইউজার কিছু জানবে না, শুধু admin warning এ দেখাবে (msg_txt এ)
@@ -6063,11 +6063,12 @@ async def _broadcast_task_notify(ctx, reply_msg, sender_uid,
     ticon           = task_type_icon(task_type)
     _country_line   = f"🌍 *Available to:* {fmt_allowed_countries(allowed_countries)}" if allowed_countries else "🌍 *Available to:* All countries 🌐"
     _ch_code_line   = f"\n🔑 *Task Code:* `{t_code}`" if t_code else ""
+    _t_name_safe    = str(t_name or '').replace('`', "'")
 
     # ── Channel message (instant) ──────────────────────────────────
     ch_msg = (
         f"🆕 *New Task Available!*\n\n"
-        f"{ticon} *Task:* `{t_name}`{_ch_code_line}\n"
+        f"{ticon} *Task:* `{_t_name_safe}`{_ch_code_line}\n"
         f"💵 *Reward:* `{t_price}$ USDT`\n"
         f"👥 *Max Participants:* `{slot_txt}`\n"
         f"{njo_line}\n"
@@ -7955,10 +7956,12 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         row = await asyncio.to_thread(_db_6146)
         cur_bn = row["label_bn"] if row else DEFAULT_BTNS.get(btn_key,('?','?'))[0]
         cur_en = row["label_en"] if row else DEFAULT_BTNS.get(btn_key,('?','?'))[1]
+        _cur_bn_safe = str(cur_bn or '').replace('`', "'")
+        _cur_en_safe = str(cur_en or '').replace('`', "'")
         await q.message.reply_text(
             f"✏️ *Button Edit: `{btn_key}`*\n\n"
-            f"বর্তমান BN: `{cur_bn}`\n"
-            f"বর্তমান EN: `{cur_en}`\n\n"
+            f"বর্তমান BN: `{_cur_bn_safe}`\n"
+            f"বর্তমান EN: `{_cur_en_safe}`\n\n"
             "নতুন লেখা পাঠান এই ফরম্যাটে:\n"
             "`বাংলা লেখা | English text`\n\n"
             "উদাহরণ: `📋 কাজ | 📋 Tasks`\n\n"
@@ -9307,8 +9310,9 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
              InlineKeyboardButton(vid_lbl, callback_data=f"adm_te_video_{tid}")],
             [InlineKeyboardButton("❌ বাতিল",     callback_data="task_cancel")],
         ])
+        _te_tn_esc = _md_esc(str(task['name'] or ''))
         await q.message.reply_text(
-            f"✏️ *Task Edit:* `{task['name']}`\n\n"
+            f"✏️ *Task Edit:* `{_te_tn_esc}`\n\n"
             f"💵 *দাম:* `{task['price']}$ USDT`\n"
             f"👁 *Status:* {status_s}\n"
             f"📋 *Proof Fields:* {len(fields)} টি\n"
@@ -9399,14 +9403,15 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         if not task:
             await q.message.reply_text("❌ Task পাওয়া যায়নি।"); return
         fields = await asyncio.to_thread(get_task_fields, tid)
-        text   = f"📋 *Task Proof Fields: `{task['name']}`*\n\n"
+        _fields_tn_esc = _md_esc(str(task['name'] or ''))
+        text   = f"📋 *Task Proof Fields: `{_fields_tn_esc}`*\n\n"
         btns   = []
         if fields:
             for i, f in enumerate(fields, 1):
                 icon    = "📷" if f["field_type"] == "photo" else "📝"
                 has_img = bool((_rget(f, 'example_image_id', '') or '').strip())
                 img_tag = " 🖼✅" if has_img else ""
-                text += f"{i}. {icon} {f['prompt_bn']}{img_tag}\n"
+                text += f"{i}. {icon} {_md_esc(str(f['prompt_bn'] or ''))}{img_tag}\n"
                 row = [InlineKeyboardButton(
                     f"🗑 {i}. {(f['prompt_bn'] or '')[:18]}", callback_data=f"adm_field_del_{f['id']}_{tid}"
                 )]
@@ -9848,14 +9853,15 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         if not task:
             await q.message.reply_text("❌ Category Task পাওয়া যায়নি।"); return
         fields = await asyncio.to_thread(get_category_task_fields, tid)
-        text   = f"📋 *Category Task Proof Fields: `{task['name']}`*\n\n"
+        _cfields_tn_esc = _md_esc(str(task['name'] or ''))
+        text   = f"📋 *Category Task Proof Fields: `{_cfields_tn_esc}`*\n\n"
         btns   = []
         if fields:
             for i, f in enumerate(fields, 1):
                 icon    = "📷" if f["field_type"] == "photo" else "📝"
                 has_img = bool((_rget(f, 'example_image_id', '') or '').strip())
                 img_tag = " 🖼✅" if has_img else ""
-                text += f"{i}. {icon} {f['prompt_bn']}{img_tag}\n"
+                text += f"{i}. {icon} {_md_esc(str(f['prompt_bn'] or ''))}{img_tag}\n"
                 row = [InlineKeyboardButton(
                     f"🗑 {i}. {(f['prompt_bn'] or '')[:18]}", callback_data=f"adm_cfield_del_{f['id']}_{tid}"
                 )]
@@ -10621,7 +10627,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 log.warning(f"[ADM_FIND_USER] uid={tid}: {_fue}")
                 try:
                     await update.message.reply_text(
-                        f"❌ User profile লোড করতে সমস্যা হয়েছে।\nError: `{_md_esc(str(_fue))}`",
+                        f"❌ User profile লোড করতে সমস্যা হয়েছে।\nError: `{str(_fue).replace('`', \"'\")}`",
                         parse_mode="Markdown")
                 except Exception:
                     await update.message.reply_text(
@@ -11162,8 +11168,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     ctx.user_data["edit_field_id"]        = fid
                     ctx.user_data["edit_field_task_id"]   = tid
                     ctx.user_data["edit_field_is_categ"]  = False
+                    _pbn_safe = str(prompt_bn or '').replace('`', "'")
+                    _pen_safe = str(prompt_en or '').replace('`', "'")
                     await update.message.reply_text(
-                        f"✅ *Photo Field যোগ হয়েছে!*\n📷 `{prompt_bn}` / `{prompt_en}`\n\n"
+                        f"✅ *Photo Field যোগ হয়েছে!*\n📷 `{_pbn_safe}` / `{_pen_safe}`\n\n"
                         f"এই field-এর জন্য *Example Photo* সেট করবেন?\n"
                         f"_(ইউজার এই ছবি দেখে বুঝবে কেমন ছবি পাঠাতে হবে)_\n\n"
                         f"📤 এখনই ছবি পাঠান, অথবা Skip করুন:",
@@ -11178,8 +11186,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("📷 Photo Field যোগ", callback_data=f"adm_field_add_photo_{tid}")],
                 [InlineKeyboardButton("✅ Done", callback_data=f"adm_task_done_{tid}")],
             ])
+            _pbn_safe = str(prompt_bn or '').replace('`', "'")
+            _pen_safe = str(prompt_en or '').replace('`', "'")
             await update.message.reply_text(
-                f"✅ *Field যোগ হয়েছে!*\n{icon} `{prompt_bn}` / `{prompt_en}`\n\n"
+                f"✅ *Field যোগ হয়েছে!*\n{icon} `{_pbn_safe}` / `{_pen_safe}`\n\n"
                 f"মোট fields: {len(fields)} টি\n\nআরো field যোগ করুন বা Done চাপুন:",
                 parse_mode="Markdown", reply_markup=kb)
             return
@@ -11896,8 +11906,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         ctx.user_data["edit_field_id"]        = fid
                         ctx.user_data["edit_field_task_id"]   = tid
                         ctx.user_data["edit_field_is_categ"]  = True
+                        _cpbn_safe = str(prompt_bn or '').replace('`', "'")
+                        _cpen_safe = str(prompt_en or '').replace('`', "'")
                         await update.message.reply_text(
-                            f"✅ *Photo Field যোগ হয়েছে!*\n📷 `{prompt_bn}` / `{prompt_en}`\n\n"
+                            f"✅ *Photo Field যোগ হয়েছে!*\n📷 `{_cpbn_safe}` / `{_cpen_safe}`\n\n"
                             f"এই field-এর জন্য *Example Photo* সেট করবেন?\n"
                             f"_(ইউজার এই ছবি দেখে বুঝবে কেমন ছবি পাঠাতে হবে)_\n\n"
                             f"📤 এখনই ছবি পাঠান, অথবা Skip করুন:",
@@ -11911,8 +11923,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("➕ আরো Field যোগ করুন", callback_data=f"adm_cfields_{tid}")],
                     [InlineKeyboardButton("🚀 সম্পন্ন — Task Live করুন", callback_data=f"adm_ctask_golive_{tid}")],
                 ])
+                _cpbn_safe = str(prompt_bn or '').replace('`', "'")
+                _cpen_safe = str(prompt_en or '').replace('`', "'")
                 await update.message.reply_text(
-                    f"{icon} *Field যোগ হয়েছে!*\n\nBN: `{prompt_bn}`\nEN: `{prompt_en}`",
+                    f"{icon} *Field যোগ হয়েছে!*\n\nBN: `{_cpbn_safe}`\nEN: `{_cpen_safe}`",
                     parse_mode="Markdown", reply_markup=kb)
             return
 
@@ -12343,9 +12357,10 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ Confirm করুন",      callback_data=f"adm_tp_ok_{tid}_t")],
             [InlineKeyboardButton("❌ বাতিল/Delete",      callback_data=f"adm_tp_del_{tid}_t")],
         ])
+        _tp_tn_esc = _md_esc(str(task['name'] or ''))
         await q.message.reply_text(
             f"📋 *Task Preview — চেক করুন:*\n\n"
-            f"📌 *Name:* `{task['name']}`\n"
+            f"📌 *Name:* `{_tp_tn_esc}`\n"
             f"💵 *Reward:* `{task['price']}$ USDT`\n"
             f"📋 *Fields:* {len(fields)}\n"
             f"👥 *Max:* `{max_txt}`\n"
@@ -12376,8 +12391,9 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pu   = _pu_r4 if _pu_r4 is not None else 1
                 _ac  = _rget(task, 'allowed_countries', '') or ''
                 _pu_lbl4 = "Unlimited ♾️" if pu == 0 else f"{pu} বার"
+                _rtp_tn_esc4 = _md_esc(str(task['name'] or ''))
                 txt  = (f"📋 *Task Preview — চেক করুন:*\n\n"
-                        f"📌 *Name:* `{task['name']}`\n"
+                        f"📌 *Name:* `{_rtp_tn_esc4}`\n"
                         f"💵 *Reward:* `{task['price']}$ USDT`\n"
                         f"📋 *Fields:* {len(fields)}\n"
                         f"👥 *Max:* `{'Unlimited' if mc==0 else str(mc)+' people'}`\n"
@@ -12395,8 +12411,9 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 _ac  = _rget(task, 'allowed_countries', '') or ''
                 njo_lbl = "🔒 New Joiners Only: ✅ ON" if njo else "🔓 New Joiners Only: ❌ OFF"
                 _pu_lbl5 = "Unlimited ♾️" if pu == 0 else f"{pu} বার"
+                _rtp_tn_esc5 = _md_esc(str(task['name'] or ''))
                 txt  = (f"📋 *TG Task Preview — চেক করুন:*\n\n"
-                        f"📌 *Name:* `{task['name']}`\n"
+                        f"📌 *Name:* `{_rtp_tn_esc5}`\n"
                         f"💵 *Reward:* `{task['price']}$ USDT`\n"
                         f"📢 *Channel:* `{task['tg_target']}`\n"
                         f"👥 *Max:* `{'Unlimited' if mc==0 else str(mc)+' people'}`\n"
