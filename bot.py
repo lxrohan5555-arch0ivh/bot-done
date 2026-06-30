@@ -3556,7 +3556,8 @@ async def _check_ref_event_bonus(referred_id: int, referrer_id: int, bot):
 
 async def _notify_task_maxed(bot, name: str, code: str, type_label: str, done: int, max_c: int):
     """Admin-কে জানাও যে task-এর সব slot পূর্ণ হয়েছে এবং task বন্ধ হয়েছে।"""
-    code_line = f"\n🔑 *Code:* `{str(code).replace('`', \"'\")}`" if code else ""
+    _safe_code = str(code).replace('`', "'") if code else ""
+    code_line = f"\n🔑 *Code:* `{_safe_code}`" if code else ""
     msg = (
         f"🏁 *Task সম্পূর্ণ হয়েছে — Slot পূর্ণ!*\n\n"
         f"📌 *Task:* {_md_esc(name)}{code_line}\n"
@@ -3572,7 +3573,8 @@ async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str
         u = await asyncio.to_thread(get_user, user_id)
         full_name = _md_esc((u["full_name"] or "Unknown") if u else "Unknown")
         type_line = f"\n🏷️ *ধরন:* {_md_esc(task_type_label)}" if task_type_label else ""
-        code_line = f"\n🔑 *Task Code:* `{str(task_code).replace('`', \"'\")}`" if task_code else ""
+        _safe_task_code = str(task_code).replace('`', "'") if task_code else ""
+        code_line = f"\n🔑 *Task Code:* `{_safe_task_code}`" if task_code else ""
         msg = (
             f"✅ *Task সম্পন্ন হয়েছে!*\n\n"
             f"👤 *ইউজার:* {full_name}\n"
@@ -4152,7 +4154,7 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
         _u_ctry_line = ""
     msg_txt = (
         f"📨 *New Task Submission*\n\n"
-        f"📁 *Category Task:* {ttype_icon} {task_name}\n"
+        f"📁 *Category Task:* {ttype_icon} {_md_esc(str(task_name))}\n"
         f"👤 *User:* {uname}{_u_ctry_line}\n"
         f"🆔 *ID:* `{uid}`\n"
         f"━━━━━━━━━━━━━━━━\n"
@@ -4234,7 +4236,7 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
             try:
                 _cat_ow_msg = (
                     f"📬 *নতুন Submission পেয়েছেন!*\n\n"
-                    f"📁 *Task:* {ttype_icon} {task_name}\n"
+                    f"📁 *Task:* {ttype_icon} {_md_esc(str(task_name))}\n"
                     f"👤 *নাম:* {_md_esc(user.full_name or user.first_name or 'User')}\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"📋 *Proof:*\n{summary_txt}\n"
@@ -5076,7 +5078,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
         _u_ctry_line2 = ""
     msg_txt = (
         f"📨 *নতুন Task Submission*\n\n"
-        f"📌 *Task:* {_t_icon} {task_name}\n"
+        f"📌 *Task:* {_t_icon} {_md_esc(str(task_name))}\n"
         f"👤 *User:* {uname}{_u_ctry_line2}\n"
         f"🆔 *ID:* `{uid}`\n"
         f"━━━━━━━━━━━━━━━━\n"
@@ -5160,7 +5162,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
             try:
                 _reg_ow_msg = (
                     f"📬 *নতুন Submission পেয়েছেন!*\n\n"
-                    f"📌 *Task:* {_t_icon} {task_name}\n"
+                    f"📌 *Task:* {_t_icon} {_md_esc(str(task_name))}\n"
                     f"👤 *নাম:* {_md_esc(user.full_name or user.first_name or 'User')}\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"📋 *Proof:*\n{summary_txt}\n"
@@ -6923,9 +6925,10 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         max_c  = t["max_completions"]
         try: await q.message.delete()
         except Exception: pass
+        _live_tname = str(t['name'] or '').replace('`', "'")
         await q.message.reply_text(
             f"🚀 *Task এখন Live!*\n\n"
-            f"📌 *নাম:* `{t['name']}`\n"
+            f"📌 *নাম:* `{_live_tname}`\n"
             f"💰 *দাম:* `{t['price']}$ USDT`\n"
             f"👥 *Max:* `{max_c if max_c > 0 else '∞'} জন`\n"
             f"📋 *Proof Fields:* `{len(fields)} টি`\n\n"
@@ -7931,7 +7934,10 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         text = "🎛 *Menu Buttons সম্পাদনা*\n\n"
         btns = []
         for row in rows:
-            text += f"• *{row['key']}*: BN=`{row['label_bn']}` | EN=`{row['label_en']}`\n"
+            _rk = _md_esc(str(row['key']))
+            _bn = str(row['label_bn'] or "").replace('`', "'")
+            _en = str(row['label_en'] or "").replace('`', "'")
+            text += f"• *{_rk}*: BN=`{_bn}` | EN=`{_en}`\n"
             btns.append([InlineKeyboardButton(
                 f"✏️ {row['key']}", callback_data=f"adm_btn_edit_{row['key']}"
             )])
@@ -8184,14 +8190,14 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         ctx.user_data["state"] = "adm_set_welcome_bn"
         cur = await asyncio.to_thread(get_setting, 'welcome_msg_bn') or "(Default ব্যবহার হচ্ছে)"
         await q.message.reply_text(
-            f"📝 *বাংলা Welcome Message লিখুন:*\n\n_বর্তমান:_\n{cur[:300]}\n\n"
+            f"📝 *বাংলা Welcome Message লিখুন:*\n\n_বর্তমান:_\n{_md_esc(str(cur[:300]))}\n\n"
             "⚠️ শুধু `-` পাঠালে Default এ ফিরে যাবে।\n/cancel — বাতিল",
             parse_mode="Markdown"); return
     if d == "adm_set_welcome_en":
         ctx.user_data["state"] = "adm_set_welcome_en"
         cur = await asyncio.to_thread(get_setting, 'welcome_msg_en') or "(Default in use)"
         await q.message.reply_text(
-            f"📝 *English Welcome Message লিখুন:*\n\n_Current:_\n{cur[:300]}\n\n"
+            f"📝 *English Welcome Message লিখুন:*\n\n_Current:_\n{_md_esc(str(cur[:300]))}\n\n"
             "⚠️ Send `-` to reset to Default.\n/cancel — বাতিল",
             parse_mode="Markdown"); return
 
@@ -9253,8 +9259,9 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         ctx.user_data["state"] = "adm_task_price"
         icon, label = TASK_TYPE_MAP.get(ttype, ("📋", "Other"))
         name = ctx.user_data.get("new_task_name", "")
+        _name_cs1 = str(name).replace('`', "'")
         await q.message.reply_text(
-            f"✅ *নাম:* `{name}`\n🏷 *Type:* {icon} {label}\n\nএখন *মূল্য* লিখুন (যেমন: `0.10`):\n/cancel — বাতিল",
+            f"✅ *নাম:* `{_name_cs1}`\n🏷 *Type:* {icon} {label}\n\nএখন *মূল্য* লিখুন (যেমন: `0.10`):\n/cancel — বাতিল",
             parse_mode="Markdown"); return
 
     if d == "adm_task_list":
@@ -9511,7 +9518,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             text = "📢 *Required Channels তালিকা:*\n\n"
             btns = []
             for ch in channels:
-                text += f"• {ch['ch_name']} — `{ch['ch_id']}`\n"
+                text += f"• {_md_esc(str(ch['ch_name'] or ''))} — `{ch['ch_id']}`\n"
                 btns.append([InlineKeyboardButton(
                     f"🗑 Remove: {ch['ch_name']}", callback_data=f"adm_ch_del_{ch['id']}"
                 )])
@@ -9583,8 +9590,9 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
              InlineKeyboardButton(f"📋 Tasks ({len(tasks)})", callback_data=f"adm_cate_task_list_{cid}")],
             [InlineKeyboardButton("❌ বাতিল",          callback_data="task_cancel")],
         ])
+        _cat_edit_name = str(cat['name'] or '').replace('`', "'")
         await q.message.reply_text(
-            f"✏️ *Category Edit:* `{cat['name']}`\n\n"
+            f"✏️ *Category Edit:* `{_cat_edit_name}`\n\n"
             f"👁 *Status:* {s}\n"
             f"📋 *Tasks:* {len(tasks)} টি\n\nকী করবেন?",
             parse_mode="Markdown", reply_markup=kb); return
@@ -9623,8 +9631,9 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         ctx.user_data["state"] = "adm_cate_task_price"
         icon, label = TASK_TYPE_MAP.get(ttype, ("📋", "Other"))
         name = ctx.user_data.get("new_cate_task_name", "")
+        _name_cs2 = str(name).replace('`', "'")
         await q.message.reply_text(
-            f"✅ *Task নাম:* `{name}`\n🏷 *Type:* {icon} {label}\n\n💰 *দাম লিখুন* (যেমন: `0.10`):\n/cancel — বাতিল",
+            f"✅ *Task নাম:* `{_name_cs2}`\n🏷 *Type:* {icon} {label}\n\n💰 *দাম লিখুন* (যেমন: `0.10`):\n/cancel — বাতিল",
             parse_mode="Markdown"); return
 
     if d.startswith("adm_cate_task_list_"):
@@ -9686,7 +9695,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             [InlineKeyboardButton("❌ বাতিল",       callback_data="task_cancel")],
         ])
         await q.message.reply_text(
-            f"✏️ *Category Task Edit:* `{t['name']}`\n\n"
+            f"✏️ *Category Task Edit:* {_md_esc(str(t['name'] or ''))}\n\n"
             f"💵 *দাম:* `{t['price']}$ USDT`\n"
             f"👁 *Status:* {s}\n"
             f"👥 *Completions:* {slots}\n"
@@ -9977,8 +9986,9 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
              InlineKeyboardButton("🌍 দেশ নির্ধারণ", callback_data=f"adm_tgte_country_{tid}")],
             [InlineKeyboardButton("❌ বাতিল",         callback_data="task_cancel")],
         ])
+        _tgt_edit_name = str(t['name'] or '').replace('`', "'")
         await q.message.reply_text(
-            f"✏️ *TG Task Edit:* `{t['name']}`\n\n"
+            f"✏️ *TG Task Edit:* `{_tgt_edit_name}`\n\n"
             f"💰 *দাম:* `{t['price']}$ USDT`\n"
             f"📢 *Channel:* `{t['tg_target']}`\n"
             f"🔗 *Link:* `{t['tg_target_link'] or 'সেট নেই'}`\n"
@@ -10261,9 +10271,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("❌ Skip করুন",          callback_data="adm_notif_skip")],
             ])
             await update.message.reply_text(
-                f"🔔 *Updated Notification Preview:*\n\n{txt}\n\n"
+                f"🔔 <b>Updated Notification Preview:</b>\n\n<pre>{html.escape(txt)}</pre>\n\n"
                 f"👆 চেক করুন, তারপর পাঠান।",
-                parse_mode="Markdown", reply_markup=preview_kb)
+                parse_mode="HTML", reply_markup=preview_kb)
             return
 
         if st == "adm_tp_edit_name":
@@ -10280,7 +10290,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("✅ Confirm করুন",       callback_data=f"adm_tp_ok_{tp_tid}_{tp_type}")],
                 [InlineKeyboardButton("❌ বাতিল/Delete",       callback_data=f"adm_tp_del_{tp_tid}_{tp_type}")],
             ])
-            await update.message.reply_text(f"✅ *নাম আপডেট:* `{txt.strip()}`\n\nআবার চেক করুন:", parse_mode="Markdown", reply_markup=kb)
+            await update.message.reply_text(f"✅ *নাম আপডেট:* {_md_esc(str(txt.strip()))}\n\nআবার চেক করুন:", parse_mode="Markdown", reply_markup=kb)
             return
 
         if st == "adm_tp_edit_price":
@@ -10508,7 +10518,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     for s in subs
                 ) or "  _কোনো Submission নেই_"
                 text2 = (
-                    f"📌 *Task:* {tname}\n"
+                    f"📌 *Task:* {_md_esc(str(tname))}\n"
                     f"🔑 *Code:* `{code}`\n"
                     f"💰 *Price:* `{tprice}$`\n"
                     f"🏷️ *Type:* Regular Task\n"
@@ -10542,7 +10552,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     for s in subs
                 ) or "  _কোনো Completion নেই_"
                 text2 = (
-                    f"📡 *Task:* {tname}\n"
+                    f"📡 *Task:* {_md_esc(str(tname))}\n"
                     f"🔑 *Code:* `{code}`\n"
                     f"💰 *Price:* `{tprice}$`\n"
                     f"🏷️ *Type:* Telegram Join Task\n"
@@ -10594,7 +10604,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     for s in subs
                 ) or "  _কোনো Submission নেই_"
                 text2 = (
-                    f"📁 *Task:* {tname}\n"
+                    f"📁 *Task:* {_md_esc(str(tname))}\n"
                     f"🔑 *Code:* `{code}`\n"
                     f"💰 *Price:* `{tprice}$`\n"
                     f"🏷️ *Type:* Category Task\n"
@@ -10626,8 +10636,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as _fue:
                 log.warning(f"[ADM_FIND_USER] uid={tid}: {_fue}")
                 try:
+                    _fue_safe = str(_fue).replace('`', "'")
                     await update.message.reply_text(
-                        f"❌ User profile লোড করতে সমস্যা হয়েছে।\nError: `{str(_fue).replace('`', \"'\")}`",
+                        f"❌ User profile লোড করতে সমস্যা হয়েছে।\nError: `{_fue_safe}`",
                         parse_mode="Markdown")
                 except Exception:
                     await update.message.reply_text(
@@ -10991,8 +11002,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if st == "adm_task_name":
             ctx.user_data["new_task_name"] = txt
             ctx.user_data["state"] = "adm_task_await_type"
+            _txt_cs = str(txt).replace('`', "'")
             await update.message.reply_text(
-                f"✅ *নাম:* `{txt}`\n\n🏷 *Task Type বেছে নিন:*",
+                f"✅ *নাম:* `{_txt_cs}`\n\n🏷 *Task Type বেছে নিন:*",
                 parse_mode="Markdown",
                 reply_markup=task_type_picker_kb("adm_task_type_")
             ); return
@@ -11076,8 +11088,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("🎬 Demo Video যোগ",   callback_data=f"adm_te_video_{task_id}")],
                 [InlineKeyboardButton("✅ Done — Task সেভ করুন", callback_data=f"adm_task_done_{task_id}")],
             ])
+            _name_cs3 = str(name).replace('`', "'")
             await update.message.reply_text(
-                f"✅ *Task প্রায় তৈরি!*\n📌 `{name}` | 💵 `{price}$`\n"
+                f"✅ *Task প্রায় তৈরি!*\n📌 `{_name_cs3}` | 💵 `{price}$`\n"
                 f"👥 *Max:* `{max_lbl}` | 👤 *Per User:* `{per_lbl}`\n"
                 f"🌍 *দেশ:* {fmt_allowed_countries(allowed_c)}\n\n"
                 "এখন *Proof Fields* যোগ করুন — ইউজার থেকে কী কী নেওয়া হবে?\n\n"
@@ -11088,7 +11101,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if st == "adm_edit_name":
             tid = ctx.user_data.get("edit_tid"); await asyncio.to_thread(update_task_field_val, tid, "name", txt)
-            await update.message.reply_text(f"✅ *নাম আপডেট:* `{txt}`", parse_mode="Markdown")
+            await update.message.reply_text(f"✅ *নাম আপডেট:* {_md_esc(str(txt))}", parse_mode="Markdown")
             ctx.user_data.pop("state", None); ctx.user_data.pop("edit_tid", None); return
         if st == "adm_edit_price":
             tid = ctx.user_data.get("edit_tid")
@@ -11213,7 +11226,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ch_name = txt.strip()
             await asyncio.to_thread(add_req_channel, ch_id, ch_link, ch_name)
             await update.message.reply_text(
-                f"✅ *Channel যোগ হয়েছে!*\n📛 {ch_name}\n🔗 `{ch_id}`",
+                f"✅ *Channel যোগ হয়েছে!*\n📛 {_md_esc(str(ch_name))}\n🔗 `{ch_id}`",
                 parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
             for k in ("state","new_ch_id","new_ch_link"):
                 ctx.user_data.pop(k, None)
@@ -11425,9 +11438,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("✅ Confirm করুন",             callback_data=f"adm_tp_ok_{tid_new}_g")],
                 [InlineKeyboardButton("❌ বাতিল/Delete",             callback_data=f"adm_tp_del_{tid_new}_g")],
             ])
+            _name_cs4 = str(name).replace('`', "'")
             await update.message.reply_text(
                 f"📋 *Task Preview — চেক করুন:*\n\n"
-                f"📌 *Name:* `{name}`\n"
+                f"📌 *Name:* `{_name_cs4}`\n"
                 f"💰 *Reward:* `{price}$ USDT`\n"
                 f"📢 *Channel:* `{target}`\n"
                 f"👥 *Max:* `{max_txt}`\n"
@@ -11499,8 +11513,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("➕ এই Category তে Task যোগ করুন", callback_data=f"adm_cate_task_add_{cid}")],
                 [InlineKeyboardButton("📁 সব Categories", callback_data="adm_cat_list")],
             ])
+            _name_cs5 = str(name).replace('`', "'")
             await update.message.reply_text(
-                f"✅ *Category তৈরি হয়েছে:* `{name}`\n\nএখন এই Category তে Task যোগ করুন:",
+                f"✅ *Category তৈরি হয়েছে:* `{_name_cs5}`\n\nএখন এই Category তে Task যোগ করুন:",
                 parse_mode="Markdown", reply_markup=kb); return
 
         if st == "adm_cat_edit_name":
@@ -11602,9 +11617,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("🎬 Demo Video যোগ",    callback_data=f"adm_ctaste_video_{tid}")],
                 [InlineKeyboardButton("🚀 এখনই Live করুন (Proof ছাড়া)", callback_data=f"adm_ctask_golive_{tid}")],
             ])
+            _name_cs6 = str(name).replace('`', "'")
             await update.message.reply_text(
                 f"✅ *Category Task তৈরি হয়েছে!*\n\n"
-                f"📌 *Task:* `{name}`\n"
+                f"📌 *Task:* `{_name_cs6}`\n"
                 f"💰 *দাম:* `{price}$`\n"
                 f"👥 *Max:* `{max_c if max_c > 0 else '∞'}`\n"
                 f"🌍 *দেশ:* {country_lbl}\n\n"
@@ -11617,7 +11633,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             tid = ctx.user_data.pop("edit_ctask_id", None)
             ctx.user_data.pop("state", None)
             if tid: await asyncio.to_thread(update_category_task, tid, "name", txt.strip())
-            await update.message.reply_text(f"✅ *Task নাম আপডেট:* `{txt.strip()}`", parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid)); return
+            await update.message.reply_text(f"✅ *Task নাম আপডেট:* {_md_esc(str(txt.strip()))}", parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid)); return
 
         if st == "adm_ctask_edit_price":
             tid = ctx.user_data.pop("edit_ctask_id", None)
@@ -12545,15 +12561,15 @@ async def cmd_inactive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if lang == 'bn':
         lines = [f"😴 *{days} দিন+ Inactive Users ({len(rows)} জন):*\n"]
         for r in rows:
-            name  = r["full_name"] or r["username"] or "Unknown"
-            uname = f" @{r['username']}" if r["username"] else ""
+            name  = _md_esc(r["full_name"] or r["username"] or "Unknown")
+            uname = f" @{_md_esc(r['username'])}" if r["username"] else ""
             ls    = r["last_seen"] or "অজানা"
             lines.append(f"• `{r['user_id']}`{uname} — {name}\n  শেষ: {ls}")
     else:
         lines = [f"😴 *Inactive Users ({days}+ days) — {len(rows)} found:*\n"]
         for r in rows:
-            name  = r["full_name"] or r["username"] or "Unknown"
-            uname = f" @{r['username']}" if r["username"] else ""
+            name  = _md_esc(r["full_name"] or r["username"] or "Unknown")
+            uname = f" @{_md_esc(r['username'])}" if r["username"] else ""
             ls    = r["last_seen"] or "Unknown"
             lines.append(f"• `{r['user_id']}`{uname} — {name}\n  Last seen: {ls}")
     text = "\n".join(lines)
@@ -12569,7 +12585,7 @@ def _build_promo_post(code: str, amount: float, max_uses: int, req_text: str) ->
         f"🔑 *Code:* `{code}`\n"
         f"💰 *Reward:* `{amount}$ USDT`\n"
         f"👥 *Total Slots:* `{max_uses}`\n"
-        f"📋 *Requirement:* {req_text}\n\n"
+        f"📋 *Requirement:* {_md_esc(str(req_text))}\n\n"
         f"🚀 Go to the bot and type `/promo {code}` to redeem."
     )
 
@@ -12720,7 +12736,7 @@ def _build_promo_post_used(code: str, amount: float, max_uses: int, req_text: st
         f"🔑 *Code:* `{code}`\n"
         f"💰 *Reward:* `{amount}$ USDT`\n"
         f"👥 *Total Slots:* `{max_uses}` ✅ _(সব শেষ)_\n"
-        f"📋 *Requirement:* {req_text}\n\n"
+        f"📋 *Requirement:* {_md_esc(str(req_text))}\n\n"
         f"❌ *This promo code is fully used.*"
     )
 
@@ -13152,7 +13168,7 @@ async def _run_health_check_and_fix(bot, skip_admin_ping=False) -> tuple:
             lines.append("  🔧 default channels restore হয়েছে"); fixes += 1
         else:
             for ch in chs:
-                lines.append(f"  ✅ {ch['ch_name']} (`{ch['ch_id']}`)")
+                lines.append(f"  ✅ {_md_esc(str(ch['ch_name'] or ''))} (`{ch['ch_id']}`)")
     except Exception as e:
         lines.append(f"  ⚠️ চেক করতে পারেনি: {e}")
 
