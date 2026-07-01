@@ -4025,7 +4025,7 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
             else:
                 summary_lines.append(f"📷 *{_md_esc(item['prompt_bn'])}:* (Skipped)")
         else:
-            val = str(item["value"] or "").replace('`', "'")
+            val = str(item["value"] or "").replace('`', "'").replace('\n', ' ').replace('\r', '')
             summary_lines.append(f"📝 *{_md_esc(item['prompt_bn'])}:*\n`{val}`")
 
     # duplicate check — ইউজার কিছু জানবে না, শুধু admin warning এ দেখাবে (msg_txt এ)
@@ -4980,7 +4980,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
                 photo_file_ids.append(item["value"])
                 if item.get("unique_id"):
                     _submitted_unique_ids.append(item["unique_id"])
-                _cap_txt = str(item.get("caption", "") or "").strip().replace('`', "'")
+                _cap_txt = str(item.get("caption", "") or "").strip().replace('`', "'").replace('\n', ' ').replace('\r', '')
                 _plbl    = _md_esc(prompt_lbl or "")
                 if _cap_txt:
                     summary_lines.append(
@@ -4993,7 +4993,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
             else:
                 summary_lines.append(f"📷 *{_md_esc(prompt_lbl or '')}:* (Skipped)" if lang == 'en' else f"📷 *{_md_esc(prompt_lbl or '')}:* (Skip করা হয়েছে)")
         else:
-            val = str(item["value"] or "").replace('`', "'")
+            val = str(item["value"] or "").replace('`', "'").replace('\n', ' ').replace('\r', '')
             summary_lines.append(f"📝 *{_md_esc(prompt_lbl or '')}:*\n`{val}`")
 
     # duplicate check — ইউজার কিছু জানবে না, শুধু admin warning এ দেখাবে (msg_txt এ)
