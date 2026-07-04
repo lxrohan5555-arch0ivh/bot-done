@@ -672,6 +672,8 @@ def _is_md_parse_err(e) -> bool:
     s = str(e).lower()
     return "can't parse entities" in s or "can't find end" in s or "parse entities" in s
 
+_MD_FALLBACK_PATCHED = False
+
 def patch_bot_markdown_fallback(bot):
     """
     Global safety net: কোথাও যদি ভুলবশত escape না করা raw text
@@ -681,31 +683,41 @@ def patch_bot_markdown_fallback(bot):
     এটা bot.send_message/send_photo/edit_message_text/edit_message_caption
     সব জায়গায় কাজ করে, কারণ message.reply_text()/reply_photo() ভিতরে
     এই একই bot method গুলোই কল করে।
+
+    গুরুত্বপূর্ণ: python-telegram-bot এর Bot/ExtBot ক্লাস __slots__ ব্যবহার
+    করে, তাই bot.send_message = ... (instance attribute) সেট করলে
+    "Attribute can't be set" crash হয়। তাই ইনস্ট্যান্স নয়, ক্লাসের উপর
+    (type(bot)) patch করতে হবে।
     """
+    global _MD_FALLBACK_PATCHED
+    if _MD_FALLBACK_PATCHED:
+        return
+    cls = type(bot)
     _orig = {
-        "send_message":        bot.send_message,
-        "send_photo":          bot.send_photo,
-        "edit_message_text":   bot.edit_message_text,
-        "edit_message_caption": bot.edit_message_caption,
+        "send_message":         cls.send_message,
+        "send_photo":           cls.send_photo,
+        "edit_message_text":    cls.edit_message_text,
+        "edit_message_caption": cls.edit_message_caption,
     }
 
     def _wrap(name):
         _orig_fn = _orig[name]
-        async def _wrapped(*args, **kwargs):
+        async def _wrapped(self, *args, **kwargs):
             try:
-                return await _orig_fn(*args, **kwargs)
+                return await _orig_fn(self, *args, **kwargs)
             except TgBadRequest as e:
                 if kwargs.get("parse_mode") and _is_md_parse_err(e):
                     log.warning(f"[MD-FALLBACK] {name}: parse error ধরা পড়েছে, plain text এ fallback করা হচ্ছে — {e}")
                     kwargs["parse_mode"] = None
-                    return await _orig_fn(*args, **kwargs)
+                    return await _orig_fn(self, *args, **kwargs)
                 raise
         return _wrapped
 
-    bot.send_message         = _wrap("send_message")
-    bot.send_photo           = _wrap("send_photo")
-    bot.edit_message_text    = _wrap("edit_message_text")
-    bot.edit_message_caption = _wrap("edit_message_caption")
+    cls.send_message         = _wrap("send_message")
+    cls.send_photo           = _wrap("send_photo")
+    cls.edit_message_text    = _wrap("edit_message_text")
+    cls.edit_message_caption = _wrap("edit_message_caption")
+    _MD_FALLBACK_PATCHED = True
 
 def _count(row):
     """RealDictCursor COUNT(*)/COALESCE result থেকে int বের করো।"""
