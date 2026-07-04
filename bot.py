@@ -39,7 +39,7 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes
 )
 from telegram.constants import ChatMemberStatus
-from telegram.error import TelegramError, RetryAfter as TgRetryAfter
+from telegram.error import TelegramError, RetryAfter as TgRetryAfter, BadRequest as TgBadRequest
 
 # ──────────────────────────── CONFIG ────────────────────────────
 # প্রথমে Environment Variable থেকে নেওয়ার চেষ্টা করো,
@@ -667,6 +667,45 @@ def _md_esc(text: str) -> str:
     for ch in ['_', '*', '`', '[']:
         text = text.replace(ch, f'\\{ch}')
     return text
+
+def _is_md_parse_err(e) -> bool:
+    s = str(e).lower()
+    return "can't parse entities" in s or "can't find end" in s or "parse entities" in s
+
+def patch_bot_markdown_fallback(bot):
+    """
+    Global safety net: কোথাও যদি ভুলবশত escape না করা raw text
+    parse_mode="Markdown"/"MarkdownV2" দিয়ে পাঠানো হয় এবং Telegram
+    'Can't parse entities' error দেয়, তাহলে স্বয়ংক্রিয়ভাবে plain text
+    (parse_mode ছাড়া) দিয়ে retry করবে — যাতে মেসেজ পাঠানোই সম্পূর্ণ ব্যর্থ না হয়।
+    এটা bot.send_message/send_photo/edit_message_text/edit_message_caption
+    সব জায়গায় কাজ করে, কারণ message.reply_text()/reply_photo() ভিতরে
+    এই একই bot method গুলোই কল করে।
+    """
+    _orig = {
+        "send_message":        bot.send_message,
+        "send_photo":          bot.send_photo,
+        "edit_message_text":   bot.edit_message_text,
+        "edit_message_caption": bot.edit_message_caption,
+    }
+
+    def _wrap(name):
+        _orig_fn = _orig[name]
+        async def _wrapped(*args, **kwargs):
+            try:
+                return await _orig_fn(*args, **kwargs)
+            except TgBadRequest as e:
+                if kwargs.get("parse_mode") and _is_md_parse_err(e):
+                    log.warning(f"[MD-FALLBACK] {name}: parse error ধরা পড়েছে, plain text এ fallback করা হচ্ছে — {e}")
+                    kwargs["parse_mode"] = None
+                    return await _orig_fn(*args, **kwargs)
+                raise
+        return _wrapped
+
+    bot.send_message         = _wrap("send_message")
+    bot.send_photo           = _wrap("send_photo")
+    bot.edit_message_text    = _wrap("edit_message_text")
+    bot.edit_message_caption = _wrap("edit_message_caption")
 
 def _count(row):
     """RealDictCursor COUNT(*)/COALESCE result থেকে int বের করো।"""
@@ -3556,7 +3595,7 @@ async def _check_ref_event_bonus(referred_id: int, referrer_id: int, bot):
 
 async def _notify_task_maxed(bot, name: str, code: str, type_label: str, done: int, max_c: int):
     """Admin-কে জানাও যে task-এর সব slot পূর্ণ হয়েছে এবং task বন্ধ হয়েছে।"""
-    _safe_code = str(code).replace('`', "'") if code else ""
+    _safe_code = _md_esc(str(code).replace('`', "'")) if code else ""
     code_line = f"\n🔑 *Code:* `{_safe_code}`" if code else ""
     msg = (
         f"🏁 *Task সম্পূর্ণ হয়েছে — Slot পূর্ণ!*\n\n"
@@ -3573,7 +3612,7 @@ async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str
         u = await asyncio.to_thread(get_user, user_id)
         full_name = _md_esc((u["full_name"] or "Unknown") if u else "Unknown")
         type_line = f"\n🏷️ *ধরন:* {_md_esc(task_type_label)}" if task_type_label else ""
-        _safe_task_code = str(task_code).replace('`', "'") if task_code else ""
+        _safe_task_code = _md_esc(str(task_code).replace('`', "'")) if task_code else ""
         code_line = f"\n🔑 *Task Code:* `{_safe_task_code}`" if task_code else ""
         msg = (
             f"✅ *Task সম্পন্ন হয়েছে!*\n\n"
@@ -4025,7 +4064,8 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
             else:
                 summary_lines.append(f"📷 *{_md_esc(item['prompt_bn'])}:* (Skipped)")
         else:
-            val = str(item["value"] or "").replace('`', "'").replace('\n', ' ').replace('\r', '')
+            val = str(item["value"] or "").replace('\n', ' ').replace('\r', '')
+            val = _md_esc(val).replace('`', "'")
             summary_lines.append(f"📝 *{_md_esc(item['prompt_bn'])}:*\n`{val}`")
 
     # duplicate check — ইউজার কিছু জানবে না, শুধু admin warning এ দেখাবে (msg_txt এ)
@@ -4980,7 +5020,8 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
                 photo_file_ids.append(item["value"])
                 if item.get("unique_id"):
                     _submitted_unique_ids.append(item["unique_id"])
-                _cap_txt = str(item.get("caption", "") or "").strip().replace('`', "'").replace('\n', ' ').replace('\r', '')
+                _cap_txt = str(item.get("caption", "") or "").strip().replace('\n', ' ').replace('\r', '')
+                _cap_txt = _md_esc(_cap_txt).replace('`', "'")
                 _plbl    = _md_esc(prompt_lbl or "")
                 if _cap_txt:
                     summary_lines.append(
@@ -4993,7 +5034,8 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
             else:
                 summary_lines.append(f"📷 *{_md_esc(prompt_lbl or '')}:* (Skipped)" if lang == 'en' else f"📷 *{_md_esc(prompt_lbl or '')}:* (Skip করা হয়েছে)")
         else:
-            val = str(item["value"] or "").replace('`', "'").replace('\n', ' ').replace('\r', '')
+            val = str(item["value"] or "").replace('\n', ' ').replace('\r', '')
+            val = _md_esc(val).replace('`', "'")
             summary_lines.append(f"📝 *{_md_esc(prompt_lbl or '')}:*\n`{val}`")
 
     # duplicate check — ইউজার কিছু জানবে না, শুধু admin warning এ দেখাবে (msg_txt এ)
@@ -5794,6 +5836,7 @@ async def _notify_bio_text_change(bot):
     log.info(f"[BIO-NOTIFY] {len(tracked)} জন পুরানো bio user কে নোটিফিকেশন পাঠাচ্ছি…")
 
     _new_bio = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
+    _new_bio_safe = _md_esc(_new_bio)
     _sem = asyncio.Semaphore(5)   # Telegram rate limit এড়াতে
 
     async def _send_one(row):
@@ -5804,7 +5847,7 @@ async def _notify_bio_text_change(bot):
                 "🔔 *Bio Task — Text Changed!*\n\n"
                 "The required Bio text has been updated.\n\n"
                 "📝 *Set your Telegram Bio to exactly this:*\n\n"
-                f"`{_new_bio}`\n\n"
+                f"`{_new_bio_safe}`\n\n"
                 "📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
                 "⚠️ *Tonight at 12:00 AM (BD) your bio will be checked.*\n"
                 "If not set, you have *5 minutes* to update — otherwise today's payment will be cancelled."
@@ -5814,7 +5857,7 @@ async def _notify_bio_text_change(bot):
                 "🔔 *Bio Task — Bio Text পরিবর্তন হয়েছে!*\n\n"
                 "Required Bio text আপডেট করা হয়েছে।\n\n"
                 "📝 *আপনার Telegram Bio তে হুবহু এই text রাখুন:*\n\n"
-                f"`{_new_bio}`\n\n"
+                f"`{_new_bio_safe}`\n\n"
                 "📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
                 "⚠️ *আজ রাত ১২:০০ (BD) তে bio চেক হবে।*\n"
                 "সেট না থাকলে ৫ মিনিটের মধ্যে সেট করুন — না হলে আজকের payment বাতিল হবে।"
@@ -6065,7 +6108,7 @@ async def _broadcast_task_notify(ctx, reply_msg, sender_uid,
     ticon           = task_type_icon(task_type)
     _country_line   = f"🌍 *Available to:* {fmt_allowed_countries(allowed_countries)}" if allowed_countries else "🌍 *Available to:* All countries 🌐"
     _ch_code_line   = f"\n🔑 *Task Code:* `{t_code}`" if t_code else ""
-    _t_name_safe    = str(t_name or '').replace('`', "'")
+    _t_name_safe    = _md_esc(str(t_name or '').replace('`', "'"))
 
     # ── Channel message (instant) ──────────────────────────────────
     ch_msg = (
@@ -6307,7 +6350,7 @@ async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Report তৈরিতে সমস্যা: `{e}`", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Report তৈরিতে সমস্যা: `{_md_esc(str(e))}`", parse_mode="Markdown")
 
 async def cmd_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -6925,7 +6968,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         max_c  = t["max_completions"]
         try: await q.message.delete()
         except Exception: pass
-        _live_tname = str(t['name'] or '').replace('`', "'")
+        _live_tname = _md_esc(str(t['name'] or '').replace('`', "'"))
         await q.message.reply_text(
             f"🚀 *Task এখন Live!*\n\n"
             f"📌 *নাম:* `{_live_tname}`\n"
@@ -7565,7 +7608,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 f"📅 *Daily Reward (প্রতিদিন, ২৪ঘন্টা):* `{daily_reward}$ USDT`\n\n"
                 f"{track_status}\n\n"
                 f"📝 *আপনার Bio তে হুবহু এই text রাখুন:*\n\n"
-                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_⚙️ Settings → Edit Profile → Bio_\n\n"
                 f"▶️ *Bio সেট করার পর:*\n"
                 f"1️⃣ ✅ Check করুন বাটন চাপুন\n\n"
@@ -7587,7 +7630,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 f"📅 *Daily Reward (every day, 24h):* `{daily_reward}$ USDT`\n\n"
                 f"{track_status}\n\n"
                 f"📝 *Set your Telegram Bio to exactly:*\n\n"
-                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_⚙️ Settings → Edit Profile → Bio_\n\n"
                 f"▶️ *After setting bio:*\n"
                 f"1️⃣ Press ✅ Check button\n\n"
@@ -7706,7 +7749,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
             msg = (
                 "❌ *Bio পাওয়া যায়নি!*\n\n"
                 "নিচের text টি হুবহু copy করে Telegram Bio তে বসান:\n\n"
-                "`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 "📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
                 "✅ সেট করার পর আবার Check বাটন চাপুন।"
             )
@@ -7714,7 +7757,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
             msg = (
                 "❌ *Bio not found!*\n\n"
                 "Copy the text below and paste it in your Telegram Bio:\n\n"
-                "`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 "📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
                 "✅ After setting, press Check again."
             )
@@ -7935,8 +7978,8 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         btns = []
         for row in rows:
             _rk = _md_esc(str(row['key']))
-            _bn = str(row['label_bn'] or "").replace('`', "'")
-            _en = str(row['label_en'] or "").replace('`', "'")
+            _bn = _md_esc(str(row['label_bn'] or "").replace('`', "'"))
+            _en = _md_esc(str(row['label_en'] or "").replace('`', "'"))
             text += f"• *{_rk}*: BN=`{_bn}` | EN=`{_en}`\n"
             btns.append([InlineKeyboardButton(
                 f"✏️ {row['key']}", callback_data=f"adm_btn_edit_{row['key']}"
@@ -7962,8 +8005,8 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         row = await asyncio.to_thread(_db_6146)
         cur_bn = row["label_bn"] if row else DEFAULT_BTNS.get(btn_key,('?','?'))[0]
         cur_en = row["label_en"] if row else DEFAULT_BTNS.get(btn_key,('?','?'))[1]
-        _cur_bn_safe = str(cur_bn or '').replace('`', "'")
-        _cur_en_safe = str(cur_en or '').replace('`', "'")
+        _cur_bn_safe = _md_esc(str(cur_bn or '').replace('`', "'"))
+        _cur_en_safe = _md_esc(str(cur_en or '').replace('`', "'"))
         await q.message.reply_text(
             f"✏️ *Button Edit: `{btn_key}`*\n\n"
             f"বর্তমান BN: `{_cur_bn_safe}`\n"
@@ -8812,7 +8855,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             f"📅 *Daily Reward (রোজ):* `{dr}$ USDT`\n"
             f"📊 *Status:* {st}\n\n"
             f"📝 *Required Bio Text:*\n"
-            f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+            f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
             f"🕛 প্রতিদিন রাত ১২:০০ BD তে automatic check হয়।\n"
             f"⏳ Bio সরালে ৫ মিনিট grace — তারপর tracking reset।"
         ), act
@@ -8978,15 +9021,24 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         # News channel-এ বাংলা মেসেজ পাঠাও
         news_txt = bc_bn or bc_en
         try:
-            if bc_photo:
-                await ctx.bot.send_photo(LEADERBOARD_CH_ID, bc_photo, caption=news_txt, parse_mode="Markdown")
-            else:
-                await ctx.bot.send_message(LEADERBOARD_CH_ID, news_txt, parse_mode="Markdown")
+            try:
+                if bc_photo:
+                    await ctx.bot.send_photo(LEADERBOARD_CH_ID, bc_photo, caption=news_txt, parse_mode="Markdown")
+                else:
+                    await ctx.bot.send_message(LEADERBOARD_CH_ID, news_txt, parse_mode="Markdown")
+            except Exception as _pme:
+                if "parse entities" in str(_pme).lower() or "can't find end" in str(_pme).lower():
+                    if bc_photo:
+                        await ctx.bot.send_photo(LEADERBOARD_CH_ID, bc_photo, caption=news_txt)
+                    else:
+                        await ctx.bot.send_message(LEADERBOARD_CH_ID, news_txt)
+                else:
+                    raise
             await q.message.reply_text(
                 f"✅ *News Channel এ Post করা হয়েছে!*\n\n🔗 {LEADERBOARD_CH_LINK}",
                 parse_mode="Markdown")
         except Exception as _e:
-            await q.message.reply_text(f"❌ News Channel এ Post ব্যর্থ: {_e}", parse_mode="Markdown")
+            await q.message.reply_text(f"❌ News Channel এ Post ব্যর্থ: {_md_esc(str(_e))}", parse_mode="Markdown")
         for k in ("bc_msg_bn", "bc_msg_en", "bc_photo_id"): ctx.user_data.pop(k, None)
         return
 
@@ -9259,7 +9311,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         ctx.user_data["state"] = "adm_task_price"
         icon, label = TASK_TYPE_MAP.get(ttype, ("📋", "Other"))
         name = ctx.user_data.get("new_task_name", "")
-        _name_cs1 = str(name).replace('`', "'")
+        _name_cs1 = _md_esc(str(name).replace('`', "'"))
         await q.message.reply_text(
             f"✅ *নাম:* `{_name_cs1}`\n🏷 *Type:* {icon} {label}\n\nএখন *মূল্য* লিখুন (যেমন: `0.10`):\n/cancel — বাতিল",
             parse_mode="Markdown"); return
@@ -9590,7 +9642,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
              InlineKeyboardButton(f"📋 Tasks ({len(tasks)})", callback_data=f"adm_cate_task_list_{cid}")],
             [InlineKeyboardButton("❌ বাতিল",          callback_data="task_cancel")],
         ])
-        _cat_edit_name = str(cat['name'] or '').replace('`', "'")
+        _cat_edit_name = _md_esc(str(cat['name'] or '').replace('`', "'"))
         await q.message.reply_text(
             f"✏️ *Category Edit:* `{_cat_edit_name}`\n\n"
             f"👁 *Status:* {s}\n"
@@ -9631,7 +9683,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         ctx.user_data["state"] = "adm_cate_task_price"
         icon, label = TASK_TYPE_MAP.get(ttype, ("📋", "Other"))
         name = ctx.user_data.get("new_cate_task_name", "")
-        _name_cs2 = str(name).replace('`', "'")
+        _name_cs2 = _md_esc(str(name).replace('`', "'"))
         await q.message.reply_text(
             f"✅ *Task নাম:* `{_name_cs2}`\n🏷 *Type:* {icon} {label}\n\n💰 *দাম লিখুন* (যেমন: `0.10`):\n/cancel — বাতিল",
             parse_mode="Markdown"); return
@@ -9986,7 +10038,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
              InlineKeyboardButton("🌍 দেশ নির্ধারণ", callback_data=f"adm_tgte_country_{tid}")],
             [InlineKeyboardButton("❌ বাতিল",         callback_data="task_cancel")],
         ])
-        _tgt_edit_name = str(t['name'] or '').replace('`', "'")
+        _tgt_edit_name = _md_esc(str(t['name'] or '').replace('`', "'"))
         await q.message.reply_text(
             f"✏️ *TG Task Edit:* `{_tgt_edit_name}`\n\n"
             f"💰 *দাম:* `{t['price']}$ USDT`\n"
@@ -10213,10 +10265,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             target = ctx.user_data.get("direct_msg_to")
             if target:
                 try:
-                    await ctx.bot.send_message(target, txt, parse_mode="Markdown")
+                    try:
+                        await ctx.bot.send_message(target, txt, parse_mode="Markdown")
+                    except Exception as _pme:
+                        if "parse entities" in str(_pme).lower() or "can't find end" in str(_pme).lower():
+                            await ctx.bot.send_message(target, txt)
+                        else:
+                            raise
                     await update.message.reply_text(f"✅ *User `{target}` কে মেসেজ পাঠানো হয়েছে।*", parse_mode="Markdown")
                 except Exception as e:
-                    await update.message.reply_text(f"❌ ব্যর্থ: {e}", parse_mode="Markdown")
+                    await update.message.reply_text(f"❌ ব্যর্থ: {_md_esc(str(e))}", parse_mode="Markdown")
             ctx.user_data.pop("state", None); ctx.user_data.pop("direct_msg_to", None); return
 
         if st == "adm_bc_photo":
@@ -10433,9 +10491,15 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if st == "adm_msg_txt":
             try:
                 tid = ctx.user_data["adm_tid"]
-                await ctx.bot.send_message(tid, txt, parse_mode="Markdown")
+                try:
+                    await ctx.bot.send_message(tid, txt, parse_mode="Markdown")
+                except Exception as _pme:
+                    if "parse entities" in str(_pme).lower() or "can't find end" in str(_pme).lower():
+                        await ctx.bot.send_message(tid, txt)
+                    else:
+                        raise
                 await update.message.reply_text(f"✅ *`{tid}` কে মেসেজ পাঠানো হয়েছে।*", parse_mode="Markdown")
-            except Exception as e: await update.message.reply_text(f"❌ ব্যর্থ: {e}", parse_mode="Markdown")
+            except Exception as e: await update.message.reply_text(f"❌ ব্যর্থ: {_md_esc(str(e))}", parse_mode="Markdown")
             ctx.user_data.pop("state", None); ctx.user_data.pop("adm_tid", None); return
 
         if st == "adm_set_owner_input":
@@ -10484,8 +10548,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ct_row, t_row, tg_row = await asyncio.to_thread(_db_8342)
 
             if not t_row and not tg_row and not ct_row:
+                _code_safe = _md_esc(code.replace('`', "'"))
                 await update.message.reply_text(
-                    f"❌ `{code}` — এই কোড দিয়ে কোনো Task পাওয়া যায়নি।\n\n"
+                    f"❌ `{_code_safe}` — এই কোড দিয়ে কোনো Task পাওয়া যায়নি।\n\n"
                     "সঠিক কোড দিন (যেমন: `TK-AB3X7`)।",
                     parse_mode="Markdown")
                 ctx.user_data.pop("state", None); return
@@ -10672,7 +10737,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown")
                 except Exception: pass
             except Exception as _e:
-                await update.message.reply_text(f"❌ সঠিক পরিমাণ দিন। (Error: {_e})", parse_mode="Markdown")
+                await update.message.reply_text(f"❌ সঠিক পরিমাণ দিন। (Error: {_md_esc(str(_e))})", parse_mode="Markdown")
             ctx.user_data.pop("state", None); ctx.user_data.pop("adm_target", None); return
 
         if st == "adm_udedbal_amt":
@@ -10702,16 +10767,22 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown")
                 except Exception: pass
             except Exception as _e:
-                await update.message.reply_text(f"❌ সঠিক পরিমাণ দিন। (Error: {_e})", parse_mode="Markdown")
+                await update.message.reply_text(f"❌ সঠিক পরিমাণ দিন। (Error: {_md_esc(str(_e))})", parse_mode="Markdown")
             ctx.user_data.pop("state", None); ctx.user_data.pop("adm_target", None); return
 
         if st == "adm_umsg_txt":
             tid = ctx.user_data.get("adm_target")
             try:
-                await ctx.bot.send_message(tid, txt, parse_mode="Markdown")
+                try:
+                    await ctx.bot.send_message(tid, txt, parse_mode="Markdown")
+                except Exception as _pme:
+                    if "parse entities" in str(_pme).lower() or "can't find end" in str(_pme).lower():
+                        await ctx.bot.send_message(tid, txt)
+                    else:
+                        raise
                 await update.message.reply_text(f"✅ *`{tid}` কে মেসেজ পাঠানো হয়েছে।*", parse_mode="Markdown")
             except Exception as e:
-                await update.message.reply_text(f"❌ ব্যর্থ: {e}", parse_mode="Markdown")
+                await update.message.reply_text(f"❌ ব্যর্থ: {_md_esc(str(e))}", parse_mode="Markdown")
             ctx.user_data.pop("state", None); ctx.user_data.pop("adm_target", None); return
 
         if st == "adm_add_admin_id":
@@ -11002,7 +11073,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if st == "adm_task_name":
             ctx.user_data["new_task_name"] = txt
             ctx.user_data["state"] = "adm_task_await_type"
-            _txt_cs = str(txt).replace('`', "'")
+            _txt_cs = _md_esc(str(txt).replace('`', "'"))
             await update.message.reply_text(
                 f"✅ *নাম:* `{_txt_cs}`\n\n🏷 *Task Type বেছে নিন:*",
                 parse_mode="Markdown",
@@ -11088,7 +11159,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("🎬 Demo Video যোগ",   callback_data=f"adm_te_video_{task_id}")],
                 [InlineKeyboardButton("✅ Done — Task সেভ করুন", callback_data=f"adm_task_done_{task_id}")],
             ])
-            _name_cs3 = str(name).replace('`', "'")
+            _name_cs3 = _md_esc(str(name).replace('`', "'"))
             await update.message.reply_text(
                 f"✅ *Task প্রায় তৈরি!*\n📌 `{_name_cs3}` | 💵 `{price}$`\n"
                 f"👥 *Max:* `{max_lbl}` | 👤 *Per User:* `{per_lbl}`\n"
@@ -11181,8 +11252,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     ctx.user_data["edit_field_id"]        = fid
                     ctx.user_data["edit_field_task_id"]   = tid
                     ctx.user_data["edit_field_is_categ"]  = False
-                    _pbn_safe = str(prompt_bn or '').replace('`', "'")
-                    _pen_safe = str(prompt_en or '').replace('`', "'")
+                    _pbn_safe = _md_esc(str(prompt_bn or '').replace('`', "'"))
+                    _pen_safe = _md_esc(str(prompt_en or '').replace('`', "'"))
                     await update.message.reply_text(
                         f"✅ *Photo Field যোগ হয়েছে!*\n📷 `{_pbn_safe}` / `{_pen_safe}`\n\n"
                         f"এই field-এর জন্য *Example Photo* সেট করবেন?\n"
@@ -11199,8 +11270,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("📷 Photo Field যোগ", callback_data=f"adm_field_add_photo_{tid}")],
                 [InlineKeyboardButton("✅ Done", callback_data=f"adm_task_done_{tid}")],
             ])
-            _pbn_safe = str(prompt_bn or '').replace('`', "'")
-            _pen_safe = str(prompt_en or '').replace('`', "'")
+            _pbn_safe = _md_esc(str(prompt_bn or '').replace('`', "'"))
+            _pen_safe = _md_esc(str(prompt_en or '').replace('`', "'"))
             await update.message.reply_text(
                 f"✅ *Field যোগ হয়েছে!*\n{icon} `{_pbn_safe}` / `{_pen_safe}`\n\n"
                 f"মোট fields: {len(fields)} টি\n\nআরো field যোগ করুন বা Done চাপুন:",
@@ -11438,7 +11509,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("✅ Confirm করুন",             callback_data=f"adm_tp_ok_{tid_new}_g")],
                 [InlineKeyboardButton("❌ বাতিল/Delete",             callback_data=f"adm_tp_del_{tid_new}_g")],
             ])
-            _name_cs4 = str(name).replace('`', "'")
+            _name_cs4 = _md_esc(str(name).replace('`', "'"))
             await update.message.reply_text(
                 f"📋 *Task Preview — চেক করুন:*\n\n"
                 f"📌 *Name:* `{_name_cs4}`\n"
@@ -11513,7 +11584,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("➕ এই Category তে Task যোগ করুন", callback_data=f"adm_cate_task_add_{cid}")],
                 [InlineKeyboardButton("📁 সব Categories", callback_data="adm_cat_list")],
             ])
-            _name_cs5 = str(name).replace('`', "'")
+            _name_cs5 = _md_esc(str(name).replace('`', "'"))
             await update.message.reply_text(
                 f"✅ *Category তৈরি হয়েছে:* `{_name_cs5}`\n\nএখন এই Category তে Task যোগ করুন:",
                 parse_mode="Markdown", reply_markup=kb); return
@@ -11617,7 +11688,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("🎬 Demo Video যোগ",    callback_data=f"adm_ctaste_video_{tid}")],
                 [InlineKeyboardButton("🚀 এখনই Live করুন (Proof ছাড়া)", callback_data=f"adm_ctask_golive_{tid}")],
             ])
-            _name_cs6 = str(name).replace('`', "'")
+            _name_cs6 = _md_esc(str(name).replace('`', "'"))
             await update.message.reply_text(
                 f"✅ *Category Task তৈরি হয়েছে!*\n\n"
                 f"📌 *Task:* `{_name_cs6}`\n"
@@ -11922,8 +11993,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         ctx.user_data["edit_field_id"]        = fid
                         ctx.user_data["edit_field_task_id"]   = tid
                         ctx.user_data["edit_field_is_categ"]  = True
-                        _cpbn_safe = str(prompt_bn or '').replace('`', "'")
-                        _cpen_safe = str(prompt_en or '').replace('`', "'")
+                        _cpbn_safe = _md_esc(str(prompt_bn or '').replace('`', "'"))
+                        _cpen_safe = _md_esc(str(prompt_en or '').replace('`', "'"))
                         await update.message.reply_text(
                             f"✅ *Photo Field যোগ হয়েছে!*\n📷 `{_cpbn_safe}` / `{_cpen_safe}`\n\n"
                             f"এই field-এর জন্য *Example Photo* সেট করবেন?\n"
@@ -11939,8 +12010,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("➕ আরো Field যোগ করুন", callback_data=f"adm_cfields_{tid}")],
                     [InlineKeyboardButton("🚀 সম্পন্ন — Task Live করুন", callback_data=f"adm_ctask_golive_{tid}")],
                 ])
-                _cpbn_safe = str(prompt_bn or '').replace('`', "'")
-                _cpen_safe = str(prompt_en or '').replace('`', "'")
+                _cpbn_safe = _md_esc(str(prompt_bn or '').replace('`', "'"))
+                _cpen_safe = _md_esc(str(prompt_en or '').replace('`', "'"))
                 await update.message.reply_text(
                     f"{icon} *Field যোগ হয়েছে!*\n\nBN: `{_cpbn_safe}`\nEN: `{_cpen_safe}`",
                     parse_mode="Markdown", reply_markup=kb)
@@ -13815,7 +13886,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ *৫ মিনিটের মধ্যে* Bio আবার সেট করুন —\n"
                 f"নাহলে আজকের `{daily_reward}$ USDT` payment পাবেন না।\n\n"
                 f"📝 Bio তে হুবহু এই text রাখুন:\n"
-                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_(Settings → Edit Profile → Bio)_"
                 if lang == 'bn' else
                 "⚠️ *Bio Task Warning!*\n\n"
@@ -13823,7 +13894,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ Set your Bio again within *5 minutes* —\n"
                 f"otherwise you won't receive today's `{daily_reward}$ USDT` payment.\n\n"
                 f"📝 Set your Bio to exactly:\n"
-                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_(Settings → Edit Profile → Bio)_"
             )
             await bot.send_message(uid, warn_msg, parse_mode="Markdown")
@@ -13883,13 +13954,13 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                     "❌ *আজকের Bio Task Payment বাতিল হয়েছে।*\n\n"
                     "৫ মিনিটের মধ্যে Bio সেট না করায় আজকের payment হয়নি।\n\n"
                     "📝 আবার শুরু করতে Bio সেট করুন:\n"
-                    "`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                    "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                     "কাল রাত ১২:০০ তে আবার চেক হবে।"
                     if lang == 'bn' else
                     "❌ *Today's Bio Task Payment cancelled.*\n\n"
                     "Bio was not restored within 5 minutes.\n\n"
                     "📝 To restart, set your Bio to:\n"
-                    "`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                    "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                     "Next check tomorrow at 12:00 AM."
                 )
                 await bot.send_message(uid, no_msg, parse_mode="Markdown")
@@ -14049,6 +14120,7 @@ async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
         last_warned = (row.get('last_warned_at') or '')
         lang        = await asyncio.to_thread(get_lang, uid)
         _required   = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
+        _required_safe = _md_esc(_required)
 
         def _bio_matches(bio_text: str) -> bool:
             bio_text = (bio_text or "").strip()
@@ -14101,12 +14173,12 @@ async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
                             f"❌ *Bio Task — আজকের Payment বাতিল!*\n\n"
                             f"৫ মিনিটের মধ্যে Bio সেট না করায় আজকের `{daily_reward}$ USDT` payment পাবেন না।\n\n"
                             f"📝 Bio আবার সেট করে Tasks মেনু থেকে Bio Task → Check করলে কাল থেকে payment পাবেন।\n\n"
-                            f"Bio text:\n`{_required}`"
+                            f"Bio text:\n`{_required_safe}`"
                             if lang == 'bn' else
                             f"❌ *Bio Task — Today's Payment Cancelled!*\n\n"
                             f"Bio was not restored within 5 minutes. Today's `{daily_reward}$ USDT` is cancelled.\n\n"
                             f"📝 Set your Bio again and press Check in Tasks → Bio Task to resume from tomorrow.\n\n"
-                            f"Bio text:\n`{_required}`"
+                            f"Bio text:\n`{_required_safe}`"
                         )
                         await bot.send_message(uid, fail_msg, parse_mode="Markdown")
                     except Exception:
@@ -14133,7 +14205,7 @@ async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
                             f"⏳ *৫ মিনিটের মধ্যে* Bio আবার সেট করুন —\n"
                             f"না করলে আজকের `{daily_reward}$ USDT` payment *বাতিল হয়ে যাবে!*\n\n"
                             f"📝 Bio তে হুবহু এই text রাখুন:\n"
-                            f"`{_required}`\n\n"
+                            f"`{_required_safe}`\n\n"
                             f"_⚙️ Settings → Edit Profile → Bio_"
                             if lang == 'bn' else
                             "🚨 *Bio Task Warning!*\n\n"
@@ -14141,7 +14213,7 @@ async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
                             f"⏳ Restore your Bio within *5 minutes* —\n"
                             f"otherwise today's `{daily_reward}$ USDT` payment will be *cancelled!*\n\n"
                             f"📝 Set your Bio to exactly:\n"
-                            f"`{_required}`\n\n"
+                            f"`{_required_safe}`\n\n"
                             f"_⚙️ Settings → Edit Profile → Bio_"
                         )
                         await bot.send_message(uid, warn_msg, parse_mode="Markdown")
@@ -15126,7 +15198,7 @@ async def job_auto_withdraw(context):
                         f"💰 *Amount:* `${amt:.4f} USDT`\n"
                         f"📍 *Address:* `{address}`\n"
                         f"⛽ *Gas est.:* `{gas_usd_str}`\n\n"
-                        f"🔴 *Error:* `{err}`",
+                        f"🔴 *Error:* `{_md_esc(str(err))}`",
                         parse_mode="Markdown"
                     )
                 except Exception as _e:
@@ -15398,6 +15470,7 @@ def main():
         .get_updates_pool_timeout(10)       # getUpdates pool
         .build()
     )
+    patch_bot_markdown_fallback(app.bot)  # ── global Markdown parse-error fallback ──
     # ── User বট block করলে তার data মুছে দাও ────────────────────────
     from telegram.ext import ChatMemberHandler as _CmH
     async def _on_bot_blocked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
