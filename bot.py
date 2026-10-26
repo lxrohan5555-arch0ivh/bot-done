@@ -135,10 +135,10 @@ if not DATABASE_URL:
 # ── Render-এ CockroachDB SSL cert ফাইল থাকে না — sslmode=require দিয়ে fix ──
 # verify-full বা verify-ca mode certificate file খোঁজে যা Render-এ নেই।
 # require mode SSL encrypt করে কিন্তু cert verify করে না — Render-এ কাজ করে।
+import re as _re
 if "sslmode=" not in DATABASE_URL:
     DATABASE_URL += ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
 else:
-    import re as _re
     DATABASE_URL = _re.sub(r"sslmode=(verify-full|verify-ca)", "sslmode=require", DATABASE_URL)
 # sslrootcert parameter থাকলে সরিয়ে দাও — require mode-এ দরকার নেই
 DATABASE_URL = _re.sub(r"[&?]sslrootcert=[^&]*", "", DATABASE_URL)
@@ -172,6 +172,10 @@ def _bg_task_done(task):
 
 # Withdraw job lock — একসাথে একটাই cycle, nonce conflict বন্ধ
 _wd_job_lock = asyncio.Lock()
+# ── Withdraw job state — একটার পর একটা পেমেন্ট, ২ মিনিট গ্যাপ ──
+_WD_TX_MIN_GAP = 120             # দুই পেমেন্টের মাঝে ন্যূনতম ২ মিনিট
+_LOW_BAL_ALERT_COOLDOWN = 3600   # "wallet এ USDT কম" অ্যালার্ট — প্রতি ঘণ্টায় একবার
+_wd_state = {"last_tx_ts": 0.0, "low_bal_alert_ts": 0.0, "gas_reminded": {}}
 # Bio monitor lock — প্রতি cycle এ একটাই instance, overlap বন্ধ
 _bio_monitor_lock = asyncio.Lock()
 # Dirty backup lock — প্রতি cycle এ একটাই instance, overlap বন্ধ
@@ -200,7 +204,7 @@ MSGS = {
             "✅ নিরাপদে Tasks সম্পন্ন করে আয় করুন\n"
             "⚡ দ্রুত পেমেন্ট প্রসেসিং\n"
             "💰 USDT BEP-20 এর মাধ্যমে পেমেন্ট\n"
-            "🔄 *অটো Withdraw — ২ থেকে ৫ মিনিটের মধ্যে*\n"
+            "🔄 *অটো Withdraw — ২ মিনিটের মধ্যে*\n"
             "🔒 আপনার তথ্য সম্পূর্ণ গোপন রাখা হবে\n\n"
             "📌 *সেবা সমূহ:* Tasks • Balance • Withdraw • Support\n\n"
             "⚠️ ভুল Wallet Address দিলে পেমেন্ট ফেরত পাওয়া যাবে না।\n\n"
@@ -243,13 +247,13 @@ MSGS = {
         'wd_invalid_amt': "❌ *সঠিক পরিমাণ লিখুন। যেমন: 0.5*",
         'wd_min_err': "❌ *মিনিমাম উইথড্র:* `0.05$ USDT`",
         'wd_no_bal': "❌ *পর্যাপ্ত ব্যালান্স নেই!*\n💰 *ব্যালান্স:* `{bal}$ USDT`\n💸 *চাইছেন:* `{amt}$ USDT`",
-        'wd_sent': "✅ *`{amt}$ USDT` Withdraw রিকোয়েস্ট পাঠানো হয়েছে!*\n\n📍 *Address:* `{addr}`\n\n⚡ *২-৫ মিনিটের মধ্যে অটো পেমেন্ট হয়ে যাবে।*\n🔗 BSC (BEP-20) Network এ পাঠানো হবে।",
+        'wd_sent': "✅ *`{amt}$ USDT` Withdraw রিকোয়েস্ট পাঠানো হয়েছে!*\n\n📍 *Address:* `{addr}`\n\n⚡ *২ মিনিটের মধ্যে অটো পেমেন্ট হয়ে যাবে।*\n🔗 BSC (BEP-20) Network এ পাঠানো হবে।",
         'cancel_btn': "❌ বাতিল করুন",
         'skip_btn': "⏭ Skip করুন",
         'submit_ok': "✅ *আপনার তথ্য সফলভাবে এডমিনের কাছে পাঠানো হয়েছে।*\n\nরিভিউ শেষে জানিয়ে দেওয়া হবে! খুব তাড়াতাড়ি আপনার ডলার এড হয়ে যাবে 🤑",
         'approved_msg': "✅ *আপনার Submission Approve হয়েছে!*\n\n📌 *Task:* {task}\n💰 *{price}$ USDT আপনার একাউন্টে যোগ হয়েছে।*\n\n💎 *ধন্যবাদ!*",
         'rejected_msg': "❌ *আপনার Submission Reject হয়েছে।*\n\n📌 *Task:* {task}\nℹ️ নিয়মগুলো পড়ে পুনরায় চেষ্টা করুন।",
-        'wd_approved_msg': "✅ *আপনার {amt}$ USDT Withdraw Approve হয়েছে!*\n\n📍 *Address:* `{addr}`\n\n💸 *পেমেন্ট প্রক্রিয়া সম্পন্ন।*\n💎 *ধন্যবাদ!*",
+        'wd_approved_msg': "✅ *আপনার {amt}$ USDT Withdraw Approve হয়েছে!*\n\n📍 *Address:* `{addr}`\n\n⚡ *২ মিনিটের মধ্যে অটো পেমেন্ট পাঠানো হবে।*\n💎 *ধন্যবাদ!*",
         'wd_rejected_msg': "❌ *আপনার {amt}$ USDT Withdraw Reject হয়েছে।*\n\n🔄 *{amt}$ USDT আপনার একাউন্টে ফেরত দেওয়া হয়েছে।*\n\nℹ️ সমস্যার জন্য: @inkamxbd",
         'commission_msg': "🎉 *রেফার কমিশন পেয়েছেন!*\n\n👤 *Referral:* {name}\n💸 *তার আয়:* `{price}$ USDT`\n💰 *আপনার {comm_pct}% কমিশন:* `{comm}$ USDT`\n\n✅ *একাউন্টে যোগ হয়েছে।*",
         'new_user_ref': "🎉 *আপনার রেফার থেকে একজন জয়েন করেছেন!*\n\n👤 *নাম:* {name}\n\n💡 সে Task জমা দিলে আপনি *{comm_pct}% কমিশন* পাবেন।",
@@ -298,7 +302,7 @@ MSGS = {
             "✅ Complete tasks safely and earn\n"
             "⚡ Fast payment processing\n"
             "💰 Payments via USDT BEP-20\n"
-            "🔄 *Auto Withdraw — within 2 to 5 minutes*\n"
+            "🔄 *Auto Withdraw — within 2 minutes*\n"
             "🔒 Your info is completely private\n\n"
             "📌 *Services:* Tasks • Balance • Withdraw • Support\n\n"
             "⚠️ Wrong wallet address = no refund.\n\n"
@@ -341,13 +345,13 @@ MSGS = {
         'wd_invalid_amt': "❌ *Enter a valid amount. Example: 0.5*",
         'wd_min_err': "❌ *Minimum withdrawal:* `0.05$ USDT`",
         'wd_no_bal': "❌ *Insufficient balance!*\n💰 *Balance:* `{bal}$ USDT`\n💸 *Requested:* `{amt}$ USDT`",
-        'wd_sent': "✅ *Withdrawal request of `{amt}$ USDT` sent!*\n\n📍 *Address:* `{addr}`\n\n⚡ *Auto payment will be processed within 2-5 minutes.*\n🔗 Via BSC (BEP-20) Network.",
+        'wd_sent': "✅ *Withdrawal request of `{amt}$ USDT` sent!*\n\n📍 *Address:* `{addr}`\n\n⚡ *Auto payment will be processed within 2 minutes.*\n🔗 Via BSC (BEP-20) Network.",
         'cancel_btn': "❌ Cancel",
         'skip_btn': "⏭ Skip",
         'submit_ok': "✅ *Your info has been sent to admin successfully.*\n\nYou'll be notified after review! Your dollars will be added soon 🤑",
         'approved_msg': "✅ *Your Submission has been Approved!*\n\n📌 *Task:* {task}\n💰 *{price}$ USDT has been added to your account.*\n\n💎 *Thank you!*",
         'rejected_msg': "❌ *Your Submission has been Rejected.*\n\n📌 *Task:* {task}\nℹ️ Please re-read the rules and try again.",
-        'wd_approved_msg': "✅ *Your withdrawal of {amt}$ USDT has been approved!*\n\n📍 *Address:* `{addr}`\n\n💸 *Payment processed.*\n💎 *Thank you!*",
+        'wd_approved_msg': "✅ *Your withdrawal of {amt}$ USDT has been approved!*\n\n📍 *Address:* `{addr}`\n\n⚡ *Auto payment will be sent within 2 minutes.*\n💎 *Thank you!*",
         'wd_rejected_msg': "❌ *Your withdrawal of {amt}$ USDT has been rejected.*\n\n🔄 *{amt}$ USDT has been refunded to your account.*\n\nℹ️ Contact: @inkamxbd",
         'commission_msg': "🎉 *Referral commission received!*\n\n👤 *Referral:* {name}\n💸 *Their earnings:* `{price}$ USDT`\n💰 *Your {comm_pct}% commission:* `{comm}$ USDT`\n\n✅ *Added to your account.*",
         'new_user_ref': "🎉 *Someone joined via your referral link!*\n\n👤 *Name:* {name}\n\n💡 You'll earn *{comm_pct}% commission* when they get a Task approved.",
@@ -633,7 +637,6 @@ def _c():
     return _ConnCtx()
 
 
-import time as _time
 _COCKROACH_RETRY_KEYS = ("SerializationFailure", "TransactionRetry", "restart transaction")
 
 def _db_with_retry(fn, max_tries=4):
@@ -787,6 +790,16 @@ def init_db():
                 scheduled_at   TEXT    DEFAULT ''
             )
         """)
+        # ── এক ইউজারের একটাই active withdrawal — DB লেভেলের গ্যারান্টি ──
+        # কোনো কোড-বাগ থাকলেও দুইটা active request একসাথে তৈরি হতে পারবে না।
+        try:
+            with _c() as _uq_c:
+                _uq_c.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_wd_one_active_per_user "
+                    "ON withdrawals(user_id) WHERE status IN ('pending','processing','gas_pending')"
+                )
+        except Exception as _uq_e:
+            log.warning(f"[DB] uq_wd_one_active_per_user index হয়নি (পুরনো duplicate থাকতে পারে): {_uq_e}")
         c.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id               BIGSERIAL PRIMARY KEY,
@@ -1684,8 +1697,8 @@ def record_commission(referrer_id, from_user_id, amount, task_name=''):
                 "INSERT INTO commissions (user_id,from_user_id,amount,task_name,created_at) VALUES (%s,%s,%s,%s,%s)",
                 (referrer_id, from_user_id, amount, task_name, now())
             )
-        # নতুন record insert হলে পুরানো মুছো — শেষ ৩০টা রাখো
-        _trim_table("commissions", "user_id", referrer_id, keep=30)
+        # ⚠️ commission/referral history কখনো মুছি না — data loss বন্ধ
+        # (আগে প্রতি insert-এ পুরনো কমিশন trim হয়ে যেত)
     except Exception as _e:
         log.warning(f"[record_commission] failed: {_e}")
 
@@ -2200,6 +2213,25 @@ def find_duplicate_photo_submission(unique_ids, skip_gid=None):
                 return dict(row)
     return None
 
+_BIO_LEGACY_TEXT = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
+
+
+def bio_required_texts(bot_uname: str = "") -> list:
+    """Bio-তে যে টেক্সটগুলো থাকলে ধরা হবে — পুরনো হার্ডকোড + বর্তমান বটের username।"""
+    texts = [_BIO_LEGACY_TEXT]
+    if bot_uname:
+        texts.append(f"FREE TASK EARN BOT👇 @{bot_uname} 👈AUTO WITHDRAW 0.02$.Join all")
+    return texts
+
+
+def bio_text_matches(bio_text: str, bot_uname: str = "") -> bool:
+    """Bio সঠিক কিনা — পুরনো text অথবা বর্তমান বট username যেকোনোটা থাকলেই হবে।"""
+    t = (bio_text or "").strip().lower()
+    if not t:
+        return False
+    return any(x.lower() in t for x in bio_required_texts(bot_uname))
+
+
 def get_bio_paid_today_set():
     """আজ bio payment পেয়েছে এমন সব user_id একটি set-এ return করো (batch)।"""
     _tz = pytz.timezone("Asia/Dhaka")
@@ -2218,15 +2250,17 @@ def get_bio_tracked_ids_set():
         ).fetchall()
     return {r['user_id'] for r in rows}
 
-def record_bio_payment(user_id, date_str, amount):
+def record_bio_payment(user_id, date_str, amount) -> bool:
+    """পেমেন্ট রেকর্ড করো। True শুধু তখনই যখন আজকের প্রথমবার insert হলো।
+    ⚠️ False মানে আজ ইতিমধ্যে পেমেন্ট হয়ে গেছে — balance আর যোগ করা যাবে না।"""
     with _c() as c:
-        c.execute(
+        cur = c.execute(
             "INSERT INTO bio_task_completions (user_id,task_date,amount,paid_at) "
             "VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING",
             (user_id, date_str, amount, now())
         )
-    # নতুন record হলে পুরানো মুছো — শেষ ৩০টা রাখো
-    _trim_table("bio_task_completions", "user_id", user_id, keep=30)
+        return bool(cur.rowcount)
+    # ⚠️ পুরনো record সাথে সাথে মোছা হয় না — দৈনিক cleanup বয়স অনুযায়ী মুছবে
 
 def get_bio_task_history(user_id, limit=7):
     with _c() as c:
@@ -2833,7 +2867,7 @@ def w_kb_admin(wid):
 # সব চ্যানেলে থাকলে 15s cache → Task/অন্য বাটনে দ্রুত রিপ্লাই
 # কোনো চ্যানেল মিস হলে 0s cache → চ্যানেল ছাড়লে সাথে সাথে ধরা পড়বে
 _ch_cache: dict = {}          # uid → (timestamp, missing_list)
-_CH_CACHE_TTL_OK  = 600       # seconds — সব চ্যানেলে থাকলে ১০ মিনিট cache (১২০→৬০০: Telegram API call ৫ গুণ কম)
+_CH_CACHE_TTL_OK  = 1800      # seconds — সব চ্যানেলে থাকলে ৩০ মিনিট cache (API call আরও কম, দ্রুত রিপ্লাই)
 _CH_CACHE_TTL_BAD = 30        # seconds — channel মিস হলে ৩০s cache (frequent check চাই)
 
 async def check_ch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4154,8 +4188,8 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
         else:
             await ctx.bot.send_message(uid, _err_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
         return
-    # নতুন submission হলে approved/rejected পুরানো মুছো — pending কখনো না, শেষ ২০টা রাখো
-    await asyncio.to_thread(_trim_table, "gmails", "user_id", uid, keep=20, only_done=True)
+    # ⚠️ এখানে কোনো data মোছা হয় না — পুরনো submission শুধু দৈনিক cleanup-এ
+    # বয়স (৩০ দিন) অনুযায়ী মুছে; ইউজারের history সাথে সাথে হারায় না।
     # ── photo unique_ids সেভ করো ──────────────────────────────────
     if _cat_submitted_uids:
         try:
@@ -4643,7 +4677,7 @@ async def show_withdraw(update, ctx):
         txt = (
             f"{T(uid,'withdraw_title')}\n\n"
             f"{T(uid,'withdraw_only_usdt')}\n\n"
-            f"⚡ *Auto Withdraw — within 2 to 5 minutes*\n\n"
+            f"⚡ *Auto Withdraw — within 2 minutes*\n\n"
             f"💰 *Balance:* `{bal}$ USDT`\n"
             f"⚠️ *Minimum withdrawal:* `{min_w}$ USDT`\n"
             f"📉 *Fee:* `{fee}$` (deducted from your amount)\n\n"
@@ -4654,7 +4688,7 @@ async def show_withdraw(update, ctx):
         txt = (
             f"{T(uid,'withdraw_title')}\n\n"
             f"{T(uid,'withdraw_only_usdt')}\n\n"
-            f"⚡ *অটো Withdraw — ২ থেকে ৫ মিনিটের মধ্যে পাবেন*\n\n"
+            f"⚡ *অটো Withdraw — ২ মিনিটের মধ্যে পাবেন*\n\n"
             f"💰 *ব্যালান্স:* `{bal}$ USDT`\n"
             f"⚠️ *মিনিমাম উইথড্র:* `{min_w}$ USDT`\n"
             f"📉 *ফি:* `{fee}$` (পরিমাণ থেকে কাটা যাবে)\n\n"
@@ -5088,9 +5122,7 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
                 _gid = row['id'] if row else None
             return _gid
     gid = await asyncio.to_thread(_insert_gmail_row)
-    # নতুন submission হলে পুরানো approved/rejected মুছো — fire-and-forget
-    _t_trim = asyncio.ensure_future(asyncio.to_thread(_trim_table, "gmails", "user_id", uid, 20, "id", True))
-    _background_tasks.add(_t_trim); _t_trim.add_done_callback(_bg_task_done)
+    # ⚠️ সাথে সাথে trim নয় — পুরনো record দৈনিক cleanup-এ বয়স অনুযায়ী মুছবে
     # ── photo unique_ids সেভ করো ──────────────────────────────────
     if _submitted_unique_ids and gid:
         try:
@@ -5272,11 +5304,10 @@ async def wd_ask_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Saved wallet check ───────────────────────────────────────
     _saved_w = (_rget(_sw_row, "saved_wallet", "") or "").strip() if _sw_row else ""
     if _saved_w:
-        _masked = mask_addr_short(_saved_w)
         _saved_txt = (
-            f"👛 *আগের Wallet পাওয়া গেছে!*\n\n`{_masked}`\n\nএই wallet ব্যবহার করবেন, নাকি নতুন দেবেন?"
+            f"👛 *আগের Wallet পাওয়া গেছে!*\n\n`{_saved_w}`\n\nএই wallet ব্যবহার করবেন, নাকি নতুন দেবেন?"
             if lang == 'bn' else
-            f"👛 *Saved wallet found!*\n\n`{_masked}`\n\nUse this wallet or enter a new one?"
+            f"👛 *Saved wallet found!*\n\n`{_saved_w}`\n\nUse this wallet or enter a new one?"
         )
         await q.message.reply_text(
             _saved_txt,
@@ -5330,33 +5361,56 @@ async def receive_wd_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     addr_owner = await asyncio.to_thread(_db_3976)
     if addr_owner:
         owner_id = addr_owner['user_id']
-        # ── শুধু নতুন user কে ব্যান করো ──
-        await asyncio.to_thread(ban_user, uid, 1)
-        for k in ("state", "wd_addr", "wd_amt"):
-            ctx.user_data.pop(k, None)
-        # ── নতুন User কে warning পাঠাও ──
-        warn_msg = (
-            "🚫 *আপনার একাউন্ট ব্যান করা হয়েছে!*\n\n"
-            "⚠️ *কারণ:* আপনি এমন একটি Wallet Address দিয়েছেন যা আগে অন্য একটি একাউন্ট থেকে ব্যবহার করা হয়েছে।\n\n"
-            "❌ একটি Wallet Address একটিমাত্র Account থেকে ব্যবহার করা যাবে।\n\n"
-            "📞 *আপিল করতে:* @inkamxbd"
-            if lang == 'bn' else
-            "🚫 *Your account has been banned!*\n\n"
-            "⚠️ *Reason:* The wallet address you provided has already been used by another account.\n\n"
-            "❌ One wallet address can only be linked to one account.\n\n"
-            "📞 *To appeal:* @inkamxbd"
-        )
-        await update.message.reply_text(warn_msg, parse_mode="Markdown",
-                                        reply_markup=ReplyKeyboardRemove())
+        # ── শুধু নতুন user (এখনো কোনো approved task নেই) কে ব্যান করো ──
+        # পুরনো/বিশ্বস্ত user ভুল করলে শুধু address টা নেওয়া হবে না, ব্যান হবে না।
+        def _db_approved_cnt():
+            with _c() as _ac:
+                return _count(_ac.execute(
+                    "SELECT COUNT(*) FROM gmails WHERE user_id=%s AND status='approved'", (uid,)
+                ).fetchone())
+        _approved_tasks = await asyncio.to_thread(_db_approved_cnt)
+        _is_new_user = (_approved_tasks == 0)
+        if _is_new_user:
+            await asyncio.to_thread(ban_user, uid, 1)
+            for k in ("state", "wd_addr", "wd_amt"):
+                ctx.user_data.pop(k, None)
+            warn_msg = (
+                "🚫 *আপনার একাউন্ট ব্যান করা হয়েছে!*\n\n"
+                "⚠️ *কারণ:* আপনি এমন একটি Wallet Address দিয়েছেন যা আগে অন্য একটি একাউন্ট থেকে ব্যবহার করা হয়েছে।\n\n"
+                "❌ একটি Wallet Address একটিমাত্র Account থেকে ব্যবহার করা যাবে।\n\n"
+                "📞 *আপিল করতে:* @inkamxbd"
+                if lang == 'bn' else
+                "🚫 *Your account has been banned!*\n\n"
+                "⚠️ *Reason:* The wallet address you provided has already been used by another account.\n\n"
+                "❌ One wallet address can only be linked to one account.\n\n"
+                "📞 *To appeal:* @inkamxbd"
+            )
+            await update.message.reply_text(warn_msg, parse_mode="Markdown",
+                                            reply_markup=ReplyKeyboardRemove())
+        else:
+            # পুরনো user — ব্যান নয়, শুধু এই address গ্রহণ করা হলো না
+            ctx.user_data["state"] = "wd_addr"
+            _reuse_msg = (
+                "❌ *এই Wallet Address ব্যবহার করা যাবে না।*\n\n"
+                "⚠️ এই address আগে অন্য একটি একাউন্ট থেকে ব্যবহার করা হয়েছে।\n\n"
+                "📝 অন্য একটি USDT-BEP20 address পাঠান, অথবা /cancel লিখুন।"
+                if lang == 'bn' else
+                "❌ *This wallet address can't be used.*\n\n"
+                "⚠️ This address has already been used by another account.\n\n"
+                "📝 Send a different USDT-BEP20 address, or type /cancel."
+            )
+            await update.message.reply_text(_reuse_msg, parse_mode="Markdown")
         # ── Admin কে notify করো ──
         user = update.effective_user
         uname_str = _md_esc(f"@{user.username}") if user.username else _md_esc(user.full_name or "")
+        _ban_line = ("✅ নতুন user — auto-ban হয়েছে।" if _is_new_user
+                     else "ℹ️ পুরনো user — ব্যান হয়নি, শুধু address প্রত্যাখ্যান করা হয়েছে।")
         admin_msg = (
-            f"🚨 *Duplicate Wallet — Auto Ban*\n\n"
-            f"👤 *Banned User:* [{uname_str}](tg://user?id={uid}) (`{uid}`)\n"
+            f"🚨 *Duplicate Wallet*\n\n"
+            f"👤 *User:* [{uname_str}](tg://user?id={uid}) (`{uid}`)\n"
             f"🔗 *Address:* `{address}`\n"
             f"⚠️ *এই Address আগে ব্যবহার করেছে:* `{owner_id}`\n\n"
-            f"✅ নতুন User auto-ban হয়েছে।"
+            f"{_ban_line}"
         )
         await notify_full_admins(ctx.bot, admin_msg)
         return
@@ -5425,7 +5479,7 @@ async def show_wd_confirmation(msg, ctx, uid):
         asyncio.to_thread(get_lang, uid),
     )
     net_amt = round(amt - fee, 4)
-    masked  = mask_addr_short(addr)
+    masked  = addr   # ইউজার নিজের wallet সব জায়গায় ফুল দেখবে
     if lang == 'en':
         txt = (
             f"📋 *Review Your Withdrawal*\n\n"
@@ -5489,7 +5543,7 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── Security Check 2 + INSERT: একই transaction এ balance কাটো ও withdrawal তৈরি করো ──
     # এটা atomic — মাঝে crash হলেও টাকা হারাবে না।
-    _sched_sec = random.randint(120, 300)   # ২ থেকে ৫ মিনিট (120–300 সেকেন্ড)
+    _sched_sec = 120   # ঠিক ২ মিনিট পরে পেমেন্ট (120 সেকেন্ড)
     _sched_at  = (datetime.now(pytz.timezone("Asia/Dhaka")) + timedelta(seconds=_sched_sec)).strftime("%Y-%m-%d %H:%M:%S")
     def _atomic_ded_and_insert():
         with _c() as c:
@@ -5531,7 +5585,7 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.bot.send_message(uid, err_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
             return
         log.info(f"[WD-SUBMIT] uid={uid} wid={wid} amt={amt} addr={address[:10]}...")
-        await asyncio.to_thread(_trim_table, "withdrawals", "user_id", uid, keep=10, only_done=True)
+        # ⚠️ withdraw history সাথে সাথে trim হয় না — cleanup বয়স অনুযায়ী মুছবে
         # admin_msg_id=0 এবং channel_msg_id=0 ইতিমধ্যেই DDL DEFAULT — আলাদা UPDATE দরকার নেই।
     except _DuplicatePendingError:
         # Atomic transaction rollback হয়েছে — balance কাটা হয়নি, তাই refund দরকার নেই
@@ -5567,7 +5621,7 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📉 *Fee:* `${fee:.4f}`\n"
             f"💰 *You will receive:* `${net_amt:.4f}`\n"
             f"━━━━━━━━━━━━━━━━\n\n"
-            f"⚡ *Auto payment within 2–5 minutes.*"
+            f"⚡ *Auto payment within 2 minutes.*"
         )
     else:
         confirm_msg = (
@@ -5579,7 +5633,7 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📉 *ফি:* `${fee:.4f}`\n"
             f"💰 *পাবেন:* `${net_amt:.4f}`\n"
             f"━━━━━━━━━━━━━━━━\n\n"
-            f"⚡ *২-৫ মিনিটের মধ্যে অটো পেমেন্ট হবে।*"
+            f"⚡ *২ মিনিটের মধ্যে অটো পেমেন্ট হবে।*"
         )
     await ctx.bot.send_message(uid, confirm_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
 
@@ -5771,6 +5825,93 @@ async def _send_db_to_admin(bot, label="🔄 Auto Backup"):
     await asyncio.to_thread(_save_file_id, "cockroachdb_ok")
 
 
+# ═══════════ 🗄 JSON Backup & Restore — data কখনো হারাবে না ═══════════
+_BACKUP_JSON_TABLES = (
+    ("users",             "SELECT * FROM users"),
+    ("commissions",       "SELECT * FROM commissions"),
+    ("promocodes",        "SELECT * FROM promocodes"),
+    ("promo_uses",        "SELECT * FROM promo_uses"),
+    ("admins",            "SELECT * FROM admins"),
+    ("required_channels", "SELECT * FROM required_channels"),
+    ("settings",          "SELECT * FROM settings"),
+)
+
+
+def _json_backup_msg_save(target_id: int, msg_id: int):
+    with _c() as c:
+        c.execute(
+            "INSERT INTO bot_meta (key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+            (f"jsonbak_msg_{target_id}", str(msg_id))
+        )
+
+
+def _json_backup_msg_load(target_id: int):
+    try:
+        with _c() as c:
+            row = c.execute("SELECT value FROM bot_meta WHERE key=%s", (f"jsonbak_msg_{target_id}",)).fetchone()
+        return int(row["value"]) if row else None
+    except Exception:
+        return None
+
+
+def _export_backup_json() -> bytes:
+    """সব গুরুত্বপূর্ণ table JSON এ export — DB মুছে গেলেও এখান থেকে ফেরানো যাবে।"""
+    payload = {"exported_at": now(), "tables": {}}
+    with _c() as c:
+        for name, sql in _BACKUP_JSON_TABLES:
+            try:
+                payload["tables"][name] = c.execute(sql).fetchall() or []
+            except Exception as _e:
+                payload["tables"][name] = []
+                log.warning(f"[JSON-BACKUP] {name} export ব্যর্থ: {_e}")
+    return _json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+
+
+_JSON_BACKUP_MIN_GAP = 120          # dirty-backup পথে সর্বনিম্ন বিরতি (সেকেন্ড)
+_json_bak_state = {"last": 0.0}
+
+
+async def _send_json_backup(bot, label="🗄 Auto JSON Backup", force=False):
+    """BACKUP_CHANNELS + admin কে JSON backup পাঠায়।"""
+    try:
+        if not force and (_time.monotonic() - _json_bak_state["last"]) < _JSON_BACKUP_MIN_GAP:
+            return 0
+        _json_bak_state["last"] = _time.monotonic()
+        import io as _io
+        blob = await asyncio.to_thread(_export_backup_json)
+        fname = f"backup_{datetime.now(BD_TZ).strftime('%Y-%m-%d_%H%M')}.json"
+        sent = 0
+        for target in list(BACKUP_CHANNELS) + [ADMIN_ID]:
+            old = await asyncio.to_thread(_json_backup_msg_load, target)
+            if old:
+                try:
+                    await bot.delete_message(chat_id=target, message_id=old)
+                except Exception:
+                    pass
+            try:
+                msg = await bot.send_document(
+                    target,
+                    document=_io.BytesIO(blob),
+                    filename=fname,
+                    caption=(
+                        f"{label}\n\n🕐 `{now()}`\n"
+                        f"🗄 *JSON backup* — DB কখনো মুছে গেলে এই ফাইলটা `/restore` কে "
+                        f"reply দিলেই user, balance, referral, commission সব ফিরে আসবে।"
+                    ),
+                    parse_mode="Markdown",
+                )
+                if msg:
+                    await asyncio.to_thread(_json_backup_msg_save, target, msg.message_id)
+                sent += 1
+            except Exception as _e:
+                log.warning(f"[JSON-BACKUP] {target} এ পাঠানো যায়নি: {_e}")
+        log.info(f"[JSON-BACKUP] {sent} জায়গায় পাঠানো হয়েছে ({len(blob)} bytes)")
+        return sent
+    except Exception as _e:
+        log.warning(f"[JSON-BACKUP] ব্যর্থ: {_e}")
+        return 0
+
+
 async def _send_startup_report(bot):
     """
     Bot চালু হলে user report BACKUP_CHANNELS এ পাঠায় ও pin করে।
@@ -5810,6 +5951,8 @@ async def _send_startup_report(bot):
             except Exception as e:
                 log.warning(f"[STARTUP-REPORT] {target} এ পাঠাতে ব্যর্থ: {e}")
         log.info("✅ Startup user report পাঠানো হয়েছে।")
+        # ── machine-restorable JSON backup (data কখনো হারাবে না) ──
+        await _send_json_backup(bot, label="🗄 Startup JSON Backup", force=True)
     except Exception as e:
         log.warning(f"[STARTUP-REPORT] ব্যর্থ: {e}")
 
@@ -6288,6 +6431,8 @@ async def job_scheduled_report(context):
     log.info("⏰ Scheduled report চলছে...")
     # ১. DB file পাঠাও
     await _send_db_to_admin(context.bot, label="⏰ Scheduled Auto Backup")
+    # ১.খ machine-restorable JSON backup — DB মুছে গেলেও এখান থেকে ফেরানো যাবে
+    await _send_json_backup(context.bot, label="⏰ Scheduled JSON Backup", force=True)
     # ২. User data text report তৈরি করে পাঠাও
     try:
         report = await asyncio.to_thread(_build_full_users_report)
@@ -6370,10 +6515,9 @@ async def cmd_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ *এই command শুধু Admin ব্যবহার করতে পারবে।*", parse_mode="Markdown")
         return
     await update.message.reply_text(
-        "ℹ️ *PostgreSQL Mode চালু আছে।*\n\n"
-        "✅ সব data CockroachDB এ *permanently stored*।\n"
-        "🔒 Bot restart হলেও কোনো data মুছে যায় না।\n\n"
-        "❌ SQLite file restore এর দরকার নেই।",
+        "ℹ️ *সব data ডাটাবেসে স্থায়ীভাবে সেভ থাকে।*\n\n"
+        "✅ Bot restart হলেও কোনো data মুছে যায় না।\n"
+        "🗄 প্রতিবার data বদলালে auto JSON backup ব্যাকআপ চ্যানেলে চলে যায়।",
         parse_mode="Markdown"
     )
 
@@ -6386,8 +6530,8 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # PostgreSQL mode — file restore দরকার নেই
         ctx.user_data.pop("state", None)
         await update.message.reply_text(
-            "ℹ️ *PostgreSQL Mode চালু — file restore দরকার নেই।*\n\n"
-            "✅ Data CockroachDB তে permanently stored। Bot restart হলেও সব data থাকে।",
+            "ℹ️ *সব data ডাটাবেসে স্থায়ীভাবে সেভ থাকে।*\n\n"
+            "🗄 প্রতিবার data বদলালে auto JSON backup ব্যাকআপ চ্যানেলে চলে যায়।",
             parse_mode="Markdown"
         )
         return
@@ -6857,7 +7001,6 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         if missing:
             await q.message.reply_text(T(uid,'not_joined'), parse_mode="Markdown")
         else:
-            lang_cj = await asyncio.to_thread(get_lang, uid)
             try: await q.message.delete()
             except Exception: pass
             # ── Notification logic — ctx.user_data বা DB দুটো পথেই কাজ করবে ──────
@@ -6901,10 +7044,9 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                     parse_mode="Markdown", reply_markup=await asyncio.to_thread(lang_kb)  # first-time, no tick
                 )
             else:
-                lang_key = 'welcome_msg_bn' if lang_cj == 'bn' else 'welcome_msg_en'
-                custom_w  = await asyncio.to_thread(get_setting, lang_key)
-                welcome_text = custom_w if custom_w else T(uid, 'welcome')
-                await ctx.bot.send_message(uid, welcome_text, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+                # _send_welcome ব্যবহার করো — যাতে deep-link promo code
+                # (/start promo_CODE) pending থাকলে এখানেই অটো-ক্লেইম হয়।
+                await _send_welcome(update, ctx, uid)
         return
 
     # ── Leaderboard: find my place ────────────────────────────────
@@ -7504,20 +7646,26 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         wuser, wamt, waddr = row["user_id"], row["amount"], row["address"]
         masked = mask_addr_short(waddr)
         if action == "approved":
-            # Atomic: AND status='pending' — double-approve race condition প্রতিরোধ করে
+            # Approve = অটো-পেমেন্টের জন্য ছাড়। status 'pending' থাকে,
+            # শিডিউল ২ মিনিট পরে সেট হয় — তাই টাকা একবারই যাবে।
+            # (আগের বাগ: status='approved' করে দেওয়ায় TX কখনো যেত না।)
             def _db_5815():
+                _wa_sch = (datetime.now(pytz.timezone("Asia/Dhaka")) + timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
                 _wa_cur = None
                 with _c() as c:
                     _wa_cur = c.execute(
-                        "UPDATE withdrawals SET status='approved' WHERE id=%s AND status='pending'", (wid,)
+                        "UPDATE withdrawals SET status='pending', scheduled_at=%s "
+                        "WHERE id=%s AND status='pending'",
+                        (_wa_sch, wid)
                     )
                 return _wa_cur
             _wa_cur = await asyncio.to_thread(_db_5815)
             if _wa_cur.rowcount == 0:
                 return await q.message.reply_text("⚠️ ইতিমধ্যে process হয়ে গেছে!")
+            _mark_dirty()
             try:
                 await ctx.bot.send_message(wuser,
-                    T(wuser, 'wd_approved_msg', amt=wamt, addr=masked),
+                    T(wuser, 'wd_approved_msg', amt=wamt, addr=waddr),
                     parse_mode="Markdown")
             except Exception: pass
         else:
@@ -7701,15 +7849,10 @@ async def _bio_task_check_inner(update, ctx, q, uid):
     add_reward   = (bio_task.get('add_reward', 0) or 0)
     daily_reward = bio_task['reward']
     ref_link     = f"https://t.me/{bot_username}?start=ref_{uid}"
-    required_bio = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
+    required_bio = _BIO_LEGACY_TEXT
 
     def _bio_matches(bio_text: str) -> bool:
-        if not bio_text:
-            return False
-        t = bio_text.strip()
-        if required_bio.lower() in t.lower():
-            return True
-        return False
+        return bio_text_matches(bio_text, bot_username)
 
     _wait_msg_text = (
         "⏳ *Bio চেক হচ্ছে...*\n\nঅনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন।"
@@ -7720,14 +7863,11 @@ async def _bio_task_check_inner(update, ctx, q, uid):
 
     bio_ok    = False
     user_bio  = ""
-    _INTERVAL = 5
-    _attempts = 8
+    _INTERVAL = 4
+    _attempts = 4
 
     for _attempt in range(_attempts):
         try:
-            if _attempt > 0:
-                try: await ctx.bot.get_chat(uid)
-                except Exception: pass
             chat     = await ctx.bot.get_chat(uid)
             user_bio = (chat.bio or "").strip()
             log.info(f"[BIO-CHECK] uid={uid} attempt={_attempt+1}/{_attempts} bio='{user_bio[:80]}'")
@@ -11006,9 +11146,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 _wda_already = False
                 def _db_8727():
                     _wda_already = None
+                    _wda_sch = (datetime.now(pytz.timezone("Asia/Dhaka")) + timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
                     with _c() as c:
                         _wda_cur = c.execute(
-                            "UPDATE withdrawals SET status='approved' WHERE id=%s AND status='pending'", (wid,)
+                            "UPDATE withdrawals SET status='pending', scheduled_at=%s "
+                            "WHERE id=%s AND status='pending'",
+                            (_wda_sch, wid)
                         )
                         if _wda_cur.rowcount == 0:
                             _wda_already = True
@@ -11018,15 +11161,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(f"⚠️ *WD `#{wid}` ইতিমধ্যে process হয়ে গেছে।*", parse_mode="Markdown")
                     ctx.user_data.pop("state", None); return
                 wuser, wamt, waddr = row["user_id"], row["amount"], row["address"]
-                masked = mask_addr_short(waddr)
+                _mark_dirty()
                 try:
-                    await ctx.bot.send_message(wuser, T(wuser,'wd_approved_msg',amt=wamt,addr=masked), parse_mode="Markdown")
+                    await ctx.bot.send_message(wuser, T(wuser,'wd_approved_msg',amt=wamt,addr=waddr), parse_mode="Markdown")
                 except Exception: pass
                 await update.message.reply_text(
-                    f"✅ *WD `#{wid}` Approved!*\n\n"
+                    f"✅ *WD `#{wid}` Approved — অটো পেমেন্ট শিডিউল হয়েছে!*\n\n"
                     f"👤 *User:* `{wuser}`\n"
                     f"💰 *Amount:* `{wamt}$ USDT`\n"
-                    f"📍 *Address:* `{masked}`",
+                    f"📍 *Address:* `{waddr}`\n\n"
+                    f"⚡ ২ মিনিটের মধ্যে বট নিজেই পাঠাবে — হাতে পাঠাবেন না।",
                     parse_mode="Markdown")
             except ValueError:
                 await update.message.reply_text("❌ সঠিক ID দিন (শুধু সংখ্যা)।", parse_mode="Markdown")
@@ -13799,13 +13943,9 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
     _sem = asyncio.Semaphore(20)   # 10 → 20: বেশি parallel API call
 
     async def _check_bio(uid, bot_uname):
-        _required = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
         try:
             chat = await bot.get_chat(uid)
-            user_bio = (chat.bio or "").strip()
-            if _required.lower() in user_bio.lower():
-                return True
-            return False
+            return bio_text_matches(chat.bio or "", bot_uname)
         except Exception as e:
             log.warning(f"[BIO-TASK] uid={uid} bio check failed: {e}")
             return False
@@ -13829,7 +13969,9 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
             if actively_track:
                 # ✅ আগের দিনও ছিল (24h kept) → daily reward দাও
                 amt = round(daily_reward, 4)
-                await asyncio.to_thread(record_bio_payment, uid, today, amt)
+                # double-pay guard: আজ আগেই পেমেন্ট হলে balance যোগ হবে না
+                if not await asyncio.to_thread(record_bio_payment, uid, today, amt):
+                    return
                 await asyncio.to_thread(add_bal, uid, amt)
                 await asyncio.to_thread(set_bio_tracking, uid)
                 paid_list.append({'uid': uid, 'name': u.get('full_name', ''), 'amt': amt})
@@ -13853,7 +13995,8 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.to_thread(set_bio_tracking, uid)
                 if add_reward > 0 and await asyncio.to_thread(mark_add_reward_given, uid):
                     amt = round(add_reward, 4)
-                    await asyncio.to_thread(record_bio_payment, uid, today, amt)
+                    if not await asyncio.to_thread(record_bio_payment, uid, today, amt):
+                        return
                     await asyncio.to_thread(add_bal, uid, amt)
                     new_tracked_list.append({'uid': uid, 'name': u.get('full_name', ''), 'amt': amt})
                     _jaref = await asyncio.to_thread(get_referred_by, uid)
@@ -13927,7 +14070,9 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
             bio_ok = await _check_bio(uid, bot_username)
         if bio_ok:
             amt = round(daily_reward, 4)
-            await asyncio.to_thread(record_bio_payment, uid, today, amt)
+            # double-pay guard
+            if not await asyncio.to_thread(record_bio_payment, uid, today, amt):
+                return
             await asyncio.to_thread(add_bal, uid, amt)
             await asyncio.to_thread(set_bio_tracking, uid)
             grace_notified_uids.add(uid)
@@ -14131,16 +14276,11 @@ async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
         uid         = row['user_id']
         last_warned = (row.get('last_warned_at') or '')
         lang        = await asyncio.to_thread(get_lang, uid)
-        _required   = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
+        _required      = _BIO_LEGACY_TEXT
         _required_safe = _md_esc(_required)
 
         def _bio_matches(bio_text: str) -> bool:
-            bio_text = (bio_text or "").strip()
-            if not bio_text:
-                return False
-            if _required.lower() in bio_text.lower():
-                return True
-            return False
+            return bio_text_matches(bio_text, bot_username)
 
         async with _sem:
             if last_warned:
@@ -14339,6 +14479,8 @@ async def _run_dirty_backup_now(bot):
                     # NOTE: pin করা হচ্ছে না — DB file pinned থাকতে হবে যাতে restore কাজ করে
             except Exception as e:
                 log.warning(f"[DIRTY-REPORT] {target} এ পাঠাতে ব্যর্থ: {e}")
+        # ── ডাটা বদলালেই সাথে সাথে JSON backup (২ মিনিট throttle) ──
+        await _send_json_backup(bot, label="💾 Auto JSON Backup (ডাটা বদলেছে)")
         log.info("✅ Dirty-flag: user report + DB backup পাঠানো হয়েছে।")
     except Exception as e:
         log.warning(f"[DIRTY-REPORT] ব্যর্থ: {e}")
@@ -14353,77 +14495,26 @@ async def job_dirty_backup(context):
         await _run_dirty_backup_now(context.bot)
 
 
-def _trim_user_records(c, table, uid, keep=50):
-    """প্রতি user এর পুরনো processed record ছাঁটাই — শুধু approved/rejected এর মধ্যে।
-    users টেবিল, balance, referral — কোনোটাই স্পর্শ করে না।
-    """
-    try:
-        c.execute(
-            f"DELETE FROM {table} WHERE user_id=%s AND status IN ('approved','rejected') "
-            f"AND id NOT IN ("
-            f"  SELECT id FROM {table} WHERE user_id=%s AND status IN ('approved','rejected') "
-            f"  ORDER BY id DESC LIMIT %s"
-            f")",
-            (uid, uid, keep)
-        )
-    except Exception as e:
-        log.warning(f"_trim_user_records({table}, uid={uid}): {e}")
-
-
-def _trim_table(table, uid_col, uid, keep, order_col="id", only_done=False):
-    """নতুন record insert হলে পুরানোগুলো মুছে দাও — শুধু শেষ `keep` টা রাখো।
-    only_done=True হলে শুধু approved/rejected মুছে — pending কখনো ছোঁয় না।
-    users table, balance, referral এ কোনো effect নেই।
-    """
-    try:
-        with _c() as c:
-            if only_done:
-                # pending records কখনো delete হবে না
-                c.execute(
-                    f"DELETE FROM {table} WHERE {uid_col}=%s "
-                    f"AND status IN ('approved','rejected') "
-                    f"AND {order_col} NOT IN ("
-                    f"  SELECT {order_col} FROM {table} WHERE {uid_col}=%s "
-                    f"  AND status IN ('approved','rejected') "
-                    f"  ORDER BY {order_col} DESC LIMIT %s"
-                    f")",
-                    (uid, uid, keep)
-                )
-            else:
-                c.execute(
-                    f"DELETE FROM {table} WHERE {uid_col}=%s "
-                    f"AND {order_col} NOT IN ("
-                    f"  SELECT {order_col} FROM {table} WHERE {uid_col}=%s "
-                    f"  ORDER BY {order_col} DESC LIMIT %s"
-                    f")",
-                    (uid, uid, keep)
-                )
-    except Exception as e:
-        log.warning(f"[TRIM] {table} uid={uid}: {e}")
-
-
 def auto_cleanup_old_records():
     """
     পুরনো processed record পরিষ্কার — CockroachDB storage ব্যবস্থাপনা।
 
-    ✅ কখনো delete হয় না:
+    ✅ কখনো delete হয় না (টাকা / রেফারেল / পেমেন্ট হিস্ট্রি):
        - users (balance, referred_by, points)
-       - pending gmails / pending withdrawals
+       - commissions, promo_uses, bio_task_completions
        - admins, settings, tasks, tg_tasks, categories
-       - promocodes, promo_uses, required_channels
+       - promocodes, required_channels
        - bio_task_tracking (active tracking)
+       - pending gmails / pending withdrawals (record সংখ্যা অনুযায়ী কোনো trim নেই)
 
-    🗑  Delete হয় (নতুন data আসলে পুরানো মুছে):
-       - gmails approved/rejected  → শেষ 20টা রাখো, বাকি মুছো
-       - withdrawals approved/rejected → শেষ 10টা রাখো, বাকি মুছো
-       - pending_notifications > 3 দিন পুরনো
+    🗑  Delete হয় (শুধু বয়স অনুযায়ী, পুরনো বেকার ডাটা):
+       - gmails approved/rejected > 30 দিন পুরনো
        - gmails pending > 30 দিন পুরনো
-       - commissions > 14 দিন পুরনো (প্রতি user শেষ 30টা রাখো)
-       - bio_task_completions > 30 দিন পুরনো (প্রতি user শেষ 30টা)
+       - withdrawals approved/rejected > 30 দিন পুরনো
+       - pending_notifications > 3 দিন পুরনো
        - tg_task_pre_members > 7 দিন পুরনো
     """
     _now = datetime.now(BD_TZ)
-    cutoff_14 = (_now - timedelta(days=14)).strftime("%Y-%m-%d %H:%M")
     cutoff_30d = (_now - timedelta(days=30)).strftime("%Y-%m-%d")
     cutoff_7   = (_now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
     cutoff_3   = (_now - timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
@@ -14432,7 +14523,7 @@ def auto_cleanup_old_records():
     counts = {}
     try:
         with _c() as c:
-            # ── gmails: approved/rejected — প্রতি user শেষ 20টা রাখো ─
+            # ── gmails: approved/rejected > 30 দিন পুরনো ─
             r = c.execute(
                 "DELETE FROM gmails WHERE status IN ('approved','rejected') "
                 "AND submitted_at < %s",
@@ -14441,12 +14532,9 @@ def auto_cleanup_old_records():
             counts['gmails_old'] = r.rowcount or 0
             total_deleted += counts['gmails_old']
 
-            g_users = [row['user_id'] for row in
-                       c.execute("SELECT DISTINCT user_id FROM gmails WHERE status IN ('approved','rejected')").fetchall()]
-            for uid in g_users:
-                _trim_user_records(c, "gmails", uid, keep=20)
+            # per-user count trim বন্ধ — শুধু বয়স অনুযায়ী delete হয়
 
-            # ── withdrawals: approved/rejected — প্রতি user শেষ 10টা ─
+            # ── withdrawals: approved/rejected > 30 দিন পুরনো ─
             r2 = c.execute(
                 "DELETE FROM withdrawals WHERE status IN ('approved','rejected') "
                 "AND requested_at < %s",
@@ -14455,10 +14543,7 @@ def auto_cleanup_old_records():
             counts['withdrawals_old'] = r2.rowcount or 0
             total_deleted += counts['withdrawals_old']
 
-            w_users = [row['user_id'] for row in
-                       c.execute("SELECT DISTINCT user_id FROM withdrawals WHERE status IN ('approved','rejected')").fetchall()]
-            for uid in w_users:
-                _trim_user_records(c, "withdrawals", uid, keep=10)
+            # per-user count trim বন্ধ — শুধু বয়স অনুযায়ী delete হয়
 
             # ── pending_notifications > 3 দিন ──────────────────────
             r3 = c.execute(
@@ -14476,46 +14561,12 @@ def auto_cleanup_old_records():
             counts['gmails_pending'] = r4.rowcount or 0
             total_deleted += counts['gmails_pending']
 
-            # ── commissions > 14 দিন — প্রতি user শেষ 30টা রাখো ───
-            r5 = c.execute(
-                "DELETE FROM commissions WHERE created_at < %s",
-                (cutoff_14,)
-            )
-            counts['commissions'] = r5.rowcount or 0
-            total_deleted += counts['commissions']
+            # ── commissions: কখনো delete হয় না (referral history স্থায়ী) ──
+            counts['commissions'] = 0
 
-            comm_users = [row['user_id'] for row in
-                          c.execute("SELECT DISTINCT user_id FROM commissions").fetchall()]
-            for uid in comm_users:
-                # commissions table এ status column নেই — id দিয়ে সরাসরি trim করো
-                try:
-                    c.execute(
-                        "DELETE FROM commissions WHERE user_id=%s AND id NOT IN ("
-                        "  SELECT id FROM commissions WHERE user_id=%s ORDER BY id DESC LIMIT 30"
-                        ")",
-                        (uid, uid)
-                    )
-                except Exception as _ce:
-                    log.warning(f"_trim commissions uid={uid}: {_ce}")
-
-            # ── bio_task_completions > 30 দিন — প্রতি user শেষ 30টা ─
-            r6 = c.execute(
-                "DELETE FROM bio_task_completions WHERE task_date < %s",
-                (cutoff_30d,)
-            )
-            counts['bio_completions'] = r6.rowcount or 0
-            total_deleted += counts['bio_completions']
-
-            bio_users = [row['user_id'] for row in
-                         c.execute("SELECT DISTINCT user_id FROM bio_task_completions").fetchall()]
-            for uid in bio_users:
-                c.execute(
-                    "DELETE FROM bio_task_completions WHERE user_id=%s AND id NOT IN ("
-                    "  SELECT id FROM bio_task_completions WHERE user_id=%s "
-                    "  ORDER BY task_date DESC LIMIT 30"
-                    ")",
-                    (uid, uid)
-                )
+            # ── bio_task_completions: কখনো delete হয় না (payment history স্থায়ী,
+            #    cumulative মোট খরচ এই টেবিল থেকেই হিসাব হয়) ──
+            counts['bio_completions'] = 0
 
             # ── tg_task_pre_members > 7 দিন ─────────────────────────
             r7 = c.execute(
@@ -14864,28 +14915,89 @@ async def job_auto_withdraw(context):
                 log.warning(f"[AUTO-WD] #{sid}: stuck processing+tx_hash → auto-approved। tx={stx}")
                 try:
                     bscscan_url = f"https://bscscan.com/tx/{stx}"
+                    _now_pay2 = datetime.now(BD_TZ).strftime("%Y-%m-%d %I:%M %p")
                     await context.bot.send_message(
                         suid,
-                        f"✅ *Withdrawal Successful!*\n\n"
-                        f"💰 *Amount:* `${samt:.4f} USDT BEP-20`\n"
-                        f"🔗 *TX:* [BSCScan]({bscscan_url})\n\n"
-                        f"💎 *Thank you!*",
-                        parse_mode="Markdown", disable_web_page_preview=False
+                        f"✅ <b>Withdrawal Successful!</b>\n\n"
+                        f"<blockquote>💰 <b>Amount:</b> ${samt:.4f} USDT</blockquote>\n"
+                        f"<blockquote>🕐 <b>Date:</b> {_now_pay2}</blockquote>\n"
+                        f"<blockquote>🔗 <b>TxHash:</b> <code>{html.escape(str(stx), quote=False)}</code></blockquote>\n\n"
+                        f"💎 <i>Auto payment • Task Earn Bot</i>",
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔍 View on BSCScan", url=bscscan_url)
+                        ]])
                     )
                 except Exception as _e:
                     log.warning(f"[AUTO-WD] #{sid}: stuck-tx user notify ব্যর্থ: {_e}")
             else:
-                # tx_hash নেই — TX পাঠানো হয়নি, নিরাপদে pending এ ফেরত দাও
+                # tx_hash নেই — TX আদৌ গেছে কিনা নিশ্চিত নয়। অটো রিসেন্ড করলে
+                # একই withdrawal দুইবার পেমেন্ট হতে পারে, তাই অ্যাডমিনের হাতে ছাড়ো।
                 def _db_12034():
                     with _c() as c:
                         c.execute(
-                            "UPDATE withdrawals SET status='pending', locked_at=NULL WHERE id=%s AND status='processing'",
+                            "UPDATE withdrawals SET status='gas_pending', locked_at=NULL "
+                            "WHERE id=%s AND status='processing'",
                             (sid,)
                         )
                     return
                 await asyncio.to_thread(_db_12034)
                 _mark_dirty()
-                log.warning(f"[AUTO-WD] #{sid}: stuck processing (no tx) → reset to pending।")
+                log.warning(f"[AUTO-WD] #{sid}: stuck processing (no tx) → gas_pending (double-pay guard)।")
+                try:
+                    _stuck_wallet = await asyncio.to_thread(get_bsc_wallet_addr)
+                    await context.bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ *WD #{sid} — TX নিশ্চিত হওয়া যায়নি*\n\n"
+                        f"👤 *User:* `{suid}`\n"
+                        f"💰 *Amount:* `${samt:.4f} USDT`\n\n"
+                        f"🔍 *BSCScan এ এই ওয়ালেট চেক করুন:*\n`{_stuck_wallet}`\n\n"
+                        f"❌ *টাকা স্বয়ংক্রিয় ভাবে আবার পাঠানো হবে না* — double payment বন্ধ।\n"
+                        f"✅ *Approve* = আবার পাঠাও | ❌ *Cancel* = Refund",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("✅ Approve (আবার পাঠাও)", callback_data=f"gas_ok_{sid}"),
+                            InlineKeyboardButton("❌ Cancel (Refund)", callback_data=f"gas_cancel_{sid}"),
+                        ]])
+                    )
+                except Exception as _e:
+                    log.warning(f"[AUTO-WD] #{sid}: stuck-notify admin ব্যর্থ: {_e}")
+
+        # ── gas_pending দীর্ঘ সময় আটকে থাকলে অ্যাডমিনকে রিমাইন্ড (refund নয়) ──
+        _gas_old_cutoff = (datetime.now(BD_TZ) - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            def _db_gas_remind():
+                with _c() as c:
+                    return c.execute(
+                        "SELECT id, user_id, amount FROM withdrawals "
+                        "WHERE status='gas_pending' AND requested_at <= %s",
+                        (_gas_old_cutoff,)
+                    ).fetchall()
+            _gas_rows = await asyncio.to_thread(_db_gas_remind)
+            for _gr in _gas_rows:
+                _gwid = _gr["id"]
+                _now_g = _time.monotonic()
+                if _now_g - _wd_state["gas_reminded"].get(_gwid, 0) >= 1800:
+                    _wd_state["gas_reminded"][_gwid] = _now_g
+                    await context.bot.send_message(
+                        ADMIN_ID,
+                        f"⏰ *মনে করিয়ে দিচ্ছি — WD #{_gwid} এখনো gas_pending*\n\n"
+                        f"👤 *User:* `{_gr['user_id']}`\n"
+                        f"💰 *Amount:* `${_gr['amount']:.4f} USDT`\n\n"
+                        f"নিচের বাটন থেকে Approve অথবা Cancel (Refund) করুন।",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("✅ Approve (পাঠাও)", callback_data=f"gas_ok_{_gwid}"),
+                            InlineKeyboardButton("❌ Cancel (Refund)", callback_data=f"gas_cancel_{_gwid}"),
+                        ]])
+                    )
+            _active_gas_ids = {_gr["id"] for _gr in _gas_rows}
+            _wd_state["gas_reminded"] = {
+                k: v for k, v in _wd_state["gas_reminded"].items() if k in _active_gas_ids
+            }
+        except Exception as _e:
+            log.warning(f"[AUTO-WD] gas_pending reminder ব্যর্থ: {_e}")
 
         _now_str    = datetime.now(BD_TZ).strftime("%Y-%m-%d %H:%M:%S")
         _fallback2m = (datetime.now(BD_TZ) - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S")
@@ -14908,9 +15020,16 @@ async def job_auto_withdraw(context):
         if not rows:
             return
 
-        log.info(f"[AUTO-WD] {len(rows)} টি scheduled withdrawal প্রস্তুত — processing শুরু।")
+        # ── পেমেন্ট গ্যাপ: দুই পেমেন্টের মাঝে অন্তত ২ মিনিট ──────────
+        _gap_since = _time.monotonic() - _wd_state["last_tx_ts"]
+        if _gap_since < _WD_TX_MIN_GAP:
+            log.info(f"[AUTO-WD] পেমেন্ট গ্যাপ — {int(_WD_TX_MIN_GAP - _gap_since)}s পরে পরেরটি যাবে।")
+            return
 
-        for row in rows:
+        log.info(f"[AUTO-WD] {len(rows)} টি scheduled withdrawal আছে — এই সাইকেলে একটাই পাঠানো হবে।")
+
+        # এক সাইকেলে সর্বোচ্চ একটি withdrawal — বাকিগুলো ২ মিনিট পর পর যাবে
+        for row in rows[:1]:
             wid     = row["id"]
             uid     = row["user_id"]
             amt     = row["amount"]
@@ -14965,51 +15084,27 @@ async def job_auto_withdraw(context):
                 continue
             if wallet_bal < net_amt:
                 err_detail = f"Bot wallet balance ({wallet_bal:.4f} USDT) < required ({net_amt:.4f} USDT)"
-                log.warning(f"[AUTO-WD] #{wid}: {err_detail} — reject।")
-                # Atomic: AND status='pending' guard — double-refund প্রতিরোধ করে
-                def _db_12114():
-                    with _c() as c:
-                        _awd_low_cur = c.execute(
-                            "UPDATE withdrawals SET status='rejected' WHERE id=%s AND status='pending'", (wid,)
+                log.warning(f"[AUTO-WD] #{wid}: {err_detail} — pending রাখা হলো (refund নয়)।")
+                # ⚠️ টাকা ফেরত দেওয়া হবে না — withdrawal pending থাকবে।
+                # শুধু Admin কে জানানো হবে (ঘণ্টায় সর্বোচ্চ একবার)।
+                _now_lb = _time.monotonic()
+                if _now_lb - _wd_state["low_bal_alert_ts"] >= _LOW_BAL_ALERT_COOLDOWN:
+                    _wd_state["low_bal_alert_ts"] = _now_lb
+                    try:
+                        await notify_all_admins(
+                            context.bot,
+                            f"⚠️ *Wallet এ USDT কম — Withdrawal আটকে আছে!*\n\n"
+                            f"🔋 *Wallet Balance:* `{wallet_bal:.4f} USDT`\n"
+                            f"📌 *আটকে থাকা WD:* `#{wid}`\n"
+                            f"👤 *User:* `{uid}`\n"
+                            f"💰 *Amount:* `${amt:.4f} USDT`\n"
+                            f"📤 *পাঠাতে হবে:* `${net_amt:.4f} USDT`\n"
+                            f"📍 *Address:* `{address}`\n\n"
+                            f"✅ *টাকা ফেরত দেওয়া হয়নি* — WD pending আছে।\n"
+                            f"👉 *Wallet এ USDT যোগ করুন, পরের সাইকেলে আপনা-আপনি পাঠাবে।*"
                         )
-                        if _awd_low_cur.rowcount == 0:
-                            log.warning(f"[AUTO-WD] #{wid}: status আর pending নেই — skip।")
-                            return False
-                        c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amt, uid))
-                        _invalidate_user_cache(uid)
-                    return True
-                _db_12114_ok = await asyncio.to_thread(_db_12114)
-                if not _db_12114_ok:
-                    continue
-                _mark_dirty()
-                _ulang = await asyncio.to_thread(get_lang, uid)
-                try:
-                    _low_bal_txt = (
-                        f"❌ *Your withdrawal was cancelled.*\n\n"
-                        f"💰 *Amount:* `${amt:.4f} USDT`\n"
-                        f"🔄 The amount has been refunded to your account.\n\n"
-                        f"❓ Support: @inkamxbd"
-                        if _ulang == 'en' else
-                        f"❌ *Withdrawal বাতিল হয়েছে।*\n\n"
-                        f"💰 *Amount:* `${amt:.4f} USDT`\n"
-                        f"🔄 টাকা আপনার একাউন্টে ফেরত দেওয়া হয়েছে।\n\n"
-                        f"❓ সমস্যার জন্য: @inkamxbd"
-                    )
-                    await context.bot.send_message(uid, _low_bal_txt, parse_mode="Markdown")
-                except Exception as _e:
-                    log.warning(f"[AUTO-WD] #{wid}: user notify (low-bal) ব্যর্থ: {_e}")
-                try:
-                    await context.bot.send_message(
-                        ADMIN_ID,
-                        f"⚠️ *Auto-WD Reject — WD #{wid}*\n\n"
-                        f"👤 *User:* `{uid}`\n"
-                        f"💰 *Amount:* `${amt:.4f} USDT`\n"
-                        f"📍 *Address:* `{address}`\n\n"
-                        f"❌ *কারণ:* {err_detail}",
-                        parse_mode="Markdown"
-                    )
-                except Exception as _e:
-                    log.warning(f"[AUTO-WD] #{wid}: admin alert (low-bal) ব্যর্থ: {_e}")
+                    except Exception as _e:
+                        log.warning(f"[AUTO-WD] #{wid}: low-bal admin alert ব্যর্থ: {_e}")
                 continue
 
             # ── Security Lock: payment পাঠানোর আগে atomically 'processing' করো ──
@@ -15029,6 +15124,8 @@ async def job_auto_withdraw(context):
             # ── USDT পাঠাও ───────────────────────────────────────────────
             log.info(f"[AUTO-WD] #{wid}: Sending {net_amt} USDT → {address} | Est. gas: {gas_usd_str}")
             tx_hash, err, gas_usd_paid, gas_bnb_actual = await asyncio.to_thread(send_usdt_bep20, address, net_amt)
+            # পরের পেমেন্ট অন্তত ২ মিনিট পরে — একসাথে অনেক withdraw হলেও একটার পর একটা
+            _wd_state["last_tx_ts"] = _time.monotonic()
 
             if tx_hash:
                 # ── সফল ────────────────────────────────────────────────
@@ -15063,34 +15160,87 @@ async def job_auto_withdraw(context):
                     gas_paid_str = f"${gas_usd_paid:.4f}"
                 else:
                     gas_paid_str = "হিসাব করা যায়নি"
+                _now_pay = datetime.now(BD_TZ).strftime("%Y-%m-%d %I:%M %p")
                 success_msg = (
-                    f"✅ *Withdrawal Successful!*\n\n"
-                    f"💰 *Amount:* `${net_amt:.4f} USDT BEP-20`\n"
-                    f"📋 *Address:* `{address}`\n"
-                    f"🔗 *TX Hash:* `{tx_hash}`\n\n"
-                    f"🌐 *BSCScan:* [View Transaction]({bscscan_url})\n\n"
-                    f"💎 *Thank you!*"
+                    f"✅ <b>Withdrawal Successful!</b>\n\n"
+                    f"<blockquote>💰 <b>Amount:</b> ${net_amt:.4f} USDT</blockquote>\n"
+                    f"<blockquote>👛 <b>Wallet:</b> <code>{html.escape(address, quote=False)}</code></blockquote>\n"
+                    f"<blockquote>🕐 <b>Date:</b> {_now_pay}</blockquote>\n"
+                    f"<blockquote>⛽ <b>Gas Fee:</b> {html.escape(gas_paid_str, quote=False)}</blockquote>\n"
+                    f"<blockquote>🔗 <b>TxHash:</b> <code>{html.escape(tx_hash, quote=False)}</code></blockquote>\n\n"
+                    f"💎 <i>Auto payment • Task Earn Bot</i>"
                 )
                 try:
-                    await context.bot.send_message(uid, success_msg, parse_mode="Markdown", disable_web_page_preview=False)
+                    await context.bot.send_message(
+                        uid, success_msg, parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔍 View on BSCScan", url=bscscan_url)
+                        ]])
+                    )
                 except Exception as _e:
                     log.warning(f"[AUTO-WD] #{wid}: user success notify ব্যর্থ: {_e}")
+                    # HTML fail হলে প্লেইন টেক্সট fallback
+                    try:
+                        await context.bot.send_message(
+                            uid,
+                            f"✅ Withdrawal Successful!\n\n"
+                            f"💰 Amount: ${net_amt:.4f} USDT\n"
+                            f"👛 Wallet: {address}\n"
+                            f"🕐 Date: {_now_pay}\n"
+                            f"⛽ Gas Fee: {gas_paid_str}\n"
+                            f"🔗 TxHash: {tx_hash}\n\n"
+                            f"BSCScan: {bscscan_url}"
+                        )
+                    except Exception as _e2:
+                        log.warning(f"[AUTO-WD] #{wid}: user success plain fallback ব্যর্থ: {_e2}")
                 try:
                     masked = address[:6] + "..." + address[-4:]
                     _urow  = await asyncio.to_thread(get_user, uid)
                     _uname_raw = (_urow["full_name"] or _urow["username"] or "Unknown") if _urow else "Unknown"
                     _uname_clean = _uname_raw.split('@')[0].strip() or _uname_raw.lstrip('@').split()[0] if _uname_raw else "Unknown"
                     _uname = _md_esc(str(_uname_clean or "Unknown"))
+                    # ── সুন্দর পেমেন্ট পোস্ট (HTML + blockquote + বাটন) ──
+                    _esc = lambda v: html.escape(str(v), quote=False)
+                    _pay_date  = datetime.now(BD_TZ).strftime("%Y-%m-%d %I:%M %p")
+                    _addr_url  = f"https://bscscan.com/address/{address}"
                     ch_msg = (
-                        f"👤 *{_uname}*\n\n"
-                        f"✅ *Withdrawal Successful!*\n\n"
-                        f"💰 *Amount:* `${net_amt:.4f} USDT BEP-20`\n"
-                        f"📋 *Address:* `{masked}`\n"
-                        f"🔗 [View on BSCScan]({bscscan_url})"
+                        f"✅ <b>#{wid} Payment Completed</b>\n\n"
+                        f"<blockquote>👤 <b>User Name:</b> {_esc(_uname_clean or 'Unknown')}</blockquote>\n"
+                        f"<blockquote>💰 <b>Amount:</b> ${net_amt:.4f} USDT</blockquote>\n"
+                        f"<blockquote>👛 <b>Withdraw:</b> 💎 BEP20 (USDT)</blockquote>\n"
+                        f"<blockquote>📍 <b>Wallet:</b> <code>{_esc(masked)}</code></blockquote>\n"
+                        f"<blockquote>🕐 <b>Date:</b> {_pay_date}</blockquote>\n"
+                        f"<blockquote>🔗 <b>TxHash:</b> <code>{_esc(tx_hash)}</code></blockquote>\n\n"
+                        f"💎 <i>Auto payment • Task Earn Bot</i>"
                     )
-                    await context.bot.send_message(await asyncio.to_thread(get_withdraw_ch_id), ch_msg, parse_mode="Markdown", disable_web_page_preview=False)
+                    _ch_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("👛 Check Wallet", url=_addr_url)],
+                        [InlineKeyboardButton("🔍 View on BSCScan", url=bscscan_url)],
+                    ])
+                    await context.bot.send_message(
+                        await asyncio.to_thread(get_withdraw_ch_id),
+                        ch_msg, parse_mode="HTML",
+                        reply_markup=_ch_kb,
+                        disable_web_page_preview=True
+                    )
                 except Exception as _e:
                     log.warning(f"[AUTO-WD] #{wid}: withdraw channel notify ব্যর্থ: {_e}")
+                    # HTML/parse সমস্যা হলে প্লেইন টেক্সটে আবার চেষ্টা
+                    try:
+                        await context.bot.send_message(
+                            await asyncio.to_thread(get_withdraw_ch_id),
+                            f"✅ #{wid} Payment Completed\n\n"
+                            f"👤 User Name: {_uname_clean or 'Unknown'}\n"
+                            f"💰 Amount: ${net_amt:.4f} USDT\n"
+                            f"👛 Withdraw: BEP20 (USDT)\n"
+                            f"📍 Wallet: {masked}\n"
+                            f"🕐 Date: {_pay_date}\n"
+                            f"🔗 TxHash: {tx_hash}\n\n"
+                            f"BSCScan: {bscscan_url}"
+                        )
+                    except Exception as _e2:
+                        log.warning(f"[AUTO-WD] #{wid}: withdraw channel plain fallback ব্যর্থ: {_e2}")
                 try:
                     _urow       = await asyncio.to_thread(get_user, uid)
                     _uname_plain = (_urow["full_name"] or _urow["username"] or str(uid)) if _urow else str(uid)
@@ -15326,8 +15476,23 @@ def main():
         # PostgreSQL — auto-restore দরকার নেই
         # ── Step 2: Startup backup পাঠাও ──────────────────────────
         log.info("✅ PostgreSQL connected — data permanently stored in CockroachDB.")
-        # DB এর পরপরই user report পাঠাও ও pin করো
-        await _send_startup_report(application.bot)
+        # DB এর পরপরই user report পাঠাও — background-এ, যাতে polling দেরি না হয়
+        _startup_rep = asyncio.create_task(_send_startup_report(application.bot))
+        _background_tasks.add(_startup_rep)
+        _startup_rep.add_done_callback(_bg_task_done)
+        # ── DB pool + button cache আগেই গরম করো — প্রথম ক্লিকেও দেরি হবে না ──
+        async def _warmup():
+            try:
+                await asyncio.to_thread(_get_pool)
+                await asyncio.to_thread(get_all_btns, "bn")
+                await asyncio.to_thread(get_all_btns, "en")
+                await asyncio.to_thread(get_setting, "bot_status")
+                log.info("🔥 [WARMUP] DB pool + caches প্রস্তুত")
+            except Exception as _we:
+                log.warning(f"[WARMUP] ব্যর্থ: {_we}")
+        _warm_task = asyncio.create_task(_warmup())
+        _background_tasks.add(_warm_task)
+        _warm_task.add_done_callback(_bg_task_done)
         # ── Step 3: Pending notification watcher শুরু করো ─────────
         # Bot restart হলেও DB থেকে pending notifications ধরবে।
         _watcher_task = asyncio.create_task(_pn_watcher(application.bot))
@@ -15486,11 +15651,21 @@ def main():
     # ── User বট block করলে তার data মুছে দাও ────────────────────────
     from telegram.ext import ChatMemberHandler as _CmH
     async def _on_bot_blocked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not update.my_chat_member: return
-        new = update.my_chat_member.new_chat_member
-        if new and new.status in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT):
-            uid = update.my_chat_member.from_user.id
-            await asyncio.to_thread(delete_user_data, uid)
+        # ⚠️ এখানে কোনো data মুছি না — user block করলেও তার account, ব্যালান্স,
+        # referral, commission ও history সব অটুট থাকবে। শুধু log হয়।
+        # (আগে delete_user_data() ডাকা হতো — এতে user + referral মুছে যেত!)
+        try:
+            if not update.my_chat_member: return
+            _ch = update.my_chat_member.chat
+            # শুধু private chat — channel/group থেকে বট বাদ দিলে যিনি বাদ দিয়েছেন
+            # তাঁর অ্যাকাউন্ট যাতে মুছে না যায়
+            if str(getattr(_ch, "type", "")) != "private": return
+            new = update.my_chat_member.new_chat_member
+            if new and new.status in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT):
+                _uid = update.my_chat_member.from_user.id
+                log.info(f"[BOT-BLOCK] uid={_uid} বট block করেছে — সব data অটুট রাখা হলো।")
+        except Exception as _e:
+            log.warning(f"[BOT-BLOCK] handler ব্যর্থ: {_e}")
     app.add_handler(_CmH(_on_bot_blocked))
 
     app.add_handler(CommandHandler("start",       cmd_start))
