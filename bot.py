@@ -276,23 +276,23 @@ MSGS = {
         'new_joiners_only_reject': "❌ *এই Task শুধুমাত্র নতুন জয়েনারদের জন্য।*\n\nআপনি আগে থেকেই এই চ্যানেলে জয়েন আছেন, তাই এই Task করতে পারবেন না।\n\n📢 শুধু নতুন ইউজার যারা এই Task এর মাধ্যমে জয়েন করবে তারাই পুরস্কার পাবে।",
         'task_blocked_msg': (
             "⛔ *Task করা সাময়িকভাবে বন্ধ!*\n\n"
-            "আপনার পয়েন্ট ৫০ বা তার নিচে নেমে গেছে।\n\n"
+            "আপনার পয়েন্ট ০ হয়ে গেছে।\n\n"
             "🔓 *Block উঠবে:* {until}\n\n"
             "💡 */point* লিখে পয়েন্ট দেখুন।"
         ),
         'point_cmd': (
             "🎯 *আপনার Trust Points*\n\n"
             "━━━━━━━━━━━━━━━━\n"
-            "🔵 *পয়েন্ট:* `{pts}/100`\n"
+            "🔵 *পয়েন্ট:* `{pts}/50`\n"
             "🛡 *অবস্থা:* {status}\n"
             "{block_line}"
             "━━━━━━━━━━━━━━━━\n\n"
             "📜 *পয়েন্ট নিয়মাবলী:*\n"
-            "• শুরুতে সবার পয়েন্ট: `100`\n"
+            "• শুরুতে সবার পয়েন্ট: `50`\n"
             "• Task *reject* হলে: `-{reject_pts}` পয়েন্ট\n"
             "• Task *approve* হলে: `+{approve_pts}` পয়েন্ট\n"
-            "• পয়েন্ট `50` বা নিচে গেলে: `{block_days}` দিন Task বন্ধ\n"
-            "• পয়েন্ট সর্বোচ্চ `100` পর্যন্ত যাবে\n\n"
+            "• পয়েন্ট `0` হয়ে গেলে: `{block_days}` দিন Task বন্ধ\n"
+            "• পয়েন্ট সর্বোচ্চ `50` পর্যন্ত যাবে\n\n"
             "💡 সঠিক নিয়মে Task করলে পয়েন্ট বাড়বে!"
         ),
     },
@@ -374,23 +374,23 @@ MSGS = {
         'new_joiners_only_reject': "❌ *This Task is for new joiners only.*\n\nYou are already a member of this channel, so you cannot complete this task.\n\n📢 Only users who join the channel through this Task will receive the reward.",
         'task_blocked_msg': (
             "⛔ *Task submissions are temporarily blocked!*\n\n"
-            "Your trust points dropped to 50 or below.\n\n"
+            "Your trust points have reached 0.\n\n"
             "🔓 *Block lifts on:* {until}\n\n"
             "💡 Type */point* to view your points."
         ),
         'point_cmd': (
             "🎯 *Your Trust Points*\n\n"
             "━━━━━━━━━━━━━━━━\n"
-            "🔵 *Points:* `{pts}/100`\n"
+            "🔵 *Points:* `{pts}/50`\n"
             "🛡 *Status:* {status}\n"
             "{block_line}"
             "━━━━━━━━━━━━━━━━\n\n"
             "📜 *Points Rules:*\n"
-            "• Starting points: `100`\n"
+            "• Starting points: `50`\n"
             "• Task *rejected*: `-{reject_pts}` points\n"
             "• Task *approved*: `+{approve_pts}` points\n"
-            "• Points `30` or below: Tasks blocked for `{block_days}` days\n"
-            "• Maximum points: `100`\n\n"
+            "• Points reach `0`: Tasks blocked for `{block_days}` days\n"
+            "• Maximum points: `50`\n\n"
             "💡 Follow the rules correctly to keep your points high!"
         ),
     }
@@ -438,6 +438,128 @@ def md_escape(text):
         text = text.replace(ch, f'\\{ch}')
     return text
 
+# ──────────────── ভাষা গার্ড — English ইউজারের জন্য বাংলা আউটগোয়িং অটো ইংরেজি ────────────────
+# বটের শত শত হার্ডকোড মেসেজ/বাটন এখানে এক জায়গায় ধরা হয়:
+#   • ইউজারের lang='en' হলে: বাংলা টেক্সট/ক্যাপশন → translate_to_en (cached),
+#     বাংলা বাটন-লেবেল → ইংরেজি (মূল markup/button অপরিবর্তিত থাকে, copy হয়)
+#   • অনুবাদ ভেঙে Telegram 400 এলে (markdown/HTML) মূল টেক্সট দিয়ে আবার পাঠাবে
+#   • lang='bn' (ডিফল্ট) ইউজার, গ্রুপ, চ্যানেল — কোনো মেসেজ ছোঁয় না, বাংলা হুবহু থাকে
+#   • ইংরেজি-অনলি ইউজার-মেসেজগুলো নিচে হাতে bn/en করা (withdrawal success, error ইত্যাদি)
+import copy as _copymod
+
+_BN_RE = _re.compile(r"[ঀ-৿]")
+
+def _i18n_markup_en(markup, translator):
+    """ReplyMarkup-এর বাংলা বাটন-লেবেল ইংরেজি করো — মূল object ছোঁয় না।"""
+    rows = getattr(markup, "keyboard", None) or getattr(markup, "inline_keyboard", None)
+    if not rows:
+        return markup
+    new_rows, touched = [], False
+    for row in rows:
+        new_row = []
+        for btn in row:
+            t = getattr(btn, "text", None)
+            if isinstance(t, str) and _BN_RE.search(t):
+                nb = _copymod.copy(btn)
+                nb.text = translator(t)
+                new_row.append(nb)
+                touched = True
+            else:
+                new_row.append(btn)
+        new_rows.append(new_row)
+    if not touched:
+        return markup
+    new_mk = _copymod.copy(markup)
+    if hasattr(markup, "keyboard"):
+        new_mk.keyboard = new_rows
+    else:
+        new_mk.inline_keyboard = new_rows
+    return new_mk
+
+
+async def _i18n_out(text, markup, chat_id):
+    """ইউজারের lang='en' হলে বাংলা আউটগোয়িং টেক্সট+বাটন ইংরেজি; নাহলে অপরিবর্তিত।"""
+    if not text and not markup:
+        return text, markup
+    if chat_id is None:
+        return text, markup
+    try:
+        lang = _get_lang_fast(chat_id)
+        if lang is None:
+            lang = await asyncio.to_thread(get_lang, chat_id)
+        if lang != 'en':
+            return text, markup
+        if isinstance(text, str) and _BN_RE.search(text):
+            text = await asyncio.to_thread(translate_to_en, text)
+        if markup is not None:
+            markup = await asyncio.to_thread(_i18n_markup_en, markup, translate_to_en)
+    except Exception:
+        pass
+    return text, markup
+
+
+def _i18n_patch_method(cls, name, *, text_pos=None, text_kw="text", chat_get=None):
+    """PTB আউটগোয়িং মেথডে ভাষা-গার্ড বসাও — অনুবাদ ভেঙে পাঠালে মূল দিয়ে retry।"""
+    orig = getattr(cls, name, None)
+    if orig is None or getattr(orig, "_i18n", False):
+        return
+    async def _wrapped(self, *args, **kwargs):
+        args = list(args)
+        if text_pos is not None and len(args) > text_pos:
+            cur = args[text_pos]
+        else:
+            cur = kwargs.get(text_kw)
+        orig_mk = kwargs.get("reply_markup")
+        chat_id = chat_get(self, args, kwargs) if chat_get else None
+        nt, nm = await _i18n_out(cur, orig_mk, chat_id)
+        changed = (nt is not cur) or (nm is not orig_mk)
+        if text_pos is not None and len(args) > text_pos:
+            args[text_pos] = nt
+        elif nt is not cur:
+            kwargs[text_kw] = nt
+        if nm is not orig_mk:
+            kwargs["reply_markup"] = nm
+        try:
+            return await orig(self, *args, **kwargs)
+        except Exception:
+            if not changed:
+                raise
+            # অনুবাদ markdown/HTML ভেঙে দিয়েছে — মূল টেক্সট দিয়ে আবার পাঠাও
+            if text_pos is not None and len(args) > text_pos:
+                args[text_pos] = cur
+            else:
+                kwargs[text_kw] = cur
+            kwargs["reply_markup"] = orig_mk
+            return await orig(self, *args, **kwargs)
+    _wrapped._i18n = True
+    _wrapped.__name__ = name
+    setattr(cls, name, _wrapped)
+
+
+try:
+    from telegram import Message as _TgMessage, Bot as _TgBot, CallbackQuery as _TgCallbackQuery
+except Exception:
+    _TgMessage = _TgBot = _TgCallbackQuery = None
+
+if _TgMessage is not None:
+    _msg_chat  = lambda self, a, k: self.chat_id
+    _cbq_chat  = lambda self, a, k: (self.message.chat_id if self.message is not None
+                                     else (self.from_user.id if self.from_user else None))
+    _bot_chat  = lambda self, a, k: (a[0] if a else k.get("chat_id"))
+    _bot_kwchat = lambda self, a, k: k.get("chat_id")
+    _i18n_patch_method(_TgMessage, "reply_text",          text_pos=0, chat_get=_msg_chat)
+    _i18n_patch_method(_TgMessage, "edit_text",           text_pos=0, chat_get=_msg_chat)
+    _i18n_patch_method(_TgMessage, "reply_photo",         text_kw="caption", chat_get=_msg_chat)
+    _i18n_patch_method(_TgMessage, "reply_video",         text_kw="caption", chat_get=_msg_chat)
+    _i18n_patch_method(_TgMessage, "reply_document",      text_kw="caption", chat_get=_msg_chat)
+    _i18n_patch_method(_TgBot,    "send_message",         text_pos=1, chat_get=_bot_chat)
+    _i18n_patch_method(_TgBot,    "send_photo",           text_kw="caption", chat_get=_bot_chat)
+    _i18n_patch_method(_TgBot,    "send_video",           text_kw="caption", chat_get=_bot_chat)
+    _i18n_patch_method(_TgBot,    "send_document",        text_kw="caption", chat_get=_bot_chat)
+    _i18n_patch_method(_TgBot,    "edit_message_text",    text_pos=0, chat_get=_bot_kwchat)
+    _i18n_patch_method(_TgCallbackQuery, "answer",        text_pos=0, chat_get=_cbq_chat)
+    _i18n_patch_method(_TgCallbackQuery, "edit_message_text", text_pos=0, chat_get=_cbq_chat)
+
 # ── নতুন ইউজার notification — bot restart এ ctx.user_data হারালেও কাজ করবে ──
 _notified_set: set = set()   # uid set — double-notification বন্ধ (max 10,000 — পুরনো clear হয়)
 
@@ -469,7 +591,10 @@ def _mark_dirty():
                 await asyncio.sleep(3)
                 _backup_task_pending = False
                 if _app is not None:
-                    await _run_dirty_backup_now(_app.bot)
+                    # lock: আগের full-report চলতে থাকলে নতুনটা অপেক্ষা করবে,
+                    # একসাথে একাধিক backup চলে DB ও CPU নিজে থেকেই বাড়তে দেয় না
+                    async with _dirty_backup_lock:
+                        await _run_dirty_backup_now(_app.bot)
             _dbt = loop.create_task(_delayed_backup())
             _background_tasks.add(_dbt); _dbt.add_done_callback(_bg_task_done)
         except RuntimeError:
@@ -749,7 +874,7 @@ def init_db():
                 is_banned     INTEGER DEFAULT 0,
                 lang          TEXT    DEFAULT '',
                 country       TEXT    DEFAULT 'BD',
-                points        INTEGER DEFAULT 100,
+                points        INTEGER DEFAULT 50,
                 blocked_until TEXT    DEFAULT NULL,
                 last_seen     TEXT    DEFAULT '',
                 saved_wallet  TEXT    DEFAULT ''
@@ -1023,6 +1148,14 @@ def init_db():
         except Exception:
             pass
         try:
+            c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_updated_at TEXT DEFAULT ''")
+        except Exception:
+            pass
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS winback_sent_at TEXT DEFAULT ''")
+        except Exception:
+            pass
+        try:
             c.execute("ALTER TABLE task_fields ADD COLUMN IF NOT EXISTS example_image_id TEXT DEFAULT ''")
         except Exception:
             pass
@@ -1155,6 +1288,34 @@ def init_db():
                 c.execute(f"ALTER TABLE {_tbl} ADD COLUMN IF NOT EXISTS owner_id BIGINT DEFAULT 0")
             except Exception:
                 pass
+        # ── 0–50 points scale: live table-এ default 50 (আগে 100) ─────
+        try:
+            c.execute("ALTER TABLE users ALTER COLUMN points SET DEFAULT 50")
+        except Exception:
+            pass
+        # ── এককালীন: পুরনো 0–100 পয়েন্টকে অনুপাত রেখে 0–50 এ আনো ────
+        # (settings flag — দ্বিতীয়বার আর চলবে না; একই transaction তাই atomic)
+        try:
+            _psf = c.execute("SELECT value FROM settings WHERE key=%s",
+                             ('points_scale_50',)).fetchone()
+            if not _psf or (_psf["value"] or "") != "1":
+                _ps_rows = c.execute(
+                    "SELECT user_id, points FROM users WHERE points IS NOT NULL"
+                ).fetchall()
+                for _pr in _ps_rows:
+                    _p  = int(_pr["points"] or 0)
+                    _np = min(50, (_p // 2) + (_p % 2))   # round-half-up অর্ধেক
+                    if _np != _p:
+                        c.execute("UPDATE users SET points=%s WHERE user_id=%s",
+                                  (_np, _pr["user_id"]))
+                c.execute(
+                    "INSERT INTO settings (key,value) VALUES (%s,%s) "
+                    "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                    ('points_scale_50', '1')
+                )
+                log.info(f"[POINTS] 0–100 → 0–50 scale migrate: {len(_ps_rows)} users")
+        except Exception as _pe:
+            log.warning(f"[POINTS] scale migration ব্যর্থ: {_pe}")
         log.info("✅ PostgreSQL schema ready.")
 
 
@@ -1304,12 +1465,15 @@ def set_user_country(uid, country):
     _country_cache.pop(uid, None)
 
 # ── Point / Trust system ─────────────────────────────────────────
-POINT_START       = 100
-POINT_PER_REJECT  = 10   # reject হলে কমবে
-POINT_PER_APPROVE = 3    # approve হলে বাড়বে (ধীরে ধীরে)
-POINT_DUP_PHOTO   = 15   # duplicate ছবি submit করলে কমবে
-POINT_BLOCK_AT    = 50   # এর সমান বা নিচে গেলে block
-POINT_BLOCK_DAYS  = 3    # কতদিন task বন্ধ থাকবে
+POINT_START       = 50    # 0–50 স্কেল (আগে 100)
+POINT_PER_REJECT  = 10   # reject হলে ১০ পয়েন্ট কমবে (0–50 স্কেল)
+POINT_PER_APPROVE = 5    # approve হলে +5 পয়েন্ট
+POINT_DUP_PHOTO   = 3    # একই ছবি ২য়বার = −৩ পয়েন্ট (আগে 15 → 8 → 3)
+POINT_BLOCK_AT    = 0    # পয়েন্ট ০ হলেই block (০ ছাড়া আর কিছুতে block নয়)
+POINT_BLOCK_DAYS  = 2    # ০ হলে ২ দিন task বন্ধ
+WALLET_CHANGE_HOLD_HOURS = 6   # ওয়ালেট বদলের পর এত ঘণ্টা payout hold
+WINBACK_INACTIVE_DAYS    = 14  # এত দিন না আসলে উইনব্যাক মেসেজ
+WINBACK_REPEAT_DAYS      = 7   # পরপর উইনব্যাকের ন্যূনতম ব্যবধান
 
 def get_points(uid):
     with _c() as c:
@@ -1339,7 +1503,7 @@ def is_task_blocked(uid):
         return False, None
 
 def add_points(uid, delta):
-    """Points বাড়াও/কমাও। 0–100 clamp। ≤ POINT_BLOCK_AT হলে block করো।
+    """Points বাড়াও/কমাও। 0–50 clamp। ≤ POINT_BLOCK_AT হলে block করো।
     Atomic single-statement UPDATE — race condition নেই।"""
     with _c() as c:
         r = c.execute(
@@ -1418,24 +1582,14 @@ def ban_user(uid, val):
     _invalidate_user_cache(uid)
 
 def delete_user_data(uid):
-    """User বট block করলে তার সব data DB থেকে মুছে দাও।"""
-    with _c() as c:
-        c.execute("DELETE FROM gmails                  WHERE user_id=%s", (uid,))
-        c.execute("DELETE FROM withdrawals             WHERE user_id=%s", (uid,))
-        # Task completion records — UNIQUE(task_id, user_id) constraint আছে,
-        # তাই না মুছলে rejoin করলে পুরানো tasks আর করতে পারবে না
-        c.execute("DELETE FROM tg_task_completions     WHERE user_id=%s", (uid,))
-        c.execute("DELETE FROM category_task_completions WHERE user_id=%s", (uid,))
-        # Bio task records
-        c.execute("DELETE FROM bio_task_completions    WHERE user_id=%s", (uid,))
-        c.execute("DELETE FROM bio_task_tracking       WHERE user_id=%s", (uid,))
-        try:
-            c.execute("DELETE FROM referrals WHERE referrer_id=%s OR referred_id=%s", (uid, uid))
-        except Exception:
-            pass  # referrals table may not exist — referral info stored in users.referred_by
-        c.execute("DELETE FROM users                   WHERE user_id=%s", (uid,))
-    _invalidate_user_cache(uid)
-    log.info(f"[BLOCK-DELETE] user {uid} বট block করেছে — সব data মুছে দেওয়া হয়েছে।")
+    """[নিষ্ক্রিয় — ডাটা-সেফটি] User বট block করলেও কিছু মুছবে না।
+
+    আগে এটা block-এ ডাকা হতো, ফলে ইউজারের ব্যালান্স, রেফার ও পেমেন্ট
+    হিস্ট্রি মুছে যেত। মালিকের শর্ত: টাকা / রেফার / আয়ের রেকর্ড কোনো
+    সময় ডিলিট হবে না — তাই এই ফাংশন এখন ইচ্ছাকৃতভাবে কিছু করে না।
+    """
+    log.info(f"[DELETE-DATA] uid={uid} — data-safety: কোনো data মোছা হয়নি।")
+    return
 
 def all_users():
     with _c() as c:
@@ -2182,6 +2336,63 @@ def bio_task_paid_today(user_id):
         ).fetchone()
         return r is not None
 
+async def _auto_reject_duplicate_photo(update, ctx, uid, task_name, prev_sub, lang):
+    """ক্রস-ইউজার ডুপ্লিকেট ছবি — insert-এর আগে ডাকো।
+    ইউজারকে reject জানাও + পয়েন্ট কাটো + অ্যাডমিনকে অ্যালার্ট দাও।
+    DB তে নতুন row/slot খরচ হয় না (কিছুই লেখা হয় না), শুধু পয়েন্ট কমে।"""
+    new_pts = await asyncio.to_thread(add_points, uid, -POINT_DUP_PHOTO)
+    if lang == 'en':
+        _blk = (f"\n🚫 *Points reached 0! Tasks blocked for {POINT_BLOCK_DAYS} days.*"
+                if new_pts <= POINT_BLOCK_AT else "")
+        user_msg = (
+            "❌ *Photo Rejected — Duplicate!*\n\n"
+            "⚠️ This photo was already submitted from another account.\n\n"
+            f"🔴 *Points:* `{new_pts}/50` *(-{POINT_DUP_PHOTO})*"
+            f"{_blk}\n\n"
+            "💡 Submit your own screenshot/photo and try again."
+        )
+    else:
+        _blk = (f"\n🚫 *পয়েন্ট ০ হয়ে গেছে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*"
+                if new_pts <= POINT_BLOCK_AT else "")
+        user_msg = (
+            "❌ *ছবি Reject — ডুপ্লিকেট!*\n\n"
+            "⚠️ এই ছবিটি আগেই অন্য একটি অ্যাকাউন্ট থেকে জমা হয়েছিল।\n\n"
+            f"🔴 *পয়েন্ট:* `{new_pts}/50` *(-{POINT_DUP_PHOTO})*"
+            f"{_blk}\n\n"
+            "💡 নিজের স্ক্রিনশট/ছবি দিয়ে আবার চেষ্টা করুন।"
+        )
+    try:
+        kb = await asyncio.to_thread(main_kb, uid)
+        if update.message:
+            await update.message.reply_text(user_msg, parse_mode="Markdown", reply_markup=kb)
+        else:
+            await ctx.bot.send_message(uid, user_msg, parse_mode="Markdown", reply_markup=kb)
+    except Exception as _ue:
+        log.warning(f"[DUP-REJECT] user notify failed uid={uid}: {_ue}")
+    for k in ("state", "task_price", "task_name", "task_id", "categ_task_id",
+              "task_fields", "field_idx", "collected"):
+        ctx.user_data.pop(k, None)
+    try:
+        _u = update.effective_user
+        _uname = (f"@{_md_esc(_u.username)}" if (_u and _u.username)
+                  else _md_esc((_u.full_name or "") if _u else ""))
+        _ps_status = str(prev_sub.get('status', 'pending') or 'pending').lower()
+        admin_msg = (
+            f"🚫 *DUPLICATE PHOTO — AUTO-REJECTED*\n\n"
+            f"👤 *User:* {_uname} (`{uid}`)\n"
+            f"📌 *Task:* {task_name}\n"
+            f"⛔ *এই ছবি আগে ব্যবহার হয়েছে:*\n"
+            f"┌ 🔖 Sub: `#{prev_sub.get('id')}` — user `{prev_sub.get('user_id')}`\n"
+            f"└ ⏳ Status: `{_ps_status}`\n\n"
+            f"🔴 *Points:* `{new_pts}/50` *(-{POINT_DUP_PHOTO})*"
+        )
+        await notify_full_admins(ctx.bot, admin_msg)
+    except Exception as _ae:
+        log.warning(f"[DUP-REJECT] admin notify failed: {_ae}")
+    log.info(f"[DUP-REJECT] uid={uid} prev=#{prev_sub.get('id')} "
+             f"prev_user={prev_sub.get('user_id')} pts={new_pts}")
+
+
 def find_duplicate_photo_submission(unique_ids, skip_gid=None):
     """photo_unique_ids match করে আগের যেকোনো submission খোঁজো।
     skip_gid: এই gmails id বাদ দাও (newly inserted submission এর নিজের row)।
@@ -2213,23 +2424,57 @@ def find_duplicate_photo_submission(unique_ids, skip_gid=None):
                 return dict(row)
     return None
 
-_BIO_LEGACY_TEXT = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
+_BIO_LEGACY_TEXT = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot👈AUTO WITHDRAW 0.02$.Join all"
 
 
 def bio_required_texts(bot_uname: str = "") -> list:
     """Bio-তে যে টেক্সটগুলো থাকলে ধরা হবে — পুরনো হার্ডকোড + বর্তমান বটের username।"""
     texts = [_BIO_LEGACY_TEXT]
     if bot_uname:
-        texts.append(f"FREE TASK EARN BOT👇 @{bot_uname} 👈AUTO WITHDRAW 0.02$.Join all")
+        texts.append(f"FREE TASK EARN BOT👇 @{bot_uname}👈AUTO WITHDRAW 0.02$.Join all")
     return texts
 
 
+_BIO_HANDLE_LEGACY = "task_earn_bux_bot"
+# fallback matcher-এর মার্কার — হুবহু full text না মিললেও যেগুলো থাকলে ধরা হবে
+_BIO_MARKERS = ("freetaskearn", "autowithdraw", "joinall", "0.02")
+
+
+def _norm_bio(s: str) -> str:
+    """Bio compare-র জন্য normalization — ফোনভিত্তিক ছোট পার্থক্য মুছে দেয়।
+
+    • lower-case
+    • zero-width / variation-selector / soft-hyphen বাদ (👇 এর ভেতরেও থাকতে পারে)
+    • সব whitespace (space, tab, newline, NBSP) সম্পূর্ণ বাদ —
+      মোবাইলে paste করলে লাইনব্রেক/ডাবল-স্পেস এলেও match করবে
+    """
+    if not s:
+        return ""
+    t = s.lower()
+    for _ch in ("\u200b", "\u200c", "\u200d", "\ufeff", "\ufe0e", "\ufe0f", "\u00ad"):
+        t = t.replace(_ch, "")
+    return re.sub(r"\s+", "", t)
+
+
 def bio_text_matches(bio_text: str, bot_uname: str = "") -> bool:
-    """Bio সঠিক কিনা — পুরনো text অথবা বর্তমান বট username যেকোনোটা থাকলেই হবে।"""
-    t = (bio_text or "").strip().lower()
+    """Bio সঠিক কিনা — দুই ধাপে যাচাই।
+
+    ১) normalized full-text match: পুরনো text অথবা বর্তমান বট username-এর
+       কোনোটা bio-তে থাকলেই হবে (extra text, spacing, linebreak হলেও চলবে)।
+    ২) fallback: বট link (`@Task_Earn_Bux_bot` বা `t.me/…` বা বর্তমান username)
+       থাকলে + মার্কারগুলোর যেকোনো ২টি — একটা typo/emoji-variant-এও কাজ করবে।
+    """
+    t = _norm_bio(bio_text)
     if not t:
         return False
-    return any(x.lower() in t for x in bio_required_texts(bot_uname))
+    for x in bio_required_texts(bot_uname):
+        nx = _norm_bio(x)
+        if nx and nx in t:
+            return True
+    _handles = {_BIO_HANDLE_LEGACY, (bot_uname or "").strip().lower()}
+    if not any(h and ("@" + h in t or "t.me/" + h in t) for h in _handles):
+        return False
+    return sum(1 for m in _BIO_MARKERS if m in t) >= 2
 
 
 def get_bio_paid_today_set():
@@ -2981,8 +3226,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if args and args[0].startswith("ref_"):
         try:
             ref_by = int(args[0][4:])
-            if ref_by == user.id: ref_by = None
-        except ValueError: pass
+        except ValueError:
+            ref_by = None
+        if ref_by is not None:
+            if ref_by == user.id:
+                ref_by = None   # নিজের লিংকে নিজে — বাতিল
+            else:
+                # Referrer সত্যিই আছে কি না যাচাই — ভুয়া/মুছে ফেলা ID হলে
+                # referred_by সেভ করলে ভবিষ্যতের কমিশন নীরবে হারিয়ে যেত
+                _refr = await asyncio.to_thread(get_user, ref_by)
+                if not _refr or _refr.get("is_banned"):
+                    log.info(f"[REF] ref_by={ref_by} missing/banned — link ignored (user={user.id})")
+                    ref_by = None
     elif args and args[0].startswith("tgtask_"):
         try: deep_task_type = "g"; deep_task_id = int(args[0][7:])
         except ValueError: pass
@@ -3004,7 +3259,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     u = await asyncio.to_thread(get_user, user.id)
     if not u:
-        await update.message.reply_text("❌ Error loading account. Please try /start again.", parse_mode="Markdown")
+        await update.message.reply_text(
+            ("❌ *Error loading account. Please try /start again.*"
+             if await asyncio.to_thread(get_lang, user.id) == 'en' else
+             "❌ *অ্যাকাউন্ট লোড করা যায়নি। আবার /start চাপুন।*"),
+            parse_mode="Markdown")
         return
     if u["is_banned"]:
         await update.message.reply_text(T(user.id, 'banned'), parse_mode="Markdown")
@@ -3639,6 +3898,69 @@ async def _check_ref_event_bonus(referred_id: int, referrer_id: int, bot):
     except Exception as _reve:
         log.warning(f"[REF_EVENT] _check_ref_event_bonus error: {_reve}")
 
+# ── Referral commission — সব path এক জায়গা থেকে ──
+_COMM_ALERT_TS: dict = {}
+
+async def _pay_commission(bot, referrer_id, from_uid, base_amount, task_name=""):
+    """Referrer-কে কমিশন দাও, notify করো, referral event bonus-ও check করো.
+
+    • base <= 0 বা commission% = 0 হলে কিছুই হয় না (আগে `$0` মেসেজ যেত)
+    • referrer DB-তে না থাকলে commission history থাকে, কিন্তু balance যোগ হয় না
+      — তখন admin-কে alert দেওয়া হয় যাতে টাকা নীরবে না হারায়।
+    """
+    if not referrer_id:
+        return 0.0
+    try:
+        base = float(base_amount or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if base <= 0:
+        return 0.0
+    try:
+        comm_pct = float(await asyncio.to_thread(get_commission_pct))
+    except Exception:
+        comm_pct = 10.0
+    comm = round(base * comm_pct / 100.0, 4)
+    if comm <= 0:
+        return 0.0
+    try:
+        paid_ok = await asyncio.to_thread(add_bal, referrer_id, comm)
+        await asyncio.to_thread(record_commission, referrer_id, from_uid, comm, task_name or "")
+    except Exception as _ce:
+        log.warning(f"[COMMISSION] ref={referrer_id} credit fail: {_ce}")
+        return 0.0
+    if not paid_ok:
+        _now_m  = _time.monotonic()
+        _last_m = _COMM_ALERT_TS.get(referrer_id)
+        if _last_m is None or _now_m - _last_m > 3600:
+            _COMM_ALERT_TS[referrer_id] = _now_m
+            try:
+                await notify_full_admins(bot,
+                    f"⚠️ *Referral commission দেওয়া যায়নি!*\n\n"
+                    f"🆔 *Referrer ID:* `{referrer_id}` — DB-তে নেই\n"
+                    f"👤 *User ID:* `{from_uid}`\n"
+                    f"📋 *Task:* {_md_esc(str(task_name or '—'))}\n"
+                    f"💰 *Commission:* `{comm}$ USDT` — যোগ হয়নি\n\n"
+                    f"💡 ওই referred users-দের `referred_by` ঠিক করলে পরের কমিশন ঠিক যাবে।")
+            except Exception as _ne:
+                log.debug(f"[COMMISSION] admin alert fail: {_ne}")
+        return 0.0
+    try:
+        _ru    = await asyncio.to_thread(get_user, from_uid)
+        _rname = _md_esc((_ru["full_name"] or _ru["username"] or "Unknown") if _ru else "Unknown")
+        _cpd   = int(comm_pct) if comm_pct == int(comm_pct) else comm_pct
+        await bot.send_message(
+            referrer_id,
+            T(referrer_id, 'commission_msg', name=_rname, price=base, comm=comm, comm_pct=_cpd),
+            parse_mode="Markdown")
+    except Exception as _e:
+        log.debug(f"[COMMISSION] ref={referrer_id} notify fail: {_e}")
+    # ── Referral Event bonus check ──
+    _ev_t = asyncio.create_task(_check_ref_event_bonus(from_uid, referrer_id, bot))
+    _background_tasks.add(_ev_t); _ev_t.add_done_callback(_bg_task_done)
+    return comm
+
+
 async def _notify_task_maxed(bot, name: str, code: str, type_label: str, done: int, max_c: int):
     """Admin-কে জানাও যে task-এর সব slot পূর্ণ হয়েছে এবং task বন্ধ হয়েছে।"""
     _safe_code = _md_esc(str(code).replace('`', "'")) if code else ""
@@ -3854,7 +4176,8 @@ async def show_category_tasks(update, ctx, cat_id):
         asyncio.to_thread(get_category, cat_id),
     )
     if not cat:
-        await q.message.reply_text("❌ Category not found!"); return
+        await q.message.reply_text("❌ Category not found!" if lang=='en'
+                                    else "❌ এই Category টি পাওয়া যায়নি!"); return
     tasks = await asyncio.to_thread(get_category_tasks, cat_id)
     if not tasks:
         await q.message.reply_text("❌ No tasks in this category!" if lang=='en' else "❌ এই Category তে কোনো Task নেই!")
@@ -4118,6 +4441,17 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
 
     summary_txt = "\n".join(summary_lines) if summary_lines else "_No data_"
     gmail_text  = _json.dumps(collected, ensure_ascii=False)
+
+    # ── ক্রস-ইউজার ডুপ্লিকেট ছবি — mark_done/insert এর আগেই ধরে অটো-reject ──
+    if _cat_submitted_uids:
+        _cat_dup_prev = None
+        try:
+            _cat_dup_prev = await asyncio.to_thread(find_duplicate_photo_submission, _cat_submitted_uids, None)
+        except Exception as _dpe:
+            log.warning(f"[DUP-PHOTO-CAT] check failed: {_dpe}")
+        if _cat_dup_prev and _cat_dup_prev.get('user_id') != uid:
+            await _auto_reject_duplicate_photo(update, ctx, uid, task_name, _cat_dup_prev, lang)
+            return
 
     ttype_obj = await asyncio.to_thread(get_category_task, task_id)
     ttype_ins = _rget(ttype_obj, 'task_type', 'other') if ttype_obj else 'other'
@@ -4562,27 +4896,10 @@ async def handle_tg_task_check(update, ctx, tid):
         ))
         _background_tasks.add(_ttg); _ttg.add_done_callback(_bg_task_done)
 
-    # Commission to referrer
+    # Commission to referrer (+ referral event bonus check)
     ref = await asyncio.to_thread(get_referred_by, uid)
     if ref:
-        comm_pct = await asyncio.to_thread(get_commission_pct)
-        comm = round(price * comm_pct / 100.0, 4)
-        await asyncio.gather(
-            asyncio.to_thread(add_bal, ref, comm),
-            asyncio.to_thread(record_commission, ref, uid, comm, task.get('name', 'TG Join Task')),
-        )
-        try:
-            ru = await asyncio.to_thread(get_user, uid)
-            rname = _md_esc((ru["full_name"] or ru["username"] or "Unknown") if ru else "Unknown")
-            comm_pct_d = int(comm_pct) if comm_pct == int(comm_pct) else comm_pct
-            await ctx.bot.send_message(ref,
-                T(ref, 'commission_msg', name=rname, price=price, comm=comm, comm_pct=comm_pct_d),
-                parse_mode="Markdown")
-        except Exception as _e:
-            log.debug(f"[TG-TASK] ref={ref} commission notify ব্যর্থ: {_e}")
-        # ── Referral Event bonus check ──────────────────────────
-        _ref_ev_tg = asyncio.create_task(_check_ref_event_bonus(uid, ref, ctx.bot))
-        _background_tasks.add(_ref_ev_tg); _ref_ev_tg.add_done_callback(_bg_task_done)
+        await _pay_commission(ctx.bot, ref, uid, price, task.get('name', 'TG Join Task'))
 
     # Notify user
     _tg_task_name_esc = _md_esc(task['name'])
@@ -5106,6 +5423,16 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
     _t_icon      = task_type_icon(_ttype_ins)
     _reg_tcode   = _rget(_t_obj, 'task_code', '') if _t_obj else ''
     _reg_owner_ins = int(_rget(_t_obj, 'owner_id', 0) or 0) if _t_obj else 0
+    # ── ক্রস-ইউজার ডুপ্লিকেট ছবি — row insert এর আগেই ধরে অটো-reject ──
+    if _submitted_unique_ids:
+        _dup_prev = None
+        try:
+            _dup_prev = await asyncio.to_thread(find_duplicate_photo_submission, _submitted_unique_ids, None)
+        except Exception as _dpe:
+            log.warning(f"[DUP-PHOTO] check failed: {_dpe}")
+        if _dup_prev and _dup_prev.get('user_id') != uid:
+            await _auto_reject_duplicate_photo(update, ctx, uid, task_name, _dup_prev, lang)
+            return
     def _insert_gmail_row():
         _gid = None
         with _c() as c:
@@ -5417,14 +5744,57 @@ async def receive_wd_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ctx.user_data["wd_addr"] = address
     ctx.user_data["state"]   = "wd_amt"
-    # ── Wallet auto-save ─────────────────────────────────────────
+    # ── Wallet auto-save + বদল হলে ৬ ঘণ্টা payout hold নোটিশ ─────
+    _w_changed_from = ""
     try:
-        def _db_4018():
-            with _c() as _svc:
-                _svc.execute("UPDATE users SET saved_wallet=%s WHERE user_id=%s", (address, uid))
-        await asyncio.to_thread(_db_4018)
+        _w_changed_from = await asyncio.to_thread(save_wallet_if_changed, uid, address) or ""
     except Exception:
         pass
+    if _w_changed_from:
+        if lang == 'en':
+            _wc_msg = (
+                f"🔐 *Wallet address changed*\n\n"
+                f"👛 *Old:* `{_w_changed_from}`\n"
+                f"👛 *New:* `{address}`\n\n"
+                f"🔒 *Security hold:* withdrawals are locked for the next "
+                f"*{WALLET_CHANGE_HOLD_HOURS} hours.*\n"
+                f"🔓 After that window you can withdraw normally."
+            )
+        else:
+            _wc_msg = (
+                f"🔐 *ওয়ালেট ঠিকানা পরিবর্তন হয়েছে*\n\n"
+                f"👛 *পুরনো:* `{_w_changed_from}`\n"
+                f"👛 *নতুন:* `{address}`\n\n"
+                f"🔒 *নিরাপত্তা হোল্ড:* আগামী *{WALLET_CHANGE_HOLD_HOURS} ঘণ্টা* "
+                f"Withdraw করা যাবে না।\n"
+                f"🔓 সময় শেষে স্বাভাবিকভাবে Withdraw করতে পারবেন।"
+            )
+        try:
+            await update.message.reply_text(_wc_msg, parse_mode="Markdown")
+        except Exception:
+            pass
+        try:
+            await notify_full_admins(
+                ctx.bot,
+                f"🔐 *User wallet changed* — `{uid}`\n\n"
+                f"👛 *Old:* `{_w_changed_from}`\n"
+                f"👛 *New:* `{address}`\n"
+                f"🔒 Withdraw locked *{WALLET_CHANGE_HOLD_HOURS}h*"
+            )
+        except Exception:
+            pass
+        # বদল হলে এখানেই থামো — ৬ ঘণ্টা Withdraw বন্ধ, পরে এসে করবেন
+        _now_bd = datetime.now(pytz.timezone("Asia/Dhaka"))
+        try:
+            await update.message.reply_text(
+                wallet_hold_block_text(_now_bd.strftime("%Y-%m-%d %H:%M:%S"), _now_bd, lang),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        for k in ("state", "wd_addr", "wd_amt"):
+            ctx.user_data.pop(k, None)
+        return
     bal, fee, min_w = await asyncio.gather(
         asyncio.to_thread(get_bal, uid),
         asyncio.to_thread(get_wd_fee),
@@ -5434,6 +5804,65 @@ async def receive_wd_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         T(uid, 'wd_enter_amt', bal=bal, fee=fee, min_w=min_w),
         parse_mode="Markdown", reply_markup=cancel_kb(uid)
     )
+
+def save_wallet_if_changed(uid, address):
+    """saved_wallet সেভ করো; আগের ঠিকানা থেকে সত্যিই বদল হলে wallet_updated_at স্ট্যাম্প দাও।
+    Returns: আগের ঠিকানা যদি বদল হয় (নোটিফিকেশনের জন্য), নাহলে ''।
+    প্রথমবার ঠিকানা সেভ = বদল নয় → নতুন ইউজারের প্রথম withdraw hold হবে না।"""
+    with _c() as c:
+        row = c.execute("SELECT saved_wallet FROM users WHERE user_id=%s", (uid,)).fetchone()
+        old = (row["saved_wallet"] or "") if row else ""
+        if old and old != address:
+            c.execute(
+                "UPDATE users SET saved_wallet=%s, wallet_updated_at=%s WHERE user_id=%s",
+                (address, datetime.now(pytz.timezone("Asia/Dhaka")).strftime("%Y-%m-%d %H:%M:%S"), uid)
+            )
+            return old
+        c.execute("UPDATE users SET saved_wallet=%s WHERE user_id=%s", (address, uid))
+        return ""
+
+
+def get_wallet_updated_at(uid):
+    """users.wallet_updated_at লোড করো (খালি/missing = '')।"""
+    with _c() as c:
+        r = c.execute("SELECT wallet_updated_at FROM users WHERE user_id=%s", (uid,)).fetchone()
+        return (r["wallet_updated_at"] or "") if r else ""
+
+
+def wallet_hold_remaining(wallet_updated_at, now_dt):
+    """ওয়ালেট বদলের পর WALLET_CHANGE_HOLD_HOURS ঘণ্টা withdraw সম্পূর্ণ নিষিদ্ধ।
+    বাকি সেকেন্ড ফেরত (0 = হোল্ড নেই/শেষ/ভুল ডেটা — তখন স্বাভাবিক ২ মিনিট পথ)।"""
+    if not wallet_updated_at:
+        return 0
+    try:
+        hold_dt = (datetime.strptime(wallet_updated_at, "%Y-%m-%d %H:%M:%S")
+                   .replace(tzinfo=now_dt.tzinfo) + timedelta(hours=WALLET_CHANGE_HOLD_HOURS))
+    except ValueError:
+        return 0
+    return max(0, int((hold_dt - now_dt).total_seconds()))
+
+
+def wallet_hold_block_text(wallet_updated_at, now_dt, lang):
+    """হোল্ড চলছে হলে ব্লক-মেসেজ (bn/en), নাহলে ''।"""
+    rem = wallet_hold_remaining(wallet_updated_at, now_dt)
+    if rem <= 0:
+        return ""
+    unlock = (now_dt + timedelta(seconds=rem)).strftime("%d %b %Y, %I:%M %p")
+    h, m = rem // 3600, (rem % 3600) // 60
+    if lang == 'en':
+        return (
+            f"🔒 *Withdrawals are locked for {WALLET_CHANGE_HOLD_HOURS}h after a wallet change*\n\n"
+            f"⏳ *Time left:* `{h}h {m}m`\n"
+            f"🔓 *Unlocks at:* `{unlock}`\n\n"
+            f"After that you can withdraw normally."
+        )
+    return (
+        f"🔒 *ওয়ালেট পরিবর্তনের পর {WALLET_CHANGE_HOLD_HOURS} ঘণ্টা Withdraw বন্ধ*\n\n"
+        f"⏳ *বাকি আছে:* `{h} ঘণ্টা {m} মিনিট`\n"
+        f"🔓 *খুলবে:* `{unlock}`\n\n"
+        f"এরপর স্বাভাবিকভাবে Withdraw করতে পারবেন।"
+    )
+
 
 async def receive_wd_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -5447,6 +5876,13 @@ async def receive_wd_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.to_thread(get_wd_fee),
         asyncio.to_thread(get_lang, uid),
     )
+    # ── ওয়ালেট বদলের ৬ ঘণ্টা: হোল্ডে থাকলে amount নেওয়াই হবে না ──
+    _blk = wallet_hold_block_text(
+        await asyncio.to_thread(get_wallet_updated_at, uid),
+        datetime.now(pytz.timezone("Asia/Dhaka")), lang)
+    if _blk:
+        await update.message.reply_text(_blk, parse_mode="Markdown", reply_markup=cancel_kb(uid))
+        return
     if amt < min_w:
         min_msg = (f"❌ *Minimum withdrawal:* `{min_w}$ USDT`" if lang=='en'
                    else f"❌ *মিনিমাম উইথড্র:* `{min_w}$ USDT`")
@@ -5543,8 +5979,14 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── Security Check 2 + INSERT: একই transaction এ balance কাটো ও withdrawal তৈরি করো ──
     # এটা atomic — মাঝে crash হলেও টাকা হারাবে না।
-    _sched_sec = 120   # ঠিক ২ মিনিট পরে পেমেন্ট (120 সেকেন্ড)
-    _sched_at  = (datetime.now(pytz.timezone("Asia/Dhaka")) + timedelta(seconds=_sched_sec)).strftime("%Y-%m-%d %H:%M:%S")
+    # ── ওয়ালেট বদলের ৬ ঘণ্টা: হোল্ডে থাকলে submit-ই বন্ধ (নিরাপত্তা) ──
+    _now_bd = datetime.now(pytz.timezone("Asia/Dhaka"))
+    _blk = wallet_hold_block_text(await asyncio.to_thread(get_wallet_updated_at, uid), _now_bd, lang)
+    if _blk:
+        await ctx.bot.send_message(uid, _blk, parse_mode="Markdown",
+                                   reply_markup=await asyncio.to_thread(main_kb, uid))
+        return
+    _sched_at = (_now_bd + timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
     def _atomic_ded_and_insert():
         with _c() as c:
             # Step 1: balance check + deduct (atomic)
@@ -5611,6 +6053,8 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(uid, _err_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
         return
 
+    _pay_line = ("⚡ *Auto payment within 2 minutes.*" if lang == 'en'
+                 else "⚡ *২ মিনিটের মধ্যে অটো পেমেন্ট হবে।*")
     if lang == 'en':
         confirm_msg = (
             f"✅ *Withdrawal Request Submitted!*\n\n"
@@ -5621,7 +6065,7 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📉 *Fee:* `${fee:.4f}`\n"
             f"💰 *You will receive:* `${net_amt:.4f}`\n"
             f"━━━━━━━━━━━━━━━━\n\n"
-            f"⚡ *Auto payment within 2 minutes.*"
+            f"{_pay_line}"
         )
     else:
         confirm_msg = (
@@ -5633,7 +6077,7 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📉 *ফি:* `${fee:.4f}`\n"
             f"💰 *পাবেন:* `${net_amt:.4f}`\n"
             f"━━━━━━━━━━━━━━━━\n\n"
-            f"⚡ *২ মিনিটের মধ্যে অটো পেমেন্ট হবে।*"
+            f"{_pay_line}"
         )
     await ctx.bot.send_message(uid, confirm_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
 
@@ -5708,11 +6152,11 @@ async def cmd_point(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             status_txt  = "🔴 Task Blocked"
             block_line  = f"🔓 *Block lifts on:* `{until_str}`\n"
     else:
-        if pts >= 80:
+        if pts >= 40:
             status_txt = "🟢 Excellent" if lang == 'en' else "🟢 চমৎকার"
-        elif pts >= 60:
+        elif pts >= 30:
             status_txt = "🟡 Good" if lang == 'en' else "🟡 ভালো"
-        elif pts >= 40:
+        elif pts >= 20:
             status_txt = "🟠 Fair" if lang == 'en' else "🟠 মোটামুটি"
         else:
             status_txt = "🔴 Low — Be careful!" if lang == 'en' else "🔴 কম — সাবধান!"
@@ -5990,7 +6434,7 @@ async def _notify_bio_text_change(bot):
 
     log.info(f"[BIO-NOTIFY] {len(tracked)} জন পুরানো bio user কে নোটিফিকেশন পাঠাচ্ছি…")
 
-    _new_bio = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot 👈AUTO WITHDRAW 0.02$.Join all"
+    _new_bio = "FREE TASK EARN BOT👇 @Task_Earn_Bux_bot👈AUTO WITHDRAW 0.02$.Join all"
     _new_bio_safe = _md_esc(_new_bio)
     _sem = asyncio.Semaphore(5)   # Telegram rate limit এড়াতে
 
@@ -6367,7 +6811,11 @@ async def _activate_task_and_notify(ctx, q, uid,
     _mark_dirty()
     try: await q.message.edit_reply_markup(reply_markup=None)
     except Exception: pass
-    status_lbl = "✅ *Task Activated!*" if new_val else "❌ *Task Deactivated.*"
+    _st_lang = await asyncio.to_thread(get_lang, uid)
+    if _st_lang == 'en':
+        status_lbl = "✅ *Task Activated!*" if new_val else "❌ *Task Deactivated.*"
+    else:
+        status_lbl = "✅ *টাস্ক চালু হয়েছে!*" if new_val else "❌ *টাস্ক বন্ধ হয়েছে।*"
     await q.message.reply_text(status_lbl, parse_mode="Markdown")
     if new_val:
         _bun = await _get_bot_username(ctx.bot)
@@ -6387,9 +6835,56 @@ async def _activate_task_and_notify(ctx, q, uid,
 
 
 def _build_full_users_report() -> str:
-    """সব user এর data দিয়ে text report তৈরি করে"""
+    """সব user এর data দিয়ে text report — মোট ~৬টা aggregate query।
+
+    ⚠️ পুরনো সংস্করণ প্রতিজন user এর জন্য আলাদা connection নিয়ে ৫টা COUNT/SUM
+    query + information_schema check চালাত (N জনে ~7N query, একটার পর একটা,
+    ধারাবাহিক)। ইউজার/ডাটা বাড়লেই সেটা মিনিটেরও বেশি চলে CockroachDB কে
+    ঘণ্টার পর ঘণ্টা ব্যস্ত রাখত — ফলে বাটন চাপলে সবার reply ধীর হয়ে যেত।
+    এখন একবারে ৬টা GROUP BY query, তাই কয়েক সেকেন্ডেই শেষ।
+    """
     users = all_users()
     ts = now()
+
+    def _fetch(sql):
+        try:
+            with _c() as c:
+                return c.execute(sql).fetchall() or []
+        except Exception as _e:
+            log.warning(f"[USER-REPORT] query ব্যর্থ: {_e}")
+            return []
+
+    def _cnt(v):
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _num(v):
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _group(sql):
+        out = {}
+        for r in _fetch(sql):
+            k = _rget(r, "k")
+            if k is not None:
+                out[k] = _rget(r, "n")
+        return out
+
+    ref_map   = _group("SELECT referred_by AS k, COUNT(*) AS n FROM users "
+                        "WHERE referred_by IS NOT NULL GROUP BY referred_by")
+    comm_map  = _group("SELECT user_id AS k, COALESCE(SUM(amount),0) AS n "
+                        "FROM commissions GROUP BY user_id")
+    tg_map    = _group("SELECT user_id AS k, COUNT(*) AS n "
+                        "FROM tg_task_completions GROUP BY user_id")
+    gmail_map = _group("SELECT user_id AS k, COUNT(*) AS n "
+                        "FROM gmails WHERE status='approved' GROUP BY user_id")
+    wd_map    = _group("SELECT user_id AS k, COUNT(*) AS n "
+                        "FROM withdrawals WHERE status='approved' GROUP BY user_id")
+
     lines = [
         "📊 USER DATA REPORT",
         f"🕐 সময়: {ts}",
@@ -6400,18 +6895,17 @@ def _build_full_users_report() -> str:
     for u in users:
         uid = u["user_id"]
         uname = f"@{u['username']}" if _rget(u, "username") else (_rget(u, "full_name") or "Unknown")
-        bal = round(_rget(u, "balance", 0), 4)
+        bal = round(_num(_rget(u, "balance", 0)), 4)
         total_bal += bal
-        with _c() as c:
-            ref_count = _count(c.execute("SELECT COUNT(*) FROM users WHERE referred_by=%s", (uid,)).fetchone())
-            comm = _count(c.execute("SELECT COALESCE(SUM(amount),0) FROM commissions WHERE user_id=%s", (uid,)).fetchone()) if _table_exists(c, "commissions") else 0
-            tg_done  = _count(c.execute("SELECT COUNT(*) FROM tg_task_completions WHERE user_id=%s", (uid,)).fetchone())
-            sub_app  = _count(c.execute("SELECT COUNT(*) FROM gmails WHERE user_id=%s AND status='approved'", (uid,)).fetchone())
-            wd_app   = _count(c.execute("SELECT COUNT(*) FROM withdrawals WHERE user_id=%s AND status='approved'", (uid,)).fetchone())
+        ref_count = _cnt(ref_map.get(uid, 0))
+        comm      = round(_num(comm_map.get(uid, 0)), 4)
+        tg_done   = _cnt(tg_map.get(uid, 0))
+        sub_app   = _cnt(gmail_map.get(uid, 0))
+        wd_app    = _cnt(wd_map.get(uid, 0))
         ban = "🚫" if _rget(u, "is_banned") else "✅"
         lines.append(
             f"{ban} [{uid}] {uname}\n"
-            f"   💰 Balance: {bal}$ | 🔗 Refs: {ref_count} | 💸 Commission: {round(comm,4)}$\n"
+            f"   💰 Balance: {bal}$ | 🔗 Refs: {ref_count} | 💸 Commission: {comm}$\n"
             f"   📡 TG Tasks: {tg_done} | 📋 Tasks✅: {sub_app} | 💳 WD✅: {wd_app}\n"
             f"   📅 Joined: {_rget(u, 'joined_at', '')}"
         )
@@ -6857,10 +7351,73 @@ async def send_admin_panel(msg, uid):
     )
 
 # ──────────────────────────── CALLBACK HANDLER ────────────────────────────
+# ── Flood control: এক ইউজার দ্রুত/একসাথে বেশি অনুরোধ পাঠাতে পারবে না ──
+RATE_COOLDOWN = 2.5   # একই ইউজারের একই অ্যাকশনের মধ্যে ন্যূনতম বিরতি (সেকেন্ড)
+RATE_WINDOW   = 10    # ফ্লাড গণনার উইন্ডো (সেকেন্ড)
+RATE_MAX      = 8     # উইন্ডোতে সর্বোচ্চ এতটা অনুরোধ — তার বেশি বাদ
+_rate_last = {}   # (uid, key) -> monotonic ts — same-action dedupe
+_rate_win  = {}   # uid -> (window_start, count) — flood cap
+
+def _rate_gate(uid, key):
+    """True = চলতে পারবে, False = স্প্যাম/ডুপ্লিকেট — বাদ দাও।
+    (১) একই অ্যাকশন RATE_COOLDOWN সেকেন্ডের মধ্যে আবার = drop,
+    (২) RATE_WINDOW সেকেন্ডে RATE_MAX ছাড়ালে বাকিগুলো = drop।
+    dict-based, event-loop thread-এ atomic (কোনো await নেই)."""
+    now = _time.monotonic()
+    if len(_rate_last) > 5000:   # পুরনো এন্ট্রি পরিষ্কার — memory bounded
+        cut = now - max(RATE_COOLDOWN, RATE_WINDOW)
+        for k in [k for k, t in _rate_last.items() if t < cut]:
+            del _rate_last[k]
+        for u in [u for u, (s, n) in _rate_win.items() if now - s > RATE_WINDOW]:
+            del _rate_win[u]
+    k = (uid, key)
+    if now - _rate_last.get(k, -1e9) < RATE_COOLDOWN:
+        return False
+    start, cnt = _rate_win.get(uid, (0.0, 0))
+    if now - start > RATE_WINDOW:
+        start, cnt = now, 0
+    if cnt + 1 > RATE_MAX:
+        _rate_win[uid] = (start, cnt + 1)
+        return False
+    _rate_last[k] = now
+    _rate_win[uid] = (start, cnt + 1)
+    return True
+
+async def _rate_allowed(uid, key):
+    """_rate_gate + অ্যাডমিন বাইপাস — অ্যাডমিনের কাজ কখনো আটকাবে না।"""
+    if _rate_gate(uid, key):
+        return True
+    try:
+        if await asyncio.to_thread(is_admin, uid):
+            return True
+    except Exception:
+        pass
+    return False
+
+def _gate(fn, kind="cmd"):
+    """হ্যান্ডলার র‍্যাপার: গেট পাস না করলে হ্যান্ডলার চলবেই না।"""
+    async def _wrapped(update, ctx):
+        u = update.effective_user
+        if u is not None:
+            if kind == "cmd":
+                parts = ((update.effective_message.text if update.effective_message else "") or "").split()
+                sub = parts[0].split("@")[0].lower() if parts else "?"
+            else:
+                sub = ""
+            if not await _rate_allowed(u.id, f"{kind}:{sub}"):
+                return None
+        return await fn(update, ctx)
+    return _wrapped
+
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     uid = q.from_user.id
     d   = q.data
+    # স্প্যাম-গেট: একই বাটন দ্রুত বারবার / খুব বেশি চাপলে বাদ (toast দেখাও)
+    if not await _rate_allowed(uid, f"cb:{d}"):
+        try: await q.answer("⏳ একটু অপেক্ষা করুন!", show_alert=False)
+        except Exception: pass
+        return
     try:
         # ── FIRST: spinner তাৎক্ষণিক clear করো (~200ms) — তারপর বাকি কাজ ──
         try: await q.answer()
@@ -6869,7 +7426,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception(f"[on_callback ERROR] data={d} uid={uid} error={e}")
         try:
-            await q.message.reply_text("❌ Error! Admin check logs.")
+            _cb_err_lang = await asyncio.to_thread(get_lang, uid)
+            await q.message.reply_text("❌ Error! Admin check logs." if _cb_err_lang == 'en'
+                                       else "❌ এরর হয়েছে! অ্যাডমিন লগ দেখুন।")
         except Exception: pass
     return
 
@@ -7433,22 +7992,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             asyncio.to_thread(get_referred_by, guser),
         )
         if ref:
-            comm_pct = await asyncio.to_thread(get_commission_pct)
-            comm = round(price * comm_pct / 100.0, 4)
-            comm_pct_display = int(comm_pct) if comm_pct == int(comm_pct) else comm_pct
-            await asyncio.to_thread(add_bal, ref, comm)
-            await asyncio.to_thread(record_commission, ref, guser, comm, row.get('task_name', ''))
-            try:
-                ru    = await asyncio.to_thread(get_user, guser)
-                rname = (ru["full_name"] or ru["username"] or "Unknown") if ru else "Unknown"
-                await ctx.bot.send_message(ref,
-                    T(ref, 'commission_msg', name=_md_esc(rname), price=price, comm=comm, comm_pct=comm_pct_display),
-                    parse_mode="Markdown")
-            except Exception as _e:
-                log.debug(f"[APPROVE] ref={ref} commission notify ব্যর্থ: {_e}")
-            # ── Referral Event bonus check ──────────────────────────
-            _ref_ev_task = asyncio.create_task(_check_ref_event_bonus(guser, ref, ctx.bot))
-            _background_tasks.add(_ref_ev_task); _ref_ev_task.add_done_callback(_bg_task_done)
+            await _pay_commission(ctx.bot, ref, guser, price, row.get('task_name', ''))
         try:
             await ctx.bot.send_message(guser,
                 T(guser, 'approved_msg', task=_task_display, price=price),
@@ -7552,7 +8096,9 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         row = await asyncio.to_thread(_db_5732)
         if not row:
             await q.message.reply_text("❌ পাওয়া যায়নি!"); return
-        await q.message.reply_text(f"📍 Full Address:\n{row['address']}")
+        await q.message.reply_text(
+            ("📍 Full Address:" if await asyncio.to_thread(get_lang, uid) == 'en'
+             else "📍 ফুল ঠিকানা:") + f"\n{row['address']}")
         return
 
     # ── Gas Fee Alert: Admin approve (পাঠাও) বা cancel (ফেরত দাও) ──
@@ -7624,9 +8170,13 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 )
                 await ctx.bot.send_message(wuser, _cancel_txt, parse_mode="Markdown")
             except Exception: pass
-            try: await q.message.edit_text(q.message.text + "\n\n❌ *Admin cancelled — balance refunded.*", parse_mode="Markdown", reply_markup=None)
+            _ac_lang = await asyncio.to_thread(get_lang, uid)
+            _ac_line = ("\n\n❌ *Admin cancelled — balance refunded.*" if _ac_lang == 'en'
+                        else "\n\n❌ *অ্যাডমিন বাতিল করেছেন — ব্যালান্স ফেরত।*")
+            try: await q.message.edit_text(q.message.text + _ac_line, parse_mode="Markdown", reply_markup=None)
             except Exception: pass  # message edit may fail if unchanged or deleted — safe to ignore
-            await q.message.reply_text("❌ Withdrawal cancelled — balance refunded.")
+            await q.message.reply_text("❌ Withdrawal cancelled — balance refunded." if _ac_lang == 'en'
+                                       else "❌ উইথড্র বাতিল — ব্যালান্স ফেরত দেওয়া হয়েছে।")
         return
 
     # ── Withdraw approve/reject ──────────────────────────────────
@@ -7768,7 +8318,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 f"📅 *Daily Reward (প্রতিদিন, ২৪ঘন্টা):* `{daily_reward}$ USDT`\n\n"
                 f"{track_status}\n\n"
                 f"📝 *আপনার Bio তে হুবহু এই text রাখুন:*\n\n"
-                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_⚙️ Settings → Edit Profile → Bio_\n\n"
                 f"▶️ *Bio সেট করার পর:*\n"
                 f"1️⃣ ✅ Check করুন বাটন চাপুন\n\n"
@@ -7790,7 +8340,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 f"📅 *Daily Reward (every day, 24h):* `{daily_reward}$ USDT`\n\n"
                 f"{track_status}\n\n"
                 f"📝 *Set your Telegram Bio to exactly:*\n\n"
-                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_⚙️ Settings → Edit Profile → Bio_\n\n"
                 f"▶️ *After setting bio:*\n"
                 f"1️⃣ Press ✅ Check button\n\n"
@@ -7863,7 +8413,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
 
     bio_ok    = False
     user_bio  = ""
-    _INTERVAL = 4
+    _INTERVAL = 3
     _attempts = 4
 
     for _attempt in range(_attempts):
@@ -7897,19 +8447,34 @@ async def _bio_task_check_inner(update, ctx, q, uid):
         pass
 
     if not bio_ok:
+        _empty_bio = not (user_bio or "").strip()
         if lang == 'bn':
-            msg = (
+            _fail_head = (
+                "❌ *Telegram এখনো পুরনো Bio দেখাচ্ছে!*\n\n"
+                "নতুন Bio ছড়িয়ে পড়তে ১-২ মিনিনিট লাগতে পারে — একটু পরে "
+                "আবার ✅ Check চাপুন, text ঠিকই আছে।\n\n"
+                if _empty_bio else
                 "❌ *Bio পাওয়া যায়নি!*\n\n"
+            )
+            msg = (
+                _fail_head +
                 "নিচের text টি হুবহু copy করে Telegram Bio তে বসান:\n\n"
-                "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 "📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
                 "✅ সেট করার পর আবার Check বাটন চাপুন।"
             )
         else:
-            msg = (
+            _fail_head = (
+                "❌ *Telegram still shows your old Bio!*\n\n"
+                "It can take 1-2 minutes for a new Bio to propagate — press "
+                "✅ Check again in a moment, the text is correct.\n\n"
+                if _empty_bio else
                 "❌ *Bio not found!*\n\n"
+            )
+            msg = (
+                _fail_head +
                 "Copy the text below and paste it in your Telegram Bio:\n\n"
-                "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 "📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
                 "✅ After setting, press Check again."
             )
@@ -7933,21 +8498,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
             mark_db_dirty()
             _bio_ref = await asyncio.to_thread(get_referred_by, uid)
             if _bio_ref:
-                _bio_comm_pct = await asyncio.to_thread(get_commission_pct)
-                _bio_comm = round(add_reward * _bio_comm_pct / 100.0, 4)
-                await asyncio.gather(
-                    asyncio.to_thread(add_bal, _bio_ref, _bio_comm),
-                    asyncio.to_thread(record_commission, _bio_ref, uid, _bio_comm, 'Bio Task'),
-                )
-                try:
-                    _bio_ru = await asyncio.to_thread(get_user, uid)
-                    _bio_rname = (_bio_ru["full_name"] or _bio_ru["username"] or "Unknown") if _bio_ru else "Unknown"
-                    _bio_cpct_d = int(_bio_comm_pct) if _bio_comm_pct == int(_bio_comm_pct) else _bio_comm_pct
-                    await ctx.bot.send_message(_bio_ref,
-                        T(_bio_ref, 'commission_msg', name=_md_esc(_bio_rname), price=round(add_reward,4),
-                          comm=_bio_comm, comm_pct=_bio_cpct_d),
-                        parse_mode="Markdown")
-                except Exception: pass
+                await _pay_commission(ctx.bot, _bio_ref, uid, round(add_reward, 4), 'Bio Task')
             def _db_6018():
                 _brow = None
                 with _c() as _cb:
@@ -9007,7 +9558,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             f"📅 *Daily Reward (রোজ):* `{dr}$ USDT`\n"
             f"📊 *Status:* {st}\n\n"
             f"📝 *Required Bio Text:*\n"
-            f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+            f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
             f"🕛 প্রতিদিন রাত ১২:০০ BD তে automatic check হয়।\n"
             f"⏳ Bio সরালে ৫ মিনিট grace — তারপর tracking reset।"
         ), act
@@ -9234,7 +9785,8 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             asyncio.to_thread(get_all_admins),
         )
         if not _is_adm2:
-            await q.message.reply_text("⛔ Access Denied"); return
+            await q.message.reply_text("⛔ Access Denied" if await asyncio.to_thread(get_lang, uid) == 'en'
+                                        else "⛔ অনুমতি নেই"); return
         is_main_adm = (uid == ADMIN_ID)
         # Main admin সবসময় তালিকার শুরুতে দেখাবে
         lines = [f"👑 *Main Admin*\n👤 `{ADMIN_ID}`\n🔑 Full Access (সব কিছু)\n📅 সর্বদা"]
@@ -10286,6 +10838,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     uid  = user.id
     txt  = update.message.text or ""
+    # স্প্যাম-গেট: একই টেক্সট দ্রুত বারবার বা খুব বেশি এলে নীরবে বাদ
+    if not await _rate_allowed(uid, "tx:" + txt.strip().casefold()):
+        return
     st   = ctx.user_data.get("state")
 
     # Cancel always works first
@@ -10345,8 +10900,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # ── Notify user ─────────────────────────────────────────
         u_lang = await asyncio.to_thread(get_lang, guser)
         if u_lang == 'bn':
-            pt_line  = f"🔴 *পয়েন্ট:* `{new_pts}/100` *(-{POINT_PER_REJECT})*"
-            blk_line = f"\n⛔ *পয়েন্ট ৫০ বা নিচে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*" if blocked else "\nℹ️ নিয়মগুলো পড়ে পুনরায় চেষ্টা করুন।"
+            pt_line  = f"🔴 *পয়েন্ট:* `{new_pts}/50` *(-{POINT_PER_REJECT})*"
+            blk_line = f"\n⛔ *পয়েন্ট ০ হয়ে গেছে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*" if blocked else "\nℹ️ নিয়মগুলো পড়ে পুনরায় চেষ্টা করুন।"
             rej_msg  = (
                 f"❌ *আপনার Submission Reject হয়েছে।*\n\n"
                 f"📌 *Task:* {_task_display}\n"
@@ -10354,8 +10909,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"{pt_line}{blk_line}"
             )
         else:
-            pt_line  = f"🔴 *Points:* `{new_pts}/100` *(-{POINT_PER_REJECT})*"
-            blk_line = f"\n⛔ *Points at 50 or below! Tasks blocked for {POINT_BLOCK_DAYS} days.*" if blocked else "\nℹ️ Please re-read the rules and try again."
+            pt_line  = f"🔴 *Points:* `{new_pts}/50` *(-{POINT_PER_REJECT})*"
+            blk_line = f"\n⛔ *Points reached 0! Tasks blocked for {POINT_BLOCK_DAYS} days.*" if blocked else "\nℹ️ Please re-read the rules and try again."
             rej_msg  = (
                 f"❌ *Your Submission has been Rejected.*\n\n"
                 f"📌 *Task:* {_task_display}\n"
@@ -10400,7 +10955,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📌 *Task:* {_md_esc(str(row['task_name'] or ''))}\n"
             f"👤 *User:* `{guser}`\n"
             f"📝 *কারণ:* {_md_esc(str(reason))}\n"
-            f"🎯 *User এর পয়েন্ট:* `{new_pts}/100`"
+            f"🎯 *User এর পয়েন্ট:* `{new_pts}/50`"
             + (f"\n⛔ *User {POINT_BLOCK_DAYS} দিন Block হয়েছে।*" if blocked else ""),
             parse_mode="Markdown"
         )
@@ -10412,6 +10967,17 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Admin states (admin only) ─────────────────────────────────────────
     # st আগে চেক করো — regular user-এর জন্য is_admin DB call বাদ যাবে (short-circuit)
     if st and (st.startswith("adm_") or st == "adm_direct_msg") and await asyncio.to_thread(is_admin, uid):
+
+        # বাটন-অপেক্ষা step — এই state গুলোতে কোনো টেক্সট-ব্রাঞ্চ নেই
+        # (কোথাও read হয় না), তাই স্টেট পরিষ্কার করে বাটনে ফেরাও।
+        # নইলে stale state থেকে মেনু-প্রম্পট চলে আসত ও পরের ইনপুট গুলিয়ে যেত।
+        if st in ("adm_task_fields", "adm_task_await_type",
+                  "adm_cate_task_await_type", "adm_promo_preview"):
+            ctx.user_data.pop("state", None)
+            await update.message.reply_text(
+                "👆 *এই ধাপে টেক্সট নয় — উপরের বাটন থেকে বেছে নিন।*\n\n/cancel — বাতিল",
+                parse_mode="Markdown")
+            return
 
         if st == "adm_direct_msg":
             target = ctx.user_data.get("direct_msg_to")
@@ -11008,22 +11574,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if _aid_already:
                     await update.message.reply_text(f"⚠️ *Sub `#{gid}` ইতিমধ্যে approve/reject হয়েছে।*", parse_mode="Markdown")
                     ctx.user_data.pop("state", None); return
+                await asyncio.to_thread(add_points, guser, POINT_PER_APPROVE)
                 ref = await asyncio.to_thread(get_referred_by, guser)
                 if ref:
-                    comm_pct = await asyncio.to_thread(get_commission_pct)
-                    comm = round(price * comm_pct / 100.0, 4)
-                    await asyncio.to_thread(add_bal, ref, comm)
-                    await asyncio.to_thread(record_commission, ref, guser, comm, row.get('task_name', ''))
-                    try:
-                        ru = await asyncio.to_thread(get_user, guser)
-                        rname = (ru["full_name"] or ru["username"] or "Unknown") if ru else "Unknown"
-                        comm_d = int(comm_pct) if comm_pct == int(comm_pct) else comm_pct
-                        await ctx.bot.send_message(ref, T(ref,'commission_msg',name=_md_esc(rname),price=price,comm=comm,comm_pct=comm_d), parse_mode="Markdown")
-                    except Exception as _e:
-                        log.debug(f"[PHOTO-APPROVE] ref={ref} commission notify ব্যর্থ: {_e}")
-                    # ── Referral Event bonus check ──────────────────────────
-                    _ref_ev_task2 = asyncio.create_task(_check_ref_event_bonus(guser, ref, ctx.bot))
-                    _background_tasks.add(_ref_ev_task2); _ref_ev_task2.add_done_callback(_bg_task_done)
+                    await _pay_commission(ctx.bot, ref, guser, price, row.get('task_name', ''))
                 try:
                     await ctx.bot.send_message(guser, T(guser,'approved_msg',task=_aid_task_display,price=price), parse_mode="Markdown")
                 except Exception as _e:
@@ -11102,16 +11656,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     _rid_msg = (
                         f"❌ *আপনার Submission Reject হয়েছে।*\n\n"
                         f"📌 *Task:* {_rid_task_display}\n\n"
-                        f"🔴 *পয়েন্ট:* `{_rid_new_pts}/100` *(-{POINT_PER_REJECT})*"
-                        + (f"\n⛔ *পয়েন্ট ৫০ বা নিচে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*" if _rid_blocked
+                        f"🔴 *পয়েন্ট:* `{_rid_new_pts}/50` *(-{POINT_PER_REJECT})*"
+                        + (f"\n⛔ *পয়েন্ট ০ হয়ে গেছে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*" if _rid_blocked
                            else "\nℹ️ নিয়মগুলো পড়ে পুনরায় চেষ্টা করুন।")
                     )
                 else:
                     _rid_msg = (
                         f"❌ *Your Submission has been Rejected.*\n\n"
                         f"📌 *Task:* {_rid_task_display}\n\n"
-                        f"🔴 *Points:* `{_rid_new_pts}/100` *(-{POINT_PER_REJECT})*"
-                        + (f"\n⛔ *Points at 30 or below! Tasks blocked for {POINT_BLOCK_DAYS} days.*" if _rid_blocked
+                        f"🔴 *Points:* `{_rid_new_pts}/50` *(-{POINT_PER_REJECT})*"
+                        + (f"\n⛔ *Points reached 0! Tasks blocked for {POINT_BLOCK_DAYS} days.*" if _rid_blocked
                            else "\nℹ️ Please re-read the rules and try again.")
                     )
                 try:
@@ -11995,6 +12549,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "❌ Format ঠিক নেই। এভাবে লিখুন: `2026-06-30`", parse_mode="Markdown"); return
             _ev_start = ctx.user_data.get("ref_event_start", "")
+            _ev_today = datetime.now(BD_TZ).strftime("%Y-%m-%d")
+            if txt.strip() < _ev_today:
+                await update.message.reply_text(
+                    f"❌ শেষের তারিখ আগের (`{txt.strip()}`) — Event তখন কাজ করবে না।\n"
+                    f"আজ বা তার পরের তারিখ দিন (`{_ev_today}`)\n\n"
+                    "আবার লিখুন:", parse_mode="Markdown"); return
             if txt.strip() < _ev_start:
                 await update.message.reply_text(
                     f"❌ শেষের তারিখ শুরুর তারিখ (`{_ev_start}`) এর আগে হতে পারবে না।\n"
@@ -12058,7 +12618,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             def _db_9442():
                 row = None
                 with _c() as c:
-                    row = c.execute("SELECT id, used_count, max_uses FROM promocodes WHERE code=%s", (code,)).fetchone()
+                    row = c.execute("SELECT id, used_count, max_uses FROM promocodes WHERE upper(code)=upper(%s)", (code,)).fetchone()
                 return row
             _existing = await asyncio.to_thread(_db_9442)
             if _existing:
@@ -12091,7 +12651,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data["promo_amount"] = amount
             ctx.user_data["state"]        = "adm_promo_max_uses"
             await update.message.reply_text(
-                f"✅ *Reward:* `{amount}$ USDT`\n\n👥 *সর্বোচ্চ কতজন এই Code ব্যবহার করতে পারবে?*\n_(যেমন: 50)_\n\n/cancel — বাতিল",
+                f"✅ *Reward:* `{_amt(amount)}$ USDT`\n\n👥 *সর্বোচ্চ কতজন এই Code ব্যবহার করতে পারবে?*\n_(যেমন: 50)_\n\n/cancel — বাতিল",
                 parse_mode="Markdown"); return
 
         if st == "adm_promo_max_uses":
@@ -12184,7 +12744,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Registration flow: user typed text instead of clicking button ─
     if st == "first_lang":
         lang_hint = (
-            "👆 *Please tap a button to choose your language.*"
+            "👆 *Please tap a button to choose your language / ভাষা বেছে নিতে বাটনে চাপ দিন*"
         )
         await update.message.reply_text(
             lang_hint, parse_mode="Markdown",
@@ -12247,7 +12807,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         def _db_9565():
             promo = None
             with _c() as c:
-                promo = c.execute("SELECT * FROM promocodes WHERE code=%s", (code,)).fetchone()
+                promo = c.execute("SELECT * FROM promocodes WHERE upper(code)=upper(%s)", (code,)).fetchone()
             return promo
         promo = await asyncio.to_thread(_db_9565)
         if not promo:
@@ -12330,13 +12890,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ok_msg = (
             f"✅ *Promo Code রিডিম সফল!*\n\n"
             f"🔑 *Code:* `{code}`\n"
-            f"💰 *Reward:* `{amount}$ USDT` যোগ হয়েছে।\n"
-            f"💼 *বর্তমান Balance:* `{_bal_now}$ USDT`"
+            f"💰 *Reward:* `{_amt(amount)}$ USDT` যোগ হয়েছে।\n"
+            f"💼 *বর্তমান Balance:* `{_amt(_bal_now)}$ USDT`"
             if lang == 'bn' else
             f"✅ *Promo Code redeemed!*\n\n"
             f"🔑 *Code:* `{code}`\n"
-            f"💰 *Reward:* `{amount}$ USDT` added.\n"
-            f"💼 *Current Balance:* `{_bal_now}$ USDT`"
+            f"💰 *Reward:* `{_amt(amount)}$ USDT` added.\n"
+            f"💼 *Current Balance:* `{_amt(_bal_now)}$ USDT`"
         )
         await update.message.reply_text(ok_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
 
@@ -12349,7 +12909,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🎟 *Promo Code ব্যবহার হয়েছে!*\n\n"
             f"🔑 *Code:* `{code}`\n"
             f"👤 *User:* {uname_txt} | {full_name} (`{uid}`)\n"
-            f"💰 *Reward:* `{amount}$ USDT`\n\n"
+            f"💰 *Reward:* `{_amt(amount)}$ USDT`\n\n"
             f"📊 *ব্যবহার:* `{new_used}/{promo['max_uses']}`\n"
             f"🔢 *বাকি আছে:* `{remaining}` জন নিতে পারবে\n"
         )
@@ -12514,6 +13074,11 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     uid = q.from_user.id
     d   = q.data
+    # স্প্যাম-গেট: একই বাটন দ্রুত বারবার চাপলে বাদ (toast দেখাও)
+    if not await _rate_allowed(uid, f"cb:{d}"):
+        try: await q.answer("⏳ একটু অপেক্ষা করুন!", show_alert=False)
+        except Exception: pass
+        return
     # spinner তাৎক্ষণিক clear করো
     try: await q.answer()
     except Exception: pass
@@ -12553,7 +13118,11 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 fail += 1
         try: await ctx.bot.send_message(notify_ch, notif_msg, parse_mode="Markdown", reply_markup=ch_kb)
         except Exception as e: log.warning(f"notif ch fail: {e}")
-        await q.message.reply_text(f"📢 *Notification sent!* ✅ `{sent}` | ❌ `{fail}`", parse_mode="Markdown")
+        _ns_lang = await asyncio.to_thread(get_lang, uid)
+        await q.message.reply_text(
+            (f"📢 *Notification sent!* ✅ `{sent}` | ❌ `{fail}`" if _ns_lang == 'en'
+             else f"📢 *নোটিফিকেশন পাঠানো হয়েছে!* ✅ `{sent}` | ❌ `{fail}`"),
+            parse_mode="Markdown")
         for k in ("pending_notif_msg","pending_notif_ch","pending_notif_ch_link","pending_notif_bot_link"):
             ctx.user_data.pop(k, None)
         return
@@ -12754,6 +13323,72 @@ async def on_callback_extra(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
 # ──────────────────── INACTIVE USER REPORT ───────────────────
+def _mark_winback_sent(uid):
+    """উইনব্যাক পাঠানো হয়েছে সেটা সেভ — WINBACK_REPEAT_DAYS পর আবার যায়, restart-এও থাকে।"""
+    with _c() as c:
+        c.execute("UPDATE users SET winback_sent_at=%s WHERE user_id=%s",
+                  (datetime.now(pytz.timezone("Asia/Dhaka")).strftime("%Y-%m-%d %H:%M"), uid))
+
+
+async def job_winback(context):
+    """উইনব্যাক জব: WINBACK_INACTIVE_DAYS দিন ধরে না আসা ইউজারদের মেসেজ,
+    সর্বোচ্চ WINBACK_REPEAT_DAYS দিনে একবার, প্রতি রানে ২০০ জন।"""
+    try:
+        _bd = pytz.timezone("Asia/Dhaka")
+        _now = datetime.now(_bd)
+        cutoff  = (_now - timedelta(days=WINBACK_INACTIVE_DAYS)).strftime("%Y-%m-%d %H:%M")
+        wcutoff = (_now - timedelta(days=WINBACK_REPEAT_DAYS)).strftime("%Y-%m-%d %H:%M")
+        def _db_wb():
+            with _c() as c:
+                return c.execute(
+                    "SELECT user_id, lang, balance FROM users "
+                    "WHERE is_banned=0 AND last_seen IS NOT NULL AND last_seen != '' "
+                    "AND last_seen < %s "
+                    "AND (winback_sent_at IS NULL OR winback_sent_at = '' OR winback_sent_at < %s) "
+                    "ORDER BY last_seen ASC LIMIT 200",
+                    (cutoff, wcutoff)
+                ).fetchall()
+        rows = await asyncio.to_thread(_db_wb)
+        if not rows:
+            return
+        sent = 0
+        for r in rows:
+            _uid = r["user_id"]
+            _bal = round(float(r["balance"] or 0), 4)
+            if str(r["lang"] or "").lower() == "en":
+                _txt = (
+                    f"👋 *Hi there!* It's been a while.\n\n"
+                    f"New tasks are waiting for you — come back and earn!\n\n"
+                    f"💰 *Balance:* `{_bal}$ USDT`\n"
+                    f"⭐ Complete tasks to grow your balance and trust points.\n\n"
+                    f"👇 Open *Task* from the menu below."
+                )
+            else:
+                _txt = (
+                    f"👋 *আসসালামু আলাইকুম!* কেমন আছেন?\n\n"
+                    f"আপনার অ্যাকাউন্টে অনেকদিন আসেননি — নতুন কাজ অপেক্ষা করছে!\n\n"
+                    f"💰 *ব্যালান্স:* `{_bal}$ USDT`\n"
+                    f"⭐ সঠিক কাজ করলে ব্যালান্স ও পয়েন্ট দুটোই বাড়বে।\n\n"
+                    f"👇 নিচের মেনু থেকে *Task* দেখে নিন।"
+                )
+            try:
+                await context.bot.send_message(
+                    _uid, _txt, parse_mode="Markdown",
+                    reply_markup=await asyncio.to_thread(main_kb, _uid)
+                )
+                sent += 1
+            except Exception:
+                pass   # blocked/error — তবু স্ট্যাম্প, বারবার চেষ্টা হবে না
+            try:
+                await asyncio.to_thread(_mark_winback_sent, _uid)
+            except Exception:
+                pass
+            await asyncio.sleep(0.15)   # Telegram flood limit এড়াতে
+        log.info(f"[WINBACK] {sent}/{len(rows)} inactive users notified")
+    except Exception as _e:
+        log.warning(f"[WINBACK] job failed: {_e}")
+
+
 async def cmd_inactive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not await asyncio.to_thread(is_admin, uid):
@@ -12806,14 +13441,26 @@ async def cmd_inactive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────── PROMO CODE SYSTEM ──────────────────────
+def _amt(v) -> str:
+    """Amount কে মানুষের পড়ার মতো string — `0.00001` দেখাবে, `1e-05` নয়।"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f == int(f):
+        return str(int(f))
+    return (f"{f:.8f}".rstrip("0").rstrip(".")) or "0"
+
+
 def _build_promo_post(code: str, amount: float, max_uses: int, req_text: str) -> str:
     return (
         f"🎁 *New Promo Code Available!*\n\n"
         f"🔑 *Code:* `{code}`\n"
-        f"💰 *Reward:* `{amount}$ USDT`\n"
+        f"💰 *Reward:* `{_amt(amount)}$ USDT`\n"
         f"👥 *Total Slots:* `{max_uses}`\n"
         f"📋 *Requirement:* {_md_esc(str(req_text))}\n\n"
-        f"🚀 Go to the bot and type `/promo {code}` to redeem."
+        f"🚀 Tap *Get Promo Code* below to claim instantly — "
+        f"or open the bot and type `/promo {code}`."
     )
 
 async def _auto_apply_promo(bot, uid: int, code: str):
@@ -12823,11 +13470,21 @@ async def _auto_apply_promo(bot, uid: int, code: str):
     def _db_10067():
         promo = None
         with _c() as c:
-            promo = c.execute("SELECT * FROM promocodes WHERE code=%s", (code,)).fetchone()
+            promo = c.execute("SELECT * FROM promocodes WHERE upper(code)=upper(%s)", (code,)).fetchone()
         return promo
     promo = await asyncio.to_thread(_db_10067)
     if not promo:
-        return  # code doesn't exist — silently ignore
+        # নীরবে বাদ দিলে ইউজার বুঝতেই পারে না যে claim হয়নি — সবসময় feedback দাও
+        log.warning(f"[PROMO] deep-link code not found: {code!r} uid={uid}")
+        try:
+            await bot.send_message(
+                uid,
+                "❌ *Promo Code পাওয়া যায়নি — মেয়াদোত্তীর্ণ বা ভুল হতে পারে।*\n\n"
+                "❌ *Promo code not found — it may have expired or be incorrect.*",
+                parse_mode="Markdown")
+        except Exception:
+            pass
+        return
     if promo["used_count"] >= promo["max_uses"]:
         msg = ("❌ *এই Promo Code টি সম্পূর্ণ ব্যবহার হয়ে গেছে।*" if lang == 'bn'
                else "❌ *This promo code is fully used.*")
@@ -12913,13 +13570,13 @@ async def _auto_apply_promo(bot, uid: int, code: str):
     ok_msg = (
         f"🎉 *Promo Code সফলভাবে রিডিম হয়েছে!*\n\n"
         f"🔑 *Code:* `{code}`\n"
-        f"💰 *Reward:* `{amount}$ USDT` যোগ হয়েছে।\n"
-        f"💼 *বর্তমান Balance:* `{_bal_now}$ USDT`"
+        f"💰 *Reward:* `{_amt(amount)}$ USDT` যোগ হয়েছে।\n"
+        f"💼 *বর্তমান Balance:* `{_amt(_bal_now)}$ USDT`"
         if lang == 'bn' else
         f"🎉 *Promo Code redeemed successfully!*\n\n"
         f"🔑 *Code:* `{code}`\n"
-        f"💰 *Reward:* `{amount}$ USDT` added.\n"
-        f"💼 *Current Balance:* `{_bal_now}$ USDT`"
+        f"💰 *Reward:* `{_amt(amount)}$ USDT` added.\n"
+        f"💼 *Current Balance:* `{_amt(_bal_now)}$ USDT`"
     )
     await bot.send_message(uid, ok_msg, parse_mode="Markdown")
 
@@ -12931,7 +13588,7 @@ async def _auto_apply_promo(bot, uid: int, code: str):
         f"🎟 *Promo Code ব্যবহার হয়েছে!*\n\n"
         f"🔑 *Code:* `{code}`\n"
         f"👤 *User:* {_ap_uname_txt}\n"
-        f"💰 *Reward:* `{amount}$ USDT`\n\n"
+        f"💰 *Reward:* `{_amt(amount)}$ USDT`\n\n"
         f"📊 *ব্যবহার:* `{new_used}/{promo['max_uses']}`\n"
         f"🔢 *বাকি আছে:* `{_ap_remaining}` জন নিতে পারবে\n"
     )
@@ -12961,7 +13618,7 @@ def _build_promo_post_used(code: str, amount: float, max_uses: int, req_text: st
     return (
         f"🎁 *Promo Code*\n\n"
         f"🔑 *Code:* `{code}`\n"
-        f"💰 *Reward:* `{amount}$ USDT`\n"
+        f"💰 *Reward:* `{_amt(amount)}$ USDT`\n"
         f"👥 *Total Slots:* `{max_uses}` ✅ _(সব শেষ)_\n"
         f"📋 *Requirement:* {_md_esc(str(req_text))}\n\n"
         f"❌ *This promo code is fully used.*"
@@ -12998,7 +13655,7 @@ async def cmd_promo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     def _db_10183():
         promo = None
         with _c() as c:
-            promo = c.execute("SELECT * FROM promocodes WHERE code=%s", (code,)).fetchone()
+            promo = c.execute("SELECT * FROM promocodes WHERE upper(code)=upper(%s)", (code,)).fetchone()
         return promo
     promo = await asyncio.to_thread(_db_10183)
     if not promo:
@@ -13098,16 +13755,16 @@ async def cmd_promo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ok_msg = (
             f"✅ *Promo Code রিডিম সফল!*\n\n"
             f"🔑 *Code:* `{code}`\n"
-            f"💰 *Reward:* `{amount}$ USDT` যোগ হয়েছে।\n"
-            f"💼 *বর্তমান Balance:* `{_bal_now}$ USDT`"
+            f"💰 *Reward:* `{_amt(amount)}$ USDT` যোগ হয়েছে।\n"
+            f"💼 *বর্তমান Balance:* `{_amt(_bal_now)}$ USDT`"
         )
     else:
         _bal_now = await asyncio.to_thread(get_bal, uid)
         ok_msg = (
             f"✅ *Promo Code redeemed successfully!*\n\n"
             f"🔑 *Code:* `{code}`\n"
-            f"💰 *Reward:* `{amount}$ USDT` added.\n"
-            f"💼 *Current Balance:* `{_bal_now}$ USDT`"
+            f"💰 *Reward:* `{_amt(amount)}$ USDT` added.\n"
+            f"💼 *Current Balance:* `{_amt(_bal_now)}$ USDT`"
         )
     await update.message.reply_text(ok_msg, parse_mode="Markdown")
 
@@ -13120,7 +13777,7 @@ async def cmd_promo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🎟 *Promo Code ব্যবহার হয়েছে!*\n\n"
         f"🔑 *Code:* `{code}`\n"
         f"👤 *User:* {uname_txt} | {full_name} (`{uid}`)\n"
-        f"💰 *Reward:* `{amount}$ USDT`\n\n"
+        f"💰 *Reward:* `{_amt(amount)}$ USDT`\n\n"
         f"📊 *ব্যবহার:* `{new_used}/{promo['max_uses']}`\n"
         f"🔢 *বাকি আছে:* `{remaining}` জন নিতে পারবে\n"
     )
@@ -13155,6 +13812,11 @@ async def _handle_promo_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     q   = update.callback_query
     uid = q.from_user.id
     d   = q.data
+    # স্প্যাম-গেট: একই বাটন দ্রুত বারবার চাপলে বাদ (toast দেখাও)
+    if not await _rate_allowed(uid, f"cb:{d}"):
+        try: await q.answer("⏳ একটু অপেক্ষা করুন!", show_alert=False)
+        except Exception: pass
+        return
     # spinner তাৎক্ষণিক clear করো
     try: await q.answer()
     except Exception: pass
@@ -13191,7 +13853,7 @@ async def _handle_promo_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
                     "VALUES (%s,%s,%s,%s,%s,%s,%s)",
                     (code, amount, max_uses, req_text, min_tasks, uid, now())
                 )
-                promo_id = _fval(c.execute("SELECT id FROM promocodes WHERE code=%s", (code,)).fetchone())
+                promo_id = _fval(c.execute("SELECT id FROM promocodes WHERE upper(code)=upper(%s)", (code,)).fetchone())
             return promo_id
         promo_id = await asyncio.to_thread(_db_10349)
         # News channel এ post করো
@@ -13199,7 +13861,7 @@ async def _handle_promo_callbacks(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         try:
             _promo_url = f"https://t.me/{await _get_bot_username(ctx.bot)}?start=promo_{code}"
             _promo_kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎁 প্রমো কোড নিন", url=_promo_url)]
+                [InlineKeyboardButton("🎁 Get Promo Code", url=_promo_url)]
             ])
             nc_msg = await ctx.bot.send_message(LEADERBOARD_CH_ID, post_txt, parse_mode="Markdown", reply_markup=_promo_kb)
             def _db_10365():
@@ -13978,18 +14640,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                 # Referrer commission — daily
                 _jref = await asyncio.to_thread(get_referred_by, uid)
                 if _jref:
-                    _jcpct = await asyncio.to_thread(get_commission_pct)
-                    _jcomm = round(amt * _jcpct / 100.0, 4)
-                    await asyncio.to_thread(add_bal, _jref, _jcomm)
-                    await asyncio.to_thread(record_commission, _jref, uid, _jcomm, 'Bio Task Daily')
-                    try:
-                        _jru = await asyncio.to_thread(get_user, uid)
-                        _jrname = (_jru["full_name"] or _jru["username"] or "Unknown") if _jru else "Unknown"
-                        _jcpd = int(_jcpct) if _jcpct == int(_jcpct) else _jcpct
-                        await bot.send_message(_jref,
-                            T(_jref, 'commission_msg', name=_md_esc(_jrname), price=amt, comm=_jcomm, comm_pct=_jcpd),
-                            parse_mode="Markdown")
-                    except Exception: pass
+                    await _pay_commission(bot, _jref, uid, amt, 'Bio Task Daily')
             else:
                 # 🆕 bio সঠিক কিন্তু active tracking নেই → tracking শুরু, add_reward চেক
                 await asyncio.to_thread(set_bio_tracking, uid)
@@ -14001,18 +14652,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                     new_tracked_list.append({'uid': uid, 'name': u.get('full_name', ''), 'amt': amt})
                     _jaref = await asyncio.to_thread(get_referred_by, uid)
                     if _jaref:
-                        _jacpct = await asyncio.to_thread(get_commission_pct)
-                        _jacomm = round(amt * _jacpct / 100.0, 4)
-                        await asyncio.to_thread(add_bal, _jaref, _jacomm)
-                        await asyncio.to_thread(record_commission, _jaref, uid, _jacomm, 'Bio Task')
-                        try:
-                            _jaru = await asyncio.to_thread(get_user, uid)
-                            _jarname = (_jaru["full_name"] or _jaru["username"] or "Unknown") if _jaru else "Unknown"
-                            _jacpd = int(_jacpct) if _jacpct == int(_jacpct) else _jacpct
-                            await bot.send_message(_jaref,
-                                T(_jaref, 'commission_msg', name=_md_esc(_jarname), price=amt, comm=_jacomm, comm_pct=_jacpd),
-                                parse_mode="Markdown")
-                        except Exception: pass
+                        await _pay_commission(bot, _jaref, uid, amt, 'Bio Task')
         else:
             if actively_track:
                 grace_list.append({'uid': uid, 'name': u.get('full_name', ''), 'u': u})
@@ -14041,7 +14681,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ *৫ মিনিটের মধ্যে* Bio আবার সেট করুন —\n"
                 f"নাহলে আজকের `{daily_reward}$ USDT` payment পাবেন না।\n\n"
                 f"📝 Bio তে হুবহু এই text রাখুন:\n"
-                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_(Settings → Edit Profile → Bio)_"
                 if lang == 'bn' else
                 "⚠️ *Bio Task Warning!*\n\n"
@@ -14049,7 +14689,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ Set your Bio again within *5 minutes* —\n"
                 f"otherwise you won't receive today's `{daily_reward}$ USDT` payment.\n\n"
                 f"📝 Set your Bio to exactly:\n"
-                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_(Settings → Edit Profile → Bio)_"
             )
             await bot.send_message(uid, warn_msg, parse_mode="Markdown")
@@ -14079,18 +14719,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
             paid_list.append({'uid': uid, 'name': g['name'], 'amt': amt})
             _gref = await asyncio.to_thread(get_referred_by, uid)
             if _gref:
-                _gcpct = await asyncio.to_thread(get_commission_pct)
-                _gcomm = round(amt * _gcpct / 100.0, 4)
-                await asyncio.to_thread(add_bal, _gref, _gcomm)
-                await asyncio.to_thread(record_commission, _gref, uid, _gcomm, 'Bio Task Daily')
-                try:
-                    _gru = await asyncio.to_thread(get_user, uid)
-                    _grname = (_gru["full_name"] or _gru["username"] or "Unknown") if _gru else "Unknown"
-                    _gcpd = int(_gcpct) if _gcpct == int(_gcpct) else _gcpct
-                    await bot.send_message(_gref,
-                        T(_gref, 'commission_msg', name=_md_esc(_grname), price=amt, comm=_gcomm, comm_pct=_gcpd),
-                        parse_mode="Markdown")
-                except Exception: pass
+                await _pay_commission(bot, _gref, uid, amt, 'Bio Task Daily')
             try:
                 ok_msg = (
                     f"✅ *Bio আবার সেট করেছেন — Payment হয়েছে!*\n\n"
@@ -14111,13 +14740,13 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                     "❌ *আজকের Bio Task Payment বাতিল হয়েছে।*\n\n"
                     "৫ মিনিটের মধ্যে Bio সেট না করায় আজকের payment হয়নি।\n\n"
                     "📝 আবার শুরু করতে Bio সেট করুন:\n"
-                    "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                    "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                     "কাল রাত ১২:০০ তে আবার চেক হবে।"
                     if lang == 'bn' else
                     "❌ *Today's Bio Task Payment cancelled.*\n\n"
                     "Bio was not restored within 5 minutes.\n\n"
                     "📝 To restart, set your Bio to:\n"
-                    "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot 👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                    "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                     "Next check tomorrow at 12:00 AM."
                 )
                 await bot.send_message(uid, no_msg, parse_mode="Markdown")
@@ -14431,6 +15060,10 @@ async def job_post_leaderboard(context: ContextTypes.DEFAULT_TYPE):
 
 
 
+_report_bak_state = {"last": 0.0}     # text report upload throttle (১০ মিনিট)
+_REPORT_MIN_GAP   = 600               # সেকেন্ড
+
+
 async def _run_dirty_backup_now(bot):
     """
     আসল dirty-backup logic — bot object সরাসরি নেয়।
@@ -14444,8 +15077,22 @@ async def _run_dirty_backup_now(bot):
     # ── ১. DB file পাঠাও (admin + BACKUP_CHANNELS সবাইকে) ────────────────────
     await _send_db_to_admin(bot, label="💾 Auto Backup (ডাটা পরিবর্তন হয়েছে)")
 
+    # ── ১.২ JSON backup — আসল data সুরক্ষা (নিজের ২ মিনিট throttle আছে) ──
+    # এটা report throttle এর আগে যায়, তাই text report বাদ পড়লেও backup চলতেই থাকে
+    try:
+        await _send_json_backup(bot, label="💾 Auto JSON Backup (ডাটা বদলেছে)")
+    except Exception as _je:
+        log.warning(f"[DIRTY-JSON] ব্যর্থ: {_je}")
+
     # ── ২. User data report তৈরি করে BACKUP_CHANNELS এ পাঠাও ─────────────────
-    # _build_full_users_report() sync DB heavy → thread এ চালাও
+    # এই text report শুধু মানুষের পড়ার জন্য — ১০ মিনিটে একবার যথেষ্ট।
+    # প্রতিবার ডাটা বদলালেই পুরো DB ঘুরে report বানালে ও upload করলে
+    # বট ধীর হয়ে যেত — এটাই আগের slow reply-এর কারণ ছিল।
+    # আসল data-সুরক্ষা JSON backup (2 মিনিট throttle) আগের মতোই চলবে।
+    if (_time.monotonic() - _report_bak_state["last"]) < _REPORT_MIN_GAP:
+        log.info("[DIRTY-REPORT] report throttle active — text report skip, JSON backup যাচ্ছে")
+        return
+    _report_bak_state["last"] = _time.monotonic()
     try:
         import io as _io
         report = await asyncio.to_thread(_build_full_users_report)
@@ -14479,9 +15126,7 @@ async def _run_dirty_backup_now(bot):
                     # NOTE: pin করা হচ্ছে না — DB file pinned থাকতে হবে যাতে restore কাজ করে
             except Exception as e:
                 log.warning(f"[DIRTY-REPORT] {target} এ পাঠাতে ব্যর্থ: {e}")
-        # ── ডাটা বদলালেই সাথে সাথে JSON backup (২ মিনিট throttle) ──
-        await _send_json_backup(bot, label="💾 Auto JSON Backup (ডাটা বদলেছে)")
-        log.info("✅ Dirty-flag: user report + DB backup পাঠানো হয়েছে।")
+        log.info("✅ Dirty-flag: user report পাঠানো হয়েছে।")
     except Exception as e:
         log.warning(f"[DIRTY-REPORT] ব্যর্থ: {e}")
 
@@ -14499,23 +15144,20 @@ def auto_cleanup_old_records():
     """
     পুরনো processed record পরিষ্কার — CockroachDB storage ব্যবস্থাপনা।
 
-    ✅ কখনো delete হয় না (টাকা / রেফারেল / পেমেন্ট হিস্ট্রি):
+    ✅ কখনো delete হয় না (টাকা / রেফারেল / পেমেন্ট হিস্ট্রি — বয়স যাই হোক):
        - users (balance, referred_by, points)
-       - commissions, promo_uses, bio_task_completions
+       - withdrawals (pending/approved/rejected সব — পেমেন্ট প্রুফ স্থায়ী)
+       - gmails (pending/approved/rejected সব — আয়ের রেকর্ড স্থায়ী)
+       - commissions, referrals, promo_uses, bio_task_completions
        - admins, settings, tasks, tg_tasks, categories
        - promocodes, required_channels
        - bio_task_tracking (active tracking)
-       - pending gmails / pending withdrawals (record সংখ্যা অনুযায়ী কোনো trim নেই)
 
-    🗑  Delete হয় (শুধু বয়স অনুযায়ী, পুরনো বেকার ডাটা):
-       - gmails approved/rejected > 30 দিন পুরনো
-       - gmails pending > 30 দিন পুরনো
-       - withdrawals approved/rejected > 30 দিন পুরনো
+    🗑  Delete হয় (শুধু বয়স অনুযায়ী, পুরনো বেকার ডাটা — টাকা/রেফার নয়):
        - pending_notifications > 3 দিন পুরনো
        - tg_task_pre_members > 7 দিন পুরনো
     """
     _now = datetime.now(BD_TZ)
-    cutoff_30d = (_now - timedelta(days=30)).strftime("%Y-%m-%d")
     cutoff_7   = (_now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
     cutoff_3   = (_now - timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
 
@@ -14523,27 +15165,11 @@ def auto_cleanup_old_records():
     counts = {}
     try:
         with _c() as c:
-            # ── gmails: approved/rejected > 30 দিন পুরনো ─
-            r = c.execute(
-                "DELETE FROM gmails WHERE status IN ('approved','rejected') "
-                "AND submitted_at < %s",
-                (cutoff_30d,)
-            )
-            counts['gmails_old'] = r.rowcount or 0
-            total_deleted += counts['gmails_old']
-
-            # per-user count trim বন্ধ — শুধু বয়স অনুযায়ী delete হয়
-
-            # ── withdrawals: approved/rejected > 30 দিন পুরনো ─
-            r2 = c.execute(
-                "DELETE FROM withdrawals WHERE status IN ('approved','rejected') "
-                "AND requested_at < %s",
-                (cutoff_30d,)
-            )
-            counts['withdrawals_old'] = r2.rowcount or 0
-            total_deleted += counts['withdrawals_old']
-
-            # per-user count trim বন্ধ — শুধু বয়স অনুযায়ী delete হয়
+            # ── gmails + withdrawals: কখনো delete নয় ───────────────
+            # টাকা ও আয়ের রেকর্ড — ইউজারের শর্ত: টাকা/রেফার/আয় কখনো
+            # ডিলিট হবে না, বয়স যাই হোক। (আগে ৩০ দিন পর মুছে যেত)
+            counts['gmails_old'] = 0
+            counts['withdrawals_old'] = 0
 
             # ── pending_notifications > 3 দিন ──────────────────────
             r3 = c.execute(
@@ -14553,13 +15179,9 @@ def auto_cleanup_old_records():
             counts['notifications'] = r3.rowcount or 0
             total_deleted += counts['notifications']
 
-            # ── gmails pending > 30 দিন (ভুলে যাওয়া) ─────────────
-            r4 = c.execute(
-                "DELETE FROM gmails WHERE status='pending' AND submitted_at < %s",
-                (cutoff_30d,)
-            )
-            counts['gmails_pending'] = r4.rowcount or 0
-            total_deleted += counts['gmails_pending']
+            # ── gmails pending: কখনো delete নয় — ইউজারের জমাকৃত কাজ,
+            #    অ্যাডমিন approve/reject না করলেও রেকর্ড অপরিবর্তিত থাকবে ──
+            counts['gmails_pending'] = 0
 
             # ── commissions: কখনো delete হয় না (referral history স্থায়ী) ──
             counts['commissions'] = 0
@@ -14870,6 +15492,18 @@ def send_usdt_bep20(to_address: str, net_usd: float):
     except Exception as e:
         return None, str(e), gas_usd_paid, None
 
+def _bump_pay_counter() -> int:
+    """চ্যানেল পোস্টের পেমেন্ট নম্বর (১ থেকে শুরু) — atomic, race-free।
+    শুধু আসল ইউজারের পেমেন্টে বাড়ে; admin test withdrawal গোনা হয় না।"""
+    with _c() as c:
+        c.execute("INSERT INTO settings (key,value) VALUES ('pay_counter','0') ON CONFLICT DO NOTHING")
+        row = c.execute(
+            "UPDATE settings SET value=(CAST(value AS INT8)+1)::text "
+            "WHERE key='pay_counter' RETURNING value"
+        ).fetchone()
+    return int(row['value']) if row else 0
+
+
 async def job_auto_withdraw(context):
     """প্রতি ২ মিনিটে চলে — pending withdrawals গুলো BEP-20 এ auto-process করে।"""
     _gas_cur = None
@@ -14916,17 +15550,30 @@ async def job_auto_withdraw(context):
                 try:
                     bscscan_url = f"https://bscscan.com/tx/{stx}"
                     _now_pay2 = datetime.now(BD_TZ).strftime("%Y-%m-%d %I:%M %p")
+                    _s2_lang = await asyncio.to_thread(get_lang, suid)
+                    if _s2_lang == 'en':
+                        _s2_msg = (
+                            f"✅ <b>Withdrawal Successful!</b>\n\n"
+                            f"<blockquote>💰 <b>Amount:</b> ${samt:.4f} USDT</blockquote>\n"
+                            f"<blockquote>🕐 <b>Date:</b> {_now_pay2}</blockquote>\n"
+                            f"<blockquote>🔗 <b>TxHash:</b> <code>{html.escape(str(stx), quote=False)}</code></blockquote>\n\n"
+                            f"💎 <i>Auto payment • Task Earn Bot</i>"
+                        )
+                    else:
+                        _s2_msg = (
+                            f"✅ <b>উইথড্র সফল হয়েছে!</b>\n\n"
+                            f"<blockquote>💰 <b>পরিমাণ:</b> ${samt:.4f} USDT</blockquote>\n"
+                            f"<blockquote>🕐 <b>তারিখ:</b> {_now_pay2}</blockquote>\n"
+                            f"<blockquote>🔗 <b>TxHash:</b> <code>{html.escape(str(stx), quote=False)}</code></blockquote>\n\n"
+                            f"💎 <i>অটো পেমেন্ট • Task Earn Bot</i>"
+                        )
                     await context.bot.send_message(
-                        suid,
-                        f"✅ <b>Withdrawal Successful!</b>\n\n"
-                        f"<blockquote>💰 <b>Amount:</b> ${samt:.4f} USDT</blockquote>\n"
-                        f"<blockquote>🕐 <b>Date:</b> {_now_pay2}</blockquote>\n"
-                        f"<blockquote>🔗 <b>TxHash:</b> <code>{html.escape(str(stx), quote=False)}</code></blockquote>\n\n"
-                        f"💎 <i>Auto payment • Task Earn Bot</i>",
+                        suid, _s2_msg,
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                         reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("🔍 View on BSCScan", url=bscscan_url)
+                            InlineKeyboardButton("🔍 View on BSCScan" if _s2_lang == 'en'
+                                                 else "🔍 BSCScan এ দেখুন", url=bscscan_url)
                         ]])
                     )
                 except Exception as _e:
@@ -15161,21 +15808,42 @@ async def job_auto_withdraw(context):
                 else:
                     gas_paid_str = "হিসাব করা যায়নি"
                 _now_pay = datetime.now(BD_TZ).strftime("%Y-%m-%d %I:%M %p")
-                success_msg = (
-                    f"✅ <b>Withdrawal Successful!</b>\n\n"
-                    f"<blockquote>💰 <b>Amount:</b> ${net_amt:.4f} USDT</blockquote>\n"
-                    f"<blockquote>👛 <b>Wallet:</b> <code>{html.escape(address, quote=False)}</code></blockquote>\n"
-                    f"<blockquote>🕐 <b>Date:</b> {_now_pay}</blockquote>\n"
-                    f"<blockquote>⛽ <b>Gas Fee:</b> {html.escape(gas_paid_str, quote=False)}</blockquote>\n"
-                    f"<blockquote>🔗 <b>TxHash:</b> <code>{html.escape(tx_hash, quote=False)}</code></blockquote>\n\n"
-                    f"💎 <i>Auto payment • Task Earn Bot</i>"
-                )
+
+                # ── চ্যানেল পোস্টের পেমেন্ট নম্বর — admin test count হবে না ──
+                _seq = 0
+                if not await asyncio.to_thread(is_admin, uid):
+                    try:
+                        _seq = await asyncio.to_thread(_bump_pay_counter)
+                    except Exception as _e_seq:
+                        log.warning(f"[AUTO-WD] #{wid}: payment counter ব্যর্থ: {_e_seq}")
+                _num_lbl = f"#{_seq} " if _seq else ""
+
+                _wd_lang = await asyncio.to_thread(get_lang, uid)
+                if _wd_lang == 'en':
+                    success_msg = (
+                        f"✅ <b>Withdrawal Successful!</b>\n\n"
+                        f"<blockquote>💰 <b>Amount:</b> ${net_amt:.4f} USDT</blockquote>\n"
+                        f"<blockquote>👛 <b>Wallet:</b> <code>{html.escape(address, quote=False)}</code></blockquote>\n"
+                        f"<blockquote>🕐 <b>Date:</b> {_now_pay}</blockquote>\n"
+                        f"<blockquote>🔗 <b>TxHash:</b> <code>{html.escape(tx_hash, quote=False)}</code></blockquote>\n\n"
+                        f"💎 <i>Auto payment • Task Earn Bot</i>"
+                    )
+                else:
+                    success_msg = (
+                        f"✅ <b>উইথড্র সফল হয়েছে!</b>\n\n"
+                        f"<blockquote>💰 <b>পরিমাণ:</b> ${net_amt:.4f} USDT</blockquote>\n"
+                        f"<blockquote>👛 <b>ওয়ালেট:</b> <code>{html.escape(address, quote=False)}</code></blockquote>\n"
+                        f"<blockquote>🕐 <b>তারিখ:</b> {_now_pay}</blockquote>\n"
+                        f"<blockquote>🔗 <b>TxHash:</b> <code>{html.escape(tx_hash, quote=False)}</code></blockquote>\n\n"
+                        f"💎 <i>অটো পেমেন্ট • Task Earn Bot</i>"
+                    )
                 try:
                     await context.bot.send_message(
                         uid, success_msg, parse_mode="HTML",
                         disable_web_page_preview=True,
                         reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("🔍 View on BSCScan", url=bscscan_url)
+                            InlineKeyboardButton("🔍 View on BSCScan" if _wd_lang == 'en'
+                                                 else "🔍 BSCScan এ দেখুন", url=bscscan_url)
                         ]])
                     )
                 except Exception as _e:
@@ -15184,13 +15852,18 @@ async def job_auto_withdraw(context):
                     try:
                         await context.bot.send_message(
                             uid,
-                            f"✅ Withdrawal Successful!\n\n"
-                            f"💰 Amount: ${net_amt:.4f} USDT\n"
-                            f"👛 Wallet: {address}\n"
-                            f"🕐 Date: {_now_pay}\n"
-                            f"⛽ Gas Fee: {gas_paid_str}\n"
-                            f"🔗 TxHash: {tx_hash}\n\n"
-                            f"BSCScan: {bscscan_url}"
+                            (f"✅ Withdrawal Successful!\n\n"
+                             f"💰 Amount: ${net_amt:.4f} USDT\n"
+                             f"👛 Wallet: {address}\n"
+                             f"🕐 Date: {_now_pay}\n"
+                             f"🔗 TxHash: {tx_hash}\n\n"
+                             f"BSCScan: {bscscan_url}") if _wd_lang == 'en' else
+                            (f"✅ উইথড্র সফল হয়েছে!\n\n"
+                             f"💰 পরিমাণ: ${net_amt:.4f} USDT\n"
+                             f"👛 ওয়ালেট: {address}\n"
+                             f"🕐 তারিখ: {_now_pay}\n"
+                             f"🔗 TxHash: {tx_hash}\n\n"
+                             f"BSCScan: {bscscan_url}")
                         )
                     except Exception as _e2:
                         log.warning(f"[AUTO-WD] #{wid}: user success plain fallback ব্যর্থ: {_e2}")
@@ -15205,7 +15878,7 @@ async def job_auto_withdraw(context):
                     _pay_date  = datetime.now(BD_TZ).strftime("%Y-%m-%d %I:%M %p")
                     _addr_url  = f"https://bscscan.com/address/{address}"
                     ch_msg = (
-                        f"✅ <b>#{wid} Payment Completed</b>\n\n"
+                        f"✅ <b>{_num_lbl}Payment Completed</b>\n\n"
                         f"<blockquote>👤 <b>User Name:</b> {_esc(_uname_clean or 'Unknown')}</blockquote>\n"
                         f"<blockquote>💰 <b>Amount:</b> ${net_amt:.4f} USDT</blockquote>\n"
                         f"<blockquote>👛 <b>Withdraw:</b> 💎 BEP20 (USDT)</blockquote>\n"
@@ -15230,7 +15903,7 @@ async def job_auto_withdraw(context):
                     try:
                         await context.bot.send_message(
                             await asyncio.to_thread(get_withdraw_ch_id),
-                            f"✅ #{wid} Payment Completed\n\n"
+                            f"✅ {_num_lbl}Payment Completed\n\n"
                             f"👤 User Name: {_uname_clean or 'Unknown'}\n"
                             f"💰 Amount: ${net_amt:.4f} USDT\n"
                             f"👛 Withdraw: BEP20 (USDT)\n"
@@ -15353,14 +16026,21 @@ async def job_auto_withdraw(context):
                 except Exception as _e:
                     log.warning(f"[AUTO-WD] #{wid}: user fail notify ব্যর্থ: {_e}")
                 try:
+                    _af_lang = await asyncio.to_thread(get_lang, ADMIN_ID)
                     await context.bot.send_message(
                         ADMIN_ID,
-                        f"❌ *Auto-WD Failed — WD #{wid}*\n\n"
-                        f"👤 *User:* `{uid}`\n"
-                        f"💰 *Amount:* `${amt:.4f} USDT`\n"
-                        f"📍 *Address:* `{address}`\n"
-                        f"⛽ *Gas est.:* `{gas_usd_str}`\n\n"
-                        f"🔴 *Error:* `{_md_esc(str(err))}`",
+                        ((f"❌ *Auto-WD Failed — WD #{wid}*\n\n"
+                          f"👤 *User:* `{uid}`\n"
+                          f"💰 *Amount:* `${amt:.4f} USDT`\n"
+                          f"📍 *Address:* `{address}`\n"
+                          f"⛽ *Gas est.:* `{gas_usd_str}`\n\n"
+                          f"🔴 *Error:* `{_md_esc(str(err))}`") if _af_lang == 'en' else
+                         (f"❌ *অটো-উইথড্র ব্যর্থ — WD #{wid}*\n\n"
+                          f"👤 *ইউজার:* `{uid}`\n"
+                          f"💰 *পরিমাণ:* `${amt:.4f} USDT`\n"
+                          f"📍 *ঠিকানা:* `{address}`\n"
+                          f"⛽ *গ্যাস আনুমানিক:* `{gas_usd_str}`\n\n"
+                          f"🔴 *এরর:* `{_md_esc(str(err))}`")),
                         parse_mode="Markdown"
                     )
                 except Exception as _e:
@@ -15550,6 +16230,11 @@ def main():
                 time=dt_time(hour=0, minute=0, tzinfo=BD_TZ),
                 name="daily_leaderboard"
             )
+            application.job_queue.run_daily(
+                job_winback,
+                time=dt_time(hour=14, minute=0, tzinfo=BD_TZ),   # দিনে ১বার — বিকেল ২টা BD
+                name="daily_winback"
+            )
             application.job_queue.run_repeating(
                 job_lb_adm_update,
                 interval=600,    # CockroachDB — original 600s interval
@@ -15621,6 +16306,7 @@ def main():
                 asyncio.create_task(_run_periodically(job_bio_realtime_monitor, 60, first_sec=30)),
                 asyncio.create_task(_run_daily_at(job_bio_task_check,   0, 5, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_post_leaderboard, 0, 0, BD_TZ)),
+                asyncio.create_task(_run_daily_at(job_winback,        14, 0, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_auto_cleanup,     3, 0, BD_TZ)),
             ]
             if BSC_PRIVATE_KEY:
@@ -15636,7 +16322,10 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
-        .concurrent_updates(True)
+        # True = PTB-র default ৪টা worker — একটা লম্বা handler (bio check ~৯-১২s,
+        # broadcast, admin panel) চললে queue বেড়ে সবার reply দেরি হতো ("বট slow")।
+        # ১৬ worker রাখলে একসাথে অনেকেই সাথে সাথে reply পাবে।
+        .concurrent_updates(16)
         .connect_timeout(10)                # sendMessage / API call connect
         .read_timeout(15)                   # sendMessage / API call read
         .write_timeout(10)                  # sendMessage write
@@ -15668,26 +16357,26 @@ def main():
             log.warning(f"[BOT-BLOCK] handler ব্যর্থ: {_e}")
     app.add_handler(_CmH(_on_bot_blocked))
 
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("admin",       cmd_admin))
-    app.add_handler(CommandHandler("cancel",      cmd_cancel))
-    app.add_handler(CommandHandler("history",     cmd_history))
-    app.add_handler(CommandHandler("backup",          cmd_backup))
-    app.add_handler(CommandHandler("restore",         cmd_restore))
-    app.add_handler(CommandHandler("test",            cmd_testleaderboard))
-    app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
-    app.add_handler(CommandHandler("point",       cmd_point))
-    app.add_handler(CommandHandler("inactive",   cmd_inactive))
-    app.add_handler(CommandHandler("promocode",  cmd_promocode))
-    app.add_handler(CommandHandler("promo",      cmd_promo))
+    app.add_handler(CommandHandler("start",       _gate(cmd_start)))
+    app.add_handler(CommandHandler("admin",       _gate(cmd_admin)))
+    app.add_handler(CommandHandler("cancel",      _gate(cmd_cancel)))
+    app.add_handler(CommandHandler("history",     _gate(cmd_history)))
+    app.add_handler(CommandHandler("backup",          _gate(cmd_backup)))
+    app.add_handler(CommandHandler("restore",         _gate(cmd_restore)))
+    app.add_handler(CommandHandler("test",            _gate(cmd_testleaderboard)))
+    app.add_handler(CommandHandler("leaderboard", _gate(cmd_leaderboard)))
+    app.add_handler(CommandHandler("point",       _gate(cmd_point)))
+    app.add_handler(CommandHandler("inactive",   _gate(cmd_inactive)))
+    app.add_handler(CommandHandler("promocode",  _gate(cmd_promocode)))
+    app.add_handler(CommandHandler("promo",      _gate(cmd_promo)))
     # Register extra callback handler BEFORE main callback handler
     app.add_handler(CallbackQueryHandler(on_callback_extra,       pattern=r"^(adm_task_done_\d+|adm_notif_send|adm_notif_edit|adm_notif_skip|adm_tp_.+)$"))
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
     app.add_handler(CallbackQueryHandler(on_callback))
     # ~filters.VIA_BOT → inline-bot দিয়ে পাঠানো message ignore করো
-    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & ~filters.VIA_BOT, on_photo))
-    app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND & ~filters.VIA_BOT, on_video))
-    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND & ~filters.VIA_BOT, on_document))
+    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_photo, "ph")))
+    app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_video, "vid")))
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_document, "doc")))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT, on_message))
     app.add_error_handler(_smart_error_handler)
     log.info("✅ Task Earn Bot started!")
