@@ -2912,13 +2912,23 @@ def categ_task_slots_left(tid):
     return max(0, t["max_completions"] - t["completed_count"])
 
 def categ_task_mark_done(task_id, user_id):
-    """Returns True if this call actually marked done (first time), False if already done."""
+    """Returns True if this call actually marked done (first time), False if already done
+    অথবা সব স্লট পূর্ণ (slot claim atomic — completed_count কখনো max ছাড়বে না)।"""
     with _c() as c:
         # ON CONFLICT DO NOTHING — psycopg2 exception তোলে না, শুধু rowcount=0 হয়
         ins = c.execute("INSERT INTO category_task_completions (task_id,user_id,done_at) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING", (task_id, user_id, now()))
         if ins.rowcount == 0:
             return False  # ইতিমধ্যে done — completed_count double-count হবে না
-        c.execute("UPDATE category_tasks SET completed_count=completed_count+1 WHERE id=%s", (task_id,))
+        # Slot claim — একসাথে অনেকে submit করলেও max_completions ছাড়বে না
+        _claim = c.execute(
+            "UPDATE category_tasks SET completed_count=completed_count+1 "
+            "WHERE id=%s AND (max_completions=0 OR completed_count<max_completions)",
+            (task_id,)
+        )
+        if _claim.rowcount == 0:
+            # স্লট শেষ — এই completion আনডো করে caller কে False দাও
+            c.execute("DELETE FROM category_task_completions WHERE task_id=%s AND user_id=%s", (task_id, user_id))
+            return False
         t = c.execute("SELECT max_completions,completed_count FROM category_tasks WHERE id=%s", (task_id,)).fetchone()
         if t and t["max_completions"] > 0 and t["completed_count"] >= t["max_completions"]:
             c.execute("UPDATE category_tasks SET is_active=0 WHERE id=%s", (task_id,))
@@ -3795,7 +3805,13 @@ def _regular_task_mark_done(task_code: str, task_name: str):
         if not row:
             return None, False
         tid = row["id"]
-        c.execute("UPDATE tasks SET completed_count=completed_count+1 WHERE id=%s", (tid,))
+        # Slot claim — pending submission একসাথে approve হলেও max ছাড়বে না;
+        # approve তো আগেই হয় (তাই ইউজার payment পাবেন), শুধু গণনা বাড়বে না।
+        c.execute(
+            "UPDATE tasks SET completed_count=completed_count+1 "
+            "WHERE id=%s AND (max_completions=0 OR completed_count<max_completions)",
+            (tid,)
+        )
         t = c.execute("SELECT max_completions,completed_count,name,task_code,price FROM tasks WHERE id=%s", (tid,)).fetchone()
         if t and t["max_completions"] > 0 and t["completed_count"] >= t["max_completions"]:
             c.execute("UPDATE tasks SET is_active=0 WHERE id=%s", (tid,))
@@ -4473,13 +4489,20 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
     else:
         _cat_mark_ok = await asyncio.to_thread(categ_task_mark_done, task_id, uid)
     if not _cat_mark_ok:
-        # ইতিমধ্যে অন্য request এ done mark হয়ে গেছে — duplicate submission block
+        # ইতিমধ্যে done অথবা সব স্লট পূর্ণ — কারণ অনুযায়ী মেসেজ দাও
         lang = await asyncio.to_thread(get_lang, uid)
-        _dup_msg = (
-            "✅ *Task already submitted!*\n\nYour proof was already received. Please wait for admin review."
-            if lang == 'en' else
-            "✅ *Task ইতিমধ্যে Submit হয়েছে!*\n\nআপনার proof পাওয়া হয়েছে। Admin review এর জন্য অপেক্ষা করুন।"
-        )
+        if await asyncio.to_thread(categ_task_slots_left, task_id) == 0:
+            _dup_msg = (
+                "❌ *All slots for this task are filled!*"
+                if lang == 'en' else
+                "❌ *এই Task এর সব জায়গা পূর্ণ হয়ে গেছে!*"
+            )
+        else:
+            _dup_msg = (
+                "✅ *Task already submitted!*\n\nYour proof was already received. Please wait for admin review."
+                if lang == 'en' else
+                "✅ *Task ইতিমধ্যে Submit হয়েছে!*\n\nআপনার proof পাওয়া হয়েছে। Admin review এর জন্য অপেক্ষা করুন।"
+            )
         ctx.user_data.clear()
         if update.message:
             await update.message.reply_text(_dup_msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
@@ -5139,6 +5162,13 @@ async def start_task_collect(update, ctx, task_id):
                if lang == 'bn' else
                f"✅ You have already completed this task {_stc_done}/{_lim_lbl} time(s). No more submissions allowed.")
         await q.message.reply_text(msg, parse_mode="Markdown"); return
+    # ── Point block check — reject এ ০ হলে ২ দিন (category/TG path এর সাথে সমান) ──
+    _blk_st, _blk_st_dt = await asyncio.to_thread(is_task_blocked, uid)
+    if _blk_st and _blk_st_dt:
+        _blk_st_until = _blk_st_dt.astimezone(pytz.timezone("Asia/Dhaka")).strftime("%d %b %Y, %I:%M %p")
+        await q.message.reply_text(T(uid, 'task_blocked_msg', until=_blk_st_until)[:4000], parse_mode="Markdown")
+        return
+
     fields = await asyncio.to_thread(get_task_fields, task_id)
 
     ctx.user_data["state"]         = "task_collect"
@@ -5235,6 +5265,15 @@ async def handle_task_collect_text(update: Update, ctx: ContextTypes.DEFAULT_TYP
         return
 
     field = fields[idx]
+
+    # Photo field এ টেক্সট নেওয়া হয় না — category path এর সাথে সমান
+    # (না হলে ইউজার ছবির জায়গায় যেকোনো লেখা পাঠিয়ে proof ছাড়াই submit করতে পারত)
+    if field["field_type"] == "photo":
+        lang = await asyncio.to_thread(get_lang, uid)
+        await update.message.reply_text(
+            "📷 Please send a photo now, not text." if lang == 'en' else "📷 এখন ছবি পাঠান, টেক্সট নয়।",
+            parse_mode="Markdown")
+        return
 
     ctx.user_data["collected"].append({
         "type": "text", "prompt_bn": field["prompt_bn"],
@@ -7077,6 +7116,9 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     st  = ctx.user_data.get("state")
 
+    if not await _bot_accessible(uid):
+        await bot_off_reply(update, uid); return
+
     # ── Admin: Demo Video (as video message) — Category Task ─────
     if st == "adm_ctask_set_video_file" and await asyncio.to_thread(is_admin, uid):
         tid = ctx.user_data.pop("edit_ctask_id", None)
@@ -7129,6 +7171,8 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── User: Task proof — video পাঠালে (ছবির জায়গায় video) ─────
     if st in ("task_collect", "categ_task_collect"):
+        # on_photo/on_message এর মতো guard — banned বা চ্যানেল join না করলে নয়
+        if not await guard(update, ctx): return
         fields = ctx.user_data.get("task_fields", [])
         idx    = ctx.user_data.get("field_idx", 0)
         lang   = await asyncio.to_thread(get_lang, uid)
@@ -14933,7 +14977,9 @@ async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
         last_warned = (row.get('last_warned_at') or '')
         lang        = await asyncio.to_thread(get_lang, uid)
         _required      = _BIO_LEGACY_TEXT
-        _required_safe = _md_esc(_required)
+        # code-span (``` ` ```-er ভেতরে) শুধু ` আর backslash escape লাগে;
+        # _md_esc দিলে `\_` ব্যাকস্ল্যাশসহ ছাপা হয় ও কপি করলে bio মিলে না।
+        _required_safe = _required.replace('\\', '\\\\').replace('`', '\\`')
 
         def _bio_matches(bio_text: str) -> bool:
             return bio_text_matches(bio_text, bot_username)
