@@ -1805,6 +1805,14 @@ def set_setting(key, val):
         c.execute("INSERT INTO settings (key,value) VALUES (%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (key, val))
     _settings_cache.pop(key, None)   # stale cache সরিয়ে দাও
 
+def leaderboard_auto_on():
+    """রাত ১২:০০ এর daily leaderboard channel post চালু না বন্ধ — admin setting।
+    ডিফল্ট: চালু। DB fail হলে চালু ধরা হবে (safe default)।"""
+    try:
+        return (get_setting('leaderboard_auto_on') or 'on') != 'off'
+    except Exception:
+        return True
+
 def bot_is_on():
     """bot_status — get_setting cache ব্যবহার করে (60s TTL, set_setting এ invalidate হয়)।
     Admin bot off করলে সাথে সাথে cache invalidate হয় — কোনো delay নেই।"""
@@ -2451,7 +2459,7 @@ def _norm_bio(s: str) -> str:
     if not s:
         return ""
     t = s.lower()
-    for _ch in ("\u200b", "\u200c", "\u200d", "\ufeff", "\ufe0e", "\ufe0f", "\u00ad"):
+    for _ch in ("\u200b", "\u200c", "\u200d", "\ufeff", "\ufe0e", "\ufe0f", "\u00ad", "\\"):
         t = t.replace(_ch, "")
     return re.sub(r"\s+", "", t)
 
@@ -6971,7 +6979,7 @@ async def cmd_testleaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ *এই command শুধু Admin ব্যবহার করতে পারবে।*", parse_mode="Markdown")
         return
     await update.message.reply_text("⏳ *Leaderboard পাঠানো হচ্ছে...*", parse_mode="Markdown")
-    await job_post_leaderboard(ctx)
+    await job_post_leaderboard(ctx, force=True)
     await update.message.reply_text("✅ *Leaderboard পাঠানো হয়েছে।*", parse_mode="Markdown")
 
 
@@ -8318,7 +8326,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 f"📅 *Daily Reward (প্রতিদিন, ২৪ঘন্টা):* `{daily_reward}$ USDT`\n\n"
                 f"{track_status}\n\n"
                 f"📝 *আপনার Bio তে হুবহু এই text রাখুন:*\n\n"
-                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_⚙️ Settings → Edit Profile → Bio_\n\n"
                 f"▶️ *Bio সেট করার পর:*\n"
                 f"1️⃣ ✅ Check করুন বাটন চাপুন\n\n"
@@ -8340,7 +8348,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 f"📅 *Daily Reward (every day, 24h):* `{daily_reward}$ USDT`\n\n"
                 f"{track_status}\n\n"
                 f"📝 *Set your Telegram Bio to exactly:*\n\n"
-                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_⚙️ Settings → Edit Profile → Bio_\n\n"
                 f"▶️ *After setting bio:*\n"
                 f"1️⃣ Press ✅ Check button\n\n"
@@ -8459,7 +8467,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
             msg = (
                 _fail_head +
                 "নিচের text টি হুবহু copy করে Telegram Bio তে বসান:\n\n"
-                "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                "`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 "📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
                 "✅ সেট করার পর আবার Check বাটন চাপুন।"
             )
@@ -8474,7 +8482,7 @@ async def _bio_task_check_inner(update, ctx, q, uid):
             msg = (
                 _fail_head +
                 "Copy the text below and paste it in your Telegram Bio:\n\n"
-                "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                "`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 "📌 *Telegram → Settings → Edit Profile → Bio*\n\n"
                 "✅ After setting, press Check again."
             )
@@ -8669,6 +8677,20 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             f"{icon} *Task Notification {'চালু' if new_n=='on' else 'বন্ধ'} করা হয়েছে।*",
             parse_mode="Markdown"); return
 
+    if d == "adm_toggle_leaderboard":
+        if not await asyncio.to_thread(admin_has_perm, uid, PERM_SETTINGS):
+            await q.message.reply_text("❌ *এই কাজের পারমিশন নেই।*", parse_mode="Markdown"); return
+        new_lb = "off" if await asyncio.to_thread(leaderboard_auto_on) else "on"
+        await asyncio.to_thread(set_setting, "leaderboard_auto_on", new_lb)
+        if new_lb == "on":
+            msg = ("🏆 *Daily Leaderboard চালু করা হয়েছে।*\n\n"
+                   "প্রতিদিন রাত ১২:০০ (BD) তে Channel এ স্বয়ংক্রিয়ভাবে যাবে।")
+        else:
+            msg = ("🏆 *Daily Leaderboard বন্ধ করা হয়েছে।*\n\n"
+                   "এখন থেকে রাত ১২:০০ তে অটো post যাবে না।\n"
+                   "_(Admin Panel → এখনই পাঠান চাপলে ম্যানুয়ালি যাবে।)_")
+        await q.message.reply_text(msg, parse_mode="Markdown"); return
+
     # ── Menu Buttons Edit ─────────────────────────────────────────
     if d == "adm_menu_btns":
         def _db_6122():
@@ -8748,6 +8770,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         g_ch      = g_ch      or str(GMAIL_CH_ID)
         w_ch      = w_ch      or str(WITHDRAW_CH_ID)
         notify_ch = notify_ch or '-1003866731221'
+        _lb_auto  = await asyncio.to_thread(leaderboard_auto_on)
         has_wbn   = "✅ Custom" if _wmbn else "⬜ Default"
         has_wen   = "✅ Custom" if _wmen else "⬜ Default"
         bsc_short = bsc_w[:6] + "..." + bsc_w[-4:] if bsc_w else "N/A"
@@ -8766,6 +8789,9 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             [InlineKeyboardButton("📝 Welcome Message (বাংলা)",           callback_data="adm_set_welcome_bn")],
             [InlineKeyboardButton("📝 Welcome Message (English)",         callback_data="adm_set_welcome_en")],
             [InlineKeyboardButton("🔑 BSC Wallet Address পরিবর্তন",       callback_data="adm_set_bsc_wallet")],
+            [InlineKeyboardButton(
+                f"🏆 Daily Leaderboard (রাত ১২:০০): {'✅ ON' if _lb_auto else '❌ OFF'}",
+                callback_data="adm_toggle_leaderboard")],
         ])
         await q.message.reply_text(
             f"⚙️ *BOT SETTINGS*\n\n"
@@ -8780,7 +8806,8 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             f"⏱ *Bot Notify Delay:* `{_notify_delay_min} মিনিট`\n"
             f"📝 *Welcome BN:* {has_wbn}\n"
             f"📝 *Welcome EN:* {has_wen}\n"
-            f"🔑 *BSC Wallet:* `{bsc_short}`\n\n"
+            f"🔑 *BSC Wallet:* `{bsc_short}`\n"
+            f"🏆 *Daily Leaderboard:* {'✅ ON' if _lb_auto else '❌ OFF'}\n\n"
             f"👇 পরিবর্তন করতে নিচের বাটন চাপুন:",
             parse_mode="Markdown", reply_markup=kb
         ); return
@@ -8970,9 +8997,9 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         return
 
     if d == "adm_lb_post_ch":
-        # Admin panel থেকে এখনই channel এ leaderboard পাঠাও
+        # Admin panel থেকে এখনই channel এ leaderboard পাঠাও (auto-off হলেও)
         await q.message.reply_text("⏳ Channel এ পাঠানো হচ্ছে...")
-        await job_post_leaderboard(ctx)
+        await job_post_leaderboard(ctx, force=True)
         await q.message.reply_text("✅ Leaderboard channel এ পাঠানো হয়েছে।")
         return
 
@@ -9558,7 +9585,7 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             f"📅 *Daily Reward (রোজ):* `{dr}$ USDT`\n"
             f"📊 *Status:* {st}\n\n"
             f"📝 *Required Bio Text:*\n"
-            f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+            f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
             f"🕛 প্রতিদিন রাত ১২:০০ BD তে automatic check হয়।\n"
             f"⏳ Bio সরালে ৫ মিনিট grace — তারপর tracking reset।"
         ), act
@@ -14681,7 +14708,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ *৫ মিনিটের মধ্যে* Bio আবার সেট করুন —\n"
                 f"নাহলে আজকের `{daily_reward}$ USDT` payment পাবেন না।\n\n"
                 f"📝 Bio তে হুবহু এই text রাখুন:\n"
-                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_(Settings → Edit Profile → Bio)_"
                 if lang == 'bn' else
                 "⚠️ *Bio Task Warning!*\n\n"
@@ -14689,7 +14716,7 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ Set your Bio again within *5 minutes* —\n"
                 f"otherwise you won't receive today's `{daily_reward}$ USDT` payment.\n\n"
                 f"📝 Set your Bio to exactly:\n"
-                f"`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                f"`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                 f"_(Settings → Edit Profile → Bio)_"
             )
             await bot.send_message(uid, warn_msg, parse_mode="Markdown")
@@ -14740,13 +14767,13 @@ async def job_bio_task_check(context: ContextTypes.DEFAULT_TYPE):
                     "❌ *আজকের Bio Task Payment বাতিল হয়েছে।*\n\n"
                     "৫ মিনিটের মধ্যে Bio সেট না করায় আজকের payment হয়নি।\n\n"
                     "📝 আবার শুরু করতে Bio সেট করুন:\n"
-                    "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                    "`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                     "কাল রাত ১২:০০ তে আবার চেক হবে।"
                     if lang == 'bn' else
                     "❌ *Today's Bio Task Payment cancelled.*\n\n"
                     "Bio was not restored within 5 minutes.\n\n"
                     "📝 To restart, set your Bio to:\n"
-                    "`FREE TASK EARN BOT👇 @Task\\_Earn\\_Bux\\_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
+                    "`FREE TASK EARN BOT👇 @Task_Earn_Bux_bot👈AUTO WITHDRAW 0.02$.Join all`\n\n"
                     "Next check tomorrow at 12:00 AM."
                 )
                 await bot.send_message(uid, no_msg, parse_mode="Markdown")
@@ -15018,8 +15045,12 @@ async def _job_bio_realtime_monitor_inner(context: ContextTypes.DEFAULT_TYPE):
     await asyncio.gather(*[_process_user(row) for row in tracked_users])
 
 
-async def job_post_leaderboard(context: ContextTypes.DEFAULT_TYPE):
-    """প্রতিদিন রাত ১২:০০ (BD) — শুধু Channel এ পাঠায় (bot DM নয়)"""
+async def job_post_leaderboard(context: ContextTypes.DEFAULT_TYPE, force: bool = False):
+    """প্রতিদিন রাত ১২:০০ (BD) — শুধু Channel এ পাঠায় (bot DM নয়)
+    force=True হলে admin setting বাদ দিয়ে পাঠাবে (manual /test বা panel)।"""
+    if not force and not await asyncio.to_thread(leaderboard_auto_on):
+        log.info("[Leaderboard] auto post বন্ধ আছে (admin setting) — এই রাতে skip")
+        return
     bot_username = await _get_bot_username(context.bot)
     bot_link     = f"https://t.me/{bot_username}"
 
