@@ -211,7 +211,7 @@ def _mark_verified(uid: int, ip: str, payload: dict):
             (uid, now_s, now_s, ip, country, dev_hash),
         )
         cur.execute(
-            "UPDATE users SET verified=1, verified_at=%s, reg_ip=%s, last_ip=%s, "
+            "UPDATE users SET verified=1, vrf_pass=1, verified_at=%s, reg_ip=%s, last_ip=%s, "
             "reg_country=COALESCE(NULLIF(%s,''), reg_country), "
             "country=CASE WHEN COALESCE(country,'') IN ('','BD') AND %s <> '' THEN %s "
             "ELSE country END, device_hash=COALESCE(device_hash, %s), "
@@ -245,6 +245,15 @@ def _mark_verified(uid: int, ip: str, payload: dict):
             except Exception:
                 pass
     return geo
+
+
+def _mark_pass(uid: int):
+    """বটের নতুন ফ্লোতে 'পার' মার্ক — পুরোনো verified ইউজারও বট চালু করতে পারবে।"""
+    try:
+        with _db() as cur:
+            cur.execute("UPDATE users SET vrf_pass=1 WHERE user_id=%s", (uid,))
+    except Exception:
+        pass
 
 
 def _already_verified(uid: int) -> bool:
@@ -421,6 +430,7 @@ def verify_done(token):
     if not isinstance(payload, dict):
         payload = {}
     if _already_verified(uid):
+        _mark_pass(uid)
         return jsonify({"ok": True, "already": True})
     try:
         _mark_verified(uid, ip, payload)

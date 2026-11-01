@@ -897,6 +897,15 @@ def _vrf_panel_base():
 def init_security_db():
     """Verification/security টেবিল + users এর নতুন কলাম তৈরি (idempotent)।"""
     _t0 = _time.time()
+    # ── v2: vrf_pass কলাম — v1 ফ্ল্যাগ থাকলেও এই মাইগ্রেশন চলবে ──
+    try:
+        if (get_setting("security_schema_v2") or "") != "1":
+            with _c() as _c2:
+                _c2.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS vrf_pass INTEGER DEFAULT 0")
+            set_setting("security_schema_v2", "1")
+            log.info("[SECURITY-DB] v2 কলাম vrf_pass প্রস্তুত")
+    except Exception as _v2e:
+        log.warning(f"[SECURITY-DB] v2 কলাম ব্যর্থ: {_v2e}")
     try:
         if (get_setting("security_schema_v1") or "") == "1":
             _SEC_STATE["schema"] = "done"
@@ -1016,6 +1025,7 @@ def init_security_db():
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS risk_score INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason TEXT DEFAULT ''",
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS approved INTEGER DEFAULT 1",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS vrf_pass INTEGER DEFAULT 0",
             ):
                 try:
                     c.execute(_alt)
@@ -1116,6 +1126,39 @@ def vrf_is_verified(uid):
         return True
 
 
+def vrf_pass_on(uid):
+    """নতুন verification ফ্লো পার হয়েছে কি না (vrf_pass=1)।
+    DB error হলে True — কেউ ভুল করে আটকে না যায়।"""
+    try:
+        with _c() as c:
+            r = c.execute("SELECT vrf_pass FROM users WHERE user_id=%s", (uid,)).fetchone()
+        if not r:
+            return False
+        return int(_fval(r, 0) or 0) == 1
+    except Exception:
+        return True
+
+
+def vrf_mark_pass(uid):
+    try:
+        with _c() as c:
+            c.execute("UPDATE users SET vrf_pass=1 WHERE user_id=%s", (uid,))
+    except Exception as _e:
+        log.debug(f"[VRF] pass mark ব্যর্থ uid={uid}: {_e}")
+
+
+def vrf_silent(uid):
+    """True = বট এই ইউজারকে কোনো উত্তর দেবে না।
+    verify + /start এর আগে বট পুরোপুরি চুপ (শুধু /start আর verify বাটন কাজ করে)।"""
+    try:
+        if not verify_enabled():
+            return False
+    except Exception:
+        return False
+    # ADMIN-ও ব্যতিক্রম নয় — তাকেও /start + verify করতে হবে
+    return not vrf_pass_on(uid)
+
+
 def vrf_token(uid, ttl_hours=None):
     if _vtoken is None:
         return ""
@@ -1149,14 +1192,10 @@ def vrf_note_attempt(uid, kind="verify_check"):
 
 async def _vrf_gate_msg(bot, uid):
     """True = এগোতে পারবে। False = verify prompt পাঠানো হয়েছে।"""
-    try:
-        if await asyncio.to_thread(is_admin, uid):
-            return True
-    except Exception:
-        pass
+    # ADMIN-সহ সবাই verify প্রম্পট পাবে (আগের verified হলেও)
     if not verify_enabled():
         return True
-    if await asyncio.to_thread(vrf_is_verified, uid):
+    if await asyncio.to_thread(vrf_pass_on, uid):
         return True
     lang = await asyncio.to_thread(get_lang, uid)
     await _vrf_send_prompt(bot, uid, lang)
@@ -1198,6 +1237,7 @@ async def _vrf_handle_check(update, ctx, q, uid):
         await q.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
+    await asyncio.to_thread(vrf_mark_pass, uid)
     await ctx.bot.send_message(
         uid,
         "✅ *Verification successful!*\n\nএখন আপনি Task করতে পারবেন।" if lang == "bn"
@@ -7812,8 +7852,13 @@ def _gate(fn, kind="cmd"):
             if kind == "cmd":
                 parts = ((update.effective_message.text if update.effective_message else "") or "").split()
                 sub = parts[0].split("@")[0].lower() if parts else "?"
+                # /start ছাড়া আর কোনো কমান্ডে উত্তর নেই (verify না হওয়া পর্যন্ত)
+                if sub != "/start" and await asyncio.to_thread(vrf_silent, u.id):
+                    return None
             else:
                 sub = ""
+                if await asyncio.to_thread(vrf_silent, u.id):
+                    return None
             if not await _rate_allowed(u.id, f"{kind}:{sub}"):
                 return None
         return await fn(update, ctx)
@@ -7826,6 +7871,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # স্প্যাম-গেট: একই বাটন দ্রুত বারবার / খুব বেশি চাপলে বাদ (toast দেখাও)
     if not await _rate_allowed(uid, f"cb:{d}"):
         try: await q.answer("⏳ একটু অপেক্ষা করুন!", show_alert=False)
+        except Exception: pass
+        return
+    # ── verify না হওয়া পর্যন্ত শুধু /start, ভাষা ও verify বাটন কাজ করে ──
+    if d not in ("vrf_check", "lang_bn", "lang_en") and await asyncio.to_thread(vrf_silent, uid):
+        try: await q.answer()
         except Exception: pass
         return
     try:
@@ -11265,6 +11315,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _rate_allowed(uid, "tx:" + txt.strip().casefold()):
         return
     st   = ctx.user_data.get("state")
+
+    # ── নতুন রুল: verify + /start এর আগে বট কিছুই বলে না ──
+    if await asyncio.to_thread(vrf_silent, uid):
+        return
 
     # Cancel always works first
     cancel_btns = {"❌ বাতিল করুন", "❌ Cancel"}
