@@ -904,8 +904,9 @@ def init_security_db():
                 _c2.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS vrf_pass INTEGER DEFAULT 0")
             set_setting("security_schema_v2", "1")
             log.info("[SECURITY-DB] v2 কলাম vrf_pass প্রস্তুত")
+        _SEC_STATE["v2"] = "done"
     except Exception as _v2e:
-        log.warning(f"[SECURITY-DB] v2 কলাম ব্যর্থ: {_v2e}")
+        log.warning(f"[SECURITY-DB] v2 কলাম ব্যর্থ (verification বন্ধ থাকবে): {_v2e}")
     try:
         if (get_setting("security_schema_v1") or "") == "1":
             _SEC_STATE["schema"] = "done"
@@ -1044,7 +1045,7 @@ def init_security_db():
     log.info(f"[SECURITY-DB] schema প্রস্তুত ({_time.time() - _t0:.1f}s)")
 
 
-_SEC_STATE = {"schema": "pending", "grandfather": "pending"}
+_SEC_STATE = {"schema": "pending", "v2": "pending", "grandfather": "pending"}
 
 
 def _security_heavy_init():
@@ -1098,20 +1099,24 @@ def _security_boot():
         _security_heavy_init()
     except Exception as _e:
         log.error(f"[SECURITY-DB] heavy init ব্যর্থ: {_e}")
+    log.info(
+        "[VRF] enabled=%s state=%s base=%s token=%s",
+        verify_enabled(), dict(_SEC_STATE), _vrf_panel_base() or "-",
+        "ok" if _vtoken else "MISSING vtoken.py",
+    )
 
 
 def verify_enabled():
-    """Verification চালু কি না — লিংক বানানো সম্ভব না হলে নীরবে বন্ধ।"""
-    if _SEC_STATE.get("schema") != "done":
+    """Verification চালু কি না — শুধু vrf_pass কলাম + লিংক + সেটিং দেখে।
+    (schema/grandfather আটকে গেলেও verification চলবে — নতুন ফ্লো তাদের উপর নির্ভর করে না।)"""
+    if _SEC_STATE.get("v2") != "done":
         return False
-    if _SEC_STATE.get("grandfather") != "done":
+    if (_vrf_panel_base() == "") or (_vtoken is None):
         return False
     try:
-        if (_vrf_panel_base() == "") or (_vtoken is None):
-            return False
         return (get_setting("verify_enabled") or "on") != "off"
     except Exception:
-        return False
+        return True
 
 
 def vrf_is_verified(uid):
@@ -7602,6 +7607,37 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
         return
 
+async def cmd_vrfdiag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """শুধু ADMIN — verification কেন চালু/বন্ধ তা দেখায় (নীরবতার ব্যতিক্রম)।"""
+    u = update.effective_user
+    if not u or u.id != ADMIN_ID:
+        return
+    try:
+        with _c() as c:
+            r = c.execute("SELECT vrf_pass FROM users WHERE user_id=%s", (u.id,)).fetchone()
+        sel = "ok"
+        val = int(_fval(r, 0) or 0) if r else -1
+    except Exception as _e:
+        sel = f"ERR {_e}"
+        val = "?"
+    try:
+        setting = get_setting("verify_enabled") or "on"
+    except Exception as _e:
+        setting = f"ERR {_e}"
+    txt = (
+        "🔧 *VRF DIAG*\n\n"
+        f"• verify_enabled: `{verify_enabled()}`\n"
+        f"• setting: `{setting}`\n"
+        f"• state: `{dict(_SEC_STATE)}`\n"
+        f"• panel base: `{_vrf_panel_base() or '-'}`\n"
+        f"• vtoken module: `{'ok' if _vtoken else 'MISSING'}`\n"
+        f"• vrf_pass select: `{sel}`\n"
+        f"• my vrf_pass: `{val}`\n"
+        f"• my verified: `{await asyncio.to_thread(vrf_is_verified, u.id)}`"
+    )
+    await update.message.reply_text(txt, parse_mode="Markdown")
+
+
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user:
         return
@@ -7853,7 +7889,8 @@ def _gate(fn, kind="cmd"):
                 parts = ((update.effective_message.text if update.effective_message else "") or "").split()
                 sub = parts[0].split("@")[0].lower() if parts else "?"
                 # /start ছাড়া আর কোনো কমান্ডে উত্তর নেই (verify না হওয়া পর্যন্ত)
-                if sub != "/start" and await asyncio.to_thread(vrf_silent, u.id):
+                if sub != "/start" and not (sub == "/vrfdiag" and u.id == ADMIN_ID) \
+                        and await asyncio.to_thread(vrf_silent, u.id):
                     return None
             else:
                 sub = ""
@@ -16968,6 +17005,7 @@ def main():
     app.add_handler(_CmH(_on_bot_blocked))
 
     app.add_handler(CommandHandler("start",       _gate(cmd_start)))
+    app.add_handler(CommandHandler("vrfdiag",     _gate(cmd_vrfdiag)))
     app.add_handler(CommandHandler("admin",       _gate(cmd_admin)))
     app.add_handler(CommandHandler("cancel",      _gate(cmd_cancel)))
     app.add_handler(CommandHandler("history",     _gate(cmd_history)))
