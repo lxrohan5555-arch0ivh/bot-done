@@ -860,6 +860,312 @@ def _count(row):
         return int(list(row.values())[0])
     except Exception:
         return 0
+# ═══════════════════ SECURITY / VERIFICATION (Phase 1) ═══════════════════
+# নতুন টেবিল/কলাম সবই additive — পুরোনো user/balance/task/withdrawal ডেটা অক্ষত।
+try:
+    import vtoken as _vtoken
+except Exception:      # file না থাকলে verification নীরবে বন্ধ থাকবে
+    _vtoken = None
+
+VERIFY_TEXT_BN = (
+    "🔒 *Verification দরকার*\n\n"
+    "📌 Tasks ব্যবহার করতে আগে অ্যাকাউন্ট verify করতে হবে।\n\n"
+    "👇 নিচের *Verify* বাটনে চাপ দিন।\n"
+    "⏳ লিংকে ঢুকে ৫ সেকেন্ড অপেক্ষা করুন।\n"
+    "✅ ফিরে এসে *I Verified* চাপুন।"
+)
+VERIFY_TEXT_EN = (
+    "🔒 *Verification required*\n\n"
+    "📌 Please verify your account to access tasks.\n\n"
+    "👇 Tap the *Verify* button below.\n"
+    "⏳ Wait 5 seconds on the page.\n"
+    "✅ Then come back and press *I Verified*."
+)
+
+
+def _vrf_panel_base():
+    base = (os.environ.get("PANEL_BASE_URL") or "").strip()
+    if not base:
+        host = (os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "").strip()
+        if host:
+            base = "https://" + host
+    if not base:
+        base = (os.environ.get("PUBLIC_BASE_URL") or "").strip()
+    return base.rstrip("/")
+
+
+def init_security_db():
+    """Verification/security টেবিল + users এর নতুন কলাম তৈরি (idempotent)।"""
+    try:
+        with _c() as c:
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS verifications (
+                    user_id     BIGINT PRIMARY KEY,
+                    status      TEXT DEFAULT 'pending',
+                    method      TEXT DEFAULT 'web',
+                    attempts    INTEGER DEFAULT 0,
+                    created_at  TEXT DEFAULT '',
+                    verified_at TEXT DEFAULT '',
+                    ip          TEXT DEFAULT '',
+                    country     TEXT DEFAULT '',
+                    device_hash TEXT DEFAULT ''
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS devices (
+                    id          BIGSERIAL PRIMARY KEY,
+                    user_id     BIGINT,
+                    device_hash TEXT,
+                    ua          TEXT DEFAULT '',
+                    platform    TEXT DEFAULT '',
+                    first_seen  TEXT DEFAULT '',
+                    last_seen   TEXT DEFAULT '',
+                    ip          TEXT DEFAULT ''
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_ips (
+                    user_id      BIGINT,
+                    ip           TEXT,
+                    country_code TEXT DEFAULT '',
+                    country      TEXT DEFAULT '',
+                    city         TEXT DEFAULT '',
+                    isp          TEXT DEFAULT '',
+                    first_seen   TEXT DEFAULT '',
+                    last_seen    TEXT DEFAULT '',
+                    hits         INTEGER DEFAULT 1,
+                    PRIMARY KEY (user_id, ip)
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ip_history (
+                    id           BIGSERIAL PRIMARY KEY,
+                    user_id      BIGINT,
+                    ip           TEXT,
+                    country_code TEXT DEFAULT '',
+                    seen_at      TEXT DEFAULT ''
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ip_geo_cache (
+                    ip           TEXT PRIMARY KEY,
+                    country_code TEXT DEFAULT '',
+                    country      TEXT DEFAULT '',
+                    city         TEXT DEFAULT '',
+                    isp          TEXT DEFAULT '',
+                    created_at   TEXT DEFAULT ''
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS security_alerts (
+                    id          BIGSERIAL PRIMARY KEY,
+                    kind        TEXT DEFAULT '',
+                    user_id     BIGINT DEFAULT 0,
+                    related_uid BIGINT DEFAULT 0,
+                    ip          TEXT DEFAULT '',
+                    country     TEXT DEFAULT '',
+                    device_hash TEXT DEFAULT '',
+                    detail      TEXT DEFAULT '',
+                    status      TEXT DEFAULT 'new',
+                    created_at  TEXT DEFAULT '',
+                    handled_by  BIGINT DEFAULT 0,
+                    handled_at  TEXT DEFAULT ''
+                )
+                """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS admin_actions (
+                    id         BIGSERIAL PRIMARY KEY,
+                    admin_id   BIGINT DEFAULT 0,
+                    action     TEXT DEFAULT '',
+                    target_uid BIGINT DEFAULT 0,
+                    detail     TEXT DEFAULT '',
+                    ip         TEXT DEFAULT '',
+                    created_at TEXT DEFAULT ''
+                )
+                """
+            )
+            for _idx in (
+                "CREATE INDEX IF NOT EXISTS idx_users_country ON users(country)",
+                "CREATE INDEX IF NOT EXISTS idx_users_verified ON users(verified)",
+                "CREATE INDEX IF NOT EXISTS idx_gmails_user_status ON gmails(user_id, status)",
+                "CREATE INDEX IF NOT EXISTS idx_wd_user_status ON withdrawals(user_id, status)",
+                "CREATE INDEX IF NOT EXISTS idx_devices_hash ON devices(device_hash)",
+                "CREATE INDEX IF NOT EXISTS idx_user_ips_ip ON user_ips(ip)",
+                "CREATE INDEX IF NOT EXISTS idx_ip_hist_user ON ip_history(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_alerts_created ON security_alerts(created_at)",
+            ):
+                try:
+                    c.execute(_idx)
+                except Exception as _ie:
+                    log.warning(f"[SECURITY-DB] index skip: {_ie}")
+            for _alt in (
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS verified INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_at TEXT DEFAULT ''",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS reg_ip TEXT DEFAULT ''",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_ip TEXT DEFAULT ''",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS reg_country TEXT DEFAULT ''",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS device_hash TEXT DEFAULT ''",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspicious INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS risk_score INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason TEXT DEFAULT ''",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS approved INTEGER DEFAULT 1",
+            ):
+                try:
+                    c.execute(_alt)
+                except Exception as _ae:
+                    log.warning(f"[SECURITY-DB] alter skip: {_ae}")
+    except Exception as _e:
+        log.error(f"[SECURITY-DB] init ব্যর্থ: {_e}")
+        return
+    # ── একবারই: পুরোনো ইউজারদের grandfather (হঠাৎ আয় বন্ধ হবে না) ──
+    try:
+        if (get_setting("security_grandfather_done") or "") != "1":
+            with _c() as c:
+                c.execute(
+                    "UPDATE users SET verified=1, "
+                    "verified_at=COALESCE(NULLIF(verified_at,''), joined_at) "
+                    "WHERE COALESCE(verified,0)=0"
+                )
+            set_setting("security_grandfather_done", "1")
+            log.info("[SECURITY-DB] existing users grandfather → verified=1")
+    except Exception as _ge:
+        log.warning(f"[SECURITY-DB] grandfather ব্যর্থ: {_ge}")
+
+
+def verify_enabled():
+    """Verification চালু কি না — লিংক বানানো সম্ভব না হলে নীরবে বন্ধ।"""
+    try:
+        if (_vrf_panel_base() == "") or (_vtoken is None):
+            return False
+        return (get_setting("verify_enabled") or "on") != "off"
+    except Exception:
+        return False
+
+
+def vrf_is_verified(uid):
+    """DB থেকে verified স্ট্যাটাস। DB error হলে True (ইউজার আটকে না যায়)।"""
+    try:
+        with _c() as c:
+            r = c.execute("SELECT verified FROM users WHERE user_id=%s", (uid,)).fetchone()
+        if not r:
+            return True
+        return int(r["verified"] or 0) == 1
+    except Exception:
+        return True
+
+
+def vrf_token(uid, ttl_hours=None):
+    if _vtoken is None:
+        return ""
+    try:
+        ttl = int(ttl_hours or get_setting("verify_ttl_hours") or 24)
+    except Exception:
+        ttl = 24
+    return _vtoken.make_token(uid, ttl * 3600)
+
+
+def vrf_link(uid):
+    base = _vrf_panel_base()
+    tok = vrf_token(uid)
+    if not base or not tok:
+        return ""
+    return f"{base}/v/{tok}"
+
+
+def vrf_note_attempt(uid, kind="verify_check"):
+    try:
+        with _c() as c:
+            c.execute(
+                "INSERT INTO verifications (user_id, status, attempts, created_at) "
+                "VALUES (%s,'pending',1,%s) ON CONFLICT (user_id) DO UPDATE SET "
+                "attempts=verifications.attempts+1",
+                (uid, now()),
+            )
+    except Exception as _e:
+        log.debug(f"[VRF] attempt note ব্যর্থ uid={uid}: {_e}")
+
+
+async def _vrf_gate_msg(bot, uid):
+    """True = এগোতে পারবে। False = verify prompt পাঠানো হয়েছে।"""
+    try:
+        if await asyncio.to_thread(is_admin, uid):
+            return True
+    except Exception:
+        pass
+    if not verify_enabled():
+        return True
+    if await asyncio.to_thread(vrf_is_verified, uid):
+        return True
+    lang = await asyncio.to_thread(get_lang, uid)
+    await _vrf_send_prompt(bot, uid, lang)
+    return False
+
+
+async def _vrf_send_prompt(bot, uid, lang=None):
+    if lang is None:
+        lang = await asyncio.to_thread(get_lang, uid)
+    link = await asyncio.to_thread(vrf_link, uid)
+    if not link:
+        log.error(f"[VRF] PANEL_BASE_URL সেট নেই — uid={uid} verify লিংক বানানো যাচ্ছে না")
+        return
+    rows = [[InlineKeyboardButton("🔗 Verify", url=link)]]
+    rows.append([InlineKeyboardButton("✅ I verified", callback_data="vrf_check")])
+    txt = VERIFY_TEXT_EN if lang == "en" else VERIFY_TEXT_BN
+    try:
+        await bot.send_message(uid, txt, parse_mode="Markdown",
+                               reply_markup=InlineKeyboardMarkup(rows),
+                               disable_web_page_preview=True)
+    except Exception as _e:
+        log.warning(f"[VRF] prompt পাঠাতে ব্যর্থ uid={uid}: {_e}")
+
+
+async def _vrf_handle_check(update, ctx, q, uid):
+    """'I Verified' বাটন — DB থেকে স্ট্যাটাস যাচাই করে রেজিস্ট্রেশন এগিয়ে নেয়।"""
+    lang = await asyncio.to_thread(get_lang, uid)
+    ok = await asyncio.to_thread(vrf_is_verified, uid)
+    if not ok:
+        await asyncio.to_thread(vrf_note_attempt, uid)
+        try:
+            await q.answer("❌ এখনো verified হয়নি!" if lang == "bn" else "❌ Not verified yet!",
+                           show_alert=True)
+        except Exception:
+            pass
+        await _vrf_send_prompt(ctx.bot, uid, lang)
+        return
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await ctx.bot.send_message(
+        uid,
+        "✅ *Verification successful!*\n\nএখন আপনি Task করতে পারবেন।" if lang == "bn"
+        else "✅ *Verification successful!*\n\nYou now have access to tasks.",
+        parse_mode="Markdown",
+    )
+    ctx.user_data.pop("state", None)
+    try:
+        _missing = await check_ch(update, ctx)
+        if _missing:
+            await join_prompt(update, uid)
+            return
+    except Exception as _ce:
+        log.debug(f"[VRF] channel check ব্যর্থ uid={uid}: {_ce}")
+    await _send_welcome(update, ctx, uid)
+
+
 def init_db():
     with _c() as c:
         # ── Core tables ──────────────────────────────────────────
@@ -3308,22 +3614,23 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Language selected but country not yet picked → resume country selection
-    if ctx.user_data.get("state") in ("first_lang", "first_country"):
+    # ভাষা/verification অসম্পূর্ণ → সেখান থেকেই শুরু (দেশ আর জিজ্ঞেস করা হয় না)
+    if ctx.user_data.get("state") in ("first_lang", "first_country", "first_verify"):
         lang = await asyncio.to_thread(get_lang, user.id)
-        q_txt = (
-            "🌍 *আপনার দেশ বেছে নিন:*\n\n"
-            "⚠️ *সতর্কতা:* ভুল দেশ বাছলে Task পাবেন না!\n"
-            "👆 আপনি যে দেশে থাকেন সেই দেশ বেছে নিন।\n"
-            "🔒 *একবার বাছলে আর পরিবর্তন করা যাবে না।*"
-            if lang == 'bn' else
-            "🌍 *Select your country:*\n\n"
-            "⚠️ *Warning:* Selecting the wrong country means you won't get tasks!\n"
-            "👆 Please select the country where you actually live.\n"
-            "🔒 *This cannot be changed once selected.*"
-        )
-        ctx.user_data["state"] = "first_country"
-        await update.message.reply_text(q_txt, parse_mode="Markdown", reply_markup=country_kb())
+        if ctx.user_data.get("state") == "first_lang" or not await asyncio.to_thread(user_has_lang, user.id):
+            ctx.user_data["state"] = "first_lang"
+            await update.message.reply_text(
+                "🌍 *ভাষা বেছে নিন / Choose your language:*",
+                parse_mode="Markdown",
+                reply_markup=await asyncio.to_thread(lang_kb),
+            )
+            return
+        ctx.user_data["state"] = "first_verify"
+        await _vrf_send_prompt(ctx.bot, user.id, lang)
+        return
+
+    # ── Verification gate — verify না হলে Task/মেনু কিছুই নয় ──
+    if not await _vrf_gate_msg(ctx.bot, user.id):
         return
 
     if deep_task_type and deep_task_id:
@@ -4020,6 +4327,8 @@ async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str
 
 async def show_tasks(update, ctx):
     uid          = update.effective_user.id
+    if not await _vrf_gate_msg(ctx.bot, uid):
+        return
     # send_chat_action background — main path block করে না
     _act = asyncio.create_task(ctx.bot.send_chat_action(chat_id=uid, action="typing"))
     _background_tasks.add(_act); _act.add_done_callback(_bg_task_done)
@@ -7503,6 +7812,11 @@ async def _on_callback_inner(update, ctx, q, uid, d):
     total_ref = None
     total_usr = None
     wds = None
+    # ── Verification "I Verified" বাটন ──
+    if d == "vrf_check":
+        await _vrf_handle_check(update, ctx, q, uid)
+        return
+
     # q.answer() ইতিমধ্যে on_callback()-এ করা হয়েছে — এখানে আর দরকার নেই
     if d in ("lang_bn", "lang_en"):
         lang = "bn" if d == "lang_bn" else "en"
@@ -7513,22 +7827,11 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         try: await q.message.delete()
         except Exception: pass
         msg = T(uid, 'lang_set_bn') if lang == 'bn' else T(uid, 'lang_set_en')
-        # If first-time language selection, ask country next
+        # প্রথমবার ভাষা বাছলে → সরাসরি Verification (দেশ আর জিজ্ঞেস করা হয় না)
         if ctx.user_data.get("state") == "first_lang":
-            ctx.user_data["state"] = "first_country"
+            ctx.user_data["state"] = "first_verify"
             await ctx.bot.send_message(uid, msg, parse_mode="Markdown")
-            q_txt = (
-                "🌍 *আপনার দেশ বেছে নিন:*\n\n"
-                "⚠️ *সতর্কতা:* ভুল দেশ বাছলে Task পাবেন না!\n"
-                "👆 আপনি যে দেশে থাকেন সেই দেশ বেছে নিন।\n"
-                "🔒 *একবার বাছলে আর পরিবর্তন করা যাবে না।*"
-                if lang == 'bn' else
-                "🌍 *Select your country:*\n\n"
-                "⚠️ *Warning:* Selecting the wrong country means you won't get tasks!\n"
-                "👆 Please select the country where you actually live.\n"
-                "🔒 *This cannot be changed once selected.*"
-            )
-            await ctx.bot.send_message(uid, q_txt, parse_mode="Markdown", reply_markup=country_kb())
+            await _vrf_send_prompt(ctx.bot, uid, lang)
         else:
             await ctx.bot.send_message(uid, msg, parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
         return
@@ -11020,6 +11323,27 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 try:
                     await ctx.bot.delete_message(chat_id=_rdcid, message_id=_rdmid)
                 except Exception: pass
+        # ── Reject মোট একবারই হবে — যে-ই করুক, অন্য পক্ষকে জানাও ────────
+        # owner reject করলে অ্যাডমিনের কাছে, অ্যাডমিন reject করলে owner-এর কাছে
+        _rej_owner = int(_rget(row, 'owner_id', 0) or 0)
+        _rej_actor = "অ্যাডমিন" if uid == ADMIN_ID else "Task Owner"
+        _rej_notif = (
+            f"❌ *Sub `#{gid}` Reject হয়েছে — {_rej_actor} দ্বারা!*\n\n"
+            f"📌 *Task:* {_task_display}\n"
+            f"👤 *User:* `{guser}`\n"
+            f"📝 *কারণ:* {_md_esc(str(reason))}\n\n"
+            "🔒 *এক Sub এ মোট একবারই reject হবে — আপনার আর কিছু করতে হবে না।*"
+        )
+        _rej_targets = []
+        if uid != ADMIN_ID:
+            _rej_targets.append(ADMIN_ID)
+        if _rej_owner and _rej_owner != uid and _rej_owner not in _rej_targets:
+            _rej_targets.append(_rej_owner)
+        for _rej_to in _rej_targets:
+            try:
+                await ctx.bot.send_message(_rej_to, _rej_notif, parse_mode="Markdown")
+            except Exception as _rne:
+                log.warning(f"[REJECT-NOTIFY] to={_rej_to} gid={gid}: {_rne}")
         # ── Admin confirmation ────────────────────────────────────
         await update.message.reply_text(
             f"❌ *Sub `#{gid}` Rejected!*\n\n"
@@ -11350,38 +11674,72 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 tname = t_row["name"]
                 tprice= t_row["price"]
                 def _db_8362():
-                    approved = None
-                    pending = None
-                    rejected = None
-                    subs = None
-                    total = None
+                    approved = pending = rejected = total = 0
+                    subs = []
+                    paid_amt = pend_amt = 0.0
+                    owner_id = 0
+                    owner_un = ""
+                    uname_map = {}
                     with _c() as c:
                         total   = _count(c.execute("SELECT COUNT(*) FROM gmails WHERE task_code=%s", (code,)).fetchone())
                         pending = _count(c.execute("SELECT COUNT(*) FROM gmails WHERE task_code=%s AND status='pending'", (code,)).fetchone())
                         approved= _count(c.execute("SELECT COUNT(*) FROM gmails WHERE task_code=%s AND status='approved'", (code,)).fetchone())
                         rejected= _count(c.execute("SELECT COUNT(*) FROM gmails WHERE task_code=%s AND status='rejected'", (code,)).fetchone())
+                        paid_amt = float(c.execute(
+                            "SELECT COALESCE(SUM(amount),0) FROM gmails WHERE task_code=%s AND status='approved'",
+                            (code,)).fetchone()[0] or 0)
+                        pend_amt = float(c.execute(
+                            "SELECT COALESCE(SUM(amount),0) FROM gmails WHERE task_code=%s AND status='pending'",
+                            (code,)).fetchone()[0] or 0)
                         subs    = c.execute(
-                            "SELECT id,user_id,status,submitted_at FROM gmails WHERE task_code=%s ORDER BY id DESC LIMIT 15",
+                            "SELECT id,user_id,status,amount,submitted_at FROM gmails WHERE task_code=%s ORDER BY id DESC LIMIT 15",
                             (code,)
                         ).fetchall()
-                    return approved, pending, rejected, subs, total
-                approved, pending, rejected, subs, total = await asyncio.to_thread(_db_8362)
+                        owner_id = int(t_row["owner_id"] or 0)
+                        _uids = sorted({int(_s["user_id"]) for _s in subs})
+                        if _uids:
+                            _ph = ",".join(["%s"] * len(_uids))
+                            for _ur in c.execute(
+                                f"SELECT user_id, username, full_name FROM users WHERE user_id IN ({_ph})",
+                                tuple(_uids)
+                            ).fetchall():
+                                uname_map[int(_ur["user_id"])] = str(_ur["username"] or _ur["full_name"] or "")
+                        if owner_id:
+                            _our = c.execute("SELECT username, full_name FROM users WHERE user_id=%s",
+                                              (owner_id,)).fetchone()
+                            owner_un = str(_our["username"] or _our["full_name"] or "") if _our else ""
+                    return (approved, pending, rejected, subs, total,
+                            paid_amt, pend_amt, owner_id, owner_un, uname_map)
+                (approved, pending, rejected, subs, total,
+                 paid_amt, pend_amt, owner_id, owner_un, uname_map) = await asyncio.to_thread(_db_8362)
                 stat_icon = {"pending":"⏳","approved":"✅","rejected":"❌"}
-                sub_lines = "\n".join(
-                    f"  {stat_icon.get(s['status'],'❓')} `#{s['id']}` 👤`{s['user_id']}` — {s['submitted_at'][:16]}"
-                    for s in subs
-                ) or "  _কোনো Submission নেই_"
+                def _sub_ln(s):
+                    _un = uname_map.get(int(s["user_id"]), "")
+                    _unp = f"@{_un}" if _un else ""
+                    return (f"  {stat_icon.get(s['status'],'❓')} `#{s['id']}` 👤`{s['user_id']}`"
+                            f"{(' ' + _md_esc(_unp)) if _unp else ''} — `${float(s['amount'] or 0):.2f}`"
+                            f" — {(s['submitted_at'] or '')[:16]}")
+                sub_lines = "\n".join(_sub_ln(_s) for _s in subs) or "  _কোনো Submission নেই_"
+                _own_ln = (f"@{_md_esc(owner_un)} (`{owner_id}`)" if owner_un
+                           else (f"`{owner_id}`" if owner_id else "_নেই_"))
+                _slot_max = int(t_row["max_completions"] or 0)
                 text2 = (
                     f"📌 *Task:* {_md_esc(str(tname))}\n"
                     f"🔑 *Code:* `{code}`\n"
                     f"💰 *Price:* `{tprice}$`\n"
-                    f"🏷️ *Type:* Regular Task\n"
+                    f"🏷️ *Type:* Regular Task ({_md_esc(str(t_row['task_type'] or 'other'))})\n"
+                    f"👤 *Owner:* {_own_ln}\n"
+                    f"🎚️ *স্লট:* `{int(t_row['completed_count'] or 0)}/{_slot_max if _slot_max else '∞'}`"
+                    f" | *User limit:* `{int(t_row['per_user_limit'] or 0)}`"
+                    f" | *{'Active ✅' if int(t_row['is_active'] or 0) else 'Disabled ❌'}*\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"📊 *Submission সারসংক্ষেপ:*\n"
                     f"  📥 মোট: *{total}* | ⏳ Pending: *{pending}*\n"
                     f"  ✅ Approved: *{approved}* | ❌ Rejected: *{rejected}*\n"
+                    f"  💵 Approved payout: `${paid_amt:.4f}` | ⏳ Pending payout: `${pend_amt:.4f}`\n"
+                    f"  🕘 শেষ সাবমিশন: `{(subs[0]['submitted_at'] or '')[:16] if subs else '—'}`\n"
                     f"━━━━━━━━━━━━━━━━\n"
-                    f"📋 *শেষ {len(subs)}টি Submission:*\n"
+                    f"📋 *শেষ {len(subs)}টি Submission (ID • User • Amount • সময়):*\n"
                     f"{sub_lines}"
                 )
 
@@ -11391,30 +11749,59 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 tname = tg_row["name"]
                 tprice= tg_row["price"]
                 def _db_8395():
-                    subs = None
-                    total = None
+                    subs = []
+                    total = 0
+                    owner_id = 0
+                    owner_un = ""
+                    uname_map = {}
                     with _c() as c:
-                        total   = _count(c.execute("SELECT COUNT(*) FROM tg_task_completions WHERE task_id=%s", (tid,)).fetchone())
-                        subs    = c.execute(
-                            "SELECT user_id,joined_at FROM tg_task_completions WHERE task_id=%s ORDER BY id DESC LIMIT 15",
+                        total = _count(c.execute("SELECT COUNT(*) FROM tg_task_completions WHERE task_id=%s",
+                                                 (tid,)).fetchone())
+                        subs  = c.execute(
+                            "SELECT id,user_id,done_at FROM tg_task_completions WHERE task_id=%s ORDER BY id DESC LIMIT 15",
                             (tid,)
                         ).fetchall()
-                    return subs, total
-                subs, total = await asyncio.to_thread(_db_8395)
-                sub_lines = "\n".join(
-                    f"  ✅ 👤`{s['user_id']}` — {(s['joined_at'] or '')[:16]}"
-                    for s in subs
-                ) or "  _কোনো Completion নেই_"
+                        owner_id = int(tg_row["owner_id"] or 0)
+                        _uids = sorted({int(_s["user_id"]) for _s in subs})
+                        if _uids:
+                            _ph = ",".join(["%s"] * len(_uids))
+                            for _ur in c.execute(
+                                f"SELECT user_id, username, full_name FROM users WHERE user_id IN ({_ph})",
+                                tuple(_uids)
+                            ).fetchall():
+                                uname_map[int(_ur["user_id"])] = str(_ur["username"] or _ur["full_name"] or "")
+                        if owner_id:
+                            _our = c.execute("SELECT username, full_name FROM users WHERE user_id=%s",
+                                              (owner_id,)).fetchone()
+                            owner_un = str(_our["username"] or _our["full_name"] or "") if _our else ""
+                    return subs, total, owner_id, owner_un, uname_map
+                subs, total, owner_id, owner_un, uname_map = await asyncio.to_thread(_db_8395)
+                def _tg_ln(s):
+                    _un = uname_map.get(int(s["user_id"]), "")
+                    _unp = f"@{_un}" if _un else ""
+                    return (f"  ✅ 👤`{s['user_id']}`{(' ' + _md_esc(_unp)) if _unp else ''}"
+                            f" — `${float(tprice or 0):.2f}` — {(s['done_at'] or '')[:16]}")
+                sub_lines = "\n".join(_tg_ln(_s) for _s in subs) or "  _কোনো Completion নেই_"
+                _own_ln = (f"@{_md_esc(owner_un)} (`{owner_id}`)" if owner_un
+                           else (f"`{owner_id}`" if owner_id else "_নেই_"))
+                _tg_max = int(tg_row["max_completions"] or 0)
+                _tg_paid = float(tprice or 0) * int(total or 0)
                 text2 = (
                     f"📡 *Task:* {_md_esc(str(tname))}\n"
                     f"🔑 *Code:* `{code}`\n"
                     f"💰 *Price:* `{tprice}$`\n"
                     f"🏷️ *Type:* Telegram Join Task\n"
+                    f"📡 *Channel:* {_md_esc(str(tg_row['tg_target_name'] or tg_row['tg_target'] or ''))}\n"
+                    f"👤 *Owner:* {_own_ln}\n"
+                    f"🎚️ *স্লট:* `{int(tg_row['completed_count'] or 0)}/{_tg_max if _tg_max else '∞'}`"
+                    f" | *User limit:* `{int(tg_row['per_user_limit'] or 0)}`"
+                    f" | *{'Active ✅' if int(tg_row['is_active'] or 0) else 'Disabled ❌'}*\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"📊 *Completion সারসংক্ষেপ:*\n"
                     f"  ✅ মোট Completed: *{total}* (Auto-approved)\n"
+                    f"  💵 মোট payout: `${_tg_paid:.4f}`\n"
                     f"━━━━━━━━━━━━━━━━\n"
-                    f"📋 *শেষ {len(subs)}জন:*\n"
+                    f"📋 *শেষ {len(subs)}জন (ID • Username • Amount • সময়):*\n"
                     f"{sub_lines}"
                 )
 
@@ -11425,49 +11812,81 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 tprice= ct_row["price"]
                 cat_label = f"[CAT] {tname}"
                 def _db_8424():
-                    approved = None
-                    pending = None
-                    rejected = None
-                    subs = None
-                    total = None
+                    approved = pending = rejected = total = 0
+                    subs = []
+                    paid_amt = pend_amt = 0.0
+                    owner_id = 0
+                    owner_un = ""
+                    uname_map = {}
                     with _c() as c:
-                        total   = _count(c.execute("SELECT COUNT(*) FROM gmails WHERE task_code=%s", (code,)).fetchone())
-                        # fallback: match by task_name for older submissions without code
+                        _col, _val = "task_code", code
+                        total = _count(c.execute(f"SELECT COUNT(*) FROM gmails WHERE {_col}=%s", (_val,)).fetchone())
+                        # fallback: পুরনো submission — code ছাড়া task_name দিয়ে match
                         if total == 0:
-                            total   = _count(c.execute("SELECT COUNT(*) FROM gmails WHERE task_name=%s", (cat_label,)).fetchone())
-                            pending = _count(c.execute("SELECT COUNT(*) FROM gmails WHERE task_name=%s AND status='pending'", (cat_label,)).fetchone())
-                            approved= _count(c.execute("SELECT COUNT(*) FROM gmails WHERE task_name=%s AND status='approved'", (cat_label,)).fetchone())
-                            rejected= _count(c.execute("SELECT COUNT(*) FROM gmails WHERE task_name=%s AND status='rejected'", (cat_label,)).fetchone())
-                            subs    = c.execute(
-                                "SELECT id,user_id,status,submitted_at FROM gmails WHERE task_name=%s ORDER BY id DESC LIMIT 15",
-                                (cat_label,)
-                            ).fetchall()
-                        else:
-                            pending = _count(c.execute("SELECT COUNT(*) FROM gmails WHERE task_code=%s AND status='pending'", (code,)).fetchone())
-                            approved= _count(c.execute("SELECT COUNT(*) FROM gmails WHERE task_code=%s AND status='approved'", (code,)).fetchone())
-                            rejected= _count(c.execute("SELECT COUNT(*) FROM gmails WHERE task_code=%s AND status='rejected'", (code,)).fetchone())
-                            subs    = c.execute(
-                                "SELECT id,user_id,status,submitted_at FROM gmails WHERE task_code=%s ORDER BY id DESC LIMIT 15",
-                                (code,)
-                            ).fetchall()
-                    return approved, pending, rejected, subs, total
-                approved, pending, rejected, subs, total = await asyncio.to_thread(_db_8424)
+                            _col, _val = "task_name", cat_label
+                            total = _count(c.execute(f"SELECT COUNT(*) FROM gmails WHERE {_col}=%s", (_val,)).fetchone())
+                        pending = _count(c.execute(
+                            f"SELECT COUNT(*) FROM gmails WHERE {_col}=%s AND status='pending'", (_val,)).fetchone())
+                        approved = _count(c.execute(
+                            f"SELECT COUNT(*) FROM gmails WHERE {_col}=%s AND status='approved'", (_val,)).fetchone())
+                        rejected = _count(c.execute(
+                            f"SELECT COUNT(*) FROM gmails WHERE {_col}=%s AND status='rejected'", (_val,)).fetchone())
+                        paid_amt = float(c.execute(
+                            f"SELECT COALESCE(SUM(amount),0) FROM gmails WHERE {_col}=%s AND status='approved'",
+                            (_val,)).fetchone()[0] or 0)
+                        pend_amt = float(c.execute(
+                            f"SELECT COALESCE(SUM(amount),0) FROM gmails WHERE {_col}=%s AND status='pending'",
+                            (_val,)).fetchone()[0] or 0)
+                        subs = c.execute(
+                            f"SELECT id,user_id,status,amount,submitted_at FROM gmails WHERE {_col}=%s "
+                            "ORDER BY id DESC LIMIT 15",
+                            (_val,)
+                        ).fetchall()
+                        owner_id = int(ct_row["owner_id"] or 0)
+                        _uids = sorted({int(_s["user_id"]) for _s in subs})
+                        if _uids:
+                            _ph = ",".join(["%s"] * len(_uids))
+                            for _ur in c.execute(
+                                f"SELECT user_id, username, full_name FROM users WHERE user_id IN ({_ph})",
+                                tuple(_uids)
+                            ).fetchall():
+                                uname_map[int(_ur["user_id"])] = str(_ur["username"] or _ur["full_name"] or "")
+                        if owner_id:
+                            _our = c.execute("SELECT username, full_name FROM users WHERE user_id=%s",
+                                              (owner_id,)).fetchone()
+                            owner_un = str(_our["username"] or _our["full_name"] or "") if _our else ""
+                    return (approved, pending, rejected, subs, total,
+                            paid_amt, pend_amt, owner_id, owner_un, uname_map)
+                (approved, pending, rejected, subs, total,
+                 paid_amt, pend_amt, owner_id, owner_un, uname_map) = await asyncio.to_thread(_db_8424)
                 stat_icon = {"pending":"⏳","approved":"✅","rejected":"❌"}
-                sub_lines = "\n".join(
-                    f"  {stat_icon.get(s['status'],'❓')} `#{s['id']}` 👤`{s['user_id']}` — {s['submitted_at'][:16]}"
-                    for s in subs
-                ) or "  _কোনো Submission নেই_"
+                def _sub_ln(s):
+                    _un = uname_map.get(int(s["user_id"]), "")
+                    _unp = f"@{_un}" if _un else ""
+                    return (f"  {stat_icon.get(s['status'],'❓')} `#{s['id']}` 👤`{s['user_id']}`"
+                            f"{(' ' + _md_esc(_unp)) if _unp else ''} — `${float(s['amount'] or 0):.2f}`"
+                            f" — {(s['submitted_at'] or '')[:16]}")
+                sub_lines = "\n".join(_sub_ln(_s) for _s in subs) or "  _কোনো Submission নেই_"
+                _own_ln = (f"@{_md_esc(owner_un)} (`{owner_id}`)" if owner_un
+                           else (f"`{owner_id}`" if owner_id else "_নেই_"))
+                _slot_max = int(ct_row["max_completions"] or 0)
                 text2 = (
                     f"📁 *Task:* {_md_esc(str(tname))}\n"
                     f"🔑 *Code:* `{code}`\n"
                     f"💰 *Price:* `{tprice}$`\n"
-                    f"🏷️ *Type:* Category Task\n"
+                    f"🏷️ *Type:* Category Task ({_md_esc(str(ct_row['task_type'] or 'other'))})\n"
+                    f"👤 *Owner:* {_own_ln}\n"
+                    f"🎚️ *স্লট:* `{int(ct_row['completed_count'] or 0)}/{_slot_max if _slot_max else '∞'}`"
+                    f" | *User limit:* `{int(ct_row['per_user_limit'] or 0)}`"
+                    f" | *{'Active ✅' if int(ct_row['is_active'] or 0) else 'Disabled ❌'}*\n"
                     f"━━━━━━━━━━━━━━━━\n"
                     f"📊 *Submission সারসংক্ষেপ:*\n"
                     f"  📥 মোট: *{total}* | ⏳ Pending: *{pending}*\n"
                     f"  ✅ Approved: *{approved}* | ❌ Rejected: *{rejected}*\n"
+                    f"  💵 Approved payout: `${paid_amt:.4f}` | ⏳ Pending payout: `${pend_amt:.4f}`\n"
+                    f"  🕘 শেষ সাবমিশন: `{(subs[0]['submitted_at'] or '')[:16] if subs else '—'}`\n"
                     f"━━━━━━━━━━━━━━━━\n"
-                    f"📋 *শেষ {len(subs)}টি Submission:*\n"
+                    f"📋 *শেষ {len(subs)}টি Submission (ID • User • Amount • সময়):*\n"
                     f"{sub_lines}"
                 )
 
@@ -12831,6 +13250,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             country_hint, parse_mode="Markdown",
             reply_markup=await asyncio.to_thread(country_kb))
+        return
+
+    if st == "first_verify":
+        await _vrf_send_prompt(ctx.bot, uid, await asyncio.to_thread(get_lang, uid))
         return
 
     if st == "first_channel":
@@ -15953,7 +16376,6 @@ async def job_auto_withdraw(context):
                     # ── সুন্দর পেমেন্ট পোস্ট (HTML + blockquote + বাটন) ──
                     _esc = lambda v: html.escape(str(v), quote=False)
                     _pay_date  = datetime.now(BD_TZ).strftime("%Y-%m-%d %I:%M %p")
-                    _addr_url  = f"https://bscscan.com/address/{address}"
                     ch_msg = (
                         f"✅ <b>{_num_lbl}Payment Completed</b>\n\n"
                         f"<blockquote>👤 <b>User Name:</b> {_esc(_uname_clean or 'Unknown')}</blockquote>\n"
@@ -15965,7 +16387,10 @@ async def job_auto_withdraw(context):
                         f"💎 <i>Auto payment • Task Earn Bot</i>"
                     )
                     _ch_kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("👛 Check Wallet", url=_addr_url)],
+                        # 💱 Wallet-check বাটনের বদলে বট join লিংক
+                        [InlineKeyboardButton(
+                            "🤖 Join Bot" if _wd_lang == 'en' else "🤖 বটে জয়েন করুন",
+                            url=f"https://t.me/{await _get_bot_username(context.bot)}")],
                         [InlineKeyboardButton("🔍 View on BSCScan", url=bscscan_url)],
                     ])
                     await context.bot.send_message(
@@ -16224,6 +16649,7 @@ def main():
 
     # PostgreSQL ব্যবহার হচ্ছে — file backup/restore দরকার নেই
     init_db()
+    init_security_db()
     _auto_configure()
     _setup_uptimerobot()  # no-ops if UPTIMEROBOT_API_KEY not set
     async def post_init(application):
