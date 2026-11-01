@@ -8,7 +8,7 @@ from flask import request, redirect, Response
 from webadmin import (
     wadm, page, guard, table, badge, kpi, money, num, flag, esc, icon, now,
     one, many, scal, sfloat, _x, log_admin, client_ip, spark, bars, donut,
-    admin_key, unread_alerts,
+    admin_key, unread_alerts, _fire_settings_changed, _fire_user_changed,
 )
 
 
@@ -29,6 +29,10 @@ def settings_set(key, value):
     try:
         _x("INSERT INTO settings (key, value) VALUES (%s,%s) "
            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (key, str(value)))
+        try:
+            _fire_settings_changed([key])   # বটের ৬০s ক্যাশে বাধা — সাথে সাথে কার্যকর
+        except Exception:
+            pass
         return True
     except Exception:
         return False
@@ -209,6 +213,7 @@ def ipban_user(uid):
                "ON CONFLICT (ip) DO UPDATE SET reason=EXCLUDED.reason",
                (ip, f"user {uid}", now()))
             log_admin("ipban", uid, ip)
+            _fire_user_changed(uid)
         except Exception:
             pass
     return redirect(f"/admin/user/{uid}?ok=IP+banned")
@@ -555,7 +560,8 @@ def settings():
     if g:
         return g
     keys = ["verify_enabled", "sec_device_limit", "sec_ip_limit", "sec_auto_ban",
-            "sec_ip_retention_days", "notify_security", "bot_status"]
+            "sec_ip_retention_days", "notify_security", "bot_status",
+            "points_on", "points_block", "reset_on_update"]
     vals = {k: settings_get(k, "") for k in keys}
     body = (
         f"<div class='grid g2'>"
@@ -578,10 +584,10 @@ def settings():
         f"<option value='on' {'selected' if vals['sec_auto_ban'] != 'off' else ''}>চালু</option>"
         f"<option value='off' {'selected' if vals['sec_auto_ban'] == 'off' else ''}>বন্ধ</option>"
         "</select></div>"
-        "<div class='form'><label>Device limit (একই ডিভাইসে সর্বোচ্চ অ্যাকাউন্ট)</label>"
-        f"<input name='sec_device_limit' type='number' min='2' value='{esc(vals['sec_device_limit'] or 3)}'></div>"
-        "<div class='form'><label>IP limit (একই IP-তে সর্বোচ্চ অ্যাকাউন্ট)</label>"
-        f"<input name='sec_ip_limit' type='number' min='2' value='{esc(vals['sec_ip_limit'] or 5)}'></div>"
+        "<div class='form'><label>Device limit — একই ফোনে সর্বোচ্চ অ্যাকাউন্ট (1 = এক ফোন এক অ্যাকাউন্ট)</label>"
+        f"<input name='sec_device_limit' type='number' min='1' value='{esc(vals['sec_device_limit'] or 1)}'></div>"
+        "<div class='form'><label>IP limit — একই IP-তে সর্বোচ্চ অ্যাকাউন্ট (ছাড়ালে শুধু অ্যালার্ট, ব্যান নয়)</label>"
+        f"<input name='sec_ip_limit' type='number' min='2' value='{esc(vals['sec_ip_limit'] or 2)}'></div>"
         "<div class='form'><label>IP data retention (দিন)</label>"
         f"<input name='sec_ip_retention_days' type='number' min='1' value='{esc(vals['sec_ip_retention_days'] or 90)}'></div>"
         "<button type='submit' style='margin-top:10px'>Save Security</button></form></div>"
@@ -595,6 +601,24 @@ def settings():
         f"<option value='on' {'selected' if vals['bot_status'] != 'off' else ''}>চালু</option>"
         f"<option value='off' {'selected' if vals['bot_status'] == 'off' else ''}>বন্ধ</option>"
         "</select></div>"
+        "<div class='form'><label>Point system (trust points)</label><select name='points_on'>"
+        f"<option value='on' {'selected' if vals['points_on'] != 'off' else ''}>চালু (ON)</option>"
+        f"<option value='off' {'selected' if vals['points_on'] == 'off' else ''}>বন্ধ (OFF)</option>"
+        "</select>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>বন্ধ থাকলে approve/reject-এ পয়েন্ট বাড়বে/কমবে না, "
+        "পয়েন্ট ০ হয়ে ব্লকও হবে না।</p></div>"
+        "<div class='form'><label>Point 0 → Task block (পয়েন্ট ০ হলে task ২ দিন ব্লক)</label><select name='points_block'>"
+        f"<option value='on' {'selected' if vals['points_block'] == 'on' else ''}>চালু</option>"
+        f"<option value='off' {'selected' if vals['points_block'] != 'on' else ''}>বন্ধ (ডিফল্ট)</option>"
+        "</select>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>বন্ধ থাকলে পয়েন্ট ০ হলেও Task করা যাবে। "
+        "চালু করলে আগের মতো ২ দিন ব্লক হবে।</p></div>"
+        "<div class='form'><label>Update reset — নতুন build-এ সবাই আবার verify করবে</label>"
+        "<select name='reset_on_update'>"
+        f"<option value='on' {'selected' if vals['reset_on_update'] != 'off' else ''}>চালু</option>"
+        f"<option value='off' {'selected' if vals['reset_on_update'] == 'off' else ''}>বন্ধ</option>"
+        "</select>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>ব্যালান্স/পয়েন্ট মোছা হয় না — শুধু verify আবার করতে হয়।</p></div>"
         "<button type='submit' style='margin-top:10px'>Save System</button></form></div>"
         "</div>"
     )
@@ -611,7 +635,8 @@ def settings_save():
     if len(key) >= 6:
         settings_set("admin_web_key", key)
         saved.append("password")
-    for k in ("verify_enabled", "sec_auto_ban", "notify_security", "bot_status"):
+    for k in ("verify_enabled", "sec_auto_ban", "notify_security", "bot_status",
+              "points_on", "points_block", "reset_on_update"):
         v = (request.form.get(k) or "").strip()
         if v in ("on", "off"):
             settings_set(k, v)

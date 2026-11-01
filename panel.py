@@ -216,7 +216,11 @@ def _known_country(code: str) -> str:
     return code if code in known else ("OT" if code else "")
 
 
-def _device_hash(payload: dict) -> str:
+def _device_hash(payload: dict, with_did: bool = True) -> str:
+    """ডিভাইস ফিঙ্গারপ্রিন্ট।
+    with_did=True  → নতুন ফরম্যাট (localStorage did + GPU) — অনেক নির্ভুল
+    with_did=False → পুরোনো ফরম্যাট — আগের ইউজারদের সাথে মেলাতে লাগে
+    """
     parts = [
         str(payload.get("ua", ""))[:300], str(payload.get("platform", "")),
         str(payload.get("tz", "")), str(payload.get("lang", "")),
@@ -224,7 +228,55 @@ def _device_hash(payload: dict) -> str:
         str(payload.get("hw", "")), str(payload.get("touch", "")),
         str(payload.get("mem", "")),
     ]
+    if with_did:
+        parts.append(str(payload.get("did", ""))[:64])
+        parts.append(str(payload.get("gpu", ""))[:90])
+        parts.append(str(payload.get("hard", ""))[:40])
     return hashlib.sha256(("|".join(parts) + "|te-v1").encode("utf-8", "ignore")).hexdigest()
+
+
+def _limit_check(uid: int, ip: str, hashes):
+    """এক ফোন = এক অ্যাকাউন্ট, এক IP-তে সর্বোচ্চ ২ — ভাঙলে কারণ ফেরত দেয়।
+    কোনো query ব্যর্থ হলে None (কাউকে ভুলভাবে আটকাবে না)।"""
+    try:
+        with _db() as cur:
+            try:
+                dlim = int(str(_setting(cur, "sec_device_limit", "1")).strip() or 1)
+            except Exception:
+                dlim = 1
+            try:
+                ilim = int(str(_setting(cur, "sec_ip_limit", "2")).strip() or 2)
+            except Exception:
+                ilim = 2
+            for dh in [h for h in (hashes or []) if h]:
+                r1 = cur.execute(
+                    "SELECT COUNT(DISTINCT user_id) AS n FROM devices "
+                    "WHERE device_hash=%s AND user_id<>%s", (dh, uid)).fetchone()
+                n_dev = int((r1 or {}).get("n") or 0)
+                if n_dev == 0:
+                    r2 = cur.execute(
+                        "SELECT COUNT(*) AS n FROM users WHERE device_hash=%s AND user_id<>%s",
+                        (dh, uid)).fetchone()
+                    n_dev = int((r2 or {}).get("n") or 0)
+                if n_dev >= max(1, dlim):
+                    return "device"
+            if ip:
+                r3 = cur.execute(
+                    "SELECT COUNT(DISTINCT user_id) AS n FROM user_ips "
+                    "WHERE ip=%s AND user_id<>%s", (ip, uid)).fetchone()
+                r4 = cur.execute(
+                    "SELECT COUNT(*) AS n FROM users WHERE (last_ip=%s OR reg_ip=%s) "
+                    "AND user_id<>%s", (ip, ip, uid)).fetchone()
+                n_ip = max(int((r3 or {}).get("n") or 0), int((r4 or {}).get("n") or 0))
+                if n_ip >= max(1, ilim):
+                    return "ip"
+    except Exception as e:
+        try:
+            print(f"[verify] limit check skip uid={uid}: {e}")
+        except Exception:
+            pass
+        return None
+    return None
 
 
 def _rate_ok(ip: str, limit: int = 40, window: int = 60) -> bool:
@@ -431,6 +483,23 @@ def _page_countdown(token: str, seconds: int) -> str:
       dpr:String(window.devicePixelRatio||1),hw:String(navigator.hardwareConcurrency||''),
       touch:String((navigator.maxTouchPoints||0)),mem:String(navigator.deviceMemory||'')};
     try{ p.tz=Intl.DateTimeFormat().resolvedOptions().timeZone||''; }catch(e){}
+    var did='';
+    try{
+      did=localStorage.getItem('teb_did')||'';
+      if(!did){
+        did=(window.crypto&&crypto.randomUUID)?crypto.randomUUID():
+            ('d'+Date.now()+Math.random().toString(36).slice(2));
+        localStorage.setItem('teb_did',did);
+      }
+    }catch(e){}
+    p.did=did;
+    p.hard=String(navigator.hardwareConcurrency||'')+'x'+String(navigator.deviceMemory||'');
+    try{
+      var cv=document.createElement('canvas');
+      var gl=cv.getContext('webgl')||cv.getContext('experimental-webgl');
+      var dbg=gl&&gl.getExtension('WEBGL_debug_renderer_info');
+      p.gpu=dbg?String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)).slice(0,80):'';
+    }catch(e){ p.gpu=''; }
     return p;
   }
   function showSuccess(){
@@ -457,9 +526,14 @@ def _page_countdown(token: str, seconds: int) -> str:
         }, 2500);
       });
   }
-  function fail(){
-    title.textContent='Try Again';
-    sub.textContent='Something went wrong. Please reopen the link.';
+  function fail(err){
+    var m={device:'এই ফোনে ইতিমধ্যে একটি অ্যাকাউন্ট আছে। এক ফোনে একটির বেশি অ্যাকাউন্ট চলবে না।',
+           ip:'এই ইন্টারনেট (IP) দিয়ে ইতিমধ্যে ২টি অ্যাকাউন্ট খোলা হয়েছে। Wi-Fi বন্ধ করে মোবাইল ডেটা দিয়ে চেষ্টা করুন।',
+           rate:'অনেকবার চেষ্টা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।'};
+    title.textContent='Verification Blocked';
+    title.className='warn';
+    sub.textContent=m[err]||'Something went wrong. Please reopen the link.';
+    try{ document.querySelector('.note').textContent='Contact admin if you think this is a mistake.'; }catch(e){}
   }
   if(document.readyState!=='loading'){} 
 })();
@@ -496,6 +570,66 @@ def _page_invalid() -> str:
         "Open the bot and press Verify again.</p>"
     )
     return _shell(inner, "Invalid Link")
+
+
+# ────────────── web → bot bridge (verify শেষে বট নিজেই মেনু পাঠায়) ──────────────
+_VERIFY_HOOK = None
+_VERIFY_LOOP = None
+_SIG_READY = False
+
+
+def set_verify_hook(fn, loop=None):
+    """bot.py post_init থেকে কল হয় — (coroutine_fn(uid), running_loop)।"""
+    global _VERIFY_HOOK, _VERIFY_LOOP
+    _VERIFY_HOOK, _VERIFY_LOOP = fn, loop
+    try:
+        print("[panel] verify hook রেজিস্টার্ড")
+    except Exception:
+        pass
+
+
+def _sig_table():
+    global _SIG_READY
+    if _SIG_READY:
+        return
+    try:
+        with _db() as cur:
+            cur.execute("CREATE TABLE IF NOT EXISTS vrf_signals (id BIGSERIAL PRIMARY KEY, "
+                        "user_id BIGINT, created_at TEXT DEFAULT '', processed INTEGER DEFAULT 0)")
+        _SIG_READY = True
+    except Exception as e:
+        try:
+            print(f"[panel] vrf_signals তৈরি ব্যর্থ: {e}")
+        except Exception:
+            pass
+
+
+def _fire_verify(uid: int):
+    """⟵ এখানেই আসল ফিক্স: verify সেভ হওয়ার সাথে সাথে বটকে মেনু পাঠাতে বলা হয়।"""
+    if not uid or uid <= 0:
+        return
+    # ১) সিগন্যাল (bot restart হলেও কাজ করবে)
+    try:
+        _sig_table()
+        with _db() as cur:
+            cur.execute("INSERT INTO vrf_signals (user_id, created_at, processed) "
+                        "VALUES (%s,%s,0)", (uid, str(int(time.time()))))
+    except Exception as e:
+        try:
+            print(f"[panel] signal insert ব্যর্থ uid={uid}: {e}")
+        except Exception:
+            pass
+    # ২) সাথে সাথে (thread-safe) — বট একই প্রসেসে চলছে
+    fn, loop = _VERIFY_HOOK, _VERIFY_LOOP
+    if fn and loop is not None:
+        try:
+            import asyncio as _a
+            _a.run_coroutine_threadsafe(fn(uid), loop)
+        except Exception as e:
+            try:
+                print(f"[panel] hook call ব্যর্থ uid={uid}: {e}")
+            except Exception:
+                pass
 
 
 # ──────────────────────────── routes ────────────────────────────
@@ -551,7 +685,32 @@ def verify_done(token):
         payload = {}
     if _already_verified(uid):
         _mark_pass(uid)
+        _fire_verify(uid)
         return jsonify({"ok": True, "already": True})
+    # ── ১ ফোন = ১ অ্যাকাউন্ট, এক IP-তে ২ — ভাঙলে verify হবে না ──
+    _hashes = []
+    try:
+        _hashes = [_device_hash(payload), _device_hash(payload, with_did=False)]
+    except Exception:
+        _hashes = []
+    _block = _limit_check(uid, ip, _hashes)
+    if _block:
+        try:
+            with _db() as cur:
+                cur.execute(
+                    "INSERT INTO security_alerts (kind, user_id, related_uid, ip, country, "
+                    "device_hash, detail, status, created_at) "
+                    "VALUES (%s,%s,0,%s,'',%s,%s,'new',%s)",
+                    ("verify_blocked", uid, ip, (_hashes[0] if _hashes else ""),
+                     ("একই ফোনে অন্য অ্যাকাউন্ট" if _block == "device"
+                      else "একই IP-তে ২টির বেশি অ্যাকাউন্ট"), str(int(time.time()))),
+                )
+        except Exception as _ae:
+            try:
+                print(f"[verify] block alert skip uid={uid}: {_ae}")
+            except Exception:
+                pass
+        return jsonify({"ok": False, "error": _block}), 403
     try:
         _mark_verified(uid, ip, payload)
     except Exception as e:
@@ -569,4 +728,5 @@ def verify_done(token):
             except Exception:
                 pass
             return jsonify({"ok": False, "error": "db"}), 500
+    _fire_verify(uid)
     return jsonify({"ok": True})

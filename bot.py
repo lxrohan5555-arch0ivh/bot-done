@@ -291,7 +291,7 @@ MSGS = {
             "• শুরুতে সবার পয়েন্ট: `50`\n"
             "• Task *reject* হলে: `-{reject_pts}` পয়েন্ট\n"
             "• Task *approve* হলে: `+{approve_pts}` পয়েন্ট\n"
-            "• পয়েন্ট `0` হয়ে গেলে: `{block_days}` দিন Task বন্ধ\n"
+            "• {block_rule}\n"
             "• পয়েন্ট সর্বোচ্চ `50` পর্যন্ত যাবে\n\n"
             "💡 সঠিক নিয়মে Task করলে পয়েন্ট বাড়বে!"
         ),
@@ -389,7 +389,7 @@ MSGS = {
             "• Starting points: `50`\n"
             "• Task *rejected*: `-{reject_pts}` points\n"
             "• Task *approved*: `+{approve_pts}` points\n"
-            "• Points reach `0`: Tasks blocked for `{block_days}` days\n"
+            "• {block_rule}\n"
             "• Maximum points: `50`\n\n"
             "💡 Follow the rules correctly to keep your points high!"
         ),
@@ -1227,6 +1227,7 @@ def vrf_pass_on(uid):
 
 
 def vrf_mark_pass(uid):
+    _VRF_SILENT_MEMO.pop(uid, None)   # verify সফল → সাথে সাথে বট কথা বলবে
     try:
         with _c() as c:
             c.execute("UPDATE users SET vrf_pass=1 WHERE user_id=%s", (uid,))
@@ -1234,9 +1235,12 @@ def vrf_mark_pass(uid):
         log.debug(f"[VRF] pass mark ব্যর্থ uid={uid}: {_e}")
 
 
-def vrf_silent(uid):
-    """True = বট এই ইউজারকে কোনো উত্তর দেবে না।
-    verify + /start এর আগে বট পুরোপুরি চুপ (শুধু /start আর verify বাটন কাজ করে)।"""
+_VRF_SILENT_MEMO: "dict[int, tuple[bool, float]]" = {}   # uid → (silent?, monotonic ts)
+_VRF_SILENT_TTL = 3.0   # ৩ সেকেন্ড — verify শেষ হলে সর্বোচ্চ ৩s পরে বট আবার কথা বলবে
+
+
+def _vrf_silent_now(uid):
+    """মেমো ছাড়া আসল কাজ: verify on? vrf_pass? (২টি DB/setting চেক)"""
     try:
         if not verify_enabled():
             return False
@@ -1244,6 +1248,23 @@ def vrf_silent(uid):
         return False
     # ADMIN-ও ব্যতিক্রম নয় — তাকেও /start + verify করতে হবে
     return not vrf_pass_on(uid)
+
+
+def vrf_silent(uid):
+    """True = বট এই ইউজারকে কোনো উত্তর দেবে না।
+    verify + /start এর আগে বট পুরোপুরি চুপ (শুধু /start আর verify বাটন কাজ করে)।
+    ⚡ ৩ সেকেন্ডের মেমো: এক আপডেটে _gate + on_callback + guard ২-৩ বার ডাক করে এবং
+    রিসেটের পর সবাই unverified — প্রতি ডাকে DB SELECT যাওয়া যেত, এখন ১ বারই যায়।"""
+    now_ts = _time.monotonic()
+    m = _VRF_SILENT_MEMO.get(uid)
+    if m is not None and now_ts - m[1] < _VRF_SILENT_TTL:
+        return m[0]
+    res = _vrf_silent_now(uid)
+    if len(_VRF_SILENT_MEMO) > 5000:   # memory bounded
+        for _k in [k for k, (_, t) in _VRF_SILENT_MEMO.items() if now_ts - t >= _VRF_SILENT_TTL]:
+            del _VRF_SILENT_MEMO[_k]
+    _VRF_SILENT_MEMO[uid] = (res, now_ts)
+    return res
 
 
 # ═══════════ SECURITY PHASE 2 — মাল্টি-অ্যাকাউন্ট ডিটেকশন ═══════════
@@ -1264,8 +1285,9 @@ def _sec_cfg():
     except Exception:
         auto = True
     return {
-        "device_limit": max(2, _int("sec_device_limit", 3)),  # নিজেসহ মোট অ্যাকাউন্ট
-        "ip_limit": max(2, _int("sec_ip_limit", 5)),
+        # ১ ফোন = ১ অ্যাকাউন্ট; এক IP-তে ২টি পর্যন্ত (VPN/মোবাইল NAT — IP শুধু সতর্কতা)
+        "device_limit": max(1, _int("sec_device_limit", 1)),
+        "ip_limit": max(2, _int("sec_ip_limit", 2)),
         "auto_ban": auto,
     }
 
@@ -1314,6 +1336,34 @@ def sec_multi_scan(uid):
         except Exception as _e:
             log.debug(f"[SEC2] ip count ব্যর্থ: {_e}")
     return out
+
+
+def _unban_iponly_sync():
+    """শুধু IP-জনিত কারণে ব্যান হওয়া অ্যাকাউন্ট আনব্যান (ডিভাইস রুল লঙ্ঘনকারী নয়)।"""
+    out = []
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT user_id, ban_reason FROM users WHERE COALESCE(is_banned,0)=1"
+            ).fetchall()
+        for r in rows:
+            rsn = r["ban_reason"] or ""
+            low = rsn.lower()
+            if "ip" not in low:
+                continue
+            if "ডিভাইস" in rsn or "device" in low:
+                continue
+            out.append(int(r["user_id"]))
+        for _u in out:
+            with _c() as c:
+                c.execute("UPDATE users SET is_banned=0, ban_reason='' WHERE user_id=%s", (_u,))
+            try:
+                _invalidate_user_cache(_u)
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning(f"[SEC2] unban_iponly ব্যর্থ: {e}")
+    return len(out)
 
 
 def sec_add_alert(kind, uid, related_uid=0, ip="", country="", device_hash="", detail=""):
@@ -1370,9 +1420,20 @@ async def sec_after_verify(bot, uid, lang="bn"):
         log.warning(f"[SEC2] scan ব্যর্থ uid={uid}: {_e}")
         return
     cfg = _sec_cfg()
-    device_hit = int(info["device_n"]) >= cfg["device_limit"]
-    ip_hit = int(info["ip_n"]) >= cfg["ip_limit"]
+    # limit=1 → দ্বিতীয় অ্যাকাউন্টেই ধরা পড়বে (নিজে বাদ দিয়ে গোনা হয়)
+    device_hit = int(info["device_n"]) > cfg["device_limit"]
+    ip_hit = int(info["ip_n"]) > cfg["ip_limit"]
     if not (device_hit or ip_hit):
+        return
+    if ip_hit and not device_hit:
+        # ── শুধু IP মিলেছে (VPN/মোবাইল NAT-এ সাধারণ ব্যাপার) → ব্যান নয়, শুধু নোট ──
+        try:
+            await asyncio.to_thread(
+                sec_add_alert, "suspicious_ip", uid, 0, info["ip"], info["country"],
+                info["device_hash"], f"একই IP-তে {info['ip_n']}টি অ্যাকাউন্ট (ব্যান হয়নি)",
+            )
+        except Exception as _ie:
+            log.debug(f"[SEC2] ip note ব্যর্থ uid={uid}: {_ie}")
         return
     why = []
     if device_hit:
@@ -1391,8 +1452,11 @@ async def sec_after_verify(bot, uid, lang="bn"):
         sec_add_alert, "multi_account", uid, 0, info["ip"], info["country"],
         info["device_hash"], detail,
     )
-    # ── অ্যাডমিনকে সাথে সাথে জানাও ──
+    # ── অ্যাডমিনকে সাথে সাথে জানাও (Settings → Notifications বন্ধ থাকলে DM যাবে না;
+    #    alert সবসময় security_alerts টেবিলে থাকে) ──
     try:
+        if (await asyncio.to_thread(get_setting, "notify_security") or "on") == "off":
+            raise RuntimeError("notify_security off")
         u = await asyncio.to_thread(get_user, uid)
         uname = (u.get("username") or "") if u else ""
         fname = (u.get("full_name") or "") if u else ""
@@ -1432,6 +1496,47 @@ async def sec_after_verify(bot, uid, lang="bn"):
             )
         except Exception:
             pass
+
+
+def _ip_retention_once():
+    """Settings → IP data retention (দিন): user_ips/ip_history এর পুরোনো row মুছে দেয়।
+    ডিফল্ট ৯০ দিন; খালি/ভুল মান হলে ৯০ ধরা হয়। কাজ না থাকলে ০ রিটার্ন, ক্র্যাশ নয়।"""
+    try:
+        _v = (get_setting("sec_ip_retention_days") or "").strip()
+        days = int(_v) if _v.isdigit() else 90
+    except Exception:
+        days = 90
+    if days < 1:
+        return 0
+    # panel.py epoch-second স্ট্রিং রাখে (user_ips.last_seen / ip_history.seen_at)
+    _cut = str(int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp()))
+    n = 0
+    try:
+        with _c() as c:
+            cur = c.execute(
+                "DELETE FROM user_ips  WHERE last_seen ~ '^[0-9]+$' AND last_seen < %s", (_cut,))
+            n += int(cur.rowcount or 0)
+            cur = c.execute(
+                "DELETE FROM ip_history WHERE seen_at ~ '^[0-9]+$' AND seen_at < %s", (_cut,))
+            n += int(cur.rowcount or 0)
+    except Exception as _e:
+        log.warning(f"[RETENTION] cleanup ব্যর্থ: {_e}")
+        return 0
+    if n:
+        log.info(f"[RETENTION] {days} দিনের পুরোনো IP row মুছেছে: {n}")
+    return n
+
+
+async def _ip_retention_loop():
+    """১২ ঘণ্টায় একবার IP retention cleanup চালায়।"""
+    while True:
+        try:
+            await asyncio.sleep(12 * 3600)
+            await asyncio.to_thread(_ip_retention_once)
+        except asyncio.CancelledError:
+            raise
+        except Exception as _e:
+            log.debug(f"[RETENTION] {_e}")
 
 
 async def sec_callback(update, ctx):
@@ -1638,8 +1743,8 @@ async def _admin_security_screen(q, uid, d):
             f"🌐 একই IP-তে সর্বোচ্চ: `{cfg['ip_limit']}` অ্যাকাউন্ট\n"
             f"🚫 অটো ব্যান: {'🟢 চালু' if _auto else '🔴 বন্ধ'}\n\n"
             "_সীমা বদলাতে DB settings এ এই key দিন:_\n"
-            "`sec_device_limit` = 3\n"
-            "`sec_ip_limit` = 5\n"
+            "`sec_device_limit` = 1 (১ ফোন = ১ অ্যাকাউন্ট)\n"
+            "`sec_ip_limit` = 2 (IP-তে ব্যান হয় না)\n"
             "`sec_auto_ban` = on / off"
         )
         kb = InlineKeyboardMarkup([
@@ -1685,6 +1790,71 @@ def vrf_note_attempt(uid, kind="verify_check"):
         log.debug(f"[VRF] attempt note ব্যর্থ uid={uid}: {_e}")
 
 
+def _vrf_limit_reason(uid):
+    """এক ফোন/এক IP নিয়ম ভাঙছে কি না — "device" / "ip" / ""."""
+    try:
+        cfg = _sec_cfg()
+        with _c() as c:
+            r = c.execute(
+                "SELECT device_hash, last_ip, reg_ip FROM users WHERE user_id=%s", (uid,)
+            ).fetchone()
+            if not r:
+                return ""
+            dh = r["device_hash"] or ""
+            ip = r["last_ip"] or r["reg_ip"] or ""
+            if dh:
+                n1 = c.execute(
+                    "SELECT COUNT(DISTINCT user_id) AS n FROM devices "
+                    "WHERE device_hash=%s AND user_id<>%s", (dh, uid)).fetchone()
+                n2 = c.execute(
+                    "SELECT COUNT(*) AS n FROM users WHERE device_hash=%s AND user_id<>%s",
+                    (dh, uid)).fetchone()
+                if max(int(_count(n1)), int(_count(n2))) >= max(1, int(cfg["device_limit"])):
+                    return "device"
+            if ip:
+                i1 = c.execute(
+                    "SELECT COUNT(DISTINCT user_id) AS n FROM user_ips "
+                    "WHERE ip=%s AND user_id<>%s", (ip, uid)).fetchone()
+                i2 = c.execute(
+                    "SELECT COUNT(*) AS n FROM users WHERE (last_ip=%s OR reg_ip=%s) "
+                    "AND user_id<>%s", (ip, ip, uid)).fetchone()
+                if max(int(_count(i1)), int(_count(i2))) >= max(1, int(cfg["ip_limit"])):
+                    return "ip"
+    except Exception as e:
+        log.debug(f"[VRF] limit reason ব্যর্থ uid={uid}: {e}")
+    return ""
+
+
+async def _vrf_send_blocked(bot, uid, reason, lang=None):
+    """নিয়ম ভাঙলে verify প্রম্পটের বদলে স্পষ্ট বার্তা (১০ মিনিটে একবার)।"""
+    if lang is None:
+        lang = await asyncio.to_thread(get_lang, uid)
+    _now_ts = _time.time()
+    if (_now_ts - _VRF_PROMPT_TS.get(uid, 0)) < 600:
+        return
+    _VRF_PROMPT_TS[uid] = _now_ts
+    if reason == "device":
+        bn = ("🚫 *এক ফোনে একটির বেশি অ্যাকাউন্ট চলবে না*\n\n"
+              "এই ফোন দিয়ে ইতিমধ্যে একটি অ্যাকাউন্ট চলছে।\n"
+              "দ্বিতীয় অ্যাকাউন্ট verify করা যাবে না।\n\n"
+              "ভুল মনে হলে অ্যাডমিনের সাথে যোগাযোগ করুন।")
+        en = ("🚫 *Only one account per phone is allowed*\n\n"
+              "An account is already active on this phone.\n"
+              "A second account can not be verified.\n\n"
+              "Contact the admin if you think this is a mistake.")
+    else:
+        bn = ("🚫 *এই ইন্টারনেট (IP) দিয়ে আর অ্যাকাউন্ট চলবে না*\n\n"
+              "একই IP-তে সর্বোচ্চ ২টি অ্যাকাউন্ট খোলা যায়।\n"
+              "👉 Wi-Fi বন্ধ করে মোবাইল ডেটা দিয়ে আবার চেষ্টা করুন।")
+        en = ("🚫 *No more accounts from this IP*\n\n"
+              "Up to 2 accounts per IP are allowed.\n"
+              "👉 Turn off Wi-Fi and try again with mobile data.")
+    try:
+        await bot.send_message(uid, bn if lang != "en" else en, parse_mode="Markdown")
+    except Exception as e:
+        log.debug(f"[VRF] block msg ব্যর্থ uid={uid}: {e}")
+
+
 async def _vrf_gate_msg(bot, uid):
     """True = এগোতে পারবে। False = verify prompt পাঠানো হয়েছে।"""
     # ADMIN-সহ সবাই verify প্রম্পট পাবে (আগের verified হলেও)
@@ -1693,6 +1863,11 @@ async def _vrf_gate_msg(bot, uid):
     if await asyncio.to_thread(vrf_pass_on, uid):
         return True
     lang = await asyncio.to_thread(get_lang, uid)
+    _blk = await asyncio.to_thread(_vrf_limit_reason, uid)
+    if _blk:
+        # ১ ফোন = ১ অ্যাকাউন্ট / IP সীমা — verify লিংক না দিয়ে কারণ জানাও
+        await _vrf_send_blocked(bot, uid, _blk, lang)
+        return False
     await _vrf_send_prompt(bot, uid, lang)
     return False
 
@@ -1729,9 +1904,16 @@ async def _vrf_handle_check(update, ctx, q, uid):
     # ── একবারই: আগেই pass হয়ে গেলে আর কিছু হবে না ──
     if await asyncio.to_thread(vrf_pass_on, uid):
         try:
-            await q.answer("✅ আপনি ইতিমধ্যে verified — আর দরকার নেই।", show_alert=True)
+            await q.answer("✅ Verified — মেনু খুলছে…")
         except Exception:
             pass
+        try:
+            await q.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        # ওয়েবে verify করা ইউজার এখানে চাপলে মেনু যেন আসে (নীরব না থাকে)
+        await _vrf_after_web_verify(uid, ctx.bot)
+        ctx.user_data.pop("state", None)
         return
     ok = await asyncio.to_thread(vrf_is_verified, uid)
     if not ok:
@@ -1767,6 +1949,105 @@ async def _vrf_handle_check(update, ctx, q, uid):
     except Exception as _ce:
         log.debug(f"[VRF] channel check ব্যর্থ uid={uid}: {_ce}")
     await _send_welcome(update, ctx, uid)
+
+
+_VRF_WELCOME_TS = {}
+_VRF_SIG_READY = False
+
+
+def _vrf_sig_ensure():
+    """প্যানেল → বট সিগন্যাল টেবিল (একবারই তৈরি হয়)।"""
+    global _VRF_SIG_READY
+    if _VRF_SIG_READY:
+        return
+    try:
+        with _c() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS vrf_signals (id BIGSERIAL PRIMARY KEY, "
+                      "user_id BIGINT, created_at TEXT DEFAULT '', processed INTEGER DEFAULT 0)")
+        _VRF_SIG_READY = True
+    except Exception as e:
+        log.debug(f"[VRF] vrf_signals তৈরি ব্যর্থ: {e}")
+
+
+def _vrf_pending_signals():
+    """প্যানেল থেকে আসা 'verify শেষ' সিগন্যাল (processed=0) → uid তালিকা।"""
+    _vrf_sig_ensure()
+    out = []
+    try:
+        with _c() as c:
+            rows = c.execute("SELECT id, user_id FROM vrf_signals "
+                             "WHERE processed=0 ORDER BY id LIMIT 20").fetchall()
+            for r in rows:
+                try:
+                    c.execute("UPDATE vrf_signals SET processed=1 WHERE id=%s", (r["id"],))
+                except Exception:
+                    pass
+                out.append(int(r["user_id"] or 0))
+    except Exception as e:
+        log.debug(f"[VRF] signal পড়া ব্যর্থ: {e}")
+    return [u for u in out if u > 0]
+
+
+def _vrf_mark_signals_done(uid):
+    try:
+        with _c() as c:
+            c.execute("UPDATE vrf_signals SET processed=1 WHERE user_id=%s AND processed=0", (uid,))
+    except Exception:
+        pass
+
+
+async def _vrf_after_web_verify(uid, bot=None):
+    """ওয়েব প্যানেলে verification সফল হওয়ার সাথে সাথে বট নিজেই welcome+মেনু পাঠায়।"""
+    try:
+        uid = int(uid)
+    except Exception:
+        return
+    if uid <= 0:
+        return
+    _VRF_SILENT_MEMO.pop(uid, None)   # প্যানেলে verify শেষ → সাথে সাথে gate খুলে দাও
+    _t = _time.time()
+    if _t - _VRF_WELCOME_TS.get(uid, 0) < 60:
+        return          # এইমাত্র পাঠানো হয়েছে — ডাবল মেসেজ নয়
+    _VRF_WELCOME_TS[uid] = _t
+    try:
+        if not await asyncio.to_thread(vrf_pass_on, uid):
+            await asyncio.to_thread(vrf_mark_pass, uid)
+        bot = bot or (_app.bot if _app else None)
+        if bot is None:
+            return
+        try:
+            lang = await asyncio.to_thread(get_lang, uid)
+        except Exception:
+            lang = "bn"
+        try:
+            kb = await asyncio.to_thread(main_kb, uid)
+        except Exception:
+            kb = None
+        _uk = "welcome_msg_bn" if lang == "bn" else "welcome_msg_en"
+        try:
+            custom_w = await asyncio.to_thread(get_setting, _uk)
+        except Exception:
+            custom_w = None
+        try:
+            welcome_text = custom_w if custom_w else T(uid, "welcome")
+        except Exception:
+            welcome_text = "🎉 স্বাগতম!"
+        try:
+            await bot.send_message(
+                uid,
+                "✅ *Verification successful!*\n\nএখন আপনি Task করতে পারবেন।" if lang == "bn"
+                else "✅ *Verification successful!*\n\nYou now have access to tasks.",
+                parse_mode="Markdown",
+            )
+        except Exception as _m1:
+            log.debug(f"[VRF] success মেসেজ ব্যর্থ uid={uid}: {_m1}")
+        await bot.send_message(uid, welcome_text, parse_mode="Markdown", reply_markup=kb)
+        await asyncio.to_thread(_vrf_mark_signals_done, uid)
+        log.info(f"[VRF] web verify → welcome পাঠানো হলো uid={uid}")
+    except Exception as e:
+        _VRF_WELCOME_TS.pop(uid, None)   # ব্যর্থ হলে আবার চেষ্টা করার সুযোগ
+        log.warning(f"[VRF] auto-welcome ব্যর্থ uid={uid}: {e}")
+
 
 
 def init_db():
@@ -2379,6 +2660,9 @@ POINT_PER_REJECT  = 10   # reject হলে ১০ পয়েন্ট কম�
 POINT_PER_APPROVE = 5    # approve হলে +5 পয়েন্ট
 POINT_DUP_PHOTO   = 3    # একই ছবি ২য়বার = −৩ পয়েন্ট (আগে 15 → 8 → 3)
 POINT_BLOCK_AT    = 0    # পয়েন্ট ০ হলেই block (০ ছাড়া আর কিছুতে block নয়)
+
+# ── বিল্ড ট্যাগ: এই মান বদলালেই পরের বার বট চালু হলে সব ইউজার আবার নতুন করে শুরু করবে ──
+BOT_BUILD = "2026-11-01.4"
 POINT_BLOCK_DAYS  = 2    # ০ হলে ২ দিন task বন্ধ
 WALLET_CHANGE_HOLD_HOURS = 6   # ওয়ালেট বদলের পর এত ঘণ্টা payout hold
 WINBACK_INACTIVE_DAYS    = 14  # এত দিন না আসলে উইনব্যাক মেসেজ
@@ -2397,6 +2681,9 @@ def get_blocked_until(uid):
         return (r["blocked_until"] or "") if r else ""
 
 def is_task_blocked(uid):
+    # সেটিং বন্ধ থাকলে পুরোনো DB block লাগবে না — পয়েন্ট ০ হলেও task চালু
+    if not points_on() or not points_block_on():
+        return False, None
     block_dt = None
     bu = get_blocked_until(uid)
     if not bu: return False, None
@@ -2413,7 +2700,15 @@ def is_task_blocked(uid):
 
 def add_points(uid, delta):
     """Points বাড়াও/কমাও। 0–50 clamp। ≤ POINT_BLOCK_AT হলে block করো।
-    Atomic single-statement UPDATE — race condition নেই।"""
+    Atomic single-statement UPDATE — race condition নেই।
+    পয়েন্ট সিস্টেম বন্ধ থাকলে (settings: points_on=off) কিছুই বদলায় না।"""
+    if not points_on():
+        try:
+            with _c() as c:
+                r = c.execute("SELECT points FROM users WHERE user_id=%s", (uid,)).fetchone()
+            return int(r["points"] or 0) if r else POINT_START
+        except Exception:
+            return POINT_START
     with _c() as c:
         r = c.execute(
             "UPDATE users SET points=GREATEST(0, LEAST(%s, COALESCE(points,%s)+%s)) "
@@ -2421,11 +2716,12 @@ def add_points(uid, delta):
             (POINT_START, POINT_START, delta, uid)
         ).fetchone()
         new_pts = r["points"] if r else POINT_START
-        if delta < 0 and new_pts <= POINT_BLOCK_AT:
+        if delta < 0 and new_pts <= POINT_BLOCK_AT and points_block_on():
             block_dt      = datetime.now(timezone.utc) + timedelta(days=POINT_BLOCK_DAYS)
             c.execute("UPDATE users SET blocked_until=%s WHERE user_id=%s",
                       (block_dt.isoformat(), uid))
-        elif new_pts > POINT_BLOCK_AT:
+        elif new_pts > POINT_BLOCK_AT or not points_block_on():
+            # ব্লক সিস্টেম বন্ধ থাকলে পুরোনো blocked_until-ও মুছে দাও
             c.execute("UPDATE users SET blocked_until=NULL WHERE user_id=%s", (uid,))
     _mark_dirty()
     return new_pts
@@ -2721,6 +3017,52 @@ def leaderboard_auto_on():
         return (get_setting('leaderboard_auto_on') or 'on') != 'off'
     except Exception:
         return True
+
+
+def points_on():
+    """পয়েন্ট (trust points) সিস্টেম চালু না বন্ধ — admin setting 'points_on'।
+    বন্ধ থাকলে পয়েন্ট যোগ/কাটা কিছুই হয় না, ব্লকও হয় না। ডিফল্ট: চালু।"""
+    try:
+        return (get_setting('points_on') or 'on') != 'off'
+    except Exception:
+        return True
+
+
+def points_block_on():
+    """পয়েন্ট ০ হলে task ২ দিন ব্লক হবে কি না — admin setting 'points_block'।
+    ডিফল্ট: বন্ধ → পয়েন্ট ০ হলেও task চালু থাকে।"""
+    try:
+        return (get_setting('points_block') or 'off') == 'on'
+    except Exception:
+        return False
+
+
+def _reset_onboarding_sync(keep_admin=True):
+    """সব ইউজারকে আবার শুরু থেকে — verification + onboarding রিসেট (একবারই)।
+    ⚠️ balance, points, রেফারেল, task/withdraw ইতিহাস — কোনো ডেটা/টাকা মোছে না।"""
+    n = 0
+    with _c() as c:
+        if keep_admin:
+            cur = c.execute(
+                "UPDATE users SET vrf_pass=0, verified=0 "
+                "WHERE user_id<>%s AND COALESCE(vrf_pass,0)<>0", (ADMIN_ID,))
+        else:
+            cur = c.execute(
+                "UPDATE users SET vrf_pass=0, verified=0 WHERE COALESCE(vrf_pass,0)<>0")
+        try:
+            n = int(cur.rowcount or 0)
+        except Exception:
+            n = 0
+        try:
+            c.execute("DELETE FROM vrf_signals")
+        except Exception:
+            pass
+    for _d in (_user_cache, _VRF_PROMPT_TS, _VRF_WELCOME_TS, _VRF_SILENT_MEMO):
+        try:
+            _d.clear()
+        except Exception:
+            pass
+    return n
 
 def bot_is_on():
     """bot_status — get_setting cache ব্যবহার করে (60s TTL, set_setting এ invalidate হয়)।
@@ -7099,6 +7441,16 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_point(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not await guard(update, ctx): return
+    if not await asyncio.to_thread(points_on):
+        await update.message.reply_text(
+            "⚙️ *পয়েন্ট সিস্টেম এখন বন্ধ আছে।*\n\n"
+            "এই মুহূর্তে Task approve/reject হলেও পয়েন্ট বাড়বে বা কমবে না।\n"
+            "অ্যাডমিন চালু করলে আবার আগের মতো কাজ করবে।"
+            if await asyncio.to_thread(get_lang, uid) == 'bn' else
+            "⚙️ *The points system is currently off.*\n\n"
+            "Approvals and rejections will not change points right now.",
+            parse_mode="Markdown")
+        return
     pts, (blk, blk_dt), lang = await asyncio.gather(
         asyncio.to_thread(get_points, uid),
         asyncio.to_thread(is_task_blocked, uid),
@@ -7125,12 +7477,20 @@ async def cmd_point(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             status_txt = "🔴 Low — Be careful!" if lang == 'en' else "🔴 কম — সাবধান!"
         block_line = ""
 
+    blk_on = await asyncio.to_thread(points_block_on)
+    if not blk_on:
+        rule_txt = ("পয়েন্ট `0` হলেও Task বন্ধ হবে না" if lang != 'en'
+                    else "Even at `0` points, tasks are never blocked")
+    else:
+        rule_txt = (f"পয়েন্ট `0` হয়ে গেলে: `{POINT_BLOCK_DAYS}` দিন Task বন্ধ" if lang != 'en'
+                    else f"Points reach `0`: Tasks blocked for `{POINT_BLOCK_DAYS}` days")
+
     await update.message.reply_text(
         T(uid, 'point_cmd',
           pts=pts,
           status=status_txt,
           block_line=block_line,
-          block_days=POINT_BLOCK_DAYS,
+          block_rule=rule_txt,
           reject_pts=POINT_PER_REJECT,
           approve_pts=POINT_PER_APPROVE),
         parse_mode="Markdown"
@@ -8120,6 +8480,266 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
         return
 
+async def cmd_unban_iponly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin — শুধু IP-এর কারণে ব্যান হওয়া ইউজারদের আনব্যান।"""
+    u = update.effective_user
+    if not u:
+        return
+    try:
+        if not await asyncio.to_thread(is_admin, u.id):
+            return
+    except Exception:
+        return
+    try:
+        n = await asyncio.to_thread(_unban_iponly_sync)
+    except Exception as _e:
+        await update.message.reply_text(f"❌ ব্যর্থ: {_e}")
+        return
+    await update.message.reply_text(
+        f"✅ IP-এর কারণে ব্যান হওয়া {n}টি অ্যাকাউন্ট আনব্যান হয়েছে।\n\n"
+        "🔒 এখন থেকে:\n"
+        "• এক ফোন = এক অ্যাকাউন্ট (ডিভাইস মিললে ব্যান)\n"
+        "• এক IP-তে ২টি পর্যন্ত — তার বেশি হলে শুধু অ্যালার্ট, ব্যান নয়\n"
+        "• VPN ব্যবহার করলে IP বদলালেও ডিভাইস ধরা পড়বে"
+    )
+
+
+# ═════════════ নতুন বিল্ডে সবাই আবার শুরু (auto reset) ═════════════
+async def _notify_reverify(bot, build=""):
+    """রিসেটের পর সব ইউজারকে একবার জানাও — /start চাপতে হবে (রেট-লিমিট মেনে)।"""
+    def _uids():
+        with _c() as c:
+            rows = c.execute(
+                "SELECT user_id FROM users WHERE user_id<>%s ORDER BY user_id", (ADMIN_ID,)
+            ).fetchall()
+        return [int(r["user_id"]) for r in rows][:4000]
+
+    try:
+        uids = await asyncio.to_thread(_uids)
+    except Exception as e:
+        log.warning(f"[RESET] ইউজার লিস্ট ব্যর্থ: {e}")
+        return
+    if not uids:
+        return
+    log.info(f"[RESET] {len(uids)} জনকে re-verify নোটিশ পাঠাচ্ছি…")
+    sem = asyncio.Semaphore(6)
+    sent = [0]
+
+    async def _one(uid):
+        async with sem:
+            try:
+                lang = await asyncio.to_thread(get_lang, uid)
+                if lang == "en":
+                    txt = ("🔄 *Bot updated*\n\n"
+                           "For security everyone must verify once again — it takes ~20 seconds.\n\n"
+                           "👉 Press /start to continue.\n\n"
+                           "✅ Your balance, points and referrals are safe.")
+                else:
+                    txt = ("🔄 *বট আপডেট হয়েছে*\n\n"
+                           "নিরাপত্তার জন্য সবাইকে আবার একবার *verify* করতে হবে — ২০ সেকেন্ডের কাজ।\n\n"
+                           "👉 চালিয়ে যেতে /start চাপুন।\n\n"
+                           "✅ আপনার ব্যালান্স, পয়েন্ট, রেফারেল — সব অক্ষত আছে।")
+                await bot.send_message(uid, txt, parse_mode="Markdown")
+                sent[0] += 1
+            except Exception:
+                pass
+            await asyncio.sleep(0.04)
+
+    for i in range(0, len(uids), 40):
+        await asyncio.gather(*[_one(x) for x in uids[i:i + 40]], return_exceptions=True)
+        await asyncio.sleep(0.5)
+    log.info(f"[RESET] re-verify নোটিশ গেছে {sent[0]}/{len(uids)} জনকে")
+    try:
+        await bot.send_message(
+            ADMIN_ID, f"📣 re-verify নোটিশ পাঠানো হয়েছে: {sent[0]}/{len(uids)} জনকে",
+            parse_mode="Markdown")
+    except Exception:
+        pass
+
+
+async def _maybe_reset_on_update(bot):
+    """বটের বিল্ড বদলালে সব ইউজার আবার নতুন করে শুরু করবে (প্রতি বিল্ডে একবারই)।"""
+    try:
+        await asyncio.sleep(10)   # বট পুরোপুরি চালু হতে দাও
+        stored = await asyncio.to_thread(get_setting, "bot_build")
+        if (stored or "") == BOT_BUILD:
+            return
+        enabled = (await asyncio.to_thread(get_setting, "reset_on_update") or "on") != "off"
+        n = 0
+        if enabled:
+            n = await asyncio.to_thread(_reset_onboarding_sync, True)
+        await asyncio.to_thread(set_setting, "bot_build", BOT_BUILD)
+        head = "🔄 *নতুন আপডেট — সবাই আবার শুরু থেকে*" if enabled else "ℹ️ *নতুন আপডেট*"
+        txt = (f"{head}\n\nbuild: `{BOT_BUILD}`\nআগের build: `{stored or '-'}`\n\n"
+               + (f"♻️ {n} জন ইউজারকে আবার verify করতে হবে।\n"
+                  "💰 ব্যালান্স, পয়েন্ট, রেফারেল — কিছুই মোছা হয়নি।\n"
+                  "📣 সবাইকে নোটিশ পাঠানো হচ্ছে।" if enabled else
+                  "⏭ ইউজার রিসেট বন্ধ আছে (Settings → Update reset)।"))
+        log.info(f"[RESET] build {stored or '-'} → {BOT_BUILD}, reset={enabled}, users={n}")
+        await bot.send_message(ADMIN_ID, txt, parse_mode="Markdown")
+        if enabled and n:
+            await _notify_reverify(bot, BOT_BUILD)
+    except Exception as e:
+        log.warning(f"[RESET] build reset ব্যর্থ: {e}")
+
+
+async def cmd_resetall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin — এখনই সব ইউজারকে আবার শুরু থেকে (নিশ্চিতকরণ বাটনসহ)।"""
+    u = update.effective_user
+    if not u:
+        return
+    try:
+        if not await asyncio.to_thread(is_admin, u.id):
+            return
+    except Exception:
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("♻️ হ্যাঁ, সবাইকে রিসেট করো", callback_data="resetall_yes")],
+        [InlineKeyboardButton("❌ বাতিল", callback_data="resetall_no")],
+    ])
+    await update.message.reply_text(
+        "♻️ *সব ইউজারকে আবার শুরু থেকে?*\n\n"
+        "• সবাইকে আবার একবার verify করতে হবে\n"
+        "• সবাই /start চাপলে নতুন করে শুরু পাবে\n"
+        "• *ব্যালান্স, পয়েন্ট, রেফারেল, ইতিহাস — কিছুই মোছা হবে না*\n"
+        "• আপনি (অ্যাডমিন) বাদ থাকবেন\n\n"
+        "নিশ্চিত হলে নিচের বাটন চাপুন।",
+        parse_mode="Markdown", reply_markup=kb)
+
+
+async def on_resetall_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    try:
+        if not await asyncio.to_thread(is_admin, q.from_user.id):
+            return
+    except Exception:
+        return
+    if q.data == "resetall_no":
+        try:
+            await q.edit_message_text("❌ বাতিল করা হয়েছে — কিছুই বদলায়নি।")
+        except Exception:
+            pass
+        return
+    try:
+        n = await asyncio.to_thread(_reset_onboarding_sync, True)
+    except Exception as e:
+        try:
+            await q.edit_message_text(f"❌ রিসেট ব্যর্থ: {e}")
+        except Exception:
+            pass
+        return
+    try:
+        await q.edit_message_text(
+            f"♻️ *{n} জন ইউজার রিসেট হয়েছে*\n\n"
+            "তারা এখন /start চাপলে আবার নতুন করে verify করবে।\n"
+            "💰 ব্যালান্স/পয়েন্ট কিছুই মোছা হয়নি।\n\n"
+            "📣 নোটিশ পাঠানো হচ্ছে…", parse_mode="Markdown")
+    except Exception:
+        pass
+    _t = asyncio.create_task(_notify_reverify(ctx.bot, BOT_BUILD))
+    _background_tasks.add(_t)
+    _t.add_done_callback(_bg_task_done)
+
+
+def _btest_health():
+    """নতুন ইউজারের চোখে পড়তে পারে এমন সমস্যা — এক নজরে।"""
+    def g(k, d=""):
+        try:
+            return get_setting(k) or d
+        except Exception:
+            return d
+    bot_ok = g("bot_status", "on") != "off"
+    try:
+        ver = verify_enabled()
+    except Exception:
+        ver = False
+    on_shared = g("sec_auto_ban", "off") == "on"
+    dl = str(g("sec_device_limit", "1"))
+    il = str(g("sec_ip_limit", "2"))
+    pts = g("points_on", "on") != "off"
+    ru = g("reset_on_update", "on") != "off"
+    base = _vrf_panel_base() or ""
+    try:
+        _tok_ok = bool(_vrf_tok())
+    except Exception:
+        _tok_ok = False
+    L = [
+        f"{'✅' if bot_ok else '❌'} বট: {'চালু' if bot_ok else 'বন্ধ (কেউ কিছু পাবে না)'}",
+        f"{'✅' if ver else '❌'} Verification: {'চালু' if ver else 'বন্ধ (সবাই সোজা ঢুকে যাবে)'}",
+        f"{'✅' if pts else '⚠️'} পয়েন্ট সিস্টেম: {'চালু' if pts else 'বন্ধ'}",
+        f"{'✅' if dl == '1' else '⚠️'} ডিভাইস লিমিট: {dl}" + (" (এক ফোন এক অ্যাকাউন্ট)" if dl == "1" else " (১ হলে এক ফোন এক অ্যাকাউন্ট)"),
+        f"✅ IP লিমিট: {il}",
+        f"{'⚠️' if on_shared else '✅'} ডুপ্লিকে অটো-ব্যান: {'চালু' if on_shared else 'বন্ধ (শুধু ব্লক + অ্যালার্ট)'}",
+        f"{'✅' if ru else '⚠️'} আপডেটে সবাই রিসেট: {'চালু' if ru else 'বন্ধ'}",
+        f"{'✅' if (base and _tok_ok) else '❌'} প্যানেল লিংক: {base or 'সেট নেই'}"
+        + ("" if _tok_ok else " (tokan মডিউল অনুপস্থিত)"),
+        f"ℹ️ build: {BOT_BUILD}",
+    ]
+    return "\n".join(L)
+
+
+async def cmd_btest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin — নতুন ইউজার ঠিক কেমন দেখবে, ধাপে ধাপে। DB-তে কিছুই বদলায় না।"""
+    u = update.effective_user
+    if not u:
+        return
+    try:
+        if not await asyncio.to_thread(is_admin, u.id):
+            return
+    except Exception:
+        return
+    lang = await asyncio.to_thread(get_lang, u.id)
+
+    # ধাপ ১ — ভাষা নির্বাচন
+    await update.message.reply_text(
+        "🧪 *বট টেস্ট — নতুন ইউজার যা দেখবে*\n\n"
+        f"`build: {BOT_BUILD}`  •  *ধাপ ১/৪:* ভাষা\n"
+        "একদম নতুন কেউ প্রথম /start দিলে শুধু এই দুটো বাটন পায়।",
+        parse_mode="Markdown", reply_markup=lang_kb())
+
+    # ধাপ ২ — verification প্রম্পট (uid=0 টেস্ট টোকেন → DB-তে লেখা হয় না)
+    link = ""
+    try:
+        base = _vrf_panel_base() or _VRF_BASE_FALLBACK
+        tk = _vrf_tok().make_token(0, 3600)
+        link = f"{base}/v/{tk}" if tk else ""
+    except Exception as _e:
+        log.debug(f"[BTEST] token ব্যর্থ: {_e}")
+    body = VERIFY_TEXT_EN if lang == "en" else VERIFY_TEXT_BN
+    kb2 = InlineKeyboardMarkup([[InlineKeyboardButton("🧪 Test Verify Page", url=link)]]) if link else None
+    await update.message.reply_text(
+        "*ধাপ ২/৪:* Verification প্রম্পট\n"
+        "━━━━━━━━━━━━━━\n" + body + "\n━━━━━━━━━━━━━━\n\n"
+        "ℹ️ এখানে *✅ I verified* বাটন ইচ্ছাকৃতভাবে নেই — চাপলে আপনার নিজের অ্যাকাউন্টে প্রভাব পড়ত।\n"
+        "নতুন ইউজার ঠিক এই মেসেজটাই পায়, সাথে verify লিংক।",
+        parse_mode="Markdown", reply_markup=kb2, disable_web_page_preview=True)
+
+    # ধাপ ৩ — স্বাগতম + মেনু
+    _w = await asyncio.to_thread(
+        get_setting, "welcome_msg_en" if lang == "en" else "welcome_msg_bn")
+    welcome = _w or T(u.id, "welcome")
+    await update.message.reply_text(
+        "*ধাপ ৩/৪:* Verify শেষে স্বাগতম + মেনু\n"
+        "━━━━━━━━━━━━━━\n" + welcome,
+        parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, u.id))
+
+    # ধাপ ৪ — সিস্টেম চেক
+    health = await asyncio.to_thread(_btest_health)
+    await update.message.reply_text(
+        "*ধাপ ৪/৪:* সিস্টেম চেক\n"
+        "━━━━━━━━━━━━━━\n" + health +
+        "\n━━━━━━━━━━━━━━\n\n"
+        "⚠️/❌ লাইন থাকলে প্যানেলের *Settings* থেকে ঠিক করুন।\n"
+        "🧪 এই টেস্টে ডেটাবেসে কিছুই বদলায়নি, আপনার verify-ও অক্ষত।",
+        parse_mode="Markdown")
+
+
 async def cmd_vfrtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Admin — verification ফ্লো টেস্ট (uid=0 = test token)। DB-তে কিছুই বদলায় না।"""
     u = update.effective_user
@@ -8487,7 +9107,8 @@ def _gate(fn, kind="cmd"):
                 parts = ((update.effective_message.text if update.effective_message else "") or "").split()
                 sub = parts[0].split("@")[0].lower() if parts else "?"
                 # /start ছাড়া আর কোনো কমান্ডে উত্তর নেই (verify না হওয়া পর্যন্ত)
-                if sub != "/start" and not (sub == "/vrfdiag" and u.id == ADMIN_ID) \
+                # অ্যাডমিন সব কমান্ড চালাতে পারবে (রিসেটের পরেও) — বাকিরা /start ছাড়া চুপ
+                if sub != "/start" and u.id != ADMIN_ID \
                         and await asyncio.to_thread(vrf_silent, u.id):
                     return None
             else:
@@ -11955,8 +12576,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     st   = ctx.user_data.get("state")
 
-    # ── নতুন রুল: verify + /start এর আগে বট কিছুই বলে না ──
+    # ── verify + /start এর আগে বট কাজ করে না ──
+    # (রিসেটের পর পুরোনো মেনু-বাটন চাপলে যেন বট চুপ না থাকে — ৬০ সেকেন্ডে একবার verify প্রম্পট)
     if await asyncio.to_thread(vrf_silent, uid):
+        if (_time.time() - _VRF_PROMPT_TS.get(uid, 0)) > 60:
+            try:
+                await _vrf_gate_msg(ctx.bot, uid)
+            except Exception as _ve:
+                log.debug(f"[VRF] silent gate প্রম্পট ব্যর্থ uid={uid}: {_ve}")
         return
 
     # Cancel always works first
@@ -17446,6 +18073,10 @@ def main():
         _warm_task = asyncio.create_task(_warmup())
         _background_tasks.add(_warm_task)
         _warm_task.add_done_callback(_bg_task_done)
+        # ── IP retention: পুরোনো user_ips/ip_history পরিষ্কার (১২ ঘণ্টা পর পর) ──
+        _ret_task = asyncio.create_task(_ip_retention_loop())
+        _background_tasks.add(_ret_task)
+        _ret_task.add_done_callback(_bg_task_done)
         # ── Step 3: Pending notification watcher শুরু করো ─────────
         # Bot restart হলেও DB থেকে pending notifications ধরবে।
         _watcher_task = asyncio.create_task(_pn_watcher(application.bot))
@@ -17456,6 +18087,86 @@ def main():
         _bio_notify_task = asyncio.create_task(_notify_bio_text_change(application.bot))
         _background_tasks.add(_bio_notify_task)
         _bio_notify_task.add_done_callback(_bg_task_done)
+        # ── সিকিউরিটি পলিসি v2: ১ ফোন = ১ অ্যাকাউন্ট, এক IP-তে ২টি ──
+        try:
+            if (get_setting("sec_policy_v2") or "") != "done":
+                set_setting("sec_device_limit", "1")
+                set_setting("sec_ip_limit", "2")
+                set_setting("sec_policy_v2", "done")
+                log.info("[SEC2] policy v2 প্রয়োগ: device_limit=1, ip_limit=2")
+        except Exception as _pv:
+            log.debug(f"[SEC2] policy migrate ব্যর্থ: {_pv}")
+        # ── policy v3: ডিভাইস/IP ডুপ্লিকে অটো-ব্যান নয় (block + alert) ──
+        try:
+            if (get_setting("sec_policy_v3") or "") != "done":
+                if get_setting("sec_auto_ban") is None:
+                    set_setting("sec_auto_ban", "off")
+                set_setting("sec_policy_v3", "done")
+                log.info("[SEC2] policy v3: অটো-ব্যান বন্ধ (verify-লেভেলে ব্লক)")
+        except Exception as _p3:
+            log.debug(f"[SEC2] policy v3 ব্যর্থ: {_p3}")
+
+        # ── নতুন বিল্ডে সব ইউজার আবার শুরু থেকে (auto reset) ──
+        _reset_task = asyncio.create_task(_maybe_reset_on_update(application.bot))
+        _background_tasks.add(_reset_task)
+        _reset_task.add_done_callback(_bg_task_done)
+
+        # ── ওয়েব প্যানেল থেকে বদলানো মান সাথে সাথে বটে কাজ করবে ──
+        try:
+            import webadmin as _wadm_mod
+
+            def _web_settings_hook(keys=None):
+                try:
+                    if keys:
+                        for _k in keys:
+                            _settings_cache.pop(_k, None)
+                    _settings_cache.clear()
+                except Exception:
+                    pass
+                try:
+                    _invalidate_btn_cache()
+                except Exception:
+                    pass
+                log.info(f"[WEB] settings বদলেছে → cache clear {list(keys or [])}")
+
+            def _web_user_hook(uid=None):
+                try:
+                    if uid:
+                        _invalidate_user_cache(int(uid))
+                except Exception:
+                    pass
+
+            _wadm_mod.set_settings_hook(_web_settings_hook)
+            _wadm_mod.set_user_hook(_web_user_hook)
+            log.info("✅ [WEB] settings/user cache hook রেজিস্টার্ড")
+        except Exception as _wh:
+            log.warning(f"[WEB] hook রেজিস্টার ব্যর্থ: {_wh}")
+
+        # ── প্যানেলে Verify শেষ হলে বট নিজেই মেনু পাঠাবে (কমান্ড ছাড়াই) ──
+        try:
+            import panel as _panel_mod
+            _panel_mod.set_verify_hook(_vrf_after_web_verify, asyncio.get_running_loop())
+            log.info("✅ [VRF] web→bot auto-start hook রেজিস্টার্ড")
+        except Exception as _he:
+            log.warning(f"[VRF] auto-start hook ব্যর্থ: {_he}")
+
+        async def _vrf_signal_watch():
+            """ফলব্যাক — hook কাজ না করলেও সিগন্যাল টেবিল থেকে মেনু পাঠাবে।"""
+            await asyncio.sleep(8)
+            while True:
+                try:
+                    for _u in await asyncio.to_thread(_vrf_pending_signals):
+                        await _vrf_after_web_verify(_u, application.bot)
+                except Exception as _e2:
+                    log.debug(f"[VRF] signal watcher: {_e2}")
+                await asyncio.sleep(5)
+
+        try:
+            _vrf_sig_task = asyncio.create_task(_vrf_signal_watch())
+            _background_tasks.add(_vrf_sig_task)
+            _vrf_sig_task.add_done_callback(_bg_task_done)
+        except Exception as _ve:
+            log.warning(f"[VRF] signal watcher চালু হয়নি: {_ve}")
         # Fallback dirty-check: ৬০ সেকেন্ড পরপর (immediate scheduling ব্যর্থ হলে)
         if application.job_queue is not None:
             application.job_queue.run_repeating(
@@ -17634,6 +18345,9 @@ def main():
     app.add_handler(CommandHandler("security",    _gate(cmd_security)))
     app.add_handler(CommandHandler("webadmin",    _gate(cmd_webadmin)))
     app.add_handler(CommandHandler("vfrtest",     _gate(cmd_vfrtest)))
+    app.add_handler(CommandHandler("unban_iponly", _gate(cmd_unban_iponly)))
+    app.add_handler(CommandHandler("btest",       _gate(cmd_btest)))
+    app.add_handler(CommandHandler("resetall",    _gate(cmd_resetall)))
     app.add_handler(CommandHandler("vrfdiag",     _gate(cmd_vrfdiag)))
     app.add_handler(CommandHandler("admin",       _gate(cmd_admin)))
     app.add_handler(CommandHandler("cancel",      _gate(cmd_cancel)))
@@ -17650,6 +18364,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback_extra,       pattern=r"^(adm_task_done_\d+|adm_notif_send|adm_notif_edit|adm_notif_skip|adm_tp_.+)$"))
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
     app.add_handler(CallbackQueryHandler(sec_callback, pattern=r"^sec_(unban|ignore)_\d+$"))
+    app.add_handler(CallbackQueryHandler(on_resetall_cb, pattern=r"^resetall_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(on_callback))
     # ~filters.VIA_BOT → inline-bot দিয়ে পাঠানো message ignore করো
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_photo, "ph")))

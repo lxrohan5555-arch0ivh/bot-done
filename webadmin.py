@@ -270,7 +270,7 @@ def _get_pool():
                 if not dsn:
                     raise RuntimeError("DATABASE_URL সেট নেই")
                 _pool = psycopg2.pool.ThreadedConnectionPool(
-                    minconn=1, maxconn=8, dsn=dsn, connect_timeout=10)
+                    minconn=2, maxconn=12, dsn=dsn, connect_timeout=10)
     return _pool
 
 
@@ -282,12 +282,33 @@ def _q(sql, args=(), one=False):
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(sql, args)
         rows = cur.fetchall()
-        return (rows[0] if rows else None) if one else rows
-    finally:
+        # SELECT-এর পরই transaction বন্ধ করো — idle-in-transaction CockroachDB-তে
+        # পরের query গুলোকে অনেক ধীর করে দেয়
         try:
-            pool.putconn(conn)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return (rows[0] if rows else None) if one else rows
+    except Exception:
+        try:
+            conn.rollback()
         except Exception:
             pass
+        try:
+            pool.putconn(conn, close=True)   # নষ্ট connection pool-এ ফেরত নয়
+        except Exception:
+            pass
+        conn = None
+        raise
+    finally:
+        if conn is not None:
+            try:
+                pool.putconn(conn)
+            except Exception:
+                pass
 
 
 def _x(sql, args=()):
@@ -327,23 +348,128 @@ def many(sql, args=()):
 
 
 def scal(sql, args=(), default=0):
+    key = ("i", sql, repr(args))
+    hit, val = _agg_get(key)
+    if hit:
+        return val
     r = one(sql, args)
-    if not r:
-        return default
-    try:
-        return int(list(r.values())[0] or 0)
-    except Exception:
-        return default
+    res = default
+    if r:
+        try:
+            res = int(list(r.values())[0] or 0)
+        except Exception:
+            res = default
+    _agg_put(key, res)
+    return res
 
 
 def sfloat(sql, args=(), default=0.0):
+    key = ("f", sql, repr(args))
+    hit, val = _agg_get(key)
+    if hit:
+        return val
     r = one(sql, args)
-    if not r:
-        return default
+    res = default
+    if r:
+        try:
+            res = float(list(r.values())[0] or 0)
+        except Exception:
+            res = default
+    _agg_put(key, res)
+    return res
+
+
+# ── aggregate ক্যাশ (ড্যাশবোর্ডের SUM/COUNT একই সংখ্যা বারবার গণে না) ──
+_AGG_CACHE = {}
+_AGG_TTL = 15.0
+_AGG_LOCK = threading.Lock()
+
+
+def _agg_get(key):
+    with _AGG_LOCK:
+        hit = _AGG_CACHE.get(key)
+        if hit and (time.time() - hit[1]) < _AGG_TTL:
+            return True, hit[0]
+    return False, None
+
+
+def _agg_put(key, val):
+    with _AGG_LOCK:
+        if len(_AGG_CACHE) > 500:
+            _AGG_CACHE.clear()
+        _AGG_CACHE[key] = (val, time.time())
+
+
+def agg_clear():
+    with _AGG_LOCK:
+        _AGG_CACHE.clear()
+
+
+# ── bot ↔ web ব্রিজ: প্যানেল থেকে বদলালে সাথে সাথে বটে প্রয়োগ ──
+_SETTINGS_HOOK = None
+_USER_HOOK = None
+
+
+def set_settings_hook(fn):
+    global _SETTINGS_HOOK
+    _SETTINGS_HOOK = fn
+
+
+def set_user_hook(fn):
+    global _USER_HOOK
+    _USER_HOOK = fn
+
+
+def _fire_settings_changed(keys=None):
+    agg_clear()
     try:
-        return float(list(r.values())[0] or 0)
+        import panel as _p
+        try:
+            _p._settings_cache.clear()
+        except Exception:
+            pass
     except Exception:
-        return default
+        pass
+    if _SETTINGS_HOOK:
+        try:
+            _SETTINGS_HOOK(list(keys or []))
+        except Exception:
+            pass
+
+
+def _fire_user_changed(uid):
+    agg_clear()
+    if _USER_HOOK:
+        try:
+            _USER_HOOK(int(uid))
+        except Exception:
+            pass
+
+
+@wadm.after_request
+def _gzip_resp(resp):
+    """HTML gzip — মোবাইল/স্লো নেটওয়ার্কে অনেক দ্রুত লোড।"""
+    try:
+        if resp.direct_passthrough or resp.status_code != 200:
+            return resp
+        if not (resp.mimetype or "").startswith("text/"):
+            return resp
+        if "gzip" not in (request.headers.get("Accept-Encoding") or ""):
+            return resp
+        body = resp.get_data()
+        if len(body) < 1200:
+            return resp
+        import gzip
+        out = gzip.compress(body, 6)
+        if len(out) >= len(body):
+            return resp
+        resp.set_data(out)
+        resp.headers["Content-Encoding"] = "gzip"
+        resp.headers["Content-Length"] = str(len(out))
+        resp.headers.add("Vary", "Accept-Encoding")
+    except Exception:
+        pass
+    return resp
 
 
 def now():
@@ -673,6 +799,7 @@ def dashboard():
     ban = scal("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned,0)=1")
     sus = scal("SELECT COUNT(*) FROM users WHERE COALESCE(is_suspicious,0)=1")
     dup = scal("SELECT COUNT(*) FROM security_alerts WHERE kind='multi_account'")
+    points_total = scal("SELECT COALESCE(SUM(points),0) FROM users")
     bal = sfloat("SELECT COALESCE(SUM(balance),0) FROM users")
     wd = sfloat("SELECT COALESCE(SUM(amount),0) FROM withdrawals")
     tc, tt, tb = task_count()
@@ -707,6 +834,7 @@ def dashboard():
         kpi("Blocked", num(ban), "ব্যান করা", "ban", "#ef4444"),
         kpi("Duplicate Device", num(dup), "মাল্টি-অ্যাকাউন্ট অ্যালার্ট", "device", "#a855f7"),
         kpi("Tasks Completed", num(done_tasks), f"cat {tc} · tg {tt} · bio {tb}", "task", "#4f7cff"),
+        kpi("Total Points", num(points_total), "ইউজারদের মোট পয়েন্ট", "trend", "#a855f7"),
         kpi("Total Earnings", money(bal), "ইউজারদের মোট ব্যালেন্স", "money", "#22c55e"),
         kpi("Total Withdrawals", money(wd), f"pending {pend}", "wallet", "#ef4444"),
     ])
@@ -1022,6 +1150,7 @@ def act_money(uid):
     else:
         _x(f"UPDATE users SET {field}=%s WHERE user_id=%s", (max(0, amt), uid))
     log_admin(f"{field}_{op}", uid, f"{amt} {request.form.get('note') or ''}")
+    _fire_user_changed(uid)      # বটের ক্যাশে সাথে সাথে নতুন ব্যালেন্স
     return back(uid)
 
 
@@ -1033,6 +1162,7 @@ def act_ban(uid):
     why = (request.form.get("reason") or "admin panel")[:200]
     _x("UPDATE users SET is_banned=1, ban_reason=%s WHERE user_id=%s", (why, uid))
     log_admin("ban", uid, why)
+    _fire_user_changed(uid)
     return back(uid)
 
 
@@ -1043,6 +1173,7 @@ def act_unban(uid):
         return g
     _x("UPDATE users SET is_banned=0, ban_reason='' WHERE user_id=%s", (uid,))
     log_admin("unban", uid)
+    _fire_user_changed(uid)
     return back(uid)
 
 
@@ -1058,4 +1189,5 @@ def act_review(uid):
     except Exception:
         pass
     log_admin("review", uid)
+    _fire_user_changed(uid)
     return back(uid)
