@@ -896,6 +896,14 @@ def _vrf_panel_base():
 
 def init_security_db():
     """Verification/security টেবিল + users এর নতুন কলাম তৈরি (idempotent)।"""
+    _t0 = _time.time()
+    try:
+        if (get_setting("security_schema_v1") or "") == "1":
+            _SEC_STATE["schema"] = "done"
+            log.info(f"[SECURITY-DB] schema আগেই তৈরি — DDL skip ({_time.time() - _t0:.1f}s)")
+            return
+    except Exception:
+        pass
     try:
         with _c() as c:
             c.execute(
@@ -1013,17 +1021,20 @@ def init_security_db():
                     c.execute(_alt)
                 except Exception as _ae:
                     log.warning(f"[SECURITY-DB] alter skip: {_ae}")
+            log.info(f"[SECURITY-DB] tables+columns ready ({_time.time() - _t0:.1f}s)")
     except Exception as _e:
         log.error(f"[SECURITY-DB] init ব্যর্থ: {_e}")
         return
-    # ── ভারী কাজ (ইনডেক্স + grandfather) background-এ — বট চালু আটকাবে না ──
+    # ── schema তৈরি → ফ্ল্যাগ সেভ (পরের রিস্টার্টে DDL একেবারে বাদ) ──
     try:
-        threading.Thread(target=_security_heavy_init, name="sec-heavy", daemon=True).start()
-    except Exception as _te:
-        log.warning(f"[SECURITY-DB] heavy thread ব্যর্থ: {_te}")
+        set_setting("security_schema_v1", "1")
+    except Exception as _sfe:
+        log.warning(f"[SECURITY-DB] schema flag ব্যর্থ: {_sfe}")
+    _SEC_STATE["schema"] = "done"
+    log.info(f"[SECURITY-DB] schema প্রস্তুত ({_time.time() - _t0:.1f}s)")
 
 
-_SEC_STATE = {"grandfather": "pending"}
+_SEC_STATE = {"schema": "pending", "grandfather": "pending"}
 
 
 def _security_heavy_init():
@@ -1064,8 +1075,25 @@ def _security_heavy_init():
         log.error(f"[SECURITY-DB] grandfather ব্যর্থ — verification বন্ধ থাকবে: {_ge}")
 
 
+def _security_boot():
+    """startup-এর security কাজ (DDL → ইনডেক্স → grandfather) — পুরোটাই background।"""
+    try:
+        init_security_db()
+    except Exception as _e:
+        log.error(f"[SECURITY-DB] boot DDL ব্যর্থ: {_e}")
+    if _SEC_STATE.get("schema") != "done":
+        log.error("[SECURITY-DB] schema তৈরি হয়নি — verification বন্ধ থাকবে")
+        return
+    try:
+        _security_heavy_init()
+    except Exception as _e:
+        log.error(f"[SECURITY-DB] heavy init ব্যর্থ: {_e}")
+
+
 def verify_enabled():
     """Verification চালু কি না — লিংক বানানো সম্ভব না হলে নীরবে বন্ধ।"""
+    if _SEC_STATE.get("schema") != "done":
+        return False
     if _SEC_STATE.get("grandfather") != "done":
         return False
     try:
@@ -16670,7 +16698,11 @@ def main():
 
     # PostgreSQL ব্যবহার হচ্ছে — file backup/restore দরকার নেই
     init_db()
-    init_security_db()
+    # ── Security init background-এ — DB ধীর/লক থাকলেও বট চালু হবে ──
+    try:
+        threading.Thread(target=_security_boot, name="sec-boot", daemon=True).start()
+    except Exception as _se:
+        log.warning(f"[SECURITY-DB] boot thread ব্যর্থ: {_se}")
     _auto_configure()
     _setup_uptimerobot()  # no-ops if UPTIMEROBOT_API_KEY not set
     async def post_init(application):
