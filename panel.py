@@ -337,6 +337,29 @@ def _already_verified(uid: int) -> bool:
         return False
 
 
+
+def _ip_banned(ip: str) -> bool:
+    """admin panel থেকে ব্যান করা IP কি না (টেবিল না থাকলে False)।"""
+    if not ip:
+        return False
+    try:
+        with _db() as cur:
+            row = cur.execute("SELECT 1 AS x FROM ip_bans WHERE ip=%s", (ip,)).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _page_blocked() -> str:
+    inner = (
+        "<div class=\"ring\"><div class=\"circle\">!</div></div>"
+        "<h1 class=\"warn\">Access Blocked</h1>"
+        "<p>This network has been blocked by the admin.<br>"
+        "Contact support if you think this is a mistake.</p>"
+    )
+    return _shell(inner, "Blocked")
+
+
 # ──────────────────────────── HTML ────────────────────────────
 _CSS = """
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -478,7 +501,19 @@ def _page_invalid() -> str:
 # ──────────────────────────── routes ────────────────────────────
 @bp.route("/v/<token>", methods=["GET"])
 def verify_page(token):
+    if _ip_banned(_client_ip()):
+        return Response(_page_blocked(), status=403, mimetype="text/html")
     uid = vtoken.parse_token(token)
+    if uid == 0:
+        # 🧪 টেস্ট মোড — কাউন্টডাউন আসল, কিন্তু DB-তে কিছুই লেখা হবে না
+        try:
+            with _db() as cur:
+                seconds = _countdown_seconds(cur)
+        except Exception:
+            seconds = DEFAULT_COUNTDOWN
+        resp = Response(_page_countdown(token, seconds), status=200, mimetype="text/html")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
     if not uid:
         return Response(_page_invalid(), status=400, mimetype="text/html")
     if _already_verified(uid):
@@ -497,7 +532,11 @@ def verify_page(token):
 
 @bp.route("/v/<token>/done", methods=["POST"])
 def verify_done(token):
+    if _ip_banned(_client_ip()):
+        return jsonify({"ok": False, "error": "blocked"}), 403
     uid = vtoken.parse_token(token)
+    if uid == 0:
+        return jsonify({"ok": True, "test": True})   # 🧪 টেস্ট — কিছুই সেভ হয় না
     if not uid:
         return jsonify({"ok": False, "error": "invalid"}), 400
     ip = _client_ip()

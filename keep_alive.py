@@ -11,6 +11,14 @@ try:
 except Exception as _pe:
     print(f"[keep_alive] verification page load ব্যর্থ: {_pe}")
 
+# ── Admin web panel (webadmin.py + webadmin2.py) — /admin ─────────
+try:
+    import webadmin as _wadm
+    import webadmin2 as _wadm2  # noqa: F401  (বাকি সব route যোগ করে)
+    app.register_blueprint(_wadm.wadm)
+except Exception as _ae:
+    print(f"[keep_alive] admin panel load ব্যর্থ: {_ae}")
+
 @app.route("/")
 def home():
     return "✅ Task Earn Bot is running!", 200

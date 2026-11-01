@@ -1246,6 +1246,412 @@ def vrf_silent(uid):
     return not vrf_pass_on(uid)
 
 
+# ═══════════ SECURITY PHASE 2 — মাল্টি-অ্যাকাউন্ট ডিটেকশন ═══════════
+# একই ডিভাইস (device hash) বা একই IP-তে বেশি অ্যাকাউন্ট = ব্যান + অ্যাডমিন অ্যালার্ট।
+# সব কিছু fail-safe: কোনো ধাপ ব্যর্থ হলে ইউজার আটকাবে না।
+_SEC_CHK_TS = {}
+
+
+def _sec_cfg():
+    """setting থেকে থ্রেশহোল্ড (না থাকলে ডিফল্ট)।"""
+    def _int(key, default):
+        try:
+            return int(get_setting(key) or default)
+        except Exception:
+            return default
+    try:
+        auto = (get_setting("sec_auto_ban") or "on").strip().lower() != "off"
+    except Exception:
+        auto = True
+    return {
+        "device_limit": max(2, _int("sec_device_limit", 3)),  # নিজেসহ মোট অ্যাকাউন্ট
+        "ip_limit": max(2, _int("sec_ip_limit", 5)),
+        "auto_ban": auto,
+    }
+
+
+def sec_multi_scan(uid):
+    """একই ডিভাইস/আইপিতে অন্য কতজন — গুনে রিপোর্ট দেয়।"""
+    out = {"device_hash": "", "ip": "", "country": "", "device_n": 1, "ip_n": 1}
+    try:
+        with _c() as c:
+            r = c.execute(
+                "SELECT device_hash, last_ip, reg_ip, reg_country FROM users WHERE user_id=%s", (uid,)
+            ).fetchone()
+    except Exception as _e:
+        log.warning(f"[SEC2] scan user পড়া যায়নি uid={uid}: {_e}")
+        return out
+    if not r:
+        return out
+    dh = (r["device_hash"] or "") if r["device_hash"] else ""
+    ip = (r["last_ip"] or r["reg_ip"] or "") if (r["last_ip"] or r["reg_ip"]) else ""
+    out["device_hash"] = dh
+    out["ip"] = ip
+    out["country"] = (r["reg_country"] or "") if r["reg_country"] else ""
+    if dh:
+        try:
+            with _c() as c:
+                n = c.execute(
+                    "SELECT COUNT(DISTINCT user_id) AS n FROM devices WHERE device_hash=%s AND user_id<>%s",
+                    (dh, uid),
+                ).fetchone()
+            out["device_n"] = int(_count(n)) + 1
+        except Exception as _e:
+            log.debug(f"[SEC2] device count ব্যর্থ: {_e}")
+    if ip:
+        try:
+            with _c() as c:
+                n1 = c.execute(
+                    "SELECT COUNT(DISTINCT user_id) AS n FROM user_ips WHERE ip=%s AND user_id<>%s",
+                    (ip, uid),
+                ).fetchone()
+                n2 = c.execute(
+                    "SELECT COUNT(DISTINCT user_id) AS n FROM users "
+                    "WHERE (last_ip=%s OR reg_ip=%s) AND user_id<>%s",
+                    (ip, ip, uid),
+                ).fetchone()
+            out["ip_n"] = max(int(_count(n1)), int(_count(n2))) + 1
+        except Exception as _e:
+            log.debug(f"[SEC2] ip count ব্যর্থ: {_e}")
+    return out
+
+
+def sec_add_alert(kind, uid, related_uid=0, ip="", country="", device_hash="", detail=""):
+    try:
+        with _c() as c:
+            c.execute(
+                "INSERT INTO security_alerts (kind, user_id, related_uid, ip, country, "
+                "device_hash, detail, status, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,'new',%s)",
+                (kind, uid, related_uid, ip, country, device_hash, str(detail)[:500], now()),
+            )
+    except Exception as _e:
+        log.warning(f"[SEC2] alert সেভ ব্যর্থ uid={uid}: {_e}")
+
+
+def sec_set_flags(uid, ban=False, risk=0, reason=""):
+    """is_suspicious/risk_score/ban সেট (প্রতিটাAlাদা, fail-safe)।"""
+    try:
+        with _c() as c:
+            c.execute(
+                "UPDATE users SET is_suspicious=1, risk_score=COALESCE(risk_score,0)+%s WHERE user_id=%s",
+                (int(risk), uid),
+            )
+    except Exception as _e:
+        log.debug(f"[SEC2] suspicion flag ব্যর্থ uid={uid}: {_e}")
+    if not ban:
+        return True
+    try:
+        with _c() as c:
+            c.execute(
+                "UPDATE users SET is_banned=1, ban_reason=%s WHERE user_id=%s",
+                (str(reason)[:200], uid),
+            )
+        try:
+            _invalidate_user_cache(uid)
+        except Exception:
+            pass
+        return True
+    except Exception as _e:
+        log.warning(f"[SEC2] ban ব্যর্থ uid={uid}: {_e}")
+        return False
+
+
+async def sec_after_verify(bot, uid, lang="bn"):
+    """verification সফল হওয়ার পর একবার মাল্টি-অ্যাকাউন্ট চেক (১২ ঘণ্টায় একবার)।"""
+    if uid == ADMIN_ID:
+        return
+    _now_ts = _time.time()
+    if (_now_ts - _SEC_CHK_TS.get(uid, 0)) < 12 * 3600:
+        return
+    _SEC_CHK_TS[uid] = _now_ts
+    try:
+        info = await asyncio.to_thread(sec_multi_scan, uid)
+    except Exception as _e:
+        log.warning(f"[SEC2] scan ব্যর্থ uid={uid}: {_e}")
+        return
+    cfg = _sec_cfg()
+    device_hit = int(info["device_n"]) >= cfg["device_limit"]
+    ip_hit = int(info["ip_n"]) >= cfg["ip_limit"]
+    if not (device_hit or ip_hit):
+        return
+    why = []
+    if device_hit:
+        why.append(f"একই ডিভাইসে {info['device_n']}টি অ্যাকাউন্ট")
+    if ip_hit:
+        why.append(f"একই IP-তে {info['ip_n']}টি অ্যাকাউন্ট")
+    detail = " | ".join(why)
+    banned = False
+    if device_hit and cfg["auto_ban"]:
+        banned = await asyncio.to_thread(
+            sec_set_flags, uid, True, 40, f"multi-account: {detail}"
+        )
+    else:
+        await asyncio.to_thread(sec_set_flags, uid, False, 15, detail)
+    await asyncio.to_thread(
+        sec_add_alert, "multi_account", uid, 0, info["ip"], info["country"],
+        info["device_hash"], detail,
+    )
+    # ── অ্যাডমিনকে সাথে সাথে জানাও ──
+    try:
+        u = await asyncio.to_thread(get_user, uid)
+        uname = (u.get("username") or "") if u else ""
+        fname = (u.get("full_name") or "") if u else ""
+        bal = (u.get("balance") if u else 0) or 0
+        rows = [[
+            InlineKeyboardButton("✅ Unban", callback_data=f"sec_unban_{uid}"),
+            InlineKeyboardButton("🗑 Ignore", callback_data=f"sec_ignore_{uid}"),
+        ]]
+        await bot.send_message(
+            ADMIN_ID,
+            "🚨 *মাল্টি-অ্যাকাউন্ট সনাক্ত*\n\n"
+            f"👤 ইউজার: [{_md_esc(fname) or 'User'}](tg://user?id={uid})\n"
+            f"🆔 `{uid}`" + (f" (@{uname})" if uname else "") + "\n"
+            f"💰 ব্যালান্স: `{round(float(bal), 4)}$`\n\n"
+            f"📱 {detail}\n"
+            f"🌐 IP: `{info['ip'] or '-'}`\n"
+            f"🔑 Device: `{(info['device_hash'] or '-')[:16]}`\n\n"
+            f"{'🚫 অ্যাকাউন্ট ব্যান করা হয়েছে' if banned else '⚠️ সন্দেহজনক হিসেবে চিহ্নিত (ব্যান নয়)'}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows),
+            disable_web_page_preview=True,
+        )
+    except Exception as _e:
+        log.warning(f"[SEC2] admin alert পাঠানো যায়নি: {_e}")
+    if banned:
+        try:
+            await bot.send_message(
+                uid,
+                "🚫 *আপনার অ্যাকাউন্ট ব্যান করা হয়েছে*\n\n"
+                "একই ডিভাইসে একাধিক অ্যাকাউন্ট ব্যবহার ধরা পড়েছে।\n"
+                "ভুল মনে হলে অ্যাডমিনের সাথে যোগাযোগ করুন।"
+                if lang != "en" else
+                "🚫 *Your account has been banned*\n\n"
+                "Multiple accounts on the same device were detected.\n"
+                "Contact the admin if you think this is a mistake.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+
+async def sec_callback(update, ctx):
+    """অ্যালার্টের ✅ Unban / 🗑 Ignore বাটন (শুধু অ্যাডমিন)।"""
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    uid = q.from_user.id
+    try:
+        if not await asyncio.to_thread(is_admin, uid):
+            return
+    except Exception:
+        return
+    d = q.data or ""
+    try:
+        target = int(d.rsplit("_", 1)[1])
+    except Exception:
+        return
+    done = ""
+    if d.startswith("sec_unban_"):
+        try:
+            with _c() as c:
+                c.execute(
+                    "UPDATE users SET is_banned=0, ban_reason='', is_suspicious=0 WHERE user_id=%s",
+                    (target,),
+                )
+            try:
+                _invalidate_user_cache(target)
+            except Exception:
+                pass
+            done = "✅ Unbanned"
+            try:
+                await ctx.bot.send_message(
+                    target,
+                    "✅ *আপনার অ্যাকাউন্ট আবার চালু হয়েছে।*\n\nএখন বট ব্যবহার করতে পারবেন।",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        except Exception as _e:
+            done = f"❌ ব্যর্থ: {_e}"
+    else:
+        try:
+            with _c() as c:
+                c.execute(
+                    "UPDATE security_alerts SET status='ignored', handled_by=%s, handled_at=%s "
+                    "WHERE user_id=%s AND status='new'",
+                    (uid, now(), target),
+                )
+        except Exception:
+            pass
+        done = "🗑 Ignored"
+    try:
+        await q.edit_message_text(
+            f"{(q.message.text or '')[:3500]}\n\n— {done} (`{target}`)",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+
+# ─────────── SECURITY CENTER (admin panel) ───────────
+def _sec_count(sql, args=()):
+    try:
+        with _c() as c:
+            return _count(c.execute(sql, args).fetchone())
+    except Exception:
+        return 0
+
+
+def sec_stats():
+    """সিকিউরিটি সংখ্যা — প্রতিটা আলাদা query, কোনোটা ফেল করলে ০।"""
+    return {
+        "users":      _sec_count("SELECT COUNT(*) AS n FROM users"),
+        "verified":   _sec_count("SELECT COUNT(*) AS n FROM users WHERE COALESCE(verified,0)=1"),
+        "pass":       _sec_count("SELECT COUNT(*) AS n FROM users WHERE COALESCE(vrf_pass,0)=1"),
+        "suspicious": _sec_count("SELECT COUNT(*) AS n FROM users WHERE COALESCE(is_suspicious,0)=1"),
+        "banned":     _sec_count("SELECT COUNT(*) AS n FROM users WHERE COALESCE(is_banned,0)=1"),
+        "alerts":     _sec_count("SELECT COUNT(*) AS n FROM security_alerts WHERE status='new'"),
+    }
+
+
+def sec_recent_alerts(n=10):
+    try:
+        with _c() as c:
+            return c.execute(
+                "SELECT user_id, kind, ip, detail, status, created_at FROM security_alerts "
+                "ORDER BY id DESC LIMIT %s", (int(n),)
+            ).fetchall()
+    except Exception as _e:
+        log.debug(f"[SEC] alert list ব্যর্থ: {_e}")
+        return []
+
+
+def sec_recent_banned(n=10):
+    try:
+        with _c() as c:
+            return c.execute(
+                "SELECT user_id, username, full_name, ban_reason FROM users "
+                "WHERE COALESCE(is_banned,0)=1 ORDER BY user_id DESC LIMIT %s", (int(n),)
+            ).fetchall()
+    except Exception as _e:
+        log.debug(f"[SEC] banned list ব্যর্থ: {_e}")
+        return []
+
+
+def _sec_summary_text(st):
+    return (
+        "🛡 *SECURITY CENTER*\n\n"
+        f"👥 মোট ইউজার: `{st['users']}`\n"
+        f"✅ Verified (old): `{st['verified']}`\n"
+        f"🔓 নতুন ফ্লো pass: `{st['pass']}`\n"
+        f"🔒 বাকি (verification pending): `{max(0, st['users'] - st['pass'])}`\n\n"
+        f"⚠️ সন্দেহজনক: `{st['suspicious']}`\n"
+        f"🚫 ব্যান: `{st['banned']}`\n"
+        f"🔔 নতুন অ্যালার্ট: `{st['alerts']}`"
+    )
+
+
+def _sec_panel_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 অ্যালার্ট তালিকা", callback_data="adm_sec_alerts"),
+         InlineKeyboardButton("🚫 ব্যান তালিকা",   callback_data="adm_sec_banned")],
+        [InlineKeyboardButton("⚙️ নিয়ম সেটিংস", callback_data="adm_sec_cfg")],
+        [InlineKeyboardButton("🔙 Admin Panel",   callback_data="adm_panel")],
+    ])
+
+
+async def _admin_security_screen(q, uid, d):
+    """adm_sec* বাটনগুলোর স্ক্রিন — শুধু মেইন অ্যাডমিন / settings পারমিশন।"""
+    try:
+        if not (uid == ADMIN_ID or await asyncio.to_thread(admin_has_perm, uid, PERM_SETTINGS)):
+            await q.message.reply_text("❌ *এই অংশ শুধু মেইন অ্যাডমিনের।*", parse_mode="Markdown")
+            return
+    except Exception:
+        return
+
+    if d == "adm_sec_toggle_ban":
+        cur = (await asyncio.to_thread(get_setting, "sec_auto_ban") or "on")
+        await asyncio.to_thread(set_setting, "sec_auto_ban", "off" if cur != "off" else "on")
+        d = "adm_sec_cfg"
+
+    if d == "adm_sec":
+        st = await asyncio.to_thread(sec_stats)
+        await q.message.reply_text(_sec_summary_text(st), parse_mode="Markdown",
+                                   reply_markup=_sec_panel_kb())
+        return
+
+    if d == "adm_sec_alerts":
+        rows = await asyncio.to_thread(sec_recent_alerts, 10)
+        if not rows:
+            await q.message.reply_text("📋 *এখনো কোনো অ্যালার্ট নেই।*", parse_mode="Markdown",
+                                       reply_markup=_sec_panel_kb())
+            return
+        txt = "📋 *সর্বশেষ ১০টি সিকিউরিটি অ্যালার্ট*\n\n"
+        kb = []
+        for r in rows:
+            u = int(r["user_id"] or 0)
+            t = str(r["created_at"] or "")[11:16]
+            txt += (f"• `{u}` — {_md_esc(str(r['kind'] or '-'))}"
+                    f" ({_md_esc(str(r['status'] or '-'))}, {t})\n"
+                    f"   _{_md_esc(str(r['detail'] or '-'))[:90]}_\n")
+            kb.append([
+                InlineKeyboardButton(f"✅ Unban {u}", callback_data=f"sec_unban_{u}"),
+                InlineKeyboardButton(f"🗑 Ignore {u}", callback_data=f"sec_ignore_{u}"),
+            ])
+        kb.append([InlineKeyboardButton("🔙 Security Center", callback_data="adm_sec")])
+        await q.message.reply_text(txt, parse_mode="Markdown",
+                                   reply_markup=InlineKeyboardMarkup(kb),
+                                   disable_web_page_preview=True)
+        return
+
+    if d == "adm_sec_banned":
+        rows = await asyncio.to_thread(sec_recent_banned, 10)
+        if not rows:
+            await q.message.reply_text("🚫 *কোনো ব্যান করা ইউজার নেই।*", parse_mode="Markdown",
+                                       reply_markup=_sec_panel_kb())
+            return
+        txt = "🚫 *ব্যান করা ইউজার (সর্বশেষ ১০)*\n\n"
+        kb = []
+        for r in rows:
+            u = int(r["user_id"] or 0)
+            nm = _md_esc(str(r["full_name"] or "User"))
+            rs = _md_esc(str(r["ban_reason"] or "-"))[:60]
+            txt += f"• [{nm}](tg://user?id={u}) `{u}`\n   _{rs}_\n"
+            kb.append([InlineKeyboardButton(f"✅ Unban {u}", callback_data=f"sec_unban_{u}")])
+        kb.append([InlineKeyboardButton("🔙 Security Center", callback_data="adm_sec")])
+        await q.message.reply_text(txt, parse_mode="Markdown",
+                                   reply_markup=InlineKeyboardMarkup(kb),
+                                   disable_web_page_preview=True)
+        return
+
+    if d == "adm_sec_cfg":
+        cfg = _sec_cfg()
+        try:
+            _auto = (await asyncio.to_thread(get_setting, "sec_auto_ban") or "on") != "off"
+        except Exception:
+            _auto = True
+        txt = (
+            "⚙️ *সিকিউরিটি নিয়ম*\n\n"
+            f"📱 একই ডিভাইসে সর্বোচ্চ: `{cfg['device_limit']}` অ্যাকাউন্ট\n"
+            f"🌐 একই IP-তে সর্বোচ্চ: `{cfg['ip_limit']}` অ্যাকাউন্ট\n"
+            f"🚫 অটো ব্যান: {'🟢 চালু' if _auto else '🔴 বন্ধ'}\n\n"
+            "_সীমা বদলাতে DB settings এ এই key দিন:_\n"
+            "`sec_device_limit` = 3\n"
+            "`sec_ip_limit` = 5\n"
+            "`sec_auto_ban` = on / off"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"🚫 অটো ব্যান {'বন্ধ করুন' if _auto else 'চালু করুন'}",
+                callback_data="adm_sec_toggle_ban")],
+            [InlineKeyboardButton("🔙 Security Center", callback_data="adm_sec")],
+        ])
+        await q.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+        return
+
+
 def vrf_token(uid, ttl_hours=None):
     try:
         ttl = int(ttl_hours or get_setting("verify_ttl_hours") or 24)
@@ -1320,6 +1726,13 @@ async def _vrf_send_prompt(bot, uid, lang=None, force=False):
 async def _vrf_handle_check(update, ctx, q, uid):
     """'I Verified' বাটন — DB থেকে স্ট্যাটাস যাচাই করে রেজিস্ট্রেশন এগিয়ে নেয়।"""
     lang = await asyncio.to_thread(get_lang, uid)
+    # ── একবারই: আগেই pass হয়ে গেলে আর কিছু হবে না ──
+    if await asyncio.to_thread(vrf_pass_on, uid):
+        try:
+            await q.answer("✅ আপনি ইতিমধ্যে verified — আর দরকার নেই।", show_alert=True)
+        except Exception:
+            pass
+        return
     ok = await asyncio.to_thread(vrf_is_verified, uid)
     if not ok:
         await asyncio.to_thread(vrf_note_attempt, uid)
@@ -1335,6 +1748,10 @@ async def _vrf_handle_check(update, ctx, q, uid):
     except Exception:
         pass
     await asyncio.to_thread(vrf_mark_pass, uid)
+    try:
+        await sec_after_verify(ctx.bot, uid, lang)
+    except Exception as _sec_e:
+        log.debug(f"[SEC2] post-verify চেক ব্যর্থ: {_sec_e}")
     await ctx.bot.send_message(
         uid,
         "✅ *Verification successful!*\n\nএখন আপনি Task করতে পারবেন।" if lang == "bn"
@@ -3818,6 +4235,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Verification gate — verify না হলে Task/মেনু কিছুই নয় ──
     if not await _vrf_gate_msg(ctx.bot, user.id):
         return
+    try:
+        await sec_after_verify(ctx.bot, user.id)
+    except Exception as _sec_e:
+        log.debug(f"[SEC2] start চেক ব্যর্থ: {_sec_e}")
 
     if deep_task_type and deep_task_id:
         # ── Channel check — deep link এ আসলেও চ্যানেল জয়েন চেক করো ──
@@ -7699,6 +8120,77 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
         return
 
+async def cmd_vfrtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin — verification ফ্লো টেস্ট (uid=0 = test token)। DB-তে কিছুই বদলায় না।"""
+    u = update.effective_user
+    if not u:
+        return
+    try:
+        if not await asyncio.to_thread(is_admin, u.id):
+            return
+    except Exception:
+        return
+    base = _vrf_panel_base() or _VRF_BASE_FALLBACK
+    try:
+        tok = _vrf_tok().make_token(0, 3600)
+    except Exception as _e:
+        log.warning(f"[VRF-TEST] token ব্যর্থ: {_e}")
+        tok = ""
+    if not tok:
+        await update.message.reply_text("❌ টেস্ট লিংক বানানো যায়নি।")
+        return
+    link = f"{base}/v/{tok}"
+    await update.message.reply_text(
+        "🧪 *Verification — Test Mode*\n\n"
+        "এই লিংকটা শুধু পরীক্ষার জন্য।\n"
+        "• কাউন্টডাউন, ✓ অ্যানিমেশন, সাকসেস স্ক্রিন — সব আসল\n"
+        "• *ডেটাবেসে কোনো পরিবর্তন হবে না*\n"
+        "• আপনার নিজের verification অক্ষত থাকবে\n\n"
+        "ℹ️ আসল ইউজার verification মাত্র *একবারই* করতে পারে — "
+        "pass হয়ে গেলে আর কখনো প্রম্পট পায় না।",
+        parse_mode="Markdown", disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧪 Test Verify Page", url=link)]]),
+    )
+
+
+async def cmd_webadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin — ওয়েব প্যানেলের লিংক ও key (শুধু অ্যাডমিন)।"""
+    u = update.effective_user
+    if not u:
+        return
+    try:
+        if not await asyncio.to_thread(is_admin, u.id):
+            return
+    except Exception:
+        return
+    base = _vrf_panel_base() or _VRF_BASE_FALLBACK
+    key = ""
+    try:
+        key = (get_setting("admin_web_key") or "").strip()
+        if not key:
+            import base64 as _b64, os as _os
+            key = _b64.urlsafe_b64encode(_os.urandom(9)).decode().rstrip("=")
+            set_setting("admin_web_key", key)
+    except Exception as _e:
+        key = f"ERR {_e}"
+    await update.message.reply_text(
+        f"🖥 *Admin Web Panel*\n\n🔗 {base}/admin\n"
+        f"👤 Username: `admin`\n🔑 Password: `{key}`\n\n"
+        "⚠️ এই key কারো সাথে শেয়ার করবেন না।",
+        parse_mode="Markdown", disable_web_page_preview=True,
+    )
+
+
+async def cmd_security(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin — Security Center সারসংক্ষেপ (`/security`)।"""
+    u = update.effective_user
+    if not u or not await asyncio.to_thread(is_admin, u.id):
+        return
+    st = await asyncio.to_thread(sec_stats)
+    await update.message.reply_text(_sec_summary_text(st), parse_mode="Markdown",
+                                    reply_markup=_sec_panel_kb())
+
+
 async def cmd_vrfdiag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """শুধু ADMIN — verification কেন চালু/বন্ধ তা দেখায় (নীরবতার ব্যতিক্রম)।"""
     u = update.effective_user
@@ -7916,6 +8408,11 @@ async def send_admin_panel(msg, uid):
         rows.append([InlineKeyboardButton("👥 Refer Stats (Daily/7d/30d)", callback_data="adm_refer_stats")])
     # Logs (main admin or settings perm)
     if is_main or has_settings:
+        _alerts_n = await asyncio.to_thread(
+            _sec_count, "SELECT COUNT(*) AS n FROM security_alerts WHERE status='new'")
+        _sec_lbl = ("🛡 Security Center" +
+                    (f" ({_alerts_n} 🔔)" if _alerts_n else ""))
+        rows.append([InlineKeyboardButton(_sec_lbl, callback_data="adm_sec")])
         rows.append([InlineKeyboardButton("📜 Bot Logs দেখুন", callback_data="adm_view_logs")])
     # Permission badge for sub-admins
     perm_line = ""
@@ -9242,6 +9739,10 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         try: await q.answer()
         except Exception: pass
         await send_admin_panel(q.message, uid)
+        return
+
+    if d in ("adm_sec", "adm_sec_alerts", "adm_sec_banned", "adm_sec_cfg", "adm_sec_toggle_ban"):
+        await _admin_security_screen(q, uid, d)
         return
 
     if d == "adm_bot_toggle":
@@ -17130,6 +17631,9 @@ def main():
     app.add_handler(_CmH(_on_bot_blocked))
 
     app.add_handler(CommandHandler("start",       _gate(cmd_start)))
+    app.add_handler(CommandHandler("security",    _gate(cmd_security)))
+    app.add_handler(CommandHandler("webadmin",    _gate(cmd_webadmin)))
+    app.add_handler(CommandHandler("vfrtest",     _gate(cmd_vfrtest)))
     app.add_handler(CommandHandler("vrfdiag",     _gate(cmd_vrfdiag)))
     app.add_handler(CommandHandler("admin",       _gate(cmd_admin)))
     app.add_handler(CommandHandler("cancel",      _gate(cmd_cancel)))
@@ -17145,6 +17649,7 @@ def main():
     # Register extra callback handler BEFORE main callback handler
     app.add_handler(CallbackQueryHandler(on_callback_extra,       pattern=r"^(adm_task_done_\d+|adm_notif_send|adm_notif_edit|adm_notif_skip|adm_tp_.+)$"))
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
+    app.add_handler(CallbackQueryHandler(sec_callback, pattern=r"^sec_(unban|ignore)_\d+$"))
     app.add_handler(CallbackQueryHandler(on_callback))
     # ~filters.VIA_BOT → inline-bot দিয়ে পাঠানো message ignore করো
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_photo, "ph")))
