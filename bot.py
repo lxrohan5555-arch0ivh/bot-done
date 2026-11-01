@@ -864,8 +864,59 @@ def _count(row):
 # নতুন টেবিল/কলাম সবই additive — পুরোনো user/balance/task/withdrawal ডেটা অক্ষত।
 try:
     import vtoken as _vtoken
-except Exception:      # file না থাকলে verification নীরবে বন্ধ থাকবে
+except Exception:      # file না থাকলেও verification চলবে — নিচে inline fallback
     _vtoken = None
+
+
+class _InlineToken:
+    """vtoken.py না থাকলে একই base64+HMAC অ্যালগরিদমে টোকেন (panel-ও এটাই বোঝে)।"""
+
+    DEFAULT_TTL = 24 * 3600
+
+    @staticmethod
+    def _secret():
+        import hashlib as _h, os as _o
+        s = (_o.environ.get("VERIFY_SECRET") or "").strip()
+        if not s:
+            s = (_o.environ.get("BOT_TOKEN") or "").strip()
+        if not s:
+            s = "task-earn-bot-verify-fallback"
+        return s.encode("utf-8")
+
+    @classmethod
+    def _sign(cls, body):
+        import hashlib as _h, hmac as _hm
+        return _hm.new(cls._secret(), body.encode("utf-8"), _h.sha256).hexdigest()[:24]
+
+    @classmethod
+    def make_token(cls, uid, ttl=DEFAULT_TTL):
+        import base64 as _b64
+        exp = int(_time.time()) + int(ttl)
+        body = f"{int(uid)}.{exp}"
+        raw = f"{body}.{cls._sign(body)}"
+        return _b64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+    @classmethod
+    def parse_token(cls, token):
+        import base64 as _b64, hmac as _hm
+        if not token:
+            return None
+        try:
+            pad = "=" * (-len(token) % 4)
+            raw = _b64.urlsafe_b64decode((token + pad).encode("ascii")).decode("utf-8")
+            uid_s, exp_s, sig = raw.rsplit(".", 2)
+            if not _hm.compare_digest(sig, cls._sign(f"{uid_s}.{exp_s}")):
+                return None
+            if int(exp_s) < int(_time.time()):
+                return None
+            return int(uid_s)
+        except Exception:
+            return None
+
+
+def _vrf_tok():
+    """vtoken মডিউল থাকলে সেটাই, নাহলে inline fallback।"""
+    return _vtoken if _vtoken is not None else _InlineToken
 
 VERIFY_TEXT_BN = (
     "🔒 *Verification দরকার*\n\n"
@@ -883,6 +934,9 @@ VERIFY_TEXT_EN = (
 )
 
 
+_VRF_BASE_FALLBACK = "https://bot-done.onrender.com"
+
+
 def _vrf_panel_base():
     base = (os.environ.get("PANEL_BASE_URL") or "").strip()
     if not base:
@@ -891,7 +945,35 @@ def _vrf_panel_base():
             base = "https://" + host
     if not base:
         base = (os.environ.get("PUBLIC_BASE_URL") or "").strip()
+    if not base:
+        for _k in ("panel_base_url", "public_base_url"):
+            try:
+                base = (get_setting(_k) or "").strip()
+            except Exception:
+                base = ""
+            if base:
+                break
+    if not base:
+        base = _VRF_BASE_FALLBACK
     return base.rstrip("/")
+
+
+class _SafeDDL:
+    """প্রতিটা DDL আলাদা ট্রানজেকশনে চালায় — একটা ফেল করলেও বাকি টেবিল/কলাম তৈরি হবে।
+    (একসাথে সব একই ট্রানজেকশনে হলে একটা error-এ সব rollback হয়ে schema আটকে যেত।)"""
+
+    def execute(self, q, *a, **k):
+        try:
+            with _c() as _cx:
+                _cx.execute(q, *a, **k)
+        except Exception as _e:
+            log.warning(f"[SECURITY-DB] DDL skip: {_e}")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
 
 
 def init_security_db():
@@ -915,7 +997,7 @@ def init_security_db():
     except Exception:
         pass
     try:
-        with _c() as c:
+        with _SafeDDL() as c:
             c.execute(
                 """
                 CREATE TABLE IF NOT EXISTS verifications (
@@ -1102,7 +1184,7 @@ def _security_boot():
     log.info(
         "[VRF] enabled=%s state=%s base=%s token=%s",
         verify_enabled(), dict(_SEC_STATE), _vrf_panel_base() or "-",
-        "ok" if _vtoken else "MISSING vtoken.py",
+        "vtoken.py" if _vtoken else "inline",
     )
 
 
@@ -1111,7 +1193,7 @@ def verify_enabled():
     (schema/grandfather আটকে গেলেও verification চলবে — নতুন ফ্লো তাদের উপর নির্ভর করে না।)"""
     if _SEC_STATE.get("v2") != "done":
         return False
-    if (_vrf_panel_base() == "") or (_vtoken is None):
+    if _vrf_panel_base() == "":
         return False
     try:
         return (get_setting("verify_enabled") or "on") != "off"
@@ -1165,13 +1247,15 @@ def vrf_silent(uid):
 
 
 def vrf_token(uid, ttl_hours=None):
-    if _vtoken is None:
-        return ""
     try:
         ttl = int(ttl_hours or get_setting("verify_ttl_hours") or 24)
     except Exception:
         ttl = 24
-    return _vtoken.make_token(uid, ttl * 3600)
+    try:
+        return _vrf_tok().make_token(uid, ttl * 3600)
+    except Exception as _e:
+        log.warning(f"[VRF] token বানাতে ব্যর্থ: {_e}")
+        return ""
 
 
 def vrf_link(uid):
@@ -1207,9 +1291,17 @@ async def _vrf_gate_msg(bot, uid):
     return False
 
 
-async def _vrf_send_prompt(bot, uid, lang=None):
+_VRF_PROMPT_TS = {}
+
+
+async def _vrf_send_prompt(bot, uid, lang=None, force=False):
     if lang is None:
         lang = await asyncio.to_thread(get_lang, uid)
+    # একই ইউজারকে ২০ সেকেন্ডের মধ্যে আবার একই প্রম্পট নয় (বারবার চাপলে স্প্যাম হবে না)
+    _now_ts = _time.time()
+    if not force and (_now_ts - _VRF_PROMPT_TS.get(uid, 0)) < 20:
+        return
+    _VRF_PROMPT_TS[uid] = _now_ts
     link = await asyncio.to_thread(vrf_link, uid)
     if not link:
         log.error(f"[VRF] PANEL_BASE_URL সেট নেই — uid={uid} verify লিংক বানানো যাচ্ছে না")
@@ -7624,6 +7716,14 @@ async def cmd_vrfdiag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         setting = get_setting("verify_enabled") or "on"
     except Exception as _e:
         setting = f"ERR {_e}"
+    _tabs = []
+    for _t in ("verifications", "devices", "user_ips", "ip_history", "security_alerts"):
+        try:
+            with _c() as _ct:
+                _ct.execute(f"SELECT 1 FROM {_t} LIMIT 1")
+            _tabs.append(f"{_t}=ok")
+        except Exception:
+            _tabs.append(f"{_t}=MISSING")
     txt = (
         "🔧 *VRF DIAG*\n\n"
         f"• verify_enabled: `{verify_enabled()}`\n"
@@ -7633,7 +7733,8 @@ async def cmd_vrfdiag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"• vtoken module: `{'ok' if _vtoken else 'MISSING'}`\n"
         f"• vrf_pass select: `{sel}`\n"
         f"• my vrf_pass: `{val}`\n"
-        f"• my verified: `{await asyncio.to_thread(vrf_is_verified, u.id)}`"
+        f"• my verified: `{await asyncio.to_thread(vrf_is_verified, u.id)}`\n"
+        f"• tables: `{' '.join(_tabs)}`"
     )
     await update.message.reply_text(txt, parse_mode="Markdown")
 
@@ -16817,6 +16918,30 @@ def main():
                 log.info("🔥 [WARMUP] DB pool + caches প্রস্তুত")
             except Exception as _we:
                 log.warning(f"[WARMUP] ব্যর্থ: {_we}")
+        async def _vrf_boot_diag():
+            """Security boot শেষ হলে অ্যাডমিনকে একবার অবস্থা জানাও (সমস্যা থাকলে)।"""
+            for _ in range(60):
+                await asyncio.sleep(2)
+                if _SEC_STATE.get("v2") in ("done", "failed"):
+                    break
+            try:
+                if verify_enabled():
+                    log.info("[VRF] verification ON — অ্যাডমিনকে আলাদা বার্তা লাগবে না")
+                    return
+                txt = (
+                    "⚠️ *Verification চালু হয়নি*\n\n"
+                    f"• state: `{dict(_SEC_STATE)}`\n"
+                    f"• panel base: `{_vrf_panel_base() or '-'}`\n"
+                    f"• token: `{'vtoken.py' if _vtoken else 'inline'}`\n\n"
+                    "`/start` দিলে এখন পুরোনো মতোই স্বাগতম আসবে।\n"
+                    "বিস্তারিত: `/vrfdiag`"
+                )
+                await application.bot.send_message(ADMIN_ID, txt, parse_mode="Markdown")
+            except Exception as _e:
+                log.warning(f"[VRF] boot diag DM ব্যর্থ: {_e}")
+        _vrf_diag_task = asyncio.create_task(_vrf_boot_diag())
+        _background_tasks.add(_vrf_diag_task)
+        _vrf_diag_task.add_done_callback(_bg_task_done)
         _warm_task = asyncio.create_task(_warmup())
         _background_tasks.add(_warm_task)
         _warm_task.add_done_callback(_bg_task_done)

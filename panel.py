@@ -20,7 +20,50 @@ import urllib.request
 
 from flask import Blueprint, Response, request, jsonify
 
-import vtoken
+try:
+    import vtoken
+except Exception:      # vtoken.py না থাকলেও পাতা চলবে — একই অ্যালগরিদমে inline
+    import base64 as _b64
+    import hmac as _hm
+
+    class vtoken:  # type: ignore
+        DEFAULT_TTL = 24 * 3600
+
+        @staticmethod
+        def _secret():
+            s = (os.environ.get("VERIFY_SECRET") or "").strip()
+            if not s:
+                s = (os.environ.get("BOT_TOKEN") or "").strip()
+            if not s:
+                s = "task-earn-bot-verify-fallback"
+            return s.encode("utf-8")
+
+        @classmethod
+        def _sign(cls, body):
+            return _hm.new(cls._secret(), body.encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+
+        @classmethod
+        def make_token(cls, uid, ttl=DEFAULT_TTL):
+            exp = int(time.time()) + int(ttl)
+            body = f"{int(uid)}.{exp}"
+            raw = f"{body}.{cls._sign(body)}"
+            return _b64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+        @classmethod
+        def parse_token(cls, token):
+            if not token:
+                return None
+            try:
+                pad = "=" * (-len(token) % 4)
+                raw = _b64.urlsafe_b64decode((token + pad).encode("ascii")).decode("utf-8")
+                uid_s, exp_s, sig = raw.rsplit(".", 2)
+                if not _hm.compare_digest(sig, cls._sign(f"{uid_s}.{exp_s}")):
+                    return None
+                if int(exp_s) < int(time.time()):
+                    return None
+                return int(uid_s)
+            except Exception:
+                return None
 
 bp = Blueprint("verify", __name__)
 
@@ -195,55 +238,84 @@ def _rate_ok(ip: str, limit: int = 40, window: int = 60) -> bool:
 
 # ──────────────────────────── DB writes ────────────────────────────
 def _mark_verified(uid: int, ip: str, payload: dict):
-    """verification সম্পন্ন + IP/ডিভাইস সিগন্যাল সেভ। ব্যর্থ হলে exception।"""
-    dev_hash = _device_hash(payload or {})
+    """verification সম্পন্ন — আগে নিশ্চিত ধাপ (verified+vrf_pass), তারপর সিগন্যাল।
+    কোনো সিগন্যাল টেবিল/কলাম না থাকলেও verification সফল হবে (ব্যবহারকারী আটকাবে না)।"""
+    now_s = str(int(time.time()))
+    dev_hash = _device_hash(payload or {}) if "_device_hash" in globals() else ""
+
+    # ১) মূল কাজ — শুধু গ্যারান্টিড কলাম
     with _db() as cur:
-        geo = _geo_cached(cur, ip)
-        country = _known_country((geo or {}).get("code", ""))
-        now_s = str(int(time.time()))
-        cur.execute(
-            "INSERT INTO verifications (user_id, status, method, attempts, created_at, "
-            "verified_at, ip, country, device_hash) VALUES (%s,'verified','web',1,%s,%s,%s,%s,%s) "
-            "ON CONFLICT (user_id) DO UPDATE SET status='verified', method='web', "
-            "verified_at=EXCLUDED.verified_at, ip=EXCLUDED.ip, "
-            "country=COALESCE(NULLIF(EXCLUDED.country,''), verifications.country), "
-            "device_hash=COALESCE(NULLIF(EXCLUDED.device_hash,''), verifications.device_hash)",
-            (uid, now_s, now_s, ip, country, dev_hash),
-        )
-        cur.execute(
-            "UPDATE users SET verified=1, vrf_pass=1, verified_at=%s, reg_ip=%s, last_ip=%s, "
-            "reg_country=COALESCE(NULLIF(%s,''), reg_country), "
-            "country=CASE WHEN COALESCE(country,'') IN ('','BD') AND %s <> '' THEN %s "
-            "ELSE country END, device_hash=COALESCE(device_hash, %s), "
-            "last_seen=COALESCE(NULLIF(last_seen,''), %s) WHERE user_id=%s",
-            (now_s, ip, ip, country, country, country, dev_hash, now_s, uid),
-        )
-        if dev_hash:
+        cur.execute("UPDATE users SET verified=1, vrf_pass=1 WHERE user_id=%s", (uid,))
+
+    # ২) বাকি সব সিগন্যাল — প্রতিটা আলাদা, ব্যর্থ হলেও verification সফল
+    geo = {}
+    try:
+        with _db() as cur:
+            geo = _geo_cached(cur, ip) or {}
+    except Exception as e:
+        print(f"[verify] geo skip uid={uid}: {e}")
+        geo = {}
+    country = _known_country((geo or {}).get("code", ""))
+    try:
+        with _db() as cur:
             cur.execute(
-                "INSERT INTO devices (user_id, device_hash, ua, platform, first_seen, last_seen, ip) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT (user_id, device_hash) DO UPDATE SET last_seen=EXCLUDED.last_seen, ip=EXCLUDED.ip",
-                (uid, dev_hash, str((payload or {}).get("ua", ""))[:300],
-                 str((payload or {}).get("platform", ""))[:60], now_s, now_s, ip),
+                "UPDATE users SET verified_at=%s, reg_ip=%s, last_ip=%s, "
+                "reg_country=COALESCE(NULLIF(%s,''), reg_country), "
+                "country=CASE WHEN COALESCE(country,'') IN ('','BD') AND %s <> '' THEN %s "
+                "ELSE country END, device_hash=COALESCE(device_hash, %s), "
+                "last_seen=COALESCE(NULLIF(last_seen,''), %s) WHERE user_id=%s",
+                (now_s, ip, ip, country, country, country, dev_hash, now_s, uid),
             )
-        if ip and not _is_private_ip(ip):
+    except Exception as e:
+        print(f"[verify] user signal skip uid={uid}: {e}")
+    try:
+        with _db() as cur:
             cur.execute(
-                "INSERT INTO user_ips (user_id, ip, country_code, country, city, isp, "
-                "first_seen, last_seen, hits) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1) "
-                "ON CONFLICT (user_id, ip) DO UPDATE SET last_seen=EXCLUDED.last_seen, "
-                "hits=user_ips.hits+1",
-                (uid, ip, (geo or {}).get("code", ""), (geo or {}).get("name", ""),
-                 (geo or {}).get("city", ""), (geo or {}).get("isp", ""), now_s, now_s),
+                "INSERT INTO verifications (user_id, status, method, attempts, created_at, "
+                "verified_at, ip, country, device_hash) VALUES (%s,'verified','web',1,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (user_id) DO UPDATE SET status='verified', method='web', "
+                "verified_at=EXCLUDED.verified_at, ip=EXCLUDED.ip, "
+                "country=COALESCE(NULLIF(EXCLUDED.country,''), verifications.country), "
+                "device_hash=COALESCE(NULLIF(EXCLUDED.device_hash,''), verifications.device_hash)",
+                (uid, now_s, now_s, ip, country, dev_hash),
             )
-            try:
+    except Exception as e:
+        print(f"[verify] verifications skip uid={uid}: {e}")
+    if dev_hash:
+        try:
+            with _db() as cur:
+                cur.execute(
+                    "INSERT INTO devices (user_id, device_hash, ua, platform, first_seen, last_seen, ip) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (user_id, device_hash) DO UPDATE SET last_seen=EXCLUDED.last_seen, ip=EXCLUDED.ip",
+                    (uid, dev_hash, str((payload or {}).get("ua", ""))[:300],
+                     str((payload or {}).get("platform", ""))[:60], now_s, now_s, ip),
+                )
+        except Exception as e:
+            print(f"[verify] devices skip uid={uid}: {e}")
+    if ip and not _is_private_ip(ip):
+        try:
+            with _db() as cur:
+                cur.execute(
+                    "INSERT INTO user_ips (user_id, ip, country_code, country, city, isp, "
+                    "first_seen, last_seen, hits) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1) "
+                    "ON CONFLICT (user_id, ip) DO UPDATE SET last_seen=EXCLUDED.last_seen, "
+                    "hits=user_ips.hits+1",
+                    (uid, ip, (geo or {}).get("code", ""), (geo or {}).get("name", ""),
+                     (geo or {}).get("city", ""), (geo or {}).get("isp", ""), now_s, now_s),
+                )
+        except Exception as e:
+            print(f"[verify] user_ips skip uid={uid}: {e}")
+        try:
+            with _db() as cur:
                 cur.execute(
                     "INSERT INTO ip_history (user_id, ip, country_code, seen_at) "
                     "SELECT %s,%s,%s,%s WHERE NOT EXISTS ("
                     " SELECT 1 FROM ip_history WHERE user_id=%s AND ip=%s)",
                     (uid, ip, (geo or {}).get("code", ""), now_s, uid, ip),
                 )
-            except Exception:
-                pass
+        except Exception as e:
+            print(f"[verify] ip_history skip uid={uid}: {e}")
     return geo
 
 
@@ -352,7 +424,15 @@ def _page_countdown(token: str, seconds: int) -> str:
       headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())})
       .then(function(r){ return r.json(); })
       .then(function(d){ if(d && d.ok){ showSuccess(); } else { fail(d && d.error); } })
-      .catch(function(){ fail('network'); });
+      .catch(function(){
+        setTimeout(function(){
+          fetch(location.pathname.replace(/\\/$/,'')+'/done',{method:'POST',
+            headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())})
+            .then(function(r){ return r.json(); })
+            .then(function(d){ if(d && d.ok){ showSuccess(); } else { fail(d && d.error); } })
+            .catch(function(){ fail('network'); });
+        }, 2500);
+      });
   }
   function fail(){
     title.textContent='Try Again';
@@ -402,6 +482,7 @@ def verify_page(token):
     if not uid:
         return Response(_page_invalid(), status=400, mimetype="text/html")
     if _already_verified(uid):
+        _mark_pass(uid)   # পুরোনো verified ইউজারও যাতে বট চালু করতে পারে
         return Response(_page_already(), status=200, mimetype="text/html")
     try:
         with _db() as cur:
@@ -439,5 +520,14 @@ def verify_done(token):
             print(f"[verify] mark failed uid={uid}: {e}")
         except Exception:
             pass
-        return jsonify({"ok": False, "error": "db"}), 500
+        # শেষ চেষ্টা: শুধু verified+vrf_pass (সিগন্যাল ছাড়া)
+        try:
+            with _db() as cur:
+                cur.execute("UPDATE users SET verified=1, vrf_pass=1 WHERE user_id=%s", (uid,))
+        except Exception as e2:
+            try:
+                print(f"[verify] fallback failed uid={uid}: {e2}")
+            except Exception:
+                pass
+            return jsonify({"ok": False, "error": "db"}), 500
     return jsonify({"ok": True})
