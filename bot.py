@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Task Earn Bot — Full Featured Telegram Bot"""
 
-import os, logging, asyncio, urllib.request, urllib.parse, urllib.error, json as _json, random, re, html
+import os, logging, asyncio, threading, urllib.request, urllib.parse, urllib.error, json as _json, random, re, html
 # pip install psycopg2-binary
 import psycopg2
 import psycopg2.extras
@@ -997,20 +997,6 @@ def init_security_db():
                 )
                 """
             )
-            for _idx in (
-                "CREATE INDEX IF NOT EXISTS idx_users_country ON users(country)",
-                "CREATE INDEX IF NOT EXISTS idx_users_verified ON users(verified)",
-                "CREATE INDEX IF NOT EXISTS idx_gmails_user_status ON gmails(user_id, status)",
-                "CREATE INDEX IF NOT EXISTS idx_wd_user_status ON withdrawals(user_id, status)",
-                "CREATE INDEX IF NOT EXISTS idx_devices_hash ON devices(device_hash)",
-                "CREATE INDEX IF NOT EXISTS idx_user_ips_ip ON user_ips(ip)",
-                "CREATE INDEX IF NOT EXISTS idx_ip_hist_user ON ip_history(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_alerts_created ON security_alerts(created_at)",
-            ):
-                try:
-                    c.execute(_idx)
-                except Exception as _ie:
-                    log.warning(f"[SECURITY-DB] index skip: {_ie}")
             for _alt in (
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS verified INTEGER DEFAULT 0",
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_at TEXT DEFAULT ''",
@@ -1030,23 +1016,58 @@ def init_security_db():
     except Exception as _e:
         log.error(f"[SECURITY-DB] init ব্যর্থ: {_e}")
         return
-    # ── একবারই: পুরোনো ইউজারদের grandfather (হঠাৎ আয় বন্ধ হবে না) ──
+    # ── ভারী কাজ (ইনডেক্স + grandfather) background-এ — বট চালু আটকাবে না ──
     try:
-        if (get_setting("security_grandfather_done") or "") != "1":
-            with _c() as c:
-                c.execute(
-                    "UPDATE users SET verified=1, "
-                    "verified_at=COALESCE(NULLIF(verified_at,''), joined_at) "
-                    "WHERE COALESCE(verified,0)=0"
-                )
-            set_setting("security_grandfather_done", "1")
-            log.info("[SECURITY-DB] existing users grandfather → verified=1")
+        threading.Thread(target=_security_heavy_init, name="sec-heavy", daemon=True).start()
+    except Exception as _te:
+        log.warning(f"[SECURITY-DB] heavy thread ব্যর্থ: {_te}")
+
+
+_SEC_STATE = {"grandfather": "pending"}
+
+
+def _security_heavy_init():
+    """ইনডেক্স + grandfather — আলাদা thread-এ, বট চালু আটকাবে না।
+    grandfather শেষ না হওয়া পর্যন্ত verification বন্ধ থাকবে (কেউ আটকাবে না)।"""
+    _t0 = _time.time()
+    for _idx in (
+        "CREATE INDEX IF NOT EXISTS idx_users_country ON users(country)",
+        "CREATE INDEX IF NOT EXISTS idx_users_verified ON users(verified)",
+        "CREATE INDEX IF NOT EXISTS idx_wd_user_status ON withdrawals(user_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_hash ON devices(device_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_user_ips_ip ON user_ips(ip)",
+        "CREATE INDEX IF NOT EXISTS idx_ip_hist_user ON ip_history(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_alerts_created ON security_alerts(created_at)",
+    ):
+        try:
+            with _c() as cc:
+                cc.execute(_idx)
+            log.info(f"[SECURITY-DB] index ok: {_idx.split()[5]} ({_time.time() - _t0:.1f}s)")
+        except Exception as _ie:
+            log.warning(f"[SECURITY-DB] index skip: {_ie}")
+    try:
+        if (get_setting("security_grandfather_done") or "") == "1":
+            _SEC_STATE["grandfather"] = "done"
+            log.info("[SECURITY-DB] grandfather আগেই হয়েছে — verification ON")
+            return
+        with _c() as cc:
+            cc.execute(
+                "UPDATE users SET verified=1, "
+                "verified_at=CASE WHEN COALESCE(verified_at,'')='' "
+                "THEN COALESCE(joined_at,'') ELSE verified_at END "
+                "WHERE COALESCE(verified,0)=0"
+            )
+        set_setting("security_grandfather_done", "1")
+        _SEC_STATE["grandfather"] = "done"
+        log.info(f"[SECURITY-DB] grandfather সম্পন্ন ({_time.time() - _t0:.1f}s) → verification ON")
     except Exception as _ge:
-        log.warning(f"[SECURITY-DB] grandfather ব্যর্থ: {_ge}")
+        log.error(f"[SECURITY-DB] grandfather ব্যর্থ — verification বন্ধ থাকবে: {_ge}")
 
 
 def verify_enabled():
     """Verification চালু কি না — লিংক বানানো সম্ভব না হলে নীরবে বন্ধ।"""
+    if _SEC_STATE.get("grandfather") != "done":
+        return False
     try:
         if (_vrf_panel_base() == "") or (_vtoken is None):
             return False
