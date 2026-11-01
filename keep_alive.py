@@ -4,6 +4,13 @@ from flask import Flask
 
 app = Flask(__name__)
 
+# ── Verification web page (panel.py) — /v/<token> ──────────────
+try:
+    from panel import bp as _verify_bp
+    app.register_blueprint(_verify_bp)
+except Exception as _pe:
+    print(f"[keep_alive] verification page load ব্যর্থ: {_pe}")
+
 @app.route("/")
 def home():
     return "✅ Task Earn Bot is running!", 200
