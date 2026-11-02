@@ -8,7 +8,8 @@ from flask import request, redirect, Response
 from webadmin import (
     wadm, page, guard, table, badge, kpi, money, num, flag, esc, icon, now,
     one, many, scal, sfloat, _x, log_admin, client_ip, spark, bars, donut,
-    admin_key, unread_alerts, _fire_settings_changed, _fire_user_changed,
+    admin_key, unread_alerts, alerts_changed, many_cached,
+    _fire_settings_changed, _fire_user_changed,
 )
 
 
@@ -23,6 +24,23 @@ def _err():
 def settings_get(key, default=""):
     r = one("SELECT value FROM settings WHERE key=%s", (key,))
     return (r["value"] if r and r["value"] is not None else default)
+
+
+def settings_all(keys):
+    """সব key এক query-তে — প্রতি key-তে আলাদা round-trip (settings পেজ ~১৭ query) বাঁচে।"""
+    keys = [str(k) for k in keys]
+    out = {k: "" for k in keys}
+    if not keys:
+        return out
+    try:
+        ph = ",".join(["%s"] * len(keys))
+        for r in many("SELECT key, value FROM settings WHERE key IN (" + ph + ")", tuple(keys)):
+            k, v = r.get("key"), r.get("value")
+            if k in out and v is not None:
+                out[k] = v
+    except Exception:
+        pass
+    return out
 
 
 def settings_set(key, value):
@@ -313,6 +331,7 @@ def alert_action(aid, act):
     status = "reviewed" if act == "review" else "ignored"
     try:
         _x("UPDATE security_alerts SET status=%s, handled_at=%s WHERE id=%s", (status, now(), aid))
+        alerts_changed()      # সাইডবারের কাউন্ট ক্যাশে পরিষ্কার
         try:
             _x("UPDATE users SET is_suspicious=0 WHERE user_id=(SELECT user_id FROM security_alerts WHERE id=%s)",
                (aid,))
@@ -330,19 +349,25 @@ def tasks():
     g = guard()
     if g:
         return g
-    cat_t = many("SELECT id, name, price, is_active, completed_count, max_completions, created_at "
-                 "FROM category_tasks ORDER BY id DESC LIMIT 30") if True else []
-    tg_t = many("SELECT id, name, price, is_active, completed_count, max_completions, created_at "
+    cat_t = many_cached("tasks_cat",
+                 "SELECT id, name, price, is_active, completed_count, max_completions, created_at "
+                 "FROM category_tasks ORDER BY id DESC LIMIT 30")
+    tg_t = many_cached("tasks_tg",
+                "SELECT id, name, price, is_active, completed_count, max_completions, created_at "
                 "FROM tg_tasks ORDER BY id DESC LIMIT 30")
-    bio_t = many("SELECT id, name, price, is_active, completed_count, max_completions "
+    bio_t = many_cached("tasks_bio",
+                 "SELECT id, name, price, is_active, completed_count, max_completions "
                  "FROM tasks ORDER BY id DESC LIMIT 30")
-    comp_cat = many("SELECT c.user_id, u.full_name, u.username, ct.name AS task, ct.price, c.done_at "
+    comp_cat = many_cached("tasks_comp_cat",
+                    "SELECT c.user_id, u.full_name, u.username, ct.name AS task, ct.price, c.done_at "
                     "FROM category_task_completions c LEFT JOIN category_tasks ct ON ct.id=c.task_id "
                     "LEFT JOIN users u ON u.user_id=c.user_id ORDER BY c.id DESC LIMIT 40")
-    comp_tg = many("SELECT c.user_id, u.full_name, u.username, tt.name AS task, tt.price, c.done_at "
+    comp_tg = many_cached("tasks_comp_tg",
+                   "SELECT c.user_id, u.full_name, u.username, tt.name AS task, tt.price, c.done_at "
                    "FROM tg_task_completions c LEFT JOIN tg_tasks tt ON tt.id=c.task_id "
                    "LEFT JOIN users u ON u.user_id=c.user_id ORDER BY c.id DESC LIMIT 40")
-    comp_bio = many("SELECT b.user_id, u.full_name, u.username, 'Bio Task' AS task, b.amount AS price, "
+    comp_bio = many_cached("tasks_comp_bio",
+                    "SELECT b.user_id, u.full_name, u.username, 'Bio Task' AS task, b.amount AS price, "
                     "b.paid_at AS done_at FROM bio_task_completions b "
                     "LEFT JOIN users u ON u.user_id=b.user_id ORDER BY b.id DESC LIMIT 40")
     rows = []
@@ -559,11 +584,12 @@ def settings():
     g = guard()
     if g:
         return g
-    keys = ["verify_enabled", "sec_device_limit", "sec_ip_limit", "sec_auto_ban",
+    keys = ["verify_enabled", "sec_device_limit", "sec_ip_limit", "sec_ip_block", "sec_auto_ban",
             "sec_ip_retention_days", "notify_security", "bot_status",
-            "points_on", "points_block", "reset_on_update",
-            "pt_max", "pt_start", "pt_approve", "pt_reject", "pt_dup"]
-    vals = {k: settings_get(k, "") for k in keys}
+            "points_on", "points_block", "reset_on_update", "sec_device_strict",
+            "pt_max", "pt_start", "pt_approve", "pt_reject", "pt_dup",
+            "task_notify_mode", "task_notify_channel", "task_notify_daily_max"]
+    vals = settings_all(keys)
     body = (
         f"<div class='grid g2'>"
         "<div class='card'><h3>" + icon("lock") + " Admin Access</h3>"
@@ -587,8 +613,18 @@ def settings():
         "</select></div>"
         "<div class='form'><label>Device limit — একই ফোনে সর্বোচ্চ অ্যাকাউন্ট (1 = এক ফোন এক অ্যাকাউন্ট)</label>"
         f"<input name='sec_device_limit' type='number' min='1' value='{esc(vals['sec_device_limit'] or 1)}'></div>"
-        "<div class='form'><label>IP limit — একই IP-তে সর্বোচ্চ অ্যাকাউন্ট (ছাড়ালে শুধু অ্যালার্ট, ব্যান নয়)</label>"
+        "<div class='form'><label>Strict one-phone rule — একই ফোন প্রোফাইল+ব্রাউজার হলে IP বদলালেও ব্লক</label><select name='sec_device_strict'>"
+        f"<option value='on' {'selected' if vals.get('sec_device_strict', 'on') != 'off' else ''}>চালু (ডিফল্ট)</option>"
+        f"<option value='off' {'selected' if vals.get('sec_device_strict') == 'off' else ''}>বন্ধ</option>"
+        "</select>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>চালু থাকলে মোবাইল ডেটা/ওয়াইফাই বদলে IP পাল্টালেও একই ফোনে দ্বিতীয় অ্যাকাউন্ট verify হবে না।</p></div>"
+        "<div class='form'><label>IP limit — একই IP-তে সর্বোচ্চ অ্যাকাউন্ট (ছাড়ালে শুধু অ্যালার্ট)</label>"
         f"<input name='sec_ip_limit' type='number' min='2' value='{esc(vals['sec_ip_limit'] or 2)}'></div>"
+        "<div class='form'><label>IP দিয়ে ব্লক</label><select name='sec_ip_block'>"
+        f"<option value='off' {'selected' if (vals.get('sec_ip_block') or 'off') != 'on' else ''}>বন্ধ (ডিফল্ট — শুধু অ্যালার্ট)</option>"
+        f"<option value='on' {'selected' if (vals.get('sec_ip_block') or 'off') == 'on' else ''}>চালু (verify আটকাবে)</option>"
+        "</select>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>মোবাইল ইন্টারনেটে (CGNAT) এক IP-তে শত শত ইউজার থাকে — তাই ডিফল্টে IP কাউকে আটকায় না, শুধু অ্যালার্ট দেয়।</p></div>"
         "<div class='form'><label>IP data retention (দিন)</label>"
         f"<input name='sec_ip_retention_days' type='number' min='1' value='{esc(vals['sec_ip_retention_days'] or 90)}'></div>"
         "<button type='submit' style='margin-top:10px'>Save Security</button></form></div>"
@@ -640,6 +676,32 @@ def settings():
         f"<input name='pt_dup' type='number' min='0' max='100000' value='{esc(vals.get('pt_dup') or 3)}'>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>ডিফল্ট −৩। বদলালে সাথে সাথে বটে কার্যকর (ক্যাশ ১০ মিনিট)।</p></div>"
         "<button type='submit' style='margin-top:10px'>Save Points</button></form></div>"
+        "<div class='card'><h3>" + icon("bell") + " Task Notification</h3>"
+        "<form method='post' action='/admin/do/settings'>"
+        "<div class='form'><label>Task সম্পন্ন / approve হলে নোটিফিকেশন কোথায় যাবে</label>"
+        "<select name='task_notify_mode'>"
+        "<option value='channel' "
+        + ("selected" if (vals.get("task_notify_mode") or "channel") == "channel" else "") + ">শুধু চ্যানেলে</option>"
+        "<option value='dm' "
+        + ("selected" if vals.get("task_notify_mode") == "dm" else "") + ">শুধু বটে (Admin DM)</option>"
+        "<option value='both' "
+        + ("selected" if vals.get("task_notify_mode") == "both" else "") + ">চ্যানেল + বটে (দুটোই)</option>"
+        "<option value='off' "
+        + ("selected" if vals.get("task_notify_mode") == "off" else "") + ">বন্ধ — কোথাও যাবে না</option>"
+        "</select>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>ডিফল্ট: শুধু চ্যানেল। "
+        "বদলালে সাথে সাথেই বটে কার্যকর।</p></div>"
+        "<div class='form'><label>চ্যানেল (আইডি বা @username)</label>"
+        f"<input name='task_notify_channel' value='{esc(vals.get('task_notify_channel') or '')}' "
+        "placeholder='-1004251213683 বা @mychannel'>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>খালি রাখলে আগের ডিফল্ট চ্যানেলেই যাবে। "
+        "বটকে ওই চ্যানেলের অ্যাডমিন করতে হবে।</p></div>"
+        "<div class='form'><label>দিনে সর্বোচ্চ কতটা নোটিফিকেশন (0 = সীমা নেই)</label>"
+        f"<input name='task_notify_daily_max' type='number' min='0' max='100000' "
+        f"value='{esc(vals.get('task_notify_daily_max') or 0)}'>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>সীমা শেষ হলে ওই দিন আর পাঠানো হবে না — "
+        "টাস্ক/টাকা কিছুই আটকাবে না, শুধু নোটিফিকেশন।</p></div>"
+        "<button type='submit' style='margin-top:10px'>Save Notification</button></form></div>"
         "</div>"
     )
     return page("Settings", body, "settings", toast=_toast())
@@ -656,7 +718,8 @@ def settings_save():
         settings_set("admin_web_key", key)
         saved.append("password")
     for k in ("verify_enabled", "sec_auto_ban", "notify_security", "bot_status",
-              "points_on", "points_block", "reset_on_update"):
+              "points_on", "points_block", "reset_on_update",
+              "sec_device_strict", "sec_ip_block"):
         v = (request.form.get(k) or "").strip()
         if v in ("on", "off"):
             settings_set(k, v)
@@ -671,5 +734,18 @@ def settings_save():
         if v.isdigit() and int(v) <= 100000 and (int(v) >= 1 if k == "pt_max" else True):
             settings_set(k, v)
             saved.append(k)
+    for k in ("task_notify_mode",):
+        v = (request.form.get(k) or "").strip().lower()
+        if v in ("channel", "dm", "both", "off"):
+            settings_set(k, v)
+            saved.append(k)
+    v = (request.form.get("task_notify_channel") or "").strip()[:80]
+    if v:
+        settings_set("task_notify_channel", v)
+        saved.append("task_notify_channel")
+    v = (request.form.get("task_notify_daily_max") or "").strip()
+    if v.isdigit() and int(v) <= 100000:
+        settings_set("task_notify_daily_max", v)
+        saved.append("task_notify_daily_max")
     log_admin("settings_save", 0, ",".join(saved))
     return redirect("/admin/settings?ok=Settings+saved")

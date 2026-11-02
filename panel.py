@@ -88,7 +88,7 @@ def _get_pool():
                 if not dsn:
                     raise RuntimeError("DATABASE_URL সেট নেই")
                 _pool = psycopg2.pool.ThreadedConnectionPool(
-                    minconn=1, maxconn=6, dsn=dsn, connect_timeout=10,
+                    minconn=4, maxconn=10, dsn=dsn, connect_timeout=10,
                 )
     return _pool
 
@@ -138,21 +138,64 @@ def _countdown_seconds(cur) -> int:
 
 
 # ──────────────────────────── helpers ────────────────────────────
+def _norm_ip(raw: str) -> str:
+    """হেডার/সকেট থেকে আসা IP ঠিক করো: পোর্ট/ব্র্যাকেট বাদ, IPv4-mapped IPv6 → IPv4,
+    ভুল/ফাঁকা হলে '' (তাহলে কখনো ভুল করে কাউকে আটকাবে না)।"""
+    ip = (raw or "").strip()
+    if not ip:
+        return ""
+    if "," in ip:                               # XFF লিস্ট হলে প্রথমটা
+        ip = ip.split(",")[0].strip()
+    if ip.startswith("["):                      # [2001:db8::1]:443
+        ip = ip[1:ip.find("]")] if "]" in ip else ip[1:]
+    elif ip.count(":") == 1 and "." in ip:      # 1.2.3.4:5678
+        ip = ip.split(":")[0]
+    try:
+        import ipaddress
+        a = ipaddress.ip_address(ip)
+        if a.version == 6 and a.ipv4_mapped:
+            a = a.ipv4_mapped
+        return str(a)
+    except Exception:
+        return ""
+
+
 def _client_ip() -> str:
+    """Render/Vercel এর প্রক্সি হেডার থেকে আসল ক্লায়েন্ট IP।"""
     for h in ("CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"):
         raw = (request.headers.get(h) or "").strip()
         if raw:
-            return raw.split(",")[0].strip()
-    return (request.remote_addr or "").strip()
+            for part in raw.split(","):        # XFF → প্রথমটা ক্লায়েন্ট
+                ip = _norm_ip(part)
+                if ip:
+                    return ip
+    return _norm_ip(request.remote_addr or "")
+
+
+def _shared_ip_net():
+    """CGNAT (100.64.0.0/10) — মোবাইল অপারেটরে হাজারো ইউজার একই IP-তে।"""
+    import ipaddress
+    return ipaddress.ip_network("100.64.0.0/10")
 
 
 def _is_private_ip(ip: str) -> bool:
+    """প্রাইভেট/লুপব্যাক/লিংক-লোকাল/CGNAT/reserved — geo আর ইউনিক-IP গণনায় বাদ।"""
     if not ip:
         return True
-    if ip.startswith(("10.", "127.", "192.168.", "172.16.", "172.17.", "172.18.",
-                      "172.19.", "172.2", "172.30.", "172.31.", "::1")):
+    try:
+        import ipaddress
+        a = ipaddress.ip_address(ip)
+    except Exception:
         return True
-    return False
+    if getattr(a, "ipv4_mapped", None):
+        a = a.ipv4_mapped
+    if a.is_private or a.is_loopback or a.is_link_local or a.is_reserved \
+            or a.is_multicast or a.is_unspecified:
+        return True
+    try:
+        return a.version == 4 and a in _shared_ip_net()
+    except Exception:
+        return False
 
 
 def _geo_lookup(ip: str):
@@ -240,6 +283,9 @@ def _coarse_hash(payload: dict) -> str:
     একই ফোনে ভিন্ন ব্রাউজার বা Telegram-এর ইন-অ্যাপ ব্রাউজার দিয়ে verify করলেও
     platform+screen+dpr+cores+mem+gpu একই থাকে → ধরা পড়ে।
     (শুধু same-IP এর সাথে মিলিয়ে ব্যবহার হয়, তাই ভিন্ন লোকের ফোন ভুলে আটকাবে না।)"""
+    # ⚠️ অসম্পূর্ণ payload (JS বন্ধ/ব্লক) হলে ফাঁকা — নাহলে সবার হ্যাশ এক হয়ে যেত
+    if not (payload.get("platform") and payload.get("screen") and payload.get("dpr")):
+        return ""
     parts = [
         str(payload.get("platform", "")),
         str(payload.get("screen", "")),
@@ -251,7 +297,7 @@ def _coarse_hash(payload: dict) -> str:
     return hashlib.sha256(("|".join(parts) + "|te-coarse-v1").encode("utf-8", "ignore")).hexdigest()
 
 
-def _limit_check(uid: int, ip: str, hashes, coarse: str = ""):
+def _limit_check(uid: int, ip: str, hashes, coarse: str = "", ua: str = ""):
     """এক ফোন = এক অ্যাকাউন্ট, এক IP-তে সর্বোচ্চ ২ — ভাঙলে কারণ ফেরত দেয়।
     কোনো query ব্যর্থ হলে None (কাউকে ভুলভাবে আটকাবে না)।"""
     try:
@@ -276,6 +322,19 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = ""):
                     n_dev = int((r2 or {}).get("n") or 0)
                 if n_dev >= max(1, dlim):
                     return "device"
+            # ── STRICT: একই ফোন প্রোফাইল + একই ব্রাউজার = একই ফোন (IP বদলালেও ধরা পড়ে) ──
+            # মোবাইল ডেটা/ওয়াইফাই বদলে IP পাল্টালেও একই ফোনে দ্বিতীয় অ্যাকাউন্ট আটকাবে।
+            try:
+                strict_on = (str(_setting(cur, "sec_device_strict", "on")).strip() or "on") != "off"
+            except Exception:
+                strict_on = True
+            if strict_on and coarse and ua:
+                r6 = cur.execute(
+                    "SELECT COUNT(DISTINCT user_id) AS n FROM devices "
+                    "WHERE device_hash=%s AND ua=%s AND user_id<>%s",
+                    (coarse, ua, uid)).fetchone()
+                if int((r6 or {}).get("n") or 0) >= max(1, dlim):
+                    return "device"
             # ── ফলব্যাক: একই IP + একই ফোন প্রোফাইল = একই ফোন ──
             # (ভিন্ন ব্রাউজার/ইন-অ্যাপ ব্রাউজারে localStorage did আলাদা হলেও ধরা পড়বে)
             if coarse and ip:
@@ -293,8 +352,30 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = ""):
                     "SELECT COUNT(*) AS n FROM users WHERE (last_ip=%s OR reg_ip=%s) "
                     "AND user_id<>%s", (ip, ip, uid)).fetchone()
                 n_ip = max(int((r3 or {}).get("n") or 0), int((r4 or {}).get("n") or 0))
-                if n_ip >= max(1, ilim):
-                    return "ip"
+                if n_ip >= max(2, ilim):
+                    try:
+                        ip_block_on = (str(_setting(cur, "sec_ip_block", "off")).strip().lower() == "on")
+                    except Exception:
+                        ip_block_on = False
+                    if ip_block_on:
+                        return "ip"
+                    # ⚠️ মোবাইল CGNAT-এ এক IP-তে শত শত ইউজার → আটকাবো না, শুধু অ্যালার্ট
+                    # (একই ইউজার+IP-তে ৬ ঘণ্টায় একবার — অ্যালার্ট স্প্যাম হবে না)
+                    _now = str(int(time.time()))
+                    try:
+                        cur.execute(
+                            "INSERT INTO security_alerts (kind, user_id, related_uid, ip, country, "
+                            "device_hash, detail, status, created_at) "
+                            "SELECT %s,%s,0,%s,'','',%s,'new',%s WHERE NOT EXISTS ("
+                            " SELECT 1 FROM security_alerts WHERE kind=%s AND user_id=%s "
+                            "AND ip=%s AND status='new' AND created_at>%s)",
+                            ("ip_multi", uid, ip,
+                             f"একই IP-তে {n_ip}টি অ্যাকাউন্ট (ব্লক হয়নি)",
+                             _now, "ip_multi", uid, ip,
+                             str(int(time.time()) - 21600)),
+                        )
+                    except Exception as _ae:
+                        print(f"[verify] ip alert skip uid={uid}: {_ae}")
     except Exception as e:
         try:
             print(f"[verify] limit check skip uid={uid}: {e}")
@@ -304,7 +385,7 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = ""):
     return None
 
 
-def _rate_ok(ip: str, limit: int = 40, window: int = 60) -> bool:
+def _rate_ok(ip: str, limit: int = 120, window: int = 60) -> bool:
     now_ts = time.time()
     with _rate_lock:
         hits = [t for t in _rate.get(ip, []) if now_ts - t < window]
@@ -363,15 +444,26 @@ def _mark_verified(uid: int, ip: str, payload: dict):
     except Exception:
         _coarse_save = ""
     for _dh in [h for h in (dev_hash, _coarse_save) if h]:
+        # ⚠️ ON CONFLICT ব্যবহার করা যাবে না — devices(user_id, device_hash)-এ
+        # unique constraint নেই, তাই INSERT প্রতি বার ব্যর্থ হয়ে চুপচাপ skip হতো
+        # এবং এক-ফোন নিয়ম কখনো কাজ করত না। এখন UPDATE → না মিললে INSERT।
         try:
+            _ua_s = str((payload or {}).get("ua", ""))[:300]
+            _plat_s = str((payload or {}).get("platform", ""))[:60]
             with _db() as cur:
-                cur.execute(
-                    "INSERT INTO devices (user_id, device_hash, ua, platform, first_seen, last_seen, ip) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s) "
-                    "ON CONFLICT (user_id, device_hash) DO UPDATE SET last_seen=EXCLUDED.last_seen, ip=EXCLUDED.ip",
-                    (uid, _dh, str((payload or {}).get("ua", ""))[:300],
-                     str((payload or {}).get("platform", ""))[:60], now_s, now_s, ip),
+                _upd = cur.execute(
+                    "UPDATE devices SET last_seen=%s, ip=%s, "
+                    "ua=CASE WHEN COALESCE(ua,'')='' THEN %s ELSE ua END, "
+                    "platform=CASE WHEN COALESCE(platform,'')='' THEN %s ELSE platform END "
+                    "WHERE user_id=%s AND device_hash=%s",
+                    (now_s, ip, _ua_s, _plat_s, uid, _dh),
                 )
+                if int(getattr(_upd, "rowcount", 0) or 0) == 0:
+                    cur.execute(
+                        "INSERT INTO devices (user_id, device_hash, ua, platform, "
+                        "first_seen, last_seen, ip) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                        (uid, _dh, _ua_s, _plat_s, now_s, now_s, ip),
+                    )
         except Exception as e:
             print(f"[verify] devices skip uid={uid}: {e}")
     if ip and not _is_private_ip(ip):
@@ -724,15 +816,35 @@ def verify_done(token):
         _coarse = _coarse_hash(payload)
     except Exception:
         _hashes = []
-    _block = _limit_check(uid, ip, _hashes, _coarse)
+    _ua = ""
+    try:
+        _ua = str((payload or {}).get("ua", ""))[:300]
+    except Exception:
+        _ua = ""
+    _block = _limit_check(uid, ip, _hashes, _coarse, _ua)
     if _block:
         try:
+            _related = 0
+            try:
+                with _db() as cur2:
+                    if _coarse:
+                        _rr = cur2.execute(
+                            "SELECT user_id FROM devices WHERE device_hash=%s AND user_id<>%s LIMIT 1",
+                            (_coarse, uid)).fetchone()
+                        _related = int((_rr or {}).get("user_id") or 0)
+                    elif _ua:
+                        _rr = cur2.execute(
+                            "SELECT user_id FROM devices WHERE ua=%s AND user_id<>%s LIMIT 1",
+                            (_ua, uid)).fetchone()
+                        _related = int((_rr or {}).get("user_id") or 0)
+            except Exception:
+                _related = 0
             with _db() as cur:
                 cur.execute(
                     "INSERT INTO security_alerts (kind, user_id, related_uid, ip, country, "
                     "device_hash, detail, status, created_at) "
-                    "VALUES (%s,%s,0,%s,'',%s,%s,'new',%s)",
-                    ("verify_blocked", uid, ip, (_hashes[0] if _hashes else ""),
+                    "VALUES (%s,%s,%s,%s,'',%s,%s,'new',%s)",
+                    ("verify_blocked", uid, _related, ip, (_hashes[0] if _hashes else ""),
                      ("একই ফোনে অন্য অ্যাকাউন্ট" if _block == "device"
                       else "একই IP-তে ২টির বেশি অ্যাকাউন্ট"), str(int(time.time()))),
                 )

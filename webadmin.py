@@ -221,10 +221,19 @@ ICONS = {
 }
 
 
+_ICON_CACHE = {}
+
+
 def icon(name, cls=""):
+    key = (name, cls)
+    hit = _ICON_CACHE.get(key)
+    if hit is not None:
+        return hit
     p = ICONS.get(name, ICONS["dash"])
-    return (f"<svg class='{cls}' viewBox='0 0 24 24' fill='none' stroke='currentColor' "
-            f"stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'>{p}</svg>")
+    out = (f"<svg class='{cls}' viewBox='0 0 24 24' fill='none' stroke='currentColor' "
+           f"stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'>{p}</svg>")
+    _ICON_CACHE[key] = out
+    return out
 
 
 def esc(v):
@@ -270,7 +279,7 @@ def _get_pool():
                 if not dsn:
                     raise RuntimeError("DATABASE_URL সেট নেই")
                 _pool = psycopg2.pool.ThreadedConnectionPool(
-                    minconn=2, maxconn=12, dsn=dsn, connect_timeout=10)
+                    minconn=4, maxconn=14, dsn=dsn, connect_timeout=10)
     return _pool
 
 
@@ -405,9 +414,33 @@ def agg_clear():
         _AGG_CACHE.clear()
 
 
+def many_cached(key, sql, args=()):
+    """১৫s ক্যাশসহ LIST query — ড্যাশবোর্ডের গ্রাফ/লিস্ট বারবার DB-তে যায় না।
+    অ্যাডমিন কিছু বদলালে (hook) ক্যাশ এমনিতেই পরিষ্কার হয়।"""
+    k = ("m", key, repr(args))
+    hit, val = _agg_get(k)
+    if hit:
+        return val
+    rows = many(sql, args)
+    _agg_put(k, rows)
+    return rows
+
+
+# ── প্রতি-রিকোয়েস্ট chrome (সাইডবার alert কাউন্ট + admin key) DB-তে একবারই যাবে ──
+_CHROME = {}
+_CHROME_ALERTS_TTL = 8.0
+_CHROME_KEY_TTL = 60.0
+
+
+def alerts_changed():
+    """অ্যালার্ট স্টেটাস বদলালে কাউন্ট ক্যাশে পরিষ্কার করো।"""
+    _CHROME.pop("alerts", None)
+
+
 # ── bot ↔ web ব্রিজ: প্যানেল থেকে বদলালে সাথে সাথে বটে প্রয়োগ ──
 _SETTINGS_HOOK = None
 _USER_HOOK = None
+_REVIEW_HOOK = None
 
 
 def set_settings_hook(fn):
@@ -420,8 +453,23 @@ def set_user_hook(fn):
     _USER_HOOK = fn
 
 
+def set_review_hook(fn):
+    """বট এই hook দিয়ে FB/IG রিভিউ job সাথে সাথে চালায়।"""
+    global _REVIEW_HOOK
+    _REVIEW_HOOK = fn
+
+
+def _fire_review_changed():
+    if _REVIEW_HOOK:
+        try:
+            _REVIEW_HOOK()
+        except Exception:
+            pass
+
+
 def _fire_settings_changed(keys=None):
     agg_clear()
+    _CHROME.pop("key", None)     # admin key বদলালে ক্যাশেও সাথে সাথে
     try:
         import panel as _p
         try:
@@ -476,10 +524,39 @@ def now():
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
 
-def client_ip():
+def _norm_ip(raw):
+    """IP নরমালাইজ: পোর্ট/ব্র্যাকেট বাদ, IPv4-mapped IPv6 → IPv4, ভুল হলে ''।"""
+    ip = (raw or "").strip()
+    if not ip:
+        return ""
+    if "," in ip:                               # XFF লিস্ট হলে প্রথমটা
+        ip = ip.split(",")[0].strip()
+    if ip.startswith("["):
+        ip = ip[1:ip.find("]")] if "]" in ip else ip[1:]
+    elif ip.count(":") == 1 and "." in ip:
+        ip = ip.split(":")[0]
     try:
-        xff = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-        return xff or (request.remote_addr or "")
+        import ipaddress
+        a = ipaddress.ip_address(ip)
+        if a.version == 6 and a.ipv4_mapped:
+            a = a.ipv4_mapped
+        return str(a)
+    except Exception:
+        return ""
+
+
+def client_ip():
+    """আসল ক্লায়েন্ট IP — প্রক্সি হেডার আগে, তারপর remote_addr।"""
+    try:
+        for h in ("CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"):
+            raw = (request.headers.get(h) or "").strip()
+            if not raw:
+                continue
+            for part in raw.split(","):
+                ip = _norm_ip(part)
+                if ip:
+                    return ip
+        return _norm_ip(request.remote_addr or "")
     except Exception:
         return ""
 
@@ -498,6 +575,9 @@ def admin_key():
     k = (os.environ.get("ADMIN_WEB_KEY") or "").strip()
     if k:
         return k
+    _ck, _ts = _CHROME.get("key", ("", 0.0))
+    if _ck and (time.time() - _ts) < _CHROME_KEY_TTL:
+        return _ck
     r = one("SELECT value FROM settings WHERE key=%s", ("admin_web_key",))
     k = (r["value"] if r else "") or ""
     if not k:
@@ -507,6 +587,10 @@ def admin_key():
                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k,))
         except Exception:
             pass
+    try:
+        _CHROME["key"] = (k, time.time())
+    except Exception:
+        pass
     return k
 
 
@@ -562,7 +646,13 @@ MENU = [
 
 
 def unread_alerts():
-    return scal("SELECT COUNT(*) FROM security_alerts WHERE status='new'")
+    """সাইডবার/বেলের কাউন্ট — ৮ সেকেন্ড ক্যাশ (প্রতি পেজে একটা extra DB হিট বাঁচে)।"""
+    n, ts = _CHROME.get("alerts", (None, 0.0))
+    if n is not None and (time.time() - ts) < _CHROME_ALERTS_TTL:
+        return n
+    n = scal("SELECT COUNT(*) FROM security_alerts WHERE status='new'")
+    _CHROME["alerts"] = (n, time.time())
+    return n
 
 
 def layout(title, body, active="", toast=None, err=None):
@@ -695,6 +785,101 @@ def table(headers, rows, empty="কোনো ডেটা নেই"):
     return f"<div class='tbl-wrap'><table><thead><tr>{th}</tr></thead><tbody>{tr}</tbody></table></div>"
 
 
+# ───────────────── FB / IG জমা রিভিউ (approve · reject) ─────────────────
+def st_badge(st):
+    """জমার স্টেটাস ব্যাজ।"""
+    st = str(st or "pending").strip().lower()
+    if st == "approved":
+        return badge("✅ approved", "ok")
+    if st == "rejected":
+        return badge("❌ rejected", "err")
+    return badge("⏳ pending", "warn")
+
+
+def review_card(tid, kind="fb"):
+    """UID/Username লিস্ট দিয়ে approve বা reject — এক ফর্মে দুই বাটন।"""
+    is_fb = (kind == "fb")
+    idname = "Facebook UID" if is_fb else "Instagram Username"
+    act = (f"/admin/do/fbtask/{tid}/review" if is_fb
+           else f"/admin/do/igtask/{tid}/review")
+    ph = ("61595645847047&#10;61595657606938" if is_fb
+          else "johhrpv67&#10;tania_9")
+    return (
+        "<div class='card'>"
+        "<h3>✅ Approve / ❌ Reject</h3>"
+        f"<p class='mut' style='font-size:12px;margin:6px 0 10px'>প্রতি লাইনে একটা {idname} দিন। "
+        "যেগুলো অ্যাকাউন্ট ঠিক আছে সেগুলো একবার ✅ Approve চাপুন; "
+        "ভুল/ব্যান করা আইডি আলাদা লিস্টে দিয়ে ❌ Reject চাপুন। "
+        "টাকা যোগ আর ইউজারকে নোটিফিকেশন — বট নিজেই পাঠাবে।</p>"
+        f"<form method='post' action='{act}'>"
+        f"<textarea name='ids' rows='5' style='width:100%;padding:10px;border-radius:11px' "
+        f"placeholder='{ph}'></textarea>"
+        "<div class='row' style='margin-top:10px;gap:8px'>"
+        "<button class='btn' name='action' value='approve'>✅ Approve</button>"
+        "<button class='btn gray' name='action' value='reject'>❌ Reject</button></div>"
+        "</form></div>"
+    )
+
+
+def review_tokens(raw):
+    """লাইনে/কমায়/স্পেসে লেখা UID বা Username — ডুপ্লিকেট বাদ।"""
+    import re as _re
+    out, seen = [], set()
+    for part in _re.split(r"[\s,;|]+", str(raw or "")):
+        t = part.strip().lstrip("@").strip()
+        if not t:
+            continue
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(t)
+    return out
+
+
+def review_apply(tid, tokens, action, table, idcol):
+    """token → pending জমা approve/reject। (done, not_found) ফেরত দেয়।"""
+    if table not in ("fb_submissions", "ig_submissions"):
+        return 0, len(tokens)
+    if idcol not in ("fb_uid", "ig_username"):
+        return 0, len(tokens)
+    status = "approved" if action == "approve" else "rejected"
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    done = 0
+    for tk in tokens:
+        r = one(f"SELECT id FROM {table} WHERE task_id=%s AND lower(trim({idcol}))=lower(%s) "
+                "AND status='pending' ORDER BY id LIMIT 1", (tid, tk))
+        if not r:
+            continue
+        _x(f"UPDATE {table} SET status=%s, notified=0, reviewed_at=%s "
+           "WHERE id=%s AND status='pending'", (status, stamp, int(r["id"])))
+        done += 1
+    if done:
+        _fire_review_changed()      # বট সাথে সাথে টাকা + মেসেজ পাঠাবে
+    return done, len(tokens) - done
+
+
+def review_counts(table, tid):
+    """pending / approved / rejected কাউন্ট।"""
+    cnt = {"pending": 0, "approved": 0, "rejected": 0}
+    if table not in ("fb_submissions", "ig_submissions"):
+        return cnt
+    for r in many(f"SELECT status, COUNT(*) AS n FROM {table} WHERE task_id=%s "
+                  "GROUP BY status", (tid,)):
+        cnt[str(r.get("status") or "pending").strip().lower()] = int(r.get("n") or 0)
+    return cnt
+
+
+def review_kpi(cnt):
+    return (
+        "<div class='grid g-kpi'>"
+        f"<div class='card kpi'><div class='t'>⏳ Pending</div><div class='v'>{num(cnt['pending'])}</div></div>"
+        f"<div class='card kpi'><div class='t'>✅ Approved</div><div class='v'>{num(cnt['approved'])}</div></div>"
+        f"<div class='card kpi'><div class='t'>❌ Rejected</div><div class='v'>{num(cnt['rejected'])}</div></div>"
+        "</div>"
+    )
+
+
 def badge(text, kind="mut"):
     return f"<span class='badge b-{kind}'>{esc(text)}</span>"
 
@@ -788,30 +973,68 @@ def task_count(uid_map=True):
     return c, t, b
 
 
+def dash_counts():
+    """ড্যাশবোর্ডের সব সংখ্যা *এক* query-তে — CockroachDB-তে ১৩টি আলাদা query মানে
+    ১৩ বার নেটওয়েট (~১০০ms করে) — এতে পেজ অনেক দ্রুত হয়।"""
+    day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 7 * 86400))
+    r = one(
+        "SELECT (SELECT COUNT(*) FROM users) AS total,"
+        " (SELECT COUNT(*) FROM users WHERE last_seen > %s) AS active,"
+        " (SELECT COUNT(*) FROM users WHERE COALESCE(vrf_pass,0)=1) AS verify,"
+        " (SELECT COUNT(*) FROM users WHERE COALESCE(is_banned,0)=1) AS ban,"
+        " (SELECT COUNT(*) FROM users WHERE COALESCE(is_suspicious,0)=1) AS sus,"
+        " (SELECT COUNT(*) FROM security_alerts WHERE kind='multi_account') AS dup,"
+        " (SELECT COALESCE(SUM(points),0) FROM users) AS points_total,"
+        " (SELECT COALESCE(SUM(balance),0) FROM users) AS balance,"
+        " (SELECT COALESCE(SUM(amount),0) FROM withdrawals) AS withdrawals,"
+        " (SELECT COUNT(*) FROM category_task_completions) AS cat,"
+        " (SELECT COUNT(*) FROM tg_task_completions) AS tg,"
+        " (SELECT COUNT(*) FROM bio_task_completions) AS bio,"
+        " (SELECT COUNT(*) FROM withdrawals WHERE status='pending') AS pending_wd",
+        (day,))
+    if r:
+        out = {}
+        for k, v in dict(r).items():
+            try:
+                out[k] = float(v or 0) if k in ("balance", "withdrawals") else int(v or 0)
+            except Exception:
+                out[k] = 0.0 if k in ("balance", "withdrawals") else 0
+        return out
+    # ব্যাকআপ — এক query ফেল করলে পুরোনো আলাদা পথেই
+    tc, tt, tb = task_count()
+    return {"total": scal("SELECT COUNT(*) FROM users"),
+            "active": scal("SELECT COUNT(*) FROM users WHERE last_seen > %s", (day,)),
+            "verify": scal("SELECT COUNT(*) FROM users WHERE COALESCE(vrf_pass,0)=1"),
+            "ban": scal("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned,0)=1"),
+            "sus": scal("SELECT COUNT(*) FROM users WHERE COALESCE(is_suspicious,0)=1"),
+            "dup": scal("SELECT COUNT(*) FROM security_alerts WHERE kind='multi_account'"),
+            "points_total": scal("SELECT COALESCE(SUM(points),0) FROM users"),
+            "balance": sfloat("SELECT COALESCE(SUM(balance),0) FROM users"),
+            "withdrawals": sfloat("SELECT COALESCE(SUM(amount),0) FROM withdrawals"),
+            "cat": tc, "tg": tt, "bio": tb,
+            "pending_wd": scal("SELECT COUNT(*) FROM withdrawals WHERE status='pending'")}
+
+
 @wadm.route("/admin/", methods=["GET"])
 def dashboard():
     g = guard()
     if g:
         return g
-    total = scal("SELECT COUNT(*) FROM users")
-    active = scal("SELECT COUNT(*) FROM users WHERE last_seen > %s", (time.strftime("%Y-%m-%d", time.gmtime(time.time() - 7 * 86400)),))
-    ver = scal("SELECT COUNT(*) FROM users WHERE COALESCE(vrf_pass,0)=1")
-    ban = scal("SELECT COUNT(*) FROM users WHERE COALESCE(is_banned,0)=1")
-    sus = scal("SELECT COUNT(*) FROM users WHERE COALESCE(is_suspicious,0)=1")
-    dup = scal("SELECT COUNT(*) FROM security_alerts WHERE kind='multi_account'")
-    points_total = scal("SELECT COALESCE(SUM(points),0) FROM users")
-    bal = sfloat("SELECT COALESCE(SUM(balance),0) FROM users")
-    wd = sfloat("SELECT COALESCE(SUM(amount),0) FROM withdrawals")
-    tc, tt, tb = task_count()
+    _c = dash_counts()
+    total, active, ver = _c["total"], _c["active"], _c["verify"]
+    ban, sus, dup = _c["ban"], _c["sus"], _c["dup"]
+    points_total, bal, wd = _c["points_total"], _c["balance"], _c["withdrawals"]
+    tc, tt, tb = _c["cat"], _c["tg"], _c["bio"]
     done_tasks = tc + tt + tb
-    pend = scal("SELECT COUNT(*) FROM withdrawals WHERE status='pending'")
+    pend = _c["pending_wd"]
 
-    growth = many("SELECT SUBSTRING(joined_at,1,10) AS d, COUNT(*) AS n FROM users "
+    growth = many_cached("dash_growth",
+                  "SELECT SUBSTRING(joined_at,1,10) AS d, COUNT(*) AS n FROM users "
                   "WHERE LENGTH(COALESCE(joined_at,''))>=10 GROUP BY d ORDER BY d DESC LIMIT 14")
     growth = list(reversed(growth))
     gvals = [r["n"] for r in growth]
 
-    earn = many("SELECT d, SUM(p) AS s FROM ("
+    earn = many_cached("dash_earn", "SELECT d, SUM(p) AS s FROM ("
                 " SELECT SUBSTRING(c.done_at,1,10) AS d, ct.price AS p FROM category_task_completions c"
                 "  LEFT JOIN category_tasks ct ON ct.id=c.task_id"
                 " UNION ALL SELECT SUBSTRING(c.done_at,1,10), tt.price FROM tg_task_completions c"
@@ -821,7 +1044,8 @@ def dashboard():
     earn = list(reversed(earn))
     evals = [r["s"] or 0 for r in earn]
 
-    countries = many("SELECT COALESCE(NULLIF(country,''),'??') AS c, COUNT(*) AS n FROM users "
+    countries = many_cached("dash_countries",
+                     "SELECT COALESCE(NULLIF(country,''),'??') AS c, COUNT(*) AS n FROM users "
                      "GROUP BY c ORDER BY n DESC LIMIT 8")
     task_parts = [("Category", tc), ("Telegram", tt), ("Bio", tb)]
 
@@ -839,7 +1063,12 @@ def dashboard():
         kpi("Total Withdrawals", money(wd), f"pending {pend}", "wallet", "#ef4444"),
     ])
 
-    recent = user_rows(limit=10)
+    recent = many_cached("dash_recent",
+        "SELECT user_id, username, full_name, balance, points, is_banned, verified, vrf_pass, "
+        "COALESCE(NULLIF(country,''),'??') AS country, COALESCE(last_ip,'') AS last_ip, "
+        "joined_at, last_seen, COALESCE(is_suspicious,0) AS is_suspicious, "
+        "COALESCE(device_hash,'') AS device_hash FROM users "
+        "ORDER BY user_id DESC LIMIT 10 OFFSET 0")
     rows = []
     for r in recent:
         uid = int(r["user_id"])
@@ -1190,8 +1419,14 @@ def act_restart(uid):
     if g:
         return g
     try:
-        _x("UPDATE users SET vrf_pass=0, verified=0, verified_at='', "
-           "vrf_notice_build='' WHERE user_id=%s", (uid,))
+        try:
+            _x("UPDATE users SET vrf_pass=0, verified=0, verified_at='', "
+               "vrf_notice_build='' WHERE user_id=%s", (uid,))
+        except Exception as e:
+            if "does not exist" not in str(e).lower():
+                raise
+            # পুরোনো DB-তে কলাম নেই → বাকি ফিল্ড দিয়েই রিসেট (ফিচার আটকাবে না)
+            _x("UPDATE users SET vrf_pass=0, verified=0, verified_at='' WHERE user_id=%s", (uid,))
     except Exception as e:
         return back(uid, msg="restartfail")
     log_admin("restart_flow", uid, "start from scratch (money/points/referral kept)")
@@ -1210,6 +1445,7 @@ def act_review(uid):
            "WHERE user_id=%s AND status='new'", (now(), uid))
     except Exception:
         pass
+    alerts_changed()          # সাইডবারের কাউন্ট সাথে সাথে আপডেট
     log_admin("review", uid)
     _fire_user_changed(uid)
     return back(uid)

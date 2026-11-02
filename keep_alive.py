@@ -15,6 +15,8 @@ except Exception as _pe:
 try:
     import webadmin as _wadm
     import webadmin2 as _wadm2  # noqa: F401  (বাকি সব route যোগ করে)
+    import webadmin3 as _wadm3  # noqa: F401  (Facebook Task pages)
+    import webadmin4 as _wadm4  # noqa: F401  (Instagram Task pages)
     app.register_blueprint(_wadm.wadm)
 except Exception as _ae:
     print(f"[keep_alive] admin panel load ব্যর্থ: {_ae}")

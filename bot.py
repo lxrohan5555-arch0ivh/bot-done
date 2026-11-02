@@ -218,10 +218,20 @@ MSGS = {
         'cancelled': "❌ *বাতিল করা হয়েছে।*",
         'bot_off': "🔴 *বট এখন বন্ধ আছে।*\n\nকিছুক্ষণ পরে আবার চেষ্টা করুন।",
         'choose_menu': "👇 *নিচের মেনু থেকে অপশন বেছে নিন।*",
-        'profile_title': "👤 *MY PROFILE*",
+        'profile_title': "👤 *Profile*",
+        'pf_tg_id': "✈️ *Telegram ID:*",
+        'pf_name': "🙍 *Name:*",
         'balance_label': "💰 *Balance:*",
         'status_active': "🛡 *Account Status:* Active ✅",
         'developer': "👨‍💻 *Developer:* @inkamxbd",
+        'pf_stats_title': "📊 *TASK STATS*",
+        'pf_completed': "✅ Completed:",
+        'pf_pending': "⏳ Pending:",
+        'pf_rejected': "❌ Rejected:",
+        'pf_earned': "💵 Total earned:",
+        'pf_withdrawn': "📤 Withdrawn:",
+        'pf_available': "✅ Available:",
+        'pf_on_hold': "🔒 On hold:",
         'balance_title': "💰 *BALANCE*",
         'balance_greet': "✅ *আসসালামু আলাইকুম ভাই/আপু*",
         'your_balance': "💰 *আপনার ব্যালান্স:*",
@@ -316,10 +326,20 @@ MSGS = {
         'cancelled': "❌ *Action cancelled.*",
         'bot_off': "🔴 *Bot is currently offline.*\n\nPlease try again later.",
         'choose_menu': "👇 *Choose an option from the menu below.*",
-        'profile_title': "👤 *MY PROFILE*",
+        'profile_title': "👤 *Profile*",
+        'pf_tg_id': "✈️ *Telegram ID:*",
+        'pf_name': "🙍 *Name:*",
         'balance_label': "💰 *Balance:*",
         'status_active': "🛡 *Account Status:* Active ✅",
         'developer': "👨‍💻 *Developer:* @inkamxbd",
+        'pf_stats_title': "📊 *TASK STATS*",
+        'pf_completed': "✅ Completed:",
+        'pf_pending': "⏳ Pending:",
+        'pf_rejected': "❌ Rejected:",
+        'pf_earned': "💵 Total earned:",
+        'pf_withdrawn': "📤 Withdrawn:",
+        'pf_available': "✅ Available:",
+        'pf_on_hold': "🔒 On hold:",
         'balance_title': "💰 *BALANCE*",
         'balance_greet': "✅ *Hello! Welcome back.*",
         'your_balance': "💰 *Your balance:*",
@@ -685,6 +705,106 @@ class _CursorWrapper:
               return None
 
 
+_DB_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_devices_hash ON devices (device_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_devices_ua ON devices (ua)",
+    "CREATE INDEX IF NOT EXISTS idx_devices_user ON devices (user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_userips_ip ON user_ips (ip)",
+    "CREATE INDEX IF NOT EXISTS idx_userips_user ON user_ips (user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_withdrawals_user ON withdrawals (user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_withdrawals_addr ON withdrawals (address)",
+    "CREATE INDEX IF NOT EXISTS idx_gmails_user ON gmails (user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_gmails_code ON gmails (task_code)",
+    "CREATE INDEX IF NOT EXISTS idx_gmails_status ON gmails (status)",
+    "CREATE INDEX IF NOT EXISTS idx_verif_user ON verifications (user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_users_device ON users (device_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_users_ref ON users (referred_by)",
+    "CREATE INDEX IF NOT EXISTS idx_alerts_status ON security_alerts (status)",
+    "CREATE INDEX IF NOT EXISTS idx_promouses_user ON promo_uses (user_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_devices_user_hash ON devices (user_id, device_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_devices_lastseen ON devices (last_seen)",
+    "CREATE INDEX IF NOT EXISTS idx_users_lastip ON users (last_ip)",
+    "CREATE INDEX IF NOT EXISTS idx_users_regip ON users (reg_ip)",
+    "CREATE INDEX IF NOT EXISTS idx_users_points ON users (points)",
+)
+
+
+def _ensure_indexes():
+    """হট কোয়েরির ইনডেক্স — একবারই তৈরি হয়, পরে ফ্ল্যাগ দেখে বাদ (বট/ওয়েব দুটোই দ্রুত হয়)।"""
+    _ver = str(len(_DB_INDEX_SQL))
+    try:
+        if (get_setting("db_indexes_v1") or "") == _ver:
+            return 0          # এই ভার্সনের সব ইনডেক্স আগেই তৈরি
+    except Exception:
+        pass
+    ok = 0
+    try:
+        with _c() as c:
+            # devices(user_id, device_hash) unique index বানানোর আগে পুরোনো ডুপ্লিকেট সরাও
+            try:
+                c.execute("DELETE FROM devices WHERE id NOT IN "
+                          "(SELECT MIN(id) FROM devices GROUP BY user_id, device_hash)")
+            except Exception as _de:
+                log.debug(f"[IDX] devices dedupe skip: {_de}")
+            for q in _DB_INDEX_SQL:
+                try:
+                    c.execute(q)
+                    ok += 1
+                except Exception as e:
+                    log.debug(f"[IDX] skip {q[:48]}: {e}")
+    except Exception as e:
+        log.warning(f"[IDX] ইনডেক্স তৈরি ব্যর্থ: {e}")
+        return 0
+    if ok == len(_DB_INDEX_SQL):     # সব না হলে পরের বুটে আবার চেষ্টা (নতুন টেবিল/রাইট)
+        try:
+            set_setting("db_indexes_v1", _ver)
+        except Exception:
+            pass
+    log.info(f"[IDX] {ok}/{len(_DB_INDEX_SQL)} ইনডেক্স প্রস্তুত")
+    return ok
+
+
+def _backfill_devices():
+    """users/verifications-এ থাকা device_hash → devices টেবিলে (একবার)।
+    এতে আগের ভেরিফাই করা অ্যাকাউন্টগুলোও এক-ফোন নিয়মে ধরা পড়বে।"""
+    try:
+        if (get_setting("devices_backfill_v1") or "") == "1":
+            return 0
+    except Exception:
+        pass
+    total = 0
+    stmts = [
+        # users.device_hash → devices
+        "INSERT INTO devices (user_id, device_hash, ua, platform, first_seen, last_seen, ip) "
+        "SELECT u.user_id, u.device_hash, '', '', COALESCE(u.verified_at,''), "
+        "COALESCE(NULLIF(u.last_seen,''), u.verified_at, ''), COALESCE(u.last_ip,'') "
+        "FROM users u WHERE COALESCE(u.device_hash,'') <> '' AND NOT EXISTS ("
+        " SELECT 1 FROM devices d WHERE d.user_id=u.user_id AND d.device_hash=u.device_hash)",
+        # verifications.device_hash → devices
+        "INSERT INTO devices (user_id, device_hash, ua, platform, first_seen, last_seen, ip) "
+        "SELECT v.user_id, v.device_hash, '', '', COALESCE(v.verified_at,''), "
+        "COALESCE(v.verified_at,''), COALESCE(v.ip,'') "
+        "FROM verifications v WHERE COALESCE(v.device_hash,'') <> '' AND NOT EXISTS ("
+        " SELECT 1 FROM devices d WHERE d.user_id=v.user_id AND d.device_hash=v.device_hash)",
+    ]
+    try:
+        with _c() as c:
+            for q in stmts:
+                try:
+                    total += int(c.execute(q).rowcount or 0)
+                except Exception as e:
+                    log.debug(f"[DEVICE-BACKFILL] skip: {e}")
+    except Exception as e:
+        log.warning(f"[DEVICE-BACKFILL] ব্যর্থ: {e}")
+        return 0
+    try:
+        set_setting("devices_backfill_v1", "1")
+    except Exception:
+        pass
+    log.info(f"[DEVICE-BACKFILL] {total}টি ডিভাইস রেকর্ড যোগ হলো")
+    return total
+
+
 # ── Connection Pool — প্রতি query তে নতুন TCP connection খরচ বাঁচায় ──────
 _conn_pool: "_pg_pool.ThreadedConnectionPool | None" = None
 
@@ -976,11 +1096,85 @@ class _SafeDDL:
         return False
 
 
+# ── users টেবিলের কলাম মাইগ্রেশন — একটাই সোর্স, প্রতিবার চলে (IF NOT EXISTS) ──
+# ⚠️ পুরোনো ডেটাবেসে "security_schema_v1" ফ্ল্যাগ যত আগে সেট হোক, পরে যোগ হওয়া
+# কলামগুলো (যেমন vrf_notice_build) এখানেই তৈরি হয় — নাহলে
+# "column ... does not exist" এরর আসে।
+_USERS_COLUMN_SQL = (
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS verified INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_at TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS reg_ip TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_ip TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS reg_country TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS device_hash TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspicious INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS risk_score INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS approved INTEGER DEFAULT 1",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS vrf_pass INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS vrf_notice_build TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS saved_wallet TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_updated_at TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS winback_sent_at TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TEXT DEFAULT ''",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT ''",
+)
+
+
+def _col_missing(err) -> bool:
+    """'column ... does not exist' ধাঁচের এরর? (পুরোনো DB / আধা-মাইগ্রেটেড)"""
+    t = str(err).lower()
+    return ("does not exist" in t or "undefined column" in t) and "column" in t
+
+
+def _users_have_all_columns(table: str = "users") -> bool:
+    """একটাই হালকা কোয়েরি — সব কলাম আগেই আছে কি না (থাকলে ১৭টা DDL বাঁচে)।"""
+    want = {q.split("EXISTS")[1].split()[0].lower() for q in _USERS_COLUMN_SQL}
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name=%s",
+                (table,)).fetchall()
+        have = {str(r["column_name"] or "").lower() for r in rows}
+        return bool(have) and want.issubset(have)
+    except Exception:
+        return False          # চেক ব্যর্থ → নিরাপদ দিকে, migration চালাও
+
+
+def _ensure_users_columns(table: str = "users"):
+    """users-এর সব দরকারি কলাম নিশ্চিত করো — প্রতিবার শুরুতে, ব্যর্থ হলেও বট চলবে।"""
+    if _users_have_all_columns(table):
+        log.info("[MIGRATE] users কলাম আগেই আছে — DDL লাগবে না")
+        return True
+    ok, miss = 0, []
+    try:
+        with _c() as c:
+            for q in _USERS_COLUMN_SQL:
+                try:
+                    c.execute(q if table == "users" else q.replace("users", table, 1))
+                    ok += 1
+                except Exception as e:
+                    miss.append(str(e)[:80])
+                    try:
+                        log.warning(f"[MIGRATE] {q.split('EXISTS')[1].strip()[:40]} ব্যর্থ: {e}")
+                    except Exception:
+                        pass
+    except Exception as e:
+        log.warning(f"[MIGRATE] কলাম মাইগ্রেশন ব্যর্থ: {e}")
+        return False
+    if miss:
+        log.warning(f"[MIGRATE] {len(miss)} কলাম যোগ হয়নি ({ok} ok)")
+    else:
+        log.info(f"[MIGRATE] users কলাম প্রস্তুত ({ok}/{len(_USERS_COLUMN_SQL)})")
+    return not miss
+
+
 def init_security_db():
     """Verification/security টেবিল + users এর নতুন কলাম তৈরি (idempotent)।"""
     _t0 = _time.time()
     # ── v2: vrf_pass কলাম — v1 ফ্ল্যাগ থাকলেও এই মাইগ্রেশন চলবে ──
     try:
+        _ensure_users_columns()      # ⚠️ ফ্ল্যাগ নির্বিশেষে সবসময় — পুরোনো DB-তে নতুন কলাম যোগ হয়
         if (get_setting("security_schema_v2") or "") != "1":
             with _c() as _c2:
                 _c2.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS vrf_pass INTEGER DEFAULT 0")
@@ -989,13 +1183,9 @@ def init_security_db():
         _SEC_STATE["v2"] = "done"
     except Exception as _v2e:
         log.warning(f"[SECURITY-DB] v2 কলাম ব্যর্থ (verification বন্ধ থাকবে): {_v2e}")
-    try:
-        if (get_setting("security_schema_v1") or "") == "1":
-            _SEC_STATE["schema"] = "done"
-            log.info(f"[SECURITY-DB] schema আগেই তৈরি — DDL skip ({_time.time() - _t0:.1f}s)")
-            return
-    except Exception:
-        pass
+    # ⚠️ আগে এখানে "schema_v1" ফ্ল্যাগ থাকলে পুরো DDL বাদ যেত → পরে যোগ করা কলাম/টেবিল
+    # পুরোনো DB-তে তৈরি হতো না ("column vrf_notice_build does not exist")।
+    # এখন CREATE ... IF NOT EXISTS গুলো প্রতিবার চলে (দ্রুত, idempotent) — drift হবে না।
     try:
         with _SafeDDL() as c:
             c.execute(
@@ -1097,24 +1287,7 @@ def init_security_db():
                 )
                 """
             )
-            for _alt in (
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS verified INTEGER DEFAULT 0",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_at TEXT DEFAULT ''",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS reg_ip TEXT DEFAULT ''",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_ip TEXT DEFAULT ''",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS reg_country TEXT DEFAULT ''",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS device_hash TEXT DEFAULT ''",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspicious INTEGER DEFAULT 0",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS risk_score INTEGER DEFAULT 0",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason TEXT DEFAULT ''",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS approved INTEGER DEFAULT 1",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS vrf_pass INTEGER DEFAULT 0",
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS vrf_notice_build TEXT DEFAULT ''",
-            ):
-                try:
-                    c.execute(_alt)
-                except Exception as _ae:
-                    log.warning(f"[SECURITY-DB] alter skip: {_ae}")
+            _ensure_users_columns()
             log.info(f"[SECURITY-DB] tables+columns ready ({_time.time() - _t0:.1f}s)")
     except Exception as _e:
         log.error(f"[SECURITY-DB] init ব্যর্থ: {_e}")
@@ -1285,11 +1458,17 @@ def _sec_cfg():
         auto = (get_setting("sec_auto_ban") or "on").strip().lower() != "off"
     except Exception:
         auto = True
+    try:
+        # ডিফল্ট off — মোবাইল CGNAT-এ এক IP-তে শত শত ইউজার, ব্লক করলে আসল ইউজার আটকাবে
+        ip_block = (get_setting("sec_ip_block") or "off").strip().lower() == "on"
+    except Exception:
+        ip_block = False
     return {
         # ১ ফোন = ১ অ্যাকাউন্ট; এক IP-তে ২টি পর্যন্ত (VPN/মোবাইল NAT — IP শুধু সতর্কতা)
         "device_limit": max(1, _int("sec_device_limit", 1)),
         "ip_limit": max(2, _int("sec_ip_limit", 2)),
         "auto_ban": auto,
+        "ip_block": ip_block,
     }
 
 
@@ -1812,14 +1991,15 @@ def _vrf_limit_reason(uid):
                     (dh, uid)).fetchone()
                 if max(int(_count(n1)), int(_count(n2))) >= max(1, int(cfg["device_limit"])):
                     return "device"
-            if ip:
+            if ip and cfg.get("ip_block"):
+                # ⚠️ শুধু অ্যাডমিন চালু করলে (sec_ip_block=on); ডিফল্টে IP কাউকে আটকায় না
                 i1 = c.execute(
                     "SELECT COUNT(DISTINCT user_id) AS n FROM user_ips "
                     "WHERE ip=%s AND user_id<>%s", (ip, uid)).fetchone()
                 i2 = c.execute(
                     "SELECT COUNT(*) AS n FROM users WHERE (last_ip=%s OR reg_ip=%s) "
                     "AND user_id<>%s", (ip, ip, uid)).fetchone()
-                if max(int(_count(i1)), int(_count(i2))) >= max(1, int(cfg["ip_limit"])):
+                if max(int(_count(i1)), int(_count(i2))) >= max(2, int(cfg["ip_limit"])):
                     return "ip"
     except Exception as e:
         log.debug(f"[VRF] limit reason ব্যর্থ uid={uid}: {e}")
@@ -3112,9 +3292,18 @@ def _restart_user_flow(uid):
     if uid <= 0:
         return False
     try:
-        with _c() as c:
-            c.execute("UPDATE users SET vrf_pass=0, verified=0, verified_at='', "
-                      "vrf_notice_build='' WHERE user_id=%s", (uid,))
+        try:
+            with _c() as c:
+                c.execute("UPDATE users SET vrf_pass=0, verified=0, verified_at='', "
+                          "vrf_notice_build='' WHERE user_id=%s", (uid,))
+        except Exception as e:
+            if not _col_missing(e):
+                raise
+            # পুরোনো DB-তে vrf_notice_build কলাম নেই → বাকিটা অন্তত রিসেট হোক
+            log.warning(f"[RESTART] uid={uid} vrf_notice_build ছাড়া রিসেট: {e}")
+            with _c() as c:
+                c.execute("UPDATE users SET vrf_pass=0, verified=0, verified_at='' "
+                          "WHERE user_id=%s", (uid,))
     except Exception as e:
         log.warning(f"[RESTART] uid={uid} রিসেট ব্যর্থ: {e}")
         return False
@@ -5013,24 +5202,104 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(T(uid, 'cancelled'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
 
 # ──────────────────────────── MENU HANDLERS ────────────────────────────
+def _profile_stats(uid):
+    """👤 Profile-এর কাউন্টার + টাকার হিসাব — ২টি query-তেই সব।
+
+    💵 Total earned = বটে এখন পর্যন্ত যোগ হওয়া সব টাকা = বর্তমান ব্যালেন্স +
+    সব উইথড্র (approved + pending/processing/gas_pending)। rejection-এ টাকা
+    ফেরত আসে বলে rejected বাদ। ফলে প্রোমো/বোনাস/অ্যাডমিন-অ্যাড — যা-ই যোগ হোক,
+    Total earned-এ ধরা পড়বে; pending টাস্কের টাকা এতে যোগ হয় না।
+    """
+    _z = {"completed": 0, "pending": 0, "rejected": 0,
+          "earned": 0.0, "withdrawn": 0.0, "hold": 0.0}
+    try:
+        with _c() as c:
+            subs = c.execute(
+                "SELECT 'g' AS src, status, COUNT(*) AS n,"
+                "       COALESCE(SUM(COALESCE(amount,0)),0) AS amt"
+                "  FROM gmails WHERE user_id=%s GROUP BY status"
+                " UNION ALL"
+                " SELECT 'f', s.status, COUNT(*),"
+                "       COALESCE(SUM(COALESCE(t.price,0)),0)"
+                "  FROM fb_submissions s LEFT JOIN fb_tasks t ON t.id=s.task_id"
+                " WHERE s.user_id=%s GROUP BY s.status"
+                " UNION ALL"
+                " SELECT 'i', s.status, COUNT(*),"
+                "       COALESCE(SUM(COALESCE(t.price,0)),0)"
+                "  FROM ig_submissions s LEFT JOIN ig_tasks t ON t.id=s.task_id"
+                " WHERE s.user_id=%s GROUP BY s.status",
+                (uid, uid, uid)).fetchall()
+            other = c.execute(
+                "SELECT 'tg' AS src, COUNT(*) AS n,"
+                "       COALESCE(SUM(COALESCE(t.price,0)),0) AS amt"
+                "  FROM tg_task_completions c LEFT JOIN tg_tasks t ON t.id=c.task_id"
+                " WHERE c.user_id=%s"
+                " UNION ALL SELECT 'bio', COUNT(*), COALESCE(SUM(amount),0)"
+                "  FROM bio_task_completions WHERE user_id=%s"
+                " UNION ALL SELECT 'wdp', COUNT(*), COALESCE(SUM(amount),0)"
+                "  FROM withdrawals WHERE user_id=%s AND status='approved'"
+                " UNION ALL SELECT 'wdo', COUNT(*), COALESCE(SUM(amount),0)"
+                "  FROM withdrawals WHERE user_id=%s"
+                "   AND status IN ('pending','processing','gas_pending')"
+                " UNION ALL SELECT 'bal', 1,"
+                "  COALESCE((SELECT balance FROM users WHERE user_id=%s),0)",
+                (uid, uid, uid, uid, uid)).fetchall()
+    except Exception as e:
+        log.warning(f"[profile_stats] uid={uid} — {e}")
+        return _z
+    try:
+        for r in subs or []:
+            _st  = str(r["status"] or "")
+            _n   = int(r["n"] or 0)
+            _amt = float(r["amt"] or 0)
+            if _st == "approved":
+                _z["completed"] += _n
+            elif _st == "pending":
+                _z["pending"] += _n
+                _z["hold"]    += _amt
+            elif _st == "rejected":
+                _z["rejected"] += _n
+        for r in other or []:
+            _key = str(r["src"])
+            _amt = float(r["amt"] or 0)
+            if _key == "wdp":
+                _z["withdrawn"] += _amt
+                _z["earned"]    += _amt
+            elif _key in ("wdo", "bal"):
+                _z["earned"] += _amt
+            elif _key in ("tg", "bio"):
+                _z["completed"] += int(r["n"] or 0)
+    except Exception as e:
+        log.warning(f"[profile_stats] parse uid={uid} — {e}")
+    _z["earned"]    = round(_z["earned"], 2)
+    _z["withdrawn"] = round(_z["withdrawn"], 2)
+    _z["hold"]      = round(_z["hold"], 2)
+    return _z
+
 async def show_profile(update, ctx):
     user = update.effective_user
     uid  = user.id
-    # get_bal + get_user parallel — sequential call বাদ
-    bal, _u = await asyncio.gather(
+    # balance + user + কাউন্টার — তিনটাই parallel
+    bal, _u, st = await asyncio.gather(
         asyncio.to_thread(get_bal, uid),
         asyncio.to_thread(get_user, uid),
+        asyncio.to_thread(_profile_stats, uid),
     )
-    uname = f"@{_md_esc(user.username)}" if user.username else _md_esc(user.full_name or "")
+    _name = _md_esc(user.full_name or user.username or "—")
+    if user.username and user.full_name:
+        _name += f" (@{_md_esc(user.username)})"
     await update.message.reply_text(
         f"{T(uid,'profile_title')}\n\n"
-        f"👤 *USER* {uname}\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"{T(uid,'balance_label')} `{bal}$ USDT`\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"{T(uid,'status_active')}\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"{T(uid,'developer')}",
+        f"{T(uid,'pf_tg_id')} `{uid}`\n"
+        f"{T(uid,'pf_name')} {_name}\n\n"
+        f"{T(uid,'pf_completed')} `{st['completed']}`\n"
+        f"{T(uid,'pf_pending')} `{st['pending']}`\n"
+        f"{T(uid,'pf_rejected')} `{st['rejected']}`\n\n"
+        f"{T(uid,'pf_earned')} `${st['earned']:.2f}`\n"
+        f"{T(uid,'pf_withdrawn')} `${st['withdrawn']:.2f}`\n"
+        f"{T(uid,'pf_available')} `${float(bal or 0):.2f}`\n"
+        f"{T(uid,'pf_on_hold')} `${st['hold']:.2f}`\n\n"
+        f"{T(uid,'status_active')}",
         parse_mode="Markdown"
     )
 
@@ -5320,9 +5589,103 @@ async def _notify_task_maxed(bot, name: str, code: str, type_label: str, done: i
     )
     await notify_full_admins(bot, msg)
 
-async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str, price: float, task_type_label: str = ""):
-    """যেকোনো task complete/approve হলে TASK_DONE_NOTIFY_CH চ্যানেলে notification পাঠাও।"""
+_TASK_NOTIFY_READY = [False]
+
+
+def _task_notify_init():
+    """দিনের কাউন্টার টেবিল — একবার।"""
+    if _TASK_NOTIFY_READY[0]:
+        return
     try:
+        with _c() as c:
+            try:
+                c.execute("CREATE TABLE IF NOT EXISTS task_notify_daily "
+                          "(day TEXT PRIMARY KEY, n INTEGER DEFAULT 0)")
+            except Exception as e:
+                log.debug(f"[NOTIFY] DDL skip: {e}")
+        _TASK_NOTIFY_READY[0] = True
+    except Exception as e:
+        log.warning(f"[NOTIFY] init ব্যর্থ: {e}")
+
+
+def _task_notify_mode():
+    """off / channel / dm / both — ডিফল্ট channel (আগের আচরণ)।"""
+    try:
+        m = (get_setting('task_notify_mode') or 'channel').strip().lower()
+    except Exception:
+        m = 'channel'
+    return m if m in ('channel', 'dm', 'both', 'off') else 'channel'
+
+
+def _task_notify_channel():
+    """settings-এ দেওয়া চ্যানেল, না থাকলে ডিফল্ট TASK_DONE_NOTIFY_CH।"""
+    try:
+        raw = (get_setting('task_notify_channel') or '').strip()
+    except Exception:
+        raw = ''
+    if not raw:
+        return TASK_DONE_NOTIFY_CH
+    v = raw.lstrip('@')
+    if v.lstrip('-').isdigit():
+        try:
+            return int(v)
+        except Exception:
+            return TASK_DONE_NOTIFY_CH
+    return raw
+
+
+def _task_notify_today():
+    try:
+        return datetime.now(BD_TZ).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def _task_notify_sent_today():
+    _task_notify_init()
+    try:
+        with _c() as c:
+            r = c.execute("SELECT n FROM task_notify_daily WHERE day=%s",
+                          (_task_notify_today(),)).fetchone()
+        return int(r["n"] or 0) if r else 0
+    except Exception as e:
+        log.debug(f"[NOTIFY] sent_today ব্যর্থ: {e}")
+        return 0
+
+
+def _task_notify_bump():
+    _task_notify_init()
+    try:
+        with _c() as c:
+            c.execute("INSERT INTO task_notify_daily (day, n) VALUES (%s,1) "
+                      "ON CONFLICT (day) DO UPDATE SET n = task_notify_daily.n + 1",
+                      (_task_notify_today(),))
+        return True
+    except Exception as e:
+        log.debug(f"[NOTIFY] bump ব্যর্থ: {e}")
+        return False
+
+
+def _task_notify_daily_max():
+    """দিনে সর্বোচ্চ কতটা নোটিফিকেশন — 0 = সীমা নেই।"""
+    try:
+        return max(0, int(get_setting('task_notify_daily_max') or 0))
+    except Exception:
+        return 0
+
+
+async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str,
+                               price: float, task_type_label: str = ""):
+    """Task সম্পন্ন/approve হলে — অ্যাডমিনের সেটিং অনুযায়ী চ্যানেল বা বট DM
+    (বা দুটোই), চাইলে বন্ধ। দিনের সীমা সেট থাকলে তার বেশি যাবে না।"""
+    try:
+        mode = _task_notify_mode()
+        if mode == 'off':
+            return
+        mx = _task_notify_daily_max()
+        if mx and _task_notify_sent_today() >= mx:
+            log.debug(f"[TASK_DONE_NOTIFY] দিনের সীমা {mx} শেষ — পাঠানো হলো না")
+            return
         u = await asyncio.to_thread(get_user, user_id)
         full_name = _md_esc((u["full_name"] or "Unknown") if u else "Unknown")
         type_line = f"\n🏷️ *ধরন:* {_md_esc(task_type_label)}" if task_type_label else ""
@@ -5336,9 +5699,24 @@ async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str
             f"💰 *আয়:* `{price}$ USDT`\n"
             f"🕐 *সময়:* {now()}"
         )
-        await bot.send_message(TASK_DONE_NOTIFY_CH, msg, parse_mode="Markdown")
+        sent = False
+        if mode in ("channel", "both"):
+            try:
+                await bot.send_message(_task_notify_channel(), msg, parse_mode="Markdown")
+                sent = True
+            except Exception as _e:
+                log.warning(f"[TASK_DONE_NOTIFY] চ্যানেলে পাঠাতে ব্যর্থ: {_e}")
+        if mode in ("dm", "both"):
+            try:
+                await notify_full_admins(bot, msg)
+                sent = True
+            except Exception as _e:
+                log.warning(f"[TASK_DONE_NOTIFY] admin DM ব্যর্থ: {_e}")
+        if sent:
+            _task_notify_bump()
     except Exception as _e:
-        log.warning(f"[TASK_DONE_NOTIFY] চ্যানেলে পাঠাতে ব্যর্থ: {_e}")
+        log.warning(f"[TASK_DONE_NOTIFY] {_e}")
+
 
 async def show_tasks(update, ctx):
     uid          = update.effective_user.id
@@ -5461,6 +5839,34 @@ async def show_tasks(update, ctx):
             else f"📲 Telegram Tasks ({available_tgt}টি available)"
         )
         btns.append([InlineKeyboardButton(tgt_label, callback_data="tgt_list")])
+
+    # Facebook Tasks — active থাকলে একটাই গ্রুপ বাটন
+    _fb_tasks = await asyncio.to_thread(_fb_active_tasks)
+    if _fb_tasks:
+        _fb_left = 0
+        for _ft in _fb_tasks:
+            _tot, _mine = await asyncio.to_thread(_fb_counts, int(_ft["id"]), uid)
+            _mx = int(_ft.get("max_accounts") or 0)
+            _lim = int(_ft.get("per_user_limit") or 1)
+            if (_mx == 0 or _tot < _mx) and (_lim == 0 or _mine < _lim):
+                _fb_left += 1
+        _fb_label = (f"📘 Facebook Tasks ({_fb_left} available)" if lang == 'en'
+                     else f"📘 Facebook Tasks ({_fb_left}টি available)")
+        btns.append([InlineKeyboardButton(_fb_label, callback_data="fbt_list")])
+
+    # Instagram Tasks — active থাকলে একটাই গ্রুপ বাটন
+    _ig_tasks = await asyncio.to_thread(_ig_active_tasks)
+    if _ig_tasks:
+        _ig_left = 0
+        for _it in _ig_tasks:
+            _tot, _mine = await asyncio.to_thread(_ig_counts, int(_it["id"]), uid)
+            _mx = int(_it.get("max_accounts") or 0)
+            _lim = int(_it.get("per_user_limit") or 1)
+            if (_mx == 0 or _tot < _mx) and (_lim == 0 or _mine < _lim):
+                _ig_left += 1
+        _ig_label = (f"📸 Instagram Tasks ({_ig_left} available)" if lang == 'en'
+                     else f"📸 Instagram Tasks ({_ig_left}টি available)")
+        btns.append([InlineKeyboardButton(_ig_label, callback_data="igt_list")])
 
     if not btns:
         await update.message.reply_text(
@@ -8527,6 +8933,10 @@ def _vrf_notice_backfill():
         log.info(f"[NOTICE] এককালীন ব্যাকফিল: {n} জন এই বিল্ডে আগেই নোটিশ পেয়েছে")
         return n
     except Exception as _e:
+        if _col_missing(_e):
+            # কলাম নেই → মাইগ্রেশন পরের বুটে যোগ করবে; ব্যাকফিল না করলেও বট চলবে
+            log.warning(f"[NOTICE] backfill বাদ (কলাম নেই, মাইগ্রেশনের পর হবে): {_e}")
+            return 0
         log.warning(f"[NOTICE] backfill ব্যর্থ: {_e}")
         return 0
 
@@ -9092,6 +9502,10 @@ async def send_admin_panel(msg, uid):
         rows.append([
             InlineKeyboardButton("📡 TG Tasks যোগ",   callback_data="adm_tgt_add"),
             InlineKeyboardButton("📡 TG Task তালিকা", callback_data="adm_tgt_list"),
+        ])
+        rows.append([
+            InlineKeyboardButton("📘 Facebook Task", callback_data="adm_fb"),
+            InlineKeyboardButton("📸 Instagram Task", callback_data="adm_ig"),
         ])
         rows.append([
             InlineKeyboardButton("📁 Category যোগ করুন", callback_data="adm_cat_add"),
@@ -18127,6 +18541,2192 @@ def _setup_uptimerobot():
         log.warning(f"[UptimeRobot] setup ব্যর্থ: {e} — manually দিন: {ping_url}")
 
 
+# ═══════════════════ FB / IG রিভিউ (approve · reject) ═══════════════════
+# অ্যাডমিন প্যানেলে UID/Username লিস্ট দিয়ে approve/reject হয়। টাকা যোগ করা আর
+# ইউজারকে নোটিফিকেশন পাঠানো — দুটোই বট করে, যাতে প্যানেল থেকে ব্যালেন্স বদলে
+# বটের ক্যাশ (১০ মিনিট TTL) ভুল না দেখায়।
+
+_REVIEW_READY = [False]
+_REVIEW_TABLES = ("fb_submissions", "ig_submissions")
+_REVIEW_LOOP = [None]     # বটের event loop (প্যানেল অন্য থ্রেড থেকে ডাকে)
+_REVIEW_CTX = [None]      # job-এর জন্য context (bot সহ)
+_REVIEW_DDL = (
+    "ALTER TABLE fb_submissions ADD COLUMN IF NOT EXISTS paid INTEGER DEFAULT 1",
+    "ALTER TABLE fb_submissions ADD COLUMN IF NOT EXISTS notified INTEGER DEFAULT 1",
+    "ALTER TABLE fb_submissions ADD COLUMN IF NOT EXISTS reviewed_at TEXT DEFAULT ''",
+    "ALTER TABLE ig_submissions ADD COLUMN IF NOT EXISTS paid INTEGER DEFAULT 1",
+    "ALTER TABLE ig_submissions ADD COLUMN IF NOT EXISTS notified INTEGER DEFAULT 1",
+    "ALTER TABLE ig_submissions ADD COLUMN IF NOT EXISTS reviewed_at TEXT DEFAULT ''",
+    "CREATE INDEX IF NOT EXISTS idx_fbsub_notify ON fb_submissions (notified, status)",
+    "CREATE INDEX IF NOT EXISTS idx_igsub_notify ON ig_submissions (notified, status)",
+)
+
+
+def _review_init():
+    """paid / notified / reviewed_at কলাম — পুরনো DB-তেও নিরাপদে যোগ হয়।"""
+    if _REVIEW_READY[0]:
+        return
+    try:
+        with _c() as c:
+            for q in _REVIEW_DDL:
+                try:
+                    c.execute(q)
+                except Exception as e:
+                    log.debug(f"[REVIEW] DDL skip: {e}")
+        _REVIEW_READY[0] = True
+    except Exception as e:
+        log.warning(f"[REVIEW] init ব্যর্থ: {e}")
+
+
+def _review_rows(limit=80):
+    """notified=0 আর approved/rejected — প্যানেল সিদ্ধান্ত দিয়েছে, বট বাকি কাজ করবে।"""
+    _review_init()
+    out = []
+    with _c() as c:
+        for table, task_tbl, idcol, pwdcol in (
+            ("fb_submissions", "fb_tasks", "fb_uid", "fb_password"),
+            ("ig_submissions", "ig_tasks", "ig_username", "ig_password"),
+        ):
+            rows = c.execute(
+                f"SELECT s.id AS sid, s.user_id, s.status, s.{idcol} AS ident, "
+                f"       s.{pwdcol} AS pwd, s.data, COALESCE(s.paid,1) AS paid, "
+                f"       COALESCE(t.price,0) AS price, COALESCE(t.name,'') AS tname "
+                f"  FROM {table} s LEFT JOIN {task_tbl} t ON t.id=s.task_id "
+                f" WHERE s.notified=0 AND s.status IN ('approved','rejected') "
+                f" ORDER BY s.user_id, s.id LIMIT %s", (limit,)).fetchall()
+            for r in rows or []:
+                d = dict(r)
+                d["table"] = table
+                out.append(d)
+    return out
+
+
+def _review_pay(table, sub_id, uid, price):
+    """approve + আগে পেইড না হলে — ঠিক একবারই টাকা যোগ।"""
+    if table not in _REVIEW_TABLES:
+        return False
+    paid = False
+    try:
+        with _c() as c:
+            cur = c.execute(
+                f"UPDATE {table} SET paid=1 WHERE id=%s AND COALESCE(paid,0)=0", (sub_id,))
+            if cur.rowcount:
+                c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (price, uid))
+                paid = True
+    except Exception as e:
+        log.warning(f"[REVIEW] pay ব্যর্থ {table}#{sub_id}: {e}")
+        return False
+    if paid:
+        try:
+            _invalidate_user_cache(uid)
+            _mark_dirty()
+        except Exception:
+            pass
+    return paid
+
+
+def _review_mark(table, ids):
+    """নোটিফিকেশন পাঠানো শেষ — আর পাঠানো হবে না।"""
+    if table not in _REVIEW_TABLES:
+        return
+    try:
+        with _c() as c:
+            for i in ids:
+                c.execute(f"UPDATE {table} SET notified=1 WHERE id=%s", (i,))
+    except Exception as e:
+        log.warning(f"[REVIEW] notified mark ব্যর্থ {table}: {e}")
+
+
+def _review_2fa(data_raw):
+    """জমার data থেকে 2FA কোড/key (থাকলে)।"""
+    try:
+        d = _json.loads(data_raw or "{}")
+    except Exception:
+        return ""
+    if not isinstance(d, dict):
+        return ""
+    for k, v in d.items():
+        kk = str(k).lower()
+        if ("2fa" in kk or "totp" in kk or "2step" in kk) and str(v or "").strip():
+            return str(v).strip()
+    return ""
+
+
+def _review_safe(v):
+    """Telegram Markdown-এর code span ভাঙবে না।"""
+    return str(v or "").replace("`", "'").replace("\n", " ").strip()
+
+
+def _review_text(lang, status, items, added):
+    """এক ইউজারের সব সিদ্ধান্ত এক মেসেজে।"""
+    en = (lang == "en")
+    n = len(items)
+    if status == "approved":
+        lines = [("✅ *Task approved!*" if en else "✅ *টাস্ক এপ্রুভ হয়েছে!*"),
+                 (f"📋 Count: {n}" if en else f"📋 পরিমাণ: {n} টি"),
+                 f"💰 {'Added' if en else 'যুক্ত হয়েছে'}: ${added:.2f}", ""]
+        for it in items:
+            tail = (f"+${float(it.get('paid_now') or 0):.2f} 😁"
+                    if float(it.get("paid_now") or 0) > 0 else "✅")
+            lines.append(f"✅ `{_review_safe(it.get('ident'))}` "
+                         + ("approved: " if en else "এপ্রুভ হয়েছে: ") + tail)
+    else:
+        lines = [("❌ *Task rejected!*" if en else "❌ *টাস্ক রিজেক্ট হয়েছে!*"),
+                 (f"📋 Count: {n}" if en else f"📋 পরিমাণ: {n} টি"),
+                 ("_(wrong or banned ID)_" if en else "_(ভুল বা ব্যান আইডির কারণে)_"), ""]
+        for it in items:
+            bits = [f"`{_review_safe(it.get('ident'))}`"]
+            pwd = _review_safe(it.get("pwd"))
+            if pwd:
+                bits.append(f"`{pwd}`")
+            two = _review_safe(it.get("2fa"))
+            if two:
+                bits.append(f"2FA: `{two}`")
+            lines.append("🚨 " + " | ".join(bits))
+    return "\n".join(lines).strip()
+
+
+def _review_chunks(text, limit=3500):
+    """Telegram-এর ৪০৯৬ অক্ষরের সীমা — বড় লিস্ট টুকরো করে।"""
+    out, cur = [], ""
+    for line in (text or "").split("\n"):
+        if cur and len(cur) + len(line) + 1 > limit:
+            out.append(cur)
+            cur = line
+        else:
+            cur = (cur + "\n" + line) if cur else line
+    if cur:
+        out.append(cur)
+    return out or [""]
+
+
+_REVIEW_BUSY = [False]
+
+
+async def job_fb_ig_review(ctx):
+    """প্যানেলে approve/reject হওয়া FB/IG জমা → টাকা যোগ + নোটিফিকেশন।
+
+    instant hook আর ২০s job একসাথে চললে যেন ডাবল মেসেজ না যায় — busy guard।
+    """
+    if _REVIEW_BUSY[0]:
+        return
+    _REVIEW_BUSY[0] = True
+    try:
+        await _fb_ig_review_once(ctx)
+    except Exception as e:
+        log.warning(f"[REVIEW] job ব্যর্থ: {e}")
+    finally:
+        _REVIEW_BUSY[0] = False
+
+
+async def _fb_ig_review_once(ctx):
+    try:
+        rows = await asyncio.to_thread(_review_rows)
+    except Exception as e:
+        log.warning(f"[REVIEW] rows পড়া ব্যর্থ: {e}")
+        return
+    if not rows:
+        return
+    groups = {}
+    for r in rows:
+        groups.setdefault((int(r["user_id"]), str(r["status"] or "")), []).append(r)
+    for (uid, status), items in groups.items():
+        added = 0.0
+        for it in items:
+            price = float(it.get("price") or 0)
+            it["2fa"] = _review_2fa(it.get("data"))
+            it["paid_now"] = 0.0
+            if status == "approved" and price > 0 and not int(it.get("paid") or 0):
+                try:
+                    ok = await asyncio.to_thread(
+                        _review_pay, it["table"], int(it["sid"]), uid, price)
+                except Exception as e:
+                    log.warning(f"[REVIEW] pay কাজ ব্যর্থ: {e}")
+                    ok = False
+                if ok:
+                    it["paid_now"] = price
+                    added += price
+        try:
+            lang = await asyncio.to_thread(get_lang, uid)
+        except Exception:
+            lang = "bn"
+        for part in _review_chunks(_review_text(lang or "bn", status, items, added)):
+            try:
+                await ctx.bot.send_message(uid, part, parse_mode="Markdown")
+            except Exception as e:
+                log.warning(f"[REVIEW] notify ব্যর্থ uid={uid} {status}: {e}")
+        if status == "approved":
+            # অ্যাডমিনের Task Notification সেটিং অনুযায়ী (চ্যানেল / DM / বন্ধ)
+            for it in items:
+                try:
+                    await _notify_task_done_ch(
+                        ctx.bot, uid, it.get("tname") or "Task", "",
+                        float(it.get("price") or 0),
+                        "Facebook" if it["table"] == "fb_submissions" else "Instagram")
+                except Exception as e:
+                    log.debug(f"[REVIEW] task notify: {e}")
+        for table in _REVIEW_TABLES:
+            ids = [int(it["sid"]) for it in items if it["table"] == table]
+            if ids:
+                try:
+                    await asyncio.to_thread(_review_mark, table, ids)
+                except Exception as e:
+                    log.warning(f"[REVIEW] mark কাজ ব্যর্থ: {e}")
+
+
+# ═══════════════════ FACEBOOK TASK (Taksly-style) ═══════════════════
+# অ্যাডমিন সব সেটিংস দেয় ওয়েব প্যানেল থেকে: /admin/fbtasks
+# এখানে: ইউজার ফ্লো (নাম → Rules → Start → লগইন → UID → ফিল্ড), ডুপ্লিকেট চেক,
+# Google Sheet sync (Apps Script), CSV export, প্রতিদিন অটো পাসওয়ার্ড বদল।
+
+_FB_DDL = (
+    """CREATE TABLE IF NOT EXISTS fb_tasks (
+        id                    BIGSERIAL PRIMARY KEY,
+        name                  TEXT DEFAULT '',
+        rules_bn              TEXT DEFAULT '',
+        rules_en              TEXT DEFAULT '',
+        price                 REAL DEFAULT 0,
+        first_name_mode       TEXT DEFAULT 'fixed',
+        first_name            TEXT DEFAULT '',
+        first_name_list       TEXT DEFAULT '',
+        last_name_mode        TEXT DEFAULT 'fixed',
+        last_name             TEXT DEFAULT '',
+        last_name_list        TEXT DEFAULT '',
+        password              TEXT DEFAULT '',
+        password_auto         INTEGER DEFAULT 0,
+        password_change_time  TEXT DEFAULT '00:00',
+        password_last_change  TEXT DEFAULT '',
+        fields                TEXT DEFAULT '[]',
+        max_accounts          INTEGER DEFAULT 0,
+        per_user_limit        INTEGER DEFAULT 1,
+        total_done            INTEGER DEFAULT 0,
+        is_active             INTEGER DEFAULT 1,
+        sheet_url             TEXT DEFAULT '',
+        sheet_columns         TEXT DEFAULT '[]',
+        export_time           TEXT DEFAULT '',
+        last_export_at        TEXT DEFAULT '',
+        created_at            TEXT DEFAULT ''
+    )""",
+    """CREATE TABLE IF NOT EXISTS fb_submissions (
+        id              BIGSERIAL PRIMARY KEY,
+        task_id         BIGINT NOT NULL,
+        user_id         BIGINT NOT NULL,
+        account_no      INTEGER DEFAULT 1,
+        fb_uid          TEXT DEFAULT '',
+        fb_password     TEXT DEFAULT '',
+        login_first     TEXT DEFAULT '',
+        login_last      TEXT DEFAULT '',
+        login_password  TEXT DEFAULT '',
+        data            TEXT DEFAULT '{}',
+        status          TEXT DEFAULT 'pending',
+        synced          INTEGER DEFAULT 0,
+        created_at      TEXT DEFAULT ''
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_fbsub_task ON fb_submissions (task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_fbsub_user ON fb_submissions (user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_fbsub_uid ON fb_submissions (fb_uid)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_fbsub_uid ON fb_submissions (task_id, fb_uid)",
+)
+
+_FB_DEFAULT_FIELDS = [
+    {"key": "uid", "label_bn": "🔑 আপনার Facebook UID দিন",
+     "label_en": "🔑 Enter your Facebook UID", "required": 1, "type": "uid"},
+]
+
+# পাসওয়ার্ড ইউজারের কাছে চাওয়া হয় না — টাস্কে অ্যাডমিন যেটা সেট করেন সেটাই ব্যবহার হবে
+_FB_HIDE_TYPES = ("password",)
+
+# ইনপুট ভ্যালিডেশন টাইপ — key থেকে অনুমান, চাইলে ফিল্ডে type দিয়ে বদলানো যায়
+_FB_TYPES = ("uid", "password", "cookies", "2fa", "email", "number", "text")
+
+
+def _fb_guess_type(key):
+    k = str(key or "").lower()
+    if k in ("uid", "fb_uid", "user_id", "profile", "id"):
+        return "uid"
+    if "cookie" in k:
+        return "cookies"
+    if "2fa" in k or "totp" in k or "2step" in k:
+        return "2fa"
+    if "pass" in k:
+        return "password"
+    if "mail" in k:
+        return "email"
+    return "text"
+
+
+def _fb_2fa_key(txt):
+    """2FA key নরমালাইজ — স্পেস/ড্যাশ বাদ, বড় হাতের অক্ষর।"""
+    return re.sub(r"[\s\-]+", "", str(txt or "")).upper()
+
+
+def _fb_totp(secret, digits=6, period=30):
+    """RFC 6238 — Facebook Authenticator-এর মতো ৬ ডিজিটের কোড।"""
+    import base64, hmac, hashlib, struct
+    sec = _fb_2fa_key(secret)
+    # কিছু key-তে ভুল করে 0/1/8/9 লেখা থাকে — Base32-এর অনুরূপ অক্ষরে বদলে নাও
+    sec = sec.translate(str.maketrans({"0": "O", "1": "I", "8": "B", "9": "G"}))
+    sec += "=" * (-len(sec) % 8)
+    key = base64.b32decode(sec, casefold=True)
+    counter = int(_time.time()) // period
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    off = digest[-1] & 0x0F
+    code = (struct.unpack(">I", digest[off:off + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+
+def _fb_validate(field, txt):
+    """(ok, ভুলের বার্তা-বাংলা, ভুলের বার্তা-English, extra কোড) — ভুল হলে পরের ধাপে এগোবে না।"""
+    typ = (field.get("type") or _fb_guess_type(field.get("key"))).lower()
+    v = (txt or "").strip()
+    if typ == "uid":
+        if not re.fullmatch(r"\d{14,16}", v):
+            return (False,
+                    "⚠️ দুঃখিত, এটি সঠিক UID নয়! অনুগ্রহ করে ১৪ থেকে ১৬ সংখ্যার সঠিক UID-টি দিন।",
+                    "⚠️ Sorry, this UID is not valid! Please send the correct 14–16 digit UID.",
+                    None)
+    elif typ == "cookies":
+        low = v.lower()
+        if ("c_user=" not in low) or ("sessionid=" not in low):
+            return (False,
+                    "⚠️ আপনার দেওয়া Cookies সঠিক নয়!\nদয়া করে ব্রাউজার থেকে সম্পূর্ণ সঠিক "
+                    "Cookies কপি করে পেস্ট করুন (যেখানে `c_user=...;` বা `sessionid=...;` থাকবে):",
+                    "⚠️ Your cookies are not valid!\nPlease paste the full cookie string from your "
+                    "browser (it must contain `c_user=...;` and `sessionid=...;`).",
+                    None)
+        if len(low) < 40:
+            return (False,
+                    "⚠️ Cookies অসম্পূর্ণ মনে হচ্ছে — পুরোটা কপি করুন।",
+                    "⚠️ That cookie looks incomplete — please copy the whole thing.", None)
+    elif typ == "password":
+        if len(v) < 6:
+            return (False, "⚠️ Password খুব ছোট মনে হচ্ছে — সঠিক Facebook Password দিন।",
+                    "⚠️ That password looks too short — send the correct Facebook password.", None)
+    elif typ == "2fa":
+        key = _fb_2fa_key(v)
+        # ইংরেজি অক্ষর/সংখ্যা, মিনিমাম ৪ অক্ষর (স্পেস/ড্যাশ বাদ দিয়ে)
+        if not re.fullmatch(r"[A-Z0-9]{4,}", key) or len(re.findall(r"[A-Z]", key)) < 2:
+            return (False,
+                    "⚠️ এটি সঠিক 2FA key নয়!\nkey-টি *ইংরেজি অক্ষর ও সংখ্যায়* মিনিমাম ৪ অক্ষরের "
+                    "হতে হবে (যেমন `EOH5 WAFU GQG3 ABUK`)।\nFacebook-এর *Settings → Security → "
+                    "Two-factor authentication → Authentication app* থেকে key-টি কপি করুন।",
+                    "⚠️ That is not a valid 2FA key!\nThe key must be in English letters/digits, "
+                    "at least 4 characters (e.g. `EOH5 WAFU GQG3 ABUK`). Copy it from Facebook → "
+                    "Settings → Security → Two-factor authentication → Authentication app.",
+                    None)
+        try:
+            return True, "", "", _fb_totp(key)
+        except Exception:
+            return True, "", "", None
+    elif typ == "email":
+        if "@" not in v or "." not in v.split("@")[-1]:
+            return (False, "⚠️ সঠিক ইমেইল দিন।", "⚠️ Please send a valid email.", None)
+    elif typ == "number":
+        if not re.fullmatch(r"\d+", v):
+            return (False, "⚠️ শুধু সংখ্যা দিন।", "⚠️ Numbers only, please.", None)
+    return True, "", "", None
+
+_FB_STATE = {}           # uid → {"task_id", "step", "answers", "login", "ts"}
+_FB_READY = [False]
+
+# Sheet column token → হেডার লেবেল
+_FB_COL_LABELS = {
+    "sl": "SL", "date": "Date", "user_id": "Telegram ID", "username": "Username",
+    "task": "Task", "account_no": "Account No", "login_first": "First Name",
+    "login_last": "Last Name", "login_password": "Login Password",
+    "uid": "uid", "password": "pass", "pass": "pass", "2fa": "2fa",
+    "coki": "coki", "cookies": "coki", "cookie": "coki",
+    "first": "First Name", "last": "Last Name", "status": "Status",
+}
+
+# ছোট/এলোমেলো নাম → আসল কলাম
+_FB_COL_ALIAS = {
+    "pass": "password", "pw": "password", "fb_pass": "password",
+    "fb_uid": "uid", "profile": "uid", "id": "uid",
+    "coki": "cookies", "cookie": "cookies", "ck": "cookies",
+    "totp": "2fa", "2step": "2fa", "auth2": "2fa",
+    "fname": "login_first", "lname": "login_last", "firstname": "login_first",
+    "lastname": "login_last", "name": "login_first", "tel": "user_id",
+}
+
+
+def _fb_data_key(task, typ):
+    """এই টাইপের ফিল্ডের key (যেমন cookies ফিল্ডের key) — না থাকলে টাইপের নাম।"""
+    try:
+        for f in _fb_fields(task or {}):
+            if (f.get("type") or "") == typ:
+                return f["key"]
+    except Exception:
+        pass
+    return typ
+
+
+def _fb_init():
+    """টেবিল/ইনডেক্স — একবার। ব্যর্থ হলেও বট চলবে।"""
+    if _FB_READY[0]:
+        return True
+    try:
+        with _c() as c:
+            for q in _FB_DDL:
+                try:
+                    c.execute(q)
+                except Exception as e:
+                    log.debug(f"[FB-TASK] DDL skip: {e}")
+        _FB_READY[0] = True
+        return True
+    except Exception as e:
+        log.warning(f"[FB-TASK] init ব্যর্থ: {e}")
+        return False
+
+
+def _fb_json(raw, default):
+    try:
+        v = _json.loads(raw or "")
+        return v if isinstance(v, (list, dict)) else default
+    except Exception:
+        return default
+
+
+def _fb_task(tid):
+    _fb_init()
+    try:
+        with _c() as c:
+            r = c.execute("SELECT * FROM fb_tasks WHERE id=%s", (int(tid),)).fetchone()
+        return dict(r) if r else None
+    except Exception as e:
+        log.warning(f"[FB-TASK] task {tid} পড়া ব্যর্থ: {e}")
+        return None
+
+
+def _fb_active_tasks():
+    _fb_init()
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT * FROM fb_tasks WHERE is_active=1 ORDER BY id DESC").fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.warning(f"[FB-TASK] list ব্যর্থ: {e}")
+        return []
+
+
+def _fb_fields(task):
+    f = _fb_json((task or {}).get("fields"), None)
+    if not f:
+        return [dict(x) for x in _FB_DEFAULT_FIELDS]
+    out = []
+    for i, x in enumerate(f):
+        if not isinstance(x, dict):
+            continue
+        _k = str(x.get("key") or f"f{i+1}")
+        _t = str(x.get("type") or _fb_guess_type(_k)).lower()
+        if _t in _FB_HIDE_TYPES:      # পাসওয়ার্ড অ্যাডমিন সেট করেন, ইউজার থেকে নেওয়া হয় না
+            continue
+        out.append({
+            "key": _k,
+            "label_bn": str(x.get("label_bn") or x.get("label_en") or f"Field {i+1}"),
+            "label_en": str(x.get("label_en") or x.get("label_bn") or f"Field {i+1}"),
+            "required": 1 if x.get("required", 1) else 0,
+            "type": _t,
+        })
+    return out or [dict(x) for x in _FB_DEFAULT_FIELDS]
+
+
+def _fb_counts(tid, uid=None):
+    """(মোট জমা, এই ইউজারের জমা)"""
+    try:
+        with _c() as c:
+            total = _count(c.execute(
+                "SELECT COUNT(*) FROM fb_submissions WHERE task_id=%s", (tid,)).fetchone())
+            mine = 0
+            if uid:
+                mine = _count(c.execute(
+                    "SELECT COUNT(*) FROM fb_submissions WHERE task_id=%s AND user_id=%s",
+                    (tid, uid)).fetchone())
+        return total, mine
+    except Exception:
+        return 0, 0
+
+
+def _fb_uid_exists(tid, fb_uid):
+    """একই UID এই টাস্কে আগে জমা হয়েছে কি না (case/স্পেস উপেক্ষা)।"""
+    u = (fb_uid or "").strip()
+    if not u:
+        return False
+    try:
+        with _c() as c:
+            r = c.execute(
+                "SELECT 1 AS x FROM fb_submissions WHERE task_id=%s "
+                "AND lower(trim(fb_uid))=lower(trim(%s)) LIMIT 1", (tid, u)).fetchone()
+        return bool(r)
+    except Exception:
+        return False
+
+
+def _fb_name_list(task, which):
+    raw = str(task.get(f"{which}_name_list") or "").replace("\r", "\n")
+    raw = raw.replace(",", "\n").replace("\t", "\n")
+    out = []
+    for x in raw.splitlines():
+        x = x.strip()
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def _fb_pick(task, which, idx=0):
+    """নাম — fixed / upload (লিস্ট ধরে ধরে ঘুরবে) / random।"""
+    mode = (task.get(f"{which}_name_mode") or "fixed").lower()
+    fixed = (task.get(f"{which}_name") or "").strip()
+    lst = _fb_name_list(task, which)
+    if mode in ("random", "shuffle") and lst:
+        return random.choice(lst)
+    if mode in ("upload", "list", "auto", "cycle") and lst:
+        # ১০০ নাম + ২০০ কাজ → ১ম ১০০ আলাদা, পরের ১০০ আবার শুরু থেকে
+        return lst[int(idx or 0) % len(lst)]
+    if fixed:
+        return fixed
+    if lst:
+        return lst[int(idx or 0) % len(lst)]
+    return "User" if which == "first" else ""
+
+
+def _fb_new_password(n=12):
+    """বিভ্রান্তিকর অক্ষর (0/O, 1/l/I) বাদ — ইউজার সহজে টাইপ করতে পারবে।"""
+    abc = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(random.choice(abc) for _ in range(n))
+
+
+def _fb_login(task, idx=0):
+    """লগইন তথ্য — নাম + অ্যাডমিনের সেট করা পাসওয়ার্ড (ইউজারের কাছে চাওয়া হয় না)।"""
+    pw = (task.get("password") or "").strip()
+    return {
+        "first": _fb_pick(task, "first", idx),
+        "last": _fb_pick(task, "last", idx),
+        "password": pw or _fb_new_password(),
+    }
+
+
+def _fb_can_start(task, uid):
+    """(ok, কারণ) — max accounts / per-user limit / active"""
+    if not task or not task.get("is_active"):
+        return False, "off"
+    total, mine = _fb_counts(int(task["id"]), uid)
+    mx = int(task.get("max_accounts") or 0)
+    if mx > 0 and total >= mx:
+        return False, "full"
+    lim = int(task.get("per_user_limit") or 1)
+    if lim > 0 and mine >= lim:
+        return False, "limit"
+    now_ts = _time.time()
+    for k in [k for k, v in list(_FB_STATE.items()) if now_ts - v.get("ts", 0) > 3600]:
+        _FB_STATE.pop(k, None)
+    return True, ""
+
+
+# ─────────────────────── Google Sheet / CSV ───────────────────────
+def _fb_columns(task):
+    cols = _fb_json((task or {}).get("sheet_columns"), [])
+    cols = [str(c) for c in cols if str(c).strip()]
+    return cols or ["sl", "date", "uid", "pass", "user_id", "username", "login_first",
+                    "login_last"]
+
+
+def _fb_col_label(tok):
+    tok = str(tok).strip()
+    if tok.startswith("f:"):
+        return tok[2:]
+    return _FB_COL_LABELS.get(_FB_COL_ALIAS.get(tok.lower(), tok), tok)
+
+
+def _fb_col_value(tok, sub, idx=0, task=None):
+    tok = str(tok).strip()
+    data = _fb_json(sub.get("data"), {})
+    if tok.startswith("f:"):
+        return data.get(tok[2:], "")
+    tok = _FB_COL_ALIAS.get(tok.lower(), tok)
+    if tok in ("2fa", "cookies"):        # যে ফিল্ডে এই টাইপ, তার উত্তর
+        return data.get(_fb_data_key(task, tok), "") or data.get(tok, "")
+    if tok == "sl":
+        return idx
+    if tok == "date":
+        return sub.get("created_at", "")
+    if tok == "user_id":
+        return sub.get("user_id", "")
+    if tok == "username":
+        return sub.get("username", "")
+    if tok == "task":
+        return (task or {}).get("name", "")
+    if tok == "account_no":
+        return sub.get("account_no", "")
+    if tok == "status":
+        return sub.get("status", "")
+    if tok == "uid":                     # ডেটাবেসে fb_uid নামে থাকে
+        return sub.get("fb_uid", "") or data.get("uid", "")
+    if tok == "password":                 # অ্যাডমিনের সেট করা পাসওয়ার্ড
+        return (sub.get("fb_password", "") or sub.get("login_password", "")
+                or data.get("password", ""))
+    if tok in ("login_first", "first"):
+        return sub.get("login_first", "")
+    if tok in ("login_last", "last"):
+        return sub.get("login_last", "")
+    return data.get(tok, "") or sub.get(tok, "")
+
+
+def _fb_subs(tid, limit=5000, only_unsynced=False):
+    q = ("SELECT s.*, COALESCE(u.username,'') AS username FROM fb_submissions s "
+         "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s")
+    if only_unsynced:
+        q += " AND COALESCE(s.synced,0)=0"
+    q += " ORDER BY s.id ASC"
+    if limit:
+        q += f" LIMIT {int(limit)}"
+    try:
+        with _c() as c:
+            rows = c.execute(q, (tid,)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.warning(f"[FB-TASK] subs ব্যর্থ: {e}")
+        return []
+
+
+def _fb_csv_bytes(task):
+    """CSV (Excel/Google Sheets-এ সোজা খোলে), ম্যাপিং অনুযায়ী কলাম সাজানো।"""
+    import csv, io
+    cols = _fb_columns(task)
+    subs = _fb_subs(int(task["id"]))
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([_fb_col_label(c) for c in cols])
+    for i, s in enumerate(subs, 1):
+        w.writerow([_fb_col_value(c, s, i, task) for c in cols])
+    data = ("\ufeff" + buf.getvalue()).encode("utf-8")
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(task.get("name") or f"task{task['id']}"))[:40]
+    return data, f"fb_{safe}_{datetime.now(BD_TZ).strftime('%Y%m%d_%H%M')}.csv"
+
+
+def _fb_push_row(sub, task):
+    """Apps Script Web App-এ এক সারি পাঠাও। সফল হলে synced=1।"""
+    url = (task.get("sheet_url") or "").strip()
+    if not url:
+        return False
+    cols = _fb_columns(task)
+    payload = {
+        "task": task.get("name", ""),
+        "task_id": task.get("id"),
+        "columns": [_fb_col_label(c) for c in cols],
+        "row": [_fb_col_value(c, sub, 0, task) for c in cols],
+    }
+    try:
+        req = urllib.request.Request(
+            url, data=_json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            ok = 200 <= int(getattr(resp, "status", 0) or 0) < 300
+    except Exception as e:
+        log.warning(f"[FB-SHEET] uid={sub.get('id')} push ব্যর্থ: {e}")
+        return False
+    if not ok:
+        return False
+    try:
+        with _c() as c:
+            c.execute("UPDATE fb_submissions SET synced=1 WHERE id=%s", (sub.get("id"),))
+    except Exception:
+        pass
+    return True
+
+
+def fb_sync_pending(limit=40):
+    """যেসব সারি এখনো Sheet-এ যায়নি — পাঠাও (job চালায়)।"""
+    _fb_init()
+    for task in _fb_active_tasks():
+        if not (task.get("sheet_url") or "").strip():
+            continue
+        for sub in _fb_subs(int(task["id"]), limit=limit, only_unsynced=True):
+            if not _fb_push_row(sub, task):
+                break
+    return True
+
+
+def _fb_submit(task, uid, login, answers):
+    """জমা সেভ করো — ডুপ্লিকেট UID হলে ('dup', None); না হলে (sub_row, None)।"""
+    tid = int(task["id"])
+    fb_uid = (answers.get("uid") or "").strip()
+    fb_pass = (answers.get("password") or "").strip() or (login.get("password") or "")
+    if fb_uid and _fb_uid_exists(tid, fb_uid):
+        return None, "dup"
+    if not fb_uid:
+        return None, "nofield"
+    _t, mine = _fb_counts(tid, uid)
+    row_id = None
+    _review_init()
+    try:
+        with _c() as c:
+            cur = c.execute(
+                "INSERT INTO fb_submissions (task_id, user_id, account_no, fb_uid, "
+                "fb_password, login_first, login_last, login_password, data, status, "
+                "synced, created_at, paid, notified) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',0,%s,0,1) "
+                "RETURNING id",
+                (tid, uid, mine + 1, fb_uid, fb_pass, login.get("first", ""),
+                 login.get("last", ""), login.get("password", ""),
+                 _json.dumps(answers, ensure_ascii=False), now()))
+            row_id = cur.lastrowid
+            c.execute("UPDATE fb_tasks SET total_done=COALESCE(total_done,0)+1 WHERE id=%s", (tid,))
+            # টাকা এখন approve-এর সময়ে যোগ হয় (প্যানেলে UID approve করলে)
+    except Exception as e:
+        msg = str(e).lower()
+        if "unique" in msg or "duplicate" in msg:
+            return None, "dup"
+        log.warning(f"[FB-TASK] submit ব্যর্থ uid={uid} task={tid}: {e}")
+        return None, "err"
+    sub = dict(answers)
+    sub.update({"id": row_id, "task_id": tid, "user_id": uid, "fb_uid": fb_uid,
+                "fb_password": fb_pass, "login_first": login.get("first", ""),
+                "login_last": login.get("last", ""), "login_password": login.get("password", ""),
+                "data": _json.dumps(answers, ensure_ascii=False), "created_at": now(),
+                "account_no": mine + 1, "username": ""})
+    if (task.get("sheet_url") or "").strip():
+        threading.Thread(target=_fb_push_row, args=(sub, task), daemon=True).start()
+    return sub, None
+
+
+# ─────────────────────── ইউজার ফ্লো (UI) ───────────────────────
+def _fb_kb(rows):
+    return InlineKeyboardMarkup(rows)
+
+
+def _fb_ask_text(fields, i, lang):
+    """প্রশ্ন + ক্রম (১/৩) — কোনটা আগে/পরে সেটা টাস্কের ফিল্ড-ক্রম অনুযায়ী।"""
+    if not fields or i >= len(fields):
+        return ""
+    f = fields[i]
+    q = f.get("label_bn") if lang != "en" else (f.get("label_en") or f.get("label_bn"))
+    return f"{i + 1}/{len(fields)}  {q}"
+
+
+async def fb_show_list(q, uid, lang=None):
+    """📘 Facebook Tasks — সব active task এক লিস্টে।"""
+    if lang is None:
+        lang = await asyncio.to_thread(get_lang, uid)
+    tasks = await asyncio.to_thread(_fb_active_tasks)
+    if not tasks:
+        await q.message.reply_text(
+            "❌ এখন কোনো Facebook Task নেই।" if lang != "en"
+            else "❌ No Facebook task available right now.")
+        return
+    rows = []
+    for t in tasks:
+        tid = int(t["id"])
+        ok, why = await asyncio.to_thread(_fb_can_start, t, uid)
+        total, mine = await asyncio.to_thread(_fb_counts, tid, uid)
+        mx = int(t.get("max_accounts") or 0)
+        left = (mx - total) if mx > 0 else 0
+        tag = "✅ Done" if why in ("limit",) else ("⛔ Full" if why == "full" else "")
+        price = float(t.get("price") or 0)
+        bits = [f"📘 {t.get('name') or 'Facebook Task'}"]
+        if price > 0:
+            bits.append(f"${price}")
+        if mx > 0:
+            bits.append(f"{max(0, left)} left")
+        if tag:
+            bits.append(tag)
+        rows.append([InlineKeyboardButton("  •  ".join(bits), callback_data=f"fbtn:{tid}")])
+    rows.append([InlineKeyboardButton(
+        "✖️ বাতিল" if lang != "en" else "✖️ Cancel", callback_data="task_cancel")])
+    await q.message.reply_text(
+        ("📘 *Facebook Tasks*\n\nএকটি টাস্ক বেছে নিন:" if lang != "en"
+         else "📘 *Facebook Tasks*\n\nChoose a task:"),
+        parse_mode="Markdown", reply_markup=_fb_kb(rows))
+
+
+async def fb_task_name(q, uid, tid):
+    """টাস্কে চাপ → নাম দেখাও (নামের বাটন)।"""
+    lang = await asyncio.to_thread(get_lang, uid)
+    task = await asyncio.to_thread(_fb_task, tid)
+    if not task:
+        await q.answer("❌ Task পাওয়া যায়নি")
+        return
+    ok, why = await asyncio.to_thread(_fb_can_start, task, uid)
+    note = ""
+    if why == "full":
+        note = "\n\n⛔ *এই টাস্কের সব স্লট শেষ।*" if lang != "en" else "\n\n⛔ *All slots are full.*"
+    elif why == "limit":
+        note = ("\n\n✅ আপনি এই টাস্কের সর্বোচ্চ সংখ্যক অ্যাকাউন্ট জমা দিয়েছেন।" if lang != "en"
+                else "\n\n✅ You already submitted the maximum accounts.")
+    rows = [[InlineKeyboardButton(f"📘 {task.get('name') or 'Task'}", callback_data=f"fbr:{tid}")]]
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data="fbt_list")])
+    await q.message.reply_text(
+        f"📘 *{task.get('name') or 'Facebook Task'}*{note}",
+        parse_mode="Markdown", reply_markup=_fb_kb(rows))
+
+
+async def fb_task_rules(q, uid, tid):
+    """নামে চাপ → Rules + Start।"""
+    lang = await asyncio.to_thread(get_lang, uid)
+    task = await asyncio.to_thread(_fb_task, tid)
+    if not task:
+        await q.answer("❌ Task পাওয়া যায়নি")
+        return
+    rules = (task.get("rules_bn") if lang != "en" else (task.get("rules_en") or task.get("rules_bn"))) or ""
+    ok, why = await asyncio.to_thread(_fb_can_start, task, uid)
+    if not rules.strip():
+        rules = ("• সঠিক তথ্য দিন, ভুল হলে রিজেক্ট হবে।" if lang != "en"
+                 else "• Submit correct information, wrong data will be rejected.")
+    if ok:
+        rows = [[InlineKeyboardButton("▶️ Start", callback_data=f"fbs:{tid}")],
+                [InlineKeyboardButton("◀️ Back", callback_data="fbt_list")]]
+        head = ("📋 *Rules*\n\n" if lang != "en" else "📋 *Rules*\n\n")
+    else:
+        rows = [[InlineKeyboardButton("◀️ Back", callback_data="fbt_list")]]
+        head = ("⚠️ *এই টাস্কে এখন কাজ করা যাবে না।*\n\n" if lang != "en"
+                else "⚠️ *You cannot do this task now.*\n\n")
+    await q.message.reply_text(head + rules, parse_mode="Markdown", reply_markup=_fb_kb(rows))
+
+
+async def fb_task_start(q, uid, tid):
+    """Start → লগইন দাও, তারপর UID (প্রথম ফিল্ড) চাও।"""
+    lang = await asyncio.to_thread(get_lang, uid)
+    task = await asyncio.to_thread(_fb_task, tid)
+    if not task:
+        await q.answer("❌ Task পাওয়া যায়নি")
+        return
+    ok, why = await asyncio.to_thread(_fb_can_start, task, uid)
+    if not ok:
+        msg = {
+            "full": "⛔ সব স্লট শেষ হয়ে গেছে।" if lang != "en" else "⛔ All slots are taken.",
+            "limit": "✅ আপনি ইতিমধ্যে সর্বোচ্চ অ্যাকাউন্ট জমা দিয়েছেন।" if lang != "en"
+                     else "✅ You already submitted the maximum accounts.",
+        }.get(why, "❌ এখন কাজ করা যাবে না।" if lang != "en" else "❌ Not available now.")
+        await q.answer(msg, show_alert=True)
+        return
+    _done = (await asyncio.to_thread(_fb_counts, int(task["id"])))[0]
+    login = await asyncio.to_thread(_fb_login, task, _done)
+    fields = await asyncio.to_thread(_fb_fields, task)
+    _FB_STATE[uid] = {"task_id": int(tid), "step": 0, "answers": {}, "login": login,
+                      "ts": _time.time()}
+    cred = (f"First name: {login['first']}\nLast name: {login['last']}\n"
+            f"Password: {login['password']}")
+    ask = _fb_ask_text(fields, 0, lang)
+    await q.message.reply_text(
+        f"📘 *{task.get('name') or 'Facebook Task'}*\n\n{cred}\n\n{ask}",
+        parse_mode="Markdown",
+        reply_markup=_fb_kb([[InlineKeyboardButton("❌ Cancel", callback_data="fbt_cancel")]]))
+
+
+async def fb_on_text(update, ctx):
+    """ইউজারের উত্তর নাও — এক ফিল্ড করে।"""
+    uid = update.effective_user.id
+    st = _FB_STATE.get(uid)
+    if not st:
+        return
+    txt = (update.message.text or "").strip()
+    task = await asyncio.to_thread(_fb_task, st["task_id"])
+    if not task:
+        _FB_STATE.pop(uid, None)
+        return
+    lang = await asyncio.to_thread(get_lang, uid)
+    fields = await asyncio.to_thread(_fb_fields, task)
+    if st["step"] >= len(fields):
+        _FB_STATE.pop(uid, None)
+        return
+    f = fields[st["step"]]
+    if not txt:
+        await update.message.reply_text(
+            "❗ ফাঁকা পাঠাবেন না।" if lang != "en" else "❗ Please don't send empty.")
+        return
+    # ── ফিল্ড-টাইপ অনুযায়ী যাচাই (UID ১৪–১৬ সংখ্যা, cookies-এ c_user/sessionid, 2FA key) ──
+    _ok, _err_bn, _err_en, _extra = _fb_validate(f, txt)
+    if not _ok:
+        await update.message.reply_text(_err_bn if lang != "en" else _err_en,
+                                        parse_mode="Markdown")
+        return
+    if (f.get("type") or _fb_guess_type(f.get("key"))) == "uid" \
+            and await asyncio.to_thread(_fb_uid_exists, st["task_id"], txt):
+        await update.message.reply_text(
+            "⚠️ এই UID আগেই জমা হয়েছে — একই UID একাধিকবার দেওয়া যাবে না।" if lang != "en"
+            else "⚠️ This UID was already submitted — duplicates are not allowed.")
+        return
+    st["answers"][f["key"]] = txt
+    st["ts"] = _time.time()
+    # ── 2FA: key ঠিক থাকলে বট কোড দেবে ──
+    if _extra:
+        await update.message.reply_text(
+            (f"🔑 আপনার 2FA কোড: `{_extra}`\n⏱ ৩০ সেকেন্ড পর বদলে যাবে — এখনই Facebook-এ দিন।"
+             if lang != "en" else
+             f"🔑 Your 2FA code: `{_extra}`\n⏱ It changes every 30 seconds — enter it now."),
+            parse_mode="Markdown",
+            reply_markup=_fb_kb([[InlineKeyboardButton(
+                "🔁 নতুন কোড" if lang != "en" else "🔁 New code",
+                callback_data=f"fbc:{st['task_id']}")]]))
+    st["step"] += 1
+    if st["step"] < len(fields):
+        await update.message.reply_text(_fb_ask_text(fields, st["step"], lang))
+        return
+    # সব ফিল্ড দেওয়া হয়েছে → সেভ
+    sub, err = await asyncio.to_thread(_fb_submit, task, uid, st["login"], st["answers"])
+    _FB_STATE.pop(uid, None)
+    if err == "dup":
+        await update.message.reply_text(
+            "⚠️ এই UID আগেই জমা হয়েছে — অ্যাকাউন্ট সেভ হয়নি।" if lang != "en"
+            else "⚠️ Duplicate UID — not saved.")
+        return
+    if err:
+        await update.message.reply_text(
+            "❌ সেভ করা যায়নি, আবার চেষ্টা করুন।" if lang != "en"
+            else "❌ Could not save, please try again.")
+        return
+    price = float(task.get("price") or 0)
+    extra_bn = f"\n⏳ Approve হলে +${price} যোগ হবে" if price > 0 else ""
+    extra_en = f"\n⏳ +${price} will be added after approval" if price > 0 else ""
+    rows = [[InlineKeyboardButton("◀️ Tasks", callback_data="fbt_list")]]
+    await update.message.reply_text(
+        ("✅ *সফলভাবে জমা হয়েছে!*\n\n"
+         f"📘 Task: {task.get('name')}\n🔑 UID: {st['answers'].get('uid', '')}{extra_bn}\n\n"
+         "অ্যাডমিন যাচাই করে দেখবেন।") if lang != "en" else
+        ("✅ *Submitted successfully!*\n\n"
+         f"📘 Task: {task.get('name')}\n🔑 UID: {st['answers'].get('uid', '')}{extra_en}\n\n"
+         "Admin will review it."),
+        parse_mode="Markdown", reply_markup=_fb_kb(rows))
+
+
+async def fb_send_2fa(q, uid, tid):
+    """ইউজারের দেওয়া 2FA key থেকে নতুন কোড।"""
+    lang = await asyncio.to_thread(get_lang, uid)
+    st = _FB_STATE.get(uid) or {}
+    task = await asyncio.to_thread(_fb_task, tid)
+    if not task:
+        await q.answer("❌ Task পাওয়া যায়নি")
+        return
+    key = ""
+    for f in await asyncio.to_thread(_fb_fields, task):
+        if (f.get("type") or "") == "2fa":
+            key = (st.get("answers") or {}).get(f["key"], "")
+            break
+    if not key:
+        await q.answer("❌ আগে 2FA key দিন" if lang != "en" else "❌ Send your 2FA key first")
+        return
+    try:
+        code = _fb_totp(key)
+    except Exception:
+        await q.answer("❌ Key থেকে কোড হলো না" if lang != "en" else "❌ Bad 2FA key")
+        return
+    await q.message.reply_text(
+        (f"🔑 নতুন 2FA কোড: `{code}`\n⏱ ৩০ সেকেন্ড পর বদলে যাবে।" if lang != "en"
+         else f"🔑 New 2FA code: `{code}`\n⏱ It changes every 30 seconds."),
+        parse_mode="Markdown",
+        reply_markup=_fb_kb([[InlineKeyboardButton(
+            "🔁 নতুন কোড" if lang != "en" else "🔁 New code",
+            callback_data=f"fbc:{tid}")]]))
+
+
+async def fb_cancel(q, uid):
+    _FB_STATE.pop(uid, None)
+    lang = await asyncio.to_thread(get_lang, uid)
+    await q.answer("✅ বাতিল হয়েছে" if lang != "en" else "✅ Cancelled")
+
+
+# ─────────────────────── অটো কাজ (jobs) ───────────────────────
+async def job_fb_sheet_sync(ctx):
+    try:
+        await asyncio.to_thread(fb_sync_pending)
+    except Exception as e:
+        log.debug(f"[FB-SHEET] job: {e}")
+
+
+async def job_fb_password_rotate(ctx):
+    """প্রতিদিন নির্দিষ্ট সময়ে পাসওয়ার্ড বদল।"""
+    try:
+        now_bd = datetime.now(BD_TZ)
+        hhmm = now_bd.strftime("%H:%M")
+        today = now_bd.strftime("%Y-%m-%d")
+        tasks = await asyncio.to_thread(_fb_active_tasks)
+        for t in tasks:
+            if not int(t.get("password_auto") or 0):
+                continue
+            if (t.get("password_change_time") or "").strip() != hhmm:
+                continue
+            if str(t.get("password_last_change") or "").startswith(today):
+                continue
+            new_pw = _fb_new_password()
+            try:
+                with _c() as c:
+                    c.execute("UPDATE fb_tasks SET password=%s, password_last_change=%s "
+                              "WHERE id=%s", (new_pw, now_bd.strftime("%Y-%m-%d %H:%M"), t["id"]))
+            except Exception as e:
+                log.warning(f"[FB-PW] uid task {t.get('id')} ব্যর্থ: {e}")
+                continue
+            try:
+                await ctx.bot.send_message(
+                    ADMIN_ID,
+                    f"🔑 *পাসওয়ার্ড অটো বদল হয়েছে*\n\n📘 {t.get('name')}\n"
+                    f"নতুন Password: `{new_pw}`", parse_mode="Markdown")
+            except Exception:
+                pass
+    except Exception as e:
+        log.debug(f"[FB-PW] job: {e}")
+
+
+async def job_fb_export(ctx):
+    """নির্ধারিত সময়ে প্রতি টাস্কের আলাদা CSV অ্যাডমিনকে।"""
+    try:
+        now_bd = datetime.now(BD_TZ)
+        hhmm = now_bd.strftime("%H:%M")
+        today = now_bd.strftime("%Y-%m-%d")
+        for t in await asyncio.to_thread(_fb_active_tasks):
+            if (t.get("export_time") or "").strip() != hhmm:
+                continue
+            if str(t.get("last_export_at") or "").startswith(today):
+                continue
+            data, fname = await asyncio.to_thread(_fb_csv_bytes, t)
+            try:
+                await ctx.bot.send_document(
+                    ADMIN_ID, document=data, filename=fname,
+                    caption=f"📊 {t.get('name')} — Google Sheet (CSV)")
+                with _c() as c:
+                    c.execute("UPDATE fb_tasks SET last_export_at=%s WHERE id=%s",
+                              (now_bd.strftime("%Y-%m-%d %H:%M"), t["id"]))
+            except Exception as e:
+                log.warning(f"[FB-EXPORT] task {t.get('id')}: {e}")
+    except Exception as e:
+        log.debug(f"[FB-EXPORT] job: {e}")
+
+
+def _kick_review():
+    """প্যানেলে approve/reject চাপা মাত্রই রিভিউ job চালাও (ফ্লাস্ক থ্রেড থেকেও)।"""
+    loop, ctx = _REVIEW_LOOP[0], _REVIEW_CTX[0]
+    if loop is None or ctx is None or loop.is_closed():
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(job_fb_ig_review(ctx), loop)
+    except Exception as e:
+        log.warning(f"[REVIEW] instant kick ব্যর্থ: {e}")
+
+
+# ─────────────────────── অ্যাডমিন (বট) কুইক ভিউ ───────────────────────
+async def adm_fb_list(q, uid):
+    tasks = await asyncio.to_thread(_fb_active_tasks)
+    if not tasks:
+        await q.message.reply_text("📘 কোনো Facebook Task নেই — ওয়েব প্যানেলে যোগ করুন।")
+        return
+    lines = ["📘 *Facebook Tasks*"]
+    rows = []
+    for t in tasks:
+        total, _m = await asyncio.to_thread(_fb_counts, int(t["id"]), None)
+        mx = int(t.get("max_accounts") or 0)
+        lines.append(f"• *{t.get('name')}* — {total}/{mx or '∞'}"
+                     + ("  🔑 auto" if int(t.get("password_auto") or 0) else "")
+                     + (f"  🕒 {t.get('password_change_time')}" if int(t.get("password_auto") or 0) else ""))
+        rows.append([InlineKeyboardButton(f"⬇️ {str(t.get('name'))[:26]} (CSV)", callback_data=f"fbx:{t['id']}")])
+    rows.append([InlineKeyboardButton("🔄 রিফ্রেশ", callback_data="adm_fb")])
+    await q.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=_fb_kb(rows))
+
+
+async def adm_fb_export(q, uid, tid):
+    task = await asyncio.to_thread(_fb_task, tid)
+    if not task:
+        await q.answer("❌ নেই")
+        return
+    data, fname = await asyncio.to_thread(_fb_csv_bytes, task)
+    await q.message.reply_document(document=data, filename=fname,
+                                   caption=f"📊 {task.get('name')} — CSV")
+    await q.answer("✅ পাঠানো হলো")
+
+
+# ─── FB Task ক্যালব্যাক রাউটার ───
+async def fb_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """fbt_list / fbtn:<id> / fbr:<id> / fbs:<id> / fbt_cancel / adm_fb / fbx:<id>"""
+    q = update.callback_query
+    uid = q.from_user.id
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    data = q.data or ''
+    try:
+        _u = await asyncio.to_thread(get_user, uid)
+        if _u and int(_u.get('is_banned') or 0):
+            await q.message.reply_text('🚫 আপনি ব্যান হয়েছেন।')
+            return
+    except Exception:
+        pass
+    try:
+        if data == 'fbt_list':
+            await fb_show_list(q, uid)
+        elif data.startswith('fbtn:'):
+            await fb_task_name(q, uid, int(data.split(':', 1)[1]))
+        elif data.startswith('fbr:'):
+            await fb_task_rules(q, uid, int(data.split(':', 1)[1]))
+        elif data.startswith('fbs:'):
+            await fb_task_start(q, uid, int(data.split(':', 1)[1]))
+        elif data == 'fbt_cancel':
+            await fb_cancel(q, uid)
+        elif data.startswith('fbc:'):
+            await fb_send_2fa(q, uid, int(data.split(':', 1)[1]))
+        elif data == 'adm_fb':
+            if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
+                return
+            await adm_fb_list(q, uid)
+        elif data.startswith('fbx:'):
+            if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
+                return
+            await adm_fb_export(q, uid, int(data.split(':', 1)[1]))
+    except Exception as e:
+        log.warning(f'[FB-TASK] callback {data}: {e}')
+
+
+def _fb_state_filter(update) -> bool:
+    try:
+        return bool(update.effective_user and update.effective_user.id in _FB_STATE)
+    except Exception:
+        return False
+
+# ═══════════════════ INSTAGRAM TASK (Taksly-style) ═══════════════════
+# অ্যাডমিন সব সেটিংস দেয় ওয়েব প্যানেল থেকে: /admin/igtasks
+# ফেসবুক টাস্কের মতোই, শুধু UID-র বদলে Instagram Username:
+#   • পাসওয়ার্ড ইউজারের কাছে চাওয়া হয় না — অ্যাডমিন যেটা সেট করেন সেটাই
+#   • Username আগে জমা হয়েছে কি না চেক হয়; থাকলে মাত্র ১ বার বদলানোর সুযোগ
+#   • নাম/ইউজারনেম fixed / upload / random — ১০০ নাম দিলে ২০০ কাজেও আলাদা
+
+_IG_DDL = (
+    """CREATE TABLE IF NOT EXISTS ig_tasks (
+        id                    BIGSERIAL PRIMARY KEY,
+        name                  TEXT DEFAULT '',
+        rules_bn              TEXT DEFAULT '',
+        rules_en              TEXT DEFAULT '',
+        price                 REAL DEFAULT 0,
+        username_mode         TEXT DEFAULT 'fixed',
+        username              TEXT DEFAULT '',
+        username_list         TEXT DEFAULT '',
+        password              TEXT DEFAULT '',
+        password_auto         INTEGER DEFAULT 0,
+        password_change_time  TEXT DEFAULT '00:00',
+        password_last_change  TEXT DEFAULT '',
+        fields                TEXT DEFAULT '[]',
+        max_accounts          INTEGER DEFAULT 0,
+        per_user_limit        INTEGER DEFAULT 1,
+        total_done            INTEGER DEFAULT 0,
+        is_active             INTEGER DEFAULT 1,
+        sheet_url             TEXT DEFAULT '',
+        sheet_columns         TEXT DEFAULT '[]',
+        export_time           TEXT DEFAULT '',
+        last_export_at        TEXT DEFAULT '',
+        created_at            TEXT DEFAULT ''
+    )""",
+    """CREATE TABLE IF NOT EXISTS ig_submissions (
+        id              BIGSERIAL PRIMARY KEY,
+        task_id         BIGINT NOT NULL,
+        user_id         BIGINT NOT NULL,
+        account_no      INTEGER DEFAULT 1,
+        ig_username     TEXT DEFAULT '',
+        ig_password     TEXT DEFAULT '',
+        login_username  TEXT DEFAULT '',
+        login_password  TEXT DEFAULT '',
+        data            TEXT DEFAULT '{}',
+        status          TEXT DEFAULT 'pending',
+        synced          INTEGER DEFAULT 0,
+        created_at      TEXT DEFAULT ''
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_igsub_task ON ig_submissions (task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_igsub_user ON ig_submissions (user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_igsub_user_name ON ig_submissions (ig_username)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_igsub_name ON ig_submissions (task_id, ig_username)",
+)
+
+_IG_DEFAULT_FIELDS = [
+    {"key": "2fa", "label_bn": "🔑 2FA Key দিন (authenticator-এর সেটআপ key)",
+     "label_en": "🔑 Enter the 2FA key (authenticator setup key)",
+     "required": 1, "type": "2fa"},
+]
+
+# Username আর Password বট নিজেই দেয় (অ্যাডমিনের সেট করা) — ইউজারকে জিজ্ঞেস করা হয় না,
+# দেওয়ার আগে চেক করা হয় যে ওই Username দিয়ে আগেই অ্যাকাউন্ট আছে কি না।
+_IG_HIDE_TYPES = ("password", "iguser", "username")
+
+# ইনপুট ভ্যালিডেশন টাইপ — key থেকে অনুমান, চাইলে ফিল্ডে type দিয়ে বদলানো যায়
+_IG_TYPES = ("iguser", "password", "cookies", "2fa", "email", "number", "text")
+
+# Instagram username: ইংরেজি অক্ষর, সংখ্যা, . এবং _ — সর্বোচ্চ ৩০ অক্ষর
+_IG_USER_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+
+
+def _ig_clean_user(txt):
+    """@ বাদ, স্পেস বাদ, ছোট হাতের অক্ষরে — তুলনার জন্য।"""
+    return re.sub(r"\s+", "", str(txt or "").strip()).lstrip("@").lower()
+
+
+def _ig_username_ok(u):
+    u = _ig_clean_user(u)
+    if not u or not _IG_USER_RE.match(u):
+        return False
+    if u.startswith(".") or u.endswith(".") or ".." in u:
+        return False
+    if not re.search(r"[a-z0-9]", u):
+        return False
+    return True
+
+
+def _ig_guess_type(key):
+    k = str(key or "").lower()
+    if k in ("username", "user", "ig", "iguser", "handle", "instagram", "user_name"):
+        return "iguser"
+    if "cookie" in k:
+        return "cookies"
+    if "2fa" in k or "totp" in k or "2step" in k:
+        return "2fa"
+    if "pass" in k:
+        return "password"
+    if "mail" in k:
+        return "email"
+    return "text"
+
+
+def _ig_validate(field, txt):
+    """(ok, বাংলা এরর, English এরর, extra কোড) — ভুল হলে পরের ধাপে এগোবে না।"""
+    typ = (field.get("type") or _ig_guess_type(field.get("key"))).lower()
+    v = (txt or "").strip()
+    if typ in ("iguser", "username"):
+        if not _ig_username_ok(v):
+            return (False,
+                    "⚠️ এটি সঠিক Instagram Username নয়!\nUsername-এ শুধু *ইংরেজি অক্ষর, সংখ্যা, "
+                    "`.` আর `_`* থাকবে (১–৩০ অক্ষর)।\nযেমন: `johhrpv67`",
+                    "⚠️ That is not a valid Instagram username!\nUse only English letters, digits, "
+                    "`.` and `_` (1–30 characters), e.g. `johhrpv67`.",
+                    None)
+    elif typ == "cookies":
+        low = v.lower()
+        if "sessionid=" not in low:
+            return (False,
+                    "⚠️ আপনার দেওয়া Cookies সঠিক নয়!\nInstagram Cookie-তে `sessionid=...` থাকতে "
+                    "হবে — ব্রাউজার থেকে পুরোটা কপি করে দিন।",
+                    "⚠️ Your cookies are not valid — the Instagram cookie must contain `sessionid=...`.",
+                    None)
+    elif typ == "password":
+        if len(v) < 6:
+            return (False, "⚠️ Password খুব ছোট মনে হচ্ছে — সঠিক Instagram Password দিন।",
+                    "⚠️ That password looks too short — send the correct Instagram password.", None)
+    elif typ == "2fa":
+        key = _fb_2fa_key(v)
+        if not re.fullmatch(r"[A-Z0-9]{4,}", key) or len(re.findall(r"[A-Z]", key)) < 2:
+            return (False,
+                    "⚠️ এটি সঠিক 2FA key নয়!\nkey-টি *ইংরেজি অক্ষর ও সংখ্যায়* মিনিমাম ৪ অক্ষরের "
+                    "হতে হবে (যেমন `EOH5 WAFU GQG3 ABUK`)।\nInstagram-এর *Settings → Security → "
+                    "Two-factor authentication → Authentication app* থেকে key-টি কপি করুন।",
+                    "⚠️ That is not a valid 2FA key!\nThe key must be in English letters/digits, "
+                    "at least 4 characters (e.g. `EOH5 WAFU GQG3 ABUK`).",
+                    None)
+        try:
+            return True, "", "", _fb_totp(key)
+        except Exception:
+            return True, "", "", None
+    elif typ == "email":
+        if "@" not in v or "." not in v.split("@")[-1]:
+            return (False, "⚠️ সঠিক ইমেইল দিন।", "⚠️ Please send a valid email.", None)
+    elif typ == "number":
+        if not re.fullmatch(r"\d+", v):
+            return (False, "⚠️ শুধু সংখ্যা দিন।", "⚠️ Numbers only, please.", None)
+    return True, "", "", None
+
+_IG_STATE = {}           # uid → {"task_id","step","answers","login","retry","ts"}
+_IG_READY = [False]
+
+# Sheet column token → হেডার লেবেল
+_IG_COL_LABELS = {
+    "sl": "SL", "date": "Date", "user_id": "Telegram ID", "tg_username": "TG Username",
+    "username": "Username", "task": "Task", "account_no": "Account No",
+    "login_username": "Login Username", "login_password": "Login Password",
+    "uid": "uid", "password": "pass", "pass": "pass", "2fa": "2fa",
+    "coki": "coki", "cookies": "coki", "cookie": "coki", "status": "Status",
+}
+
+# ছোট/এলোমেলো নাম → আসল কলাম
+_IG_COL_ALIAS = {
+    "pass": "password", "pw": "password", "ig_pass": "password",
+    "user": "username", "iguser": "username", "ig": "username", "handle": "username",
+    "coki": "cookies", "cookie": "cookies", "ck": "cookies",
+    "totp": "2fa", "2step": "2fa", "auth2": "2fa",
+    "tg": "tg_username", "tguser": "tg_username", "tg_id": "user_id",
+    "login_user": "login_username", "login_pass": "login_password",
+}
+
+
+def _ig_data_key(task, typ):
+    """এই টাইপের ফিল্ডের key (যেমন 2fa ফিল্ডের key) — না থাকলে টাইপের নাম।"""
+    try:
+        for f in _ig_fields(task or {}):
+            if (f.get("type") or "") == typ:
+                return f["key"]
+    except Exception:
+        pass
+    return typ
+
+
+def _ig_init():
+    """টেবিল/ইনডেক্স — একবার। ব্যর্থ হলেও বট চলবে।"""
+    if _IG_READY[0]:
+        return True
+    try:
+        with _c() as c:
+            for q in _IG_DDL:
+                try:
+                    c.execute(q)
+                except Exception as e:
+                    log.debug(f"[IG-TASK] DDL skip: {e}")
+        _IG_READY[0] = True
+        return True
+    except Exception as e:
+        log.warning(f"[IG-TASK] init ব্যর্থ: {e}")
+        return False
+
+
+def _ig_json(raw, default):
+    try:
+        v = _json.loads(raw or "")
+        return v if isinstance(v, (list, dict)) else default
+    except Exception:
+        return default
+
+
+def _ig_task(tid):
+    _ig_init()
+    try:
+        with _c() as c:
+            r = c.execute("SELECT * FROM ig_tasks WHERE id=%s", (int(tid),)).fetchone()
+        return dict(r) if r else None
+    except Exception as e:
+        log.warning(f"[IG-TASK] task {tid} পড়া ব্যর্থ: {e}")
+        return None
+
+
+def _ig_active_tasks():
+    _ig_init()
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT * FROM ig_tasks WHERE is_active=1 ORDER BY id DESC").fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.warning(f"[IG-TASK] list ব্যর্থ: {e}")
+        return []
+
+
+def _ig_fields(task):
+    """ইউজারকে যা যা জিজ্ঞেস করা হবে — পুরোটাই অ্যাডমিন-সেট (প্যানেলের ফিল্ড লিস্ট)।
+
+    fields কলাম NULL/ভাঙা → আগের টাস্কের জন্য নিরাপদ ডিফল্ট (2FA)।
+    অ্যাডমিন কিছু সেট করলে *ঠিক সেটাই* — কিছু না থাকলে কিছুই জিজ্ঞেস করা হবে না।
+    """
+    raw = (task or {}).get("fields")
+    f = _ig_json(raw, None)
+    if f is None:
+        return [dict(x) for x in _IG_DEFAULT_FIELDS]
+    out = []
+    for i, x in enumerate(f):
+        if not isinstance(x, dict):
+            continue
+        _k = str(x.get("key") or f"f{i+1}")
+        _t = str(x.get("type") or _ig_guess_type(_k)).lower()
+        if _t in _IG_HIDE_TYPES:      # পাসওয়ার্ড অ্যাডমিন সেট করেন, ইউজার থেকে নেওয়া হয় না
+            continue
+        if _t == "username":
+            _t = "iguser"
+        out.append({
+            "key": _k,
+            "label_bn": str(x.get("label_bn") or x.get("label_en") or f"Field {i+1}"),
+            "label_en": str(x.get("label_en") or x.get("label_bn") or f"Field {i+1}"),
+            "required": 1 if x.get("required", 1) else 0,
+            "type": _t,
+        })
+    return out
+
+
+def _ig_counts(tid, uid=None):
+    """(মোট জমা, এই ইউজারের জমা)"""
+    try:
+        with _c() as c:
+            total = _count(c.execute(
+                "SELECT COUNT(*) FROM ig_submissions WHERE task_id=%s", (tid,)).fetchone())
+            mine = 0
+            if uid:
+                mine = _count(c.execute(
+                    "SELECT COUNT(*) FROM ig_submissions WHERE task_id=%s AND user_id=%s",
+                    (tid, uid)).fetchone())
+        return total, mine
+    except Exception:
+        return 0, 0
+
+
+def _ig_username_exists(tid, name):
+    """একই Instagram Username এই টাস্কে আগে জমা হয়েছে কি না (case/স্পেস উপেক্ষা)।"""
+    u = _ig_clean_user(name)
+    if not u:
+        return False
+    try:
+        with _c() as c:
+            r = c.execute(
+                "SELECT 1 AS x FROM ig_submissions WHERE task_id=%s "
+                "AND lower(trim(replace(ig_username, '@', '')))=%s LIMIT 1", (tid, u)).fetchone()
+        return bool(r)
+    except Exception:
+        return False
+
+
+_IG_AVAIL = {}          # username -> (ts, True=ফাঁকা / False=আছে / None=বোঝা যায়নি)
+_IG_AVAIL_TTL = 6 * 3600
+_IG_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
+def _ig_live_free(name):
+    """Instagram-এ এই Username আগেই আছে কি না — True=ফাঁকা, False=আছে, None=চেক করা গেল না।
+
+    পাবলিক (লগইন ছাড়া) চেক; সার্ভার/IP ব্লক করলে None ফেরে — তখন ইউজার আটকাবে না।
+    """
+    u = _ig_clean_user(name)
+    if not u:
+        return None
+    now_ts = _time.time()
+    hit = _IG_AVAIL.get(u)
+    if hit and now_ts - hit[0] < _IG_AVAIL_TTL:
+        return hit[1]
+    res = None
+    try:
+        req = urllib.request.Request(
+            "https://www.instagram.com/api/v1/users/web_profile_info/?username=" + u,
+            headers={"User-Agent": _IG_UA, "x-ig-app-id": "936619743392459",
+                     "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            body = (r.read(300000) or b"").decode("utf-8", "ignore")
+        flat = body.replace(" ", "")
+        if '"user":null' in flat or "user not found" in body.lower():
+            res = True
+        elif '"username":"' in flat:
+            res = False
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 400):
+            res = True
+    except Exception as e:
+        log.debug(f"[IG-TASK] availability check <{u}> failed: {e}")
+    _IG_AVAIL[u] = (now_ts, res)
+    if len(_IG_AVAIL) > 5000:
+        for k, _v in sorted(_IG_AVAIL.items(), key=lambda kv: kv[1][0])[:2000]:
+            _IG_AVAIL.pop(k, None)
+    return res
+
+
+def _ig_name_list(task):
+    raw = str(task.get("username_list") or "").replace("\r", "\n")
+    raw = raw.replace(",", "\n").replace("\t", "\n")
+    out = []
+    for x in raw.splitlines():
+        x = _ig_clean_user(x)
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def _ig_pick(task, idx=0):
+    """লগইনের Username — fixed / upload (লিস্ট ধরে ঘুরবে) / random।"""
+    mode = (task.get("username_mode") or "fixed").lower()
+    fixed = _ig_clean_user(task.get("username"))
+    lst = _ig_name_list(task)
+    if mode in ("random", "shuffle") and lst:
+        return random.choice(lst)
+    if mode in ("upload", "list", "auto", "cycle") and lst:
+        # ১০০ নাম + ২০০ কাজ → ১ম ১০০ আলাদা, পরের ১০০ আবার শুরু থেকে
+        return lst[int(idx or 0) % len(lst)]
+    if fixed:
+        return fixed
+    if lst:
+        return lst[int(idx or 0) % len(lst)]
+    return ""
+
+
+def _ig_alloc_name(task, idx=0, avoid=()):
+    """বট যে Username দেবে — দেওয়ার *আগে* চেক: এই টাস্কে জমা নেই + Instagram-এ অ্যাকাউন্ট নেই।"""
+    _skip = {_ig_clean_user(x) for x in (avoid or ()) if x}
+    lst = _ig_name_list(task)
+    tries = max(1, min(len(lst) or 1, 25))
+    base = int(idx or 0)
+    for k in range(tries):
+        name = _ig_clean_user(_ig_pick(task, base + k))
+        if not name or name in _skip or not _ig_username_ok(name):
+            continue
+        try:
+            if _ig_username_exists(int(task["id"]), name):
+                continue
+        except Exception:
+            pass
+        if _ig_live_free(name) is False:      # Instagram-এ এই নামে অ্যাকাউন্ট আছে
+            continue
+        return name
+    return ""
+
+
+def _ig_login(task, idx=0):
+    """লগইন তথ্য — Username (অ্যাডমিনের লিস্ট) + অ্যাডমিনের সেট করা পাসওয়ার্ড।"""
+    pw = (task.get("password") or "").strip()
+    return {
+        "username": _ig_pick(task, idx),
+        "password": pw or _fb_new_password(),
+    }
+
+
+def _ig_can_start(task, uid):
+    """(ok, কারণ) — max accounts / per-user limit / active"""
+    if not task or not task.get("is_active"):
+        return False, "off"
+    total, mine = _ig_counts(int(task["id"]), uid)
+    mx = int(task.get("max_accounts") or 0)
+    if mx > 0 and total >= mx:
+        return False, "full"
+    lim = int(task.get("per_user_limit") or 1)
+    if lim > 0 and mine >= lim:
+        return False, "limit"
+    now_ts = _time.time()
+    for k in [k for k, v in list(_IG_STATE.items()) if now_ts - v.get("ts", 0) > 3600]:
+        _IG_STATE.pop(k, None)
+    return True, ""
+
+
+# ─────────────────────── Google Sheet / CSV ───────────────────────
+def _ig_columns(task):
+    cols = _ig_json((task or {}).get("sheet_columns"), [])
+    cols = [str(c) for c in cols if str(c).strip()]
+    return cols or ["sl", "date", "username", "pass", "2fa", "user_id", "tg_username"]
+
+
+def _ig_col_label(tok):
+    tok = str(tok).strip()
+    if tok.startswith("f:"):
+        return tok[2:]
+    return _IG_COL_LABELS.get(_IG_COL_ALIAS.get(tok.lower(), tok), tok)
+
+
+def _ig_col_value(tok, sub, idx=0, task=None):
+    tok = str(tok).strip()
+    data = _ig_json(sub.get("data"), {})
+    if tok.startswith("f:"):
+        return data.get(tok[2:], "")
+    tok = _IG_COL_ALIAS.get(tok.lower(), tok)
+    if tok in ("2fa", "cookies"):        # যে ফিল্ডে এই টাইপ, তার উত্তর
+        return data.get(_ig_data_key(task, tok), "") or data.get(tok, "")
+    if tok == "sl":
+        return idx
+    if tok == "date":
+        return sub.get("created_at", "")
+    if tok == "user_id":
+        return sub.get("user_id", "")
+    if tok == "tg_username":
+        return sub.get("username", "")
+    if tok == "task":
+        return (task or {}).get("name", "")
+    if tok == "account_no":
+        return sub.get("account_no", "")
+    if tok == "status":
+        return sub.get("status", "")
+    if tok == "username":                 # ডেটাবেসে ig_username নামে থাকে
+        return (sub.get("ig_username", "") or data.get("username", "")
+                or data.get(_ig_data_key(task, "iguser"), ""))
+    if tok == "password":                 # অ্যাডমিনের সেট করা পাসওয়ার্ড
+        return (sub.get("ig_password", "") or sub.get("login_password", "")
+                or data.get("password", ""))
+    if tok == "login_username":
+        return sub.get("login_username", "")
+    if tok == "login_password":
+        return sub.get("login_password", "")
+    return data.get(tok, "") or sub.get(tok, "")
+
+
+def _ig_subs(tid, limit=5000, only_unsynced=False):
+    q = ("SELECT s.*, COALESCE(u.username,'') AS username FROM ig_submissions s "
+         "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s")
+    if only_unsynced:
+        q += " AND COALESCE(s.synced,0)=0"
+    q += " ORDER BY s.id ASC"
+    if limit:
+        q += f" LIMIT {int(limit)}"
+    try:
+        with _c() as c:
+            rows = c.execute(q, (tid,)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.warning(f"[IG-TASK] subs ব্যর্থ: {e}")
+        return []
+
+
+def _ig_csv_bytes(task):
+    """CSV (Excel/Google Sheets-এ সোজা খোলে), ম্যাপিং অনুযায়ী কলাম সাজানো।"""
+    import csv, io
+    cols = _ig_columns(task)
+    subs = _ig_subs(int(task["id"]))
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([_ig_col_label(c) for c in cols])
+    for i, s in enumerate(subs, 1):
+        w.writerow([_ig_col_value(c, s, i, task) for c in cols])
+    data = ("\ufeff" + buf.getvalue()).encode("utf-8")
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(task.get("name") or f"task{task['id']}"))[:40]
+    return data, f"ig_{safe}_{datetime.now(BD_TZ).strftime('%Y%m%d_%H%M')}.csv"
+
+
+def _ig_push_row(sub, task):
+    """Apps Script Web App-এ এক সারি পাঠাও। সফল হলে synced=1।"""
+    url = (task.get("sheet_url") or "").strip()
+    if not url:
+        return False
+    cols = _ig_columns(task)
+    payload = {
+        "task": task.get("name", ""),
+        "task_id": task.get("id"),
+        "columns": [_ig_col_label(c) for c in cols],
+        "row": [_ig_col_value(c, sub, 0, task) for c in cols],
+    }
+    try:
+        req = urllib.request.Request(
+            url, data=_json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            ok = 200 <= int(getattr(resp, "status", 0) or 0) < 300
+    except Exception as e:
+        log.warning(f"[IG-SHEET] sub={sub.get('id')} push ব্যর্থ: {e}")
+        return False
+    if not ok:
+        return False
+    try:
+        with _c() as c:
+            c.execute("UPDATE ig_submissions SET synced=1 WHERE id=%s", (sub.get("id"),))
+    except Exception:
+        pass
+    return True
+
+
+def ig_sync_pending(limit=40):
+    """যেসব সারি এখনো Sheet-এ যায়নি — পাঠাও (job চালায়)।"""
+    _ig_init()
+    for task in _ig_active_tasks():
+        if not (task.get("sheet_url") or "").strip():
+            continue
+        for sub in _ig_subs(int(task["id"]), limit=limit, only_unsynced=True):
+            if not _ig_push_row(sub, task):
+                break
+    return True
+
+
+def _ig_submit(task, uid, login, answers):
+    """জমা সেভ করো — ডুপ্লিকেট Username হলে ('dup', None); না হলে (sub_row, None)।"""
+    tid = int(task["id"])
+    name = _ig_clean_user(login.get("username") or answers.get("username")
+                          or answers.get(_ig_data_key(task, "iguser")) or "")
+    if not name:
+        return None, "nofield"
+    if _ig_username_exists(tid, name):
+        return None, "dup"
+    _t, mine = _ig_counts(tid, uid)
+    row_id = None
+    _review_init()
+    try:
+        with _c() as c:
+            cur = c.execute(
+                "INSERT INTO ig_submissions (task_id, user_id, account_no, ig_username, "
+                "ig_password, login_username, login_password, data, status, "
+                "synced, created_at, paid, notified) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'pending',0,%s,0,1) "
+                "RETURNING id",
+                (tid, uid, mine + 1, name, login.get("password", ""),
+                 login.get("username", "") or name, login.get("password", ""),
+                 _json.dumps(answers, ensure_ascii=False), now()))
+            row_id = cur.lastrowid
+            c.execute("UPDATE ig_tasks SET total_done=COALESCE(total_done,0)+1 WHERE id=%s",
+                      (tid,))
+            # টাকা এখন approve-এর সময়ে যোগ হয় (প্যানেলে Username approve করলে)
+    except Exception as e:
+        msg = str(e).lower()
+        if "unique" in msg or "duplicate" in msg:
+            return None, "dup"
+        log.warning(f"[IG-TASK] submit ব্যর্থ uid={uid} task={tid}: {e}")
+        return None, "err"
+    sub = dict(answers)
+    sub.update({"id": row_id, "task_id": tid, "user_id": uid, "ig_username": name,
+                "ig_password": login.get("password", ""),
+                "login_username": login.get("username", "") or name,
+                "login_password": login.get("password", ""),
+                "data": _json.dumps(answers, ensure_ascii=False), "created_at": now(),
+                "account_no": mine + 1, "username": ""})
+    if (task.get("sheet_url") or "").strip():
+        threading.Thread(target=_ig_push_row, args=(sub, task), daemon=True).start()
+    return sub, None
+
+
+# ─────────────────────── ইউজার ফ্লো (UI) ───────────────────────
+def _ig_cred_card(task, login, fields, lang, step=0):
+    """ছবির মতো কার্ড — Username + Password, তারপর অ্যাডমিন-সেট করা প্রশ্ন (ক্রম অনুযায়ী)।"""
+    cred = (f"👤 Username: `{login.get('username') or '-'}`\n"
+            f"🔒 Password: `{login.get('password')}`")
+    hint = ("\n\nউপরের ইউজারনেম ও পাসওয়ার্ড দিয়ে Instagram-এ নতুন অ্যাকাউন্ট খুলুন, "
+            "তারপর নিচের প্রশ্নের উত্তর দিন।" if lang != "en" else
+            "\n\nOpen a new Instagram account with the username and password above, "
+            "then answer the question below.")
+    ask = _ig_ask_text(fields, int(step or 0), lang)
+    return (f"📸 *{task.get('name') or 'Instagram Task'}*\n\n{cred}{hint}\n\n{ask}").strip()
+
+
+def _ig_card_kb(tid, lang, done=False):
+    """কার্ডের নিচের বাটন — ১ বার Username বদলানো (+.question না থাকলে 'শেষ' বাটন) + বাতিল।"""
+    rows = [[InlineKeyboardButton(
+        "🔄 Username পরিবর্তন (১ বার)" if lang != "en" else "🔄 Change username (1 time)",
+        callback_data=f"igu:{int(tid)}")]]
+    if done:
+        rows.append([InlineKeyboardButton(
+            "✅ অ্যাকাউন্ট খোলা শেষ" if lang != "en" else "✅ Account created",
+            callback_data=f"igd:{int(tid)}")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="igt_cancel")])
+    return _ig_kb(rows)
+
+
+def _ig_kb(rows):
+    return InlineKeyboardMarkup(rows)
+
+
+def _ig_ask_text(fields, i, lang):
+    """প্রশ্ন + ক্রম (১/৩) — কোনটা আগে/পরে সেটা টাস্কের ফিল্ড-ক্রম অনুযায়ী।"""
+    if not fields or i >= len(fields):
+        return ""
+    f = fields[i]
+    q = f.get("label_bn") if lang != "en" else (f.get("label_en") or f.get("label_bn"))
+    return f"{i + 1}/{len(fields)}  {q}"
+
+
+async def ig_show_list(q, uid, lang=None):
+    """📸 Instagram Tasks — সব active task এক লিস্টে।"""
+    if lang is None:
+        lang = await asyncio.to_thread(get_lang, uid)
+    tasks = await asyncio.to_thread(_ig_active_tasks)
+    if not tasks:
+        await q.message.reply_text(
+            "❌ এখন কোনো Instagram Task নেই।" if lang != "en"
+            else "❌ No Instagram task available right now.")
+        return
+    rows = []
+    for t in tasks:
+        tid = int(t["id"])
+        ok, why = await asyncio.to_thread(_ig_can_start, t, uid)
+        total, mine = await asyncio.to_thread(_ig_counts, tid, uid)
+        mx = int(t.get("max_accounts") or 0)
+        left = (mx - total) if mx > 0 else 0
+        tag = "✅ Done" if why in ("limit",) else ("⛔ Full" if why == "full" else "")
+        price = float(t.get("price") or 0)
+        bits = [f"📸 {t.get('name') or 'Instagram Task'}"]
+        if price > 0:
+            bits.append(f"${price}")
+        if mx > 0:
+            bits.append(f"{max(0, left)} left")
+        if tag:
+            bits.append(tag)
+        rows.append([InlineKeyboardButton("  •  ".join(bits), callback_data=f"igtn:{tid}")])
+    rows.append([InlineKeyboardButton(
+        "✖️ বাতিল" if lang != "en" else "✖️ Cancel", callback_data="task_cancel")])
+    await q.message.reply_text(
+        ("📸 *Instagram Tasks*\n\nএকটি টাস্ক বেছে নিন:" if lang != "en"
+         else "📸 *Instagram Tasks*\n\nChoose a task:"),
+        parse_mode="Markdown", reply_markup=_ig_kb(rows))
+
+
+async def ig_task_name(q, uid, tid):
+    """টাস্কে চাপ → নাম দেখাও (নামের বাটন)।"""
+    lang = await asyncio.to_thread(get_lang, uid)
+    task = await asyncio.to_thread(_ig_task, tid)
+    if not task:
+        await q.answer("❌ Task পাওয়া যায়নি")
+        return
+    ok, why = await asyncio.to_thread(_ig_can_start, task, uid)
+    note = ""
+    if why == "full":
+        note = "\n\n⛔ *এই টাস্কের সব স্লট শেষ।*" if lang != "en" else "\n\n⛔ *All slots are full.*"
+    elif why == "limit":
+        note = ("\n\n✅ আপনি এই টাস্কের সর্বোচ্চ সংখ্যক অ্যাকাউন্ট জমা দিয়েছেন।" if lang != "en"
+                else "\n\n✅ You already submitted the maximum accounts.")
+    rows = [[InlineKeyboardButton(f"📸 {task.get('name') or 'Task'}", callback_data=f"igtr:{tid}")]]
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data="igt_list")])
+    await q.message.reply_text(
+        f"📸 *{task.get('name') or 'Instagram Task'}*{note}",
+        parse_mode="Markdown", reply_markup=_ig_kb(rows))
+
+
+async def ig_task_rules(q, uid, tid):
+    """নামে চাপ → Rules + Start।"""
+    lang = await asyncio.to_thread(get_lang, uid)
+    task = await asyncio.to_thread(_ig_task, tid)
+    if not task:
+        await q.answer("❌ Task পাওয়া যায়নি")
+        return
+    rules = (task.get("rules_bn") if lang != "en" else (task.get("rules_en") or task.get("rules_bn"))) or ""
+    ok, why = await asyncio.to_thread(_ig_can_start, task, uid)
+    if not rules.strip():
+        rules = ("• সঠিক তথ্য দিন, ভুল হলে রিজেক্ট হবে।" if lang != "en"
+                 else "• Submit correct information, wrong data will be rejected.")
+    if ok:
+        rows = [[InlineKeyboardButton("▶️ Start", callback_data=f"igts:{tid}")],
+                [InlineKeyboardButton("◀️ Back", callback_data="igt_list")]]
+        head = "📋 *Rules*\n\n"
+    else:
+        rows = [[InlineKeyboardButton("◀️ Back", callback_data="igt_list")]]
+        head = ("⚠️ *এই টাস্কে এখন কাজ করা যাবে না।*\n\n" if lang != "en"
+                else "⚠️ *You cannot do this task now.*\n\n")
+    await q.message.reply_text(head + rules, parse_mode="Markdown", reply_markup=_ig_kb(rows))
+
+
+async def ig_task_start(q, uid, tid):
+    """Start → বট Username+Password দেয় (ছবির মতো), দেওয়ার আগে চেক করে অ্যাকাউন্ট আছে কি না।"""
+    lang = await asyncio.to_thread(get_lang, uid)
+    task = await asyncio.to_thread(_ig_task, tid)
+    if not task:
+        await q.answer("❌ Task পাওয়া যায়নি")
+        return
+    ok, why = await asyncio.to_thread(_ig_can_start, task, uid)
+    if not ok:
+        msg = {
+            "full": "⛔ সব স্লট শেষ হয়ে গেছে।" if lang != "en" else "⛔ All slots are taken.",
+            "limit": "✅ আপনি ইতিমধ্যে সর্বোচ্চ অ্যাকাউন্ট জমা দিয়েছেন।" if lang != "en"
+                     else "✅ You already submitted the maximum accounts.",
+        }.get(why, "❌ এখন কাজ করা যাবে না।" if lang != "en" else "❌ Not available now.")
+        await q.answer(msg, show_alert=True)
+        return
+    _done = (await asyncio.to_thread(_ig_counts, int(task["id"])))[0]
+    name = await asyncio.to_thread(_ig_alloc_name, task, _done)
+    if not name:
+        await q.answer(
+            "❌ এখন কোনো ফ্রি Username পাওয়া যাচ্ছে না — অ্যাডমিনকে জানান।" if lang != "en"
+            else "❌ No free username right now — please tell the admin.", show_alert=True)
+        return
+    login = await asyncio.to_thread(_ig_login, task, _done)
+    login["username"] = name
+    fields = await asyncio.to_thread(_ig_fields, task)
+    _IG_STATE[uid] = {"task_id": int(tid), "step": 0, "answers": {}, "login": login,
+                      "retry": 0, "ts": _time.time()}
+    await q.message.reply_text(_ig_cred_card(task, login, fields, lang),
+                               parse_mode="Markdown",
+                               reply_markup=_ig_card_kb(int(tid), lang, done=not fields))
+
+
+async def _ig_finish(reply, uid, task, st, lang):
+    """সব প্রশ্ন শেষ → জমা সেভ করে রিসিপ্ট পাঠাও। `reply` = reply_text-এর মতো async কলেবল।"""
+    sub, err = await asyncio.to_thread(_ig_submit, task, uid, st["login"], st["answers"])
+    _IG_STATE.pop(uid, None)
+    if err == "dup":
+        await reply(
+            ("⚠️ এই Username আগেই জমা হয়েছে — অ্যাকাউন্ট সেভ হয়নি।\n"
+             "আবার Start চাপলে নতুন Username পাবেন।" if lang != "en" else
+             "⚠️ Duplicate username — not saved.\nStart again to get a new username."),
+            parse_mode="Markdown",
+            reply_markup=_ig_kb([[InlineKeyboardButton("▶️ Start", callback_data="igt_list")]]))
+        return
+    if err:
+        await reply("❌ সেভ করা যায়নি, আবার চেষ্টা করুন।" if lang != "en"
+                    else "❌ Could not save, please try again.")
+        return
+    price = float(task.get("price") or 0)
+    _p_bn = f"\n⏳ Approve হলে +${price} যোগ হবে" if price > 0 else ""
+    _p_en = f"\n⏳ +${price} will be added after approval" if price > 0 else ""
+    name = (sub.get("ig_username") if sub else "") or (st.get("login") or {}).get("username") or ""
+    await reply(
+        ("✅ *অ্যাকাউন্ট খোলা শেষ — জমা হয়েছে!*\n\n"
+         f"📸 Task: {task.get('name')}\n👤 Username: `{name}`{_p_bn}\n\n"
+         "অ্যাডমিন যাচাই করে দেখবেন।") if lang != "en" else
+        ("✅ *Account done — submitted!*\n\n"
+         f"📸 Task: {task.get('name')}\n👤 Username: `{name}`{_p_en}\n\n"
+         "Admin will review it."),
+        parse_mode="Markdown",
+        reply_markup=_ig_kb([[InlineKeyboardButton("◀️ Tasks", callback_data="igt_list")]]))
+
+
+async def ig_done(q, uid):
+    """✅ অ্যাকাউন্ট খোলা শেষ — প্রশ্ন না থাকলে ইউজার নিজেই এই বাটনে চাপে।"""
+    lang = await asyncio.to_thread(get_lang, uid)
+    st = _IG_STATE.get(uid)
+    if not st:
+        await q.answer("❌ ফ্লো বন্ধ" if lang != "en" else "❌ No active flow")
+        return
+    task = await asyncio.to_thread(_ig_task, st["task_id"])
+    if not task:
+        await q.answer("❌ Task পাওয়া যায়নি")
+        return
+    fields = await asyncio.to_thread(_ig_fields, task)
+    if fields and int(st.get("step") or 0) < len(fields):
+        await q.answer("❗ আগে সব প্রশ্নের উত্তর দিন" if lang != "en"
+                       else "❗ Please answer the questions first", show_alert=True)
+        return
+    st["ts"] = _time.time()
+    await _ig_finish(q.message.reply_text, uid, task, st, lang)
+
+
+async def ig_on_text(update, ctx):
+    """ইউজারের উত্তর নাও — এক ফিল্ড করে (Username/Password বট আগেই দিয়ে দিয়েছে)।"""
+    uid = update.effective_user.id
+    st = _IG_STATE.get(uid)
+    if not st:
+        return
+    txt = (update.message.text or "").strip()
+    task = await asyncio.to_thread(_ig_task, st["task_id"])
+    if not task:
+        _IG_STATE.pop(uid, None)
+        return
+    lang = await asyncio.to_thread(get_lang, uid)
+    fields = await asyncio.to_thread(_ig_fields, task)
+    if st["step"] >= len(fields):
+        _IG_STATE.pop(uid, None)
+        return
+    f = fields[st["step"]]
+    if not txt:
+        await update.message.reply_text(
+            "❗ ফাঁকা পাঠাবেন না।" if lang != "en" else "❗ Please don't send empty.")
+        return
+    # ── ফিল্ড-টাইপ অনুযায়ী যাচাই (Username ফরম্যাট, 2FA key, cookies…) ──
+    _ok, _err_bn, _err_en, _extra = _ig_validate(f, txt)
+    if not _ok:
+        await update.message.reply_text(_err_bn if lang != "en" else _err_en,
+                                        parse_mode="Markdown")
+        return
+    st["answers"][f["key"]] = txt
+    st["ts"] = _time.time()
+    # ── 2FA: key ঠিক থাকলে বট কোড দেবে ──
+    if _extra:
+        await update.message.reply_text(
+            (f"🔑 আপনার 2FA কোড: `{_extra}`\n⏱ ৩০ সেকেন্ড পর বদলে যাবে — এখনই Instagram-এ দিন।"
+             if lang != "en" else
+             f"🔑 Your 2FA code: `{_extra}`\n⏱ It changes every 30 seconds — enter it now."),
+            parse_mode="Markdown",
+            reply_markup=_ig_kb([[InlineKeyboardButton(
+                "🔁 নতুন কোড" if lang != "en" else "🔁 New code",
+                callback_data=f"igc:{st['task_id']}")]]))
+    st["step"] += 1
+    if st["step"] < len(fields):
+        await update.message.reply_text(_ig_ask_text(fields, st["step"], lang))
+        return
+    # সব প্রশ্ন শেষ → সেভ
+    await _ig_finish(update.message.reply_text, uid, task, st, lang)
+
+
+async def ig_send_2fa(q, uid, tid):
+    """ইউজারের দেওয়া 2FA key থেকে নতুন কোড।"""
+    lang = await asyncio.to_thread(get_lang, uid)
+    st = _IG_STATE.get(uid) or {}
+    task = await asyncio.to_thread(_ig_task, tid)
+    if not task:
+        await q.answer("❌ Task পাওয়া যায়নি")
+        return
+    key = ""
+    for f in await asyncio.to_thread(_ig_fields, task):
+        if (f.get("type") or "") == "2fa":
+            key = (st.get("answers") or {}).get(f["key"], "")
+            break
+    if not key:
+        await q.answer("❌ আগে 2FA key দিন" if lang != "en" else "❌ Send your 2FA key first")
+        return
+    try:
+        code = _fb_totp(key)
+    except Exception:
+        await q.answer("❌ Key থেকে কোড হলো না" if lang != "en" else "❌ Bad 2FA key")
+        return
+    await q.message.reply_text(
+        (f"🔑 নতুন 2FA কোড: `{code}`\n⏱ ৩০ সেকেন্ড পর বদলে যাবে।" if lang != "en"
+         else f"🔑 New 2FA code: `{code}`\n⏱ It changes every 30 seconds."),
+        parse_mode="Markdown",
+        reply_markup=_ig_kb([[InlineKeyboardButton(
+            "🔁 নতুন কোড" if lang != "en" else "🔁 New code",
+            callback_data=f"igc:{tid}")]]))
+
+
+async def ig_retry(q, uid):
+    """🔄 বাটন — আরেকটা ফ্রি Username দাও (মাত্র ১ বার), আগেরটা বাতিল।"""
+    lang = await asyncio.to_thread(get_lang, uid)
+    st = _IG_STATE.get(uid)
+    if not st:
+        await q.answer("❌ ফ্লো বন্ধ" if lang != "en" else "❌ No active flow")
+        return
+    if int(st.get("retry") or 0) >= 1:
+        await q.answer("⛔ বদলানোর সুযোগ শেষ" if lang != "en" else "⛔ No changes left",
+                       show_alert=True)
+        return
+    task = await asyncio.to_thread(_ig_task, st["task_id"])
+    if not task:
+        await q.answer("❌ Task পাওয়া যায়নি")
+        return
+    old = (st.get("login") or {}).get("username") or ""
+    _done = (await asyncio.to_thread(_ig_counts, int(task["id"])))[0]
+    new = await asyncio.to_thread(_ig_alloc_name, task, _done + 1, (old,))
+    if not new:
+        await q.answer("❌ এখন নতুন ফ্রি Username নেই — অ্যাডমিনকে জানান।" if lang != "en"
+                       else "❌ No new free username — tell the admin.", show_alert=True)
+        return
+    st["retry"] = int(st.get("retry") or 0) + 1
+    st.setdefault("login", {})["username"] = new
+    st["ts"] = _time.time()
+    fields = await asyncio.to_thread(_ig_fields, task)
+    await q.message.reply_text(
+        _ig_cred_card(task, st["login"], fields, lang, step=st.get("step") or 0),
+        parse_mode="Markdown",
+        reply_markup=_ig_card_kb(int(task["id"]), lang, done=not fields))
+
+
+async def ig_cancel(q, uid):
+    _IG_STATE.pop(uid, None)
+    lang = await asyncio.to_thread(get_lang, uid)
+    await q.answer("✅ বাতিল হয়েছে" if lang != "en" else "✅ Cancelled")
+
+
+# ─────────────────────── অটো কাজ (jobs) ───────────────────────
+async def job_ig_sheet_sync(ctx):
+    try:
+        await asyncio.to_thread(ig_sync_pending)
+    except Exception as e:
+        log.debug(f"[IG-SHEET] job: {e}")
+
+
+async def job_ig_password_rotate(ctx):
+    """প্রতিদিন নির্দিষ্ট সময়ে পাসওয়ার্ড বদল।"""
+    try:
+        now_bd = datetime.now(BD_TZ)
+        hhmm = now_bd.strftime("%H:%M")
+        today = now_bd.strftime("%Y-%m-%d")
+        for t in await asyncio.to_thread(_ig_active_tasks):
+            if not int(t.get("password_auto") or 0):
+                continue
+            if (t.get("password_change_time") or "").strip() != hhmm:
+                continue
+            if str(t.get("password_last_change") or "").startswith(today):
+                continue
+            new_pw = _fb_new_password()
+            try:
+                with _c() as c:
+                    c.execute("UPDATE ig_tasks SET password=%s, password_last_change=%s "
+                              "WHERE id=%s", (new_pw, now_bd.strftime("%Y-%m-%d %H:%M"), t["id"]))
+            except Exception as e:
+                log.warning(f"[IG-PW] task {t.get('id')} ব্যর্থ: {e}")
+                continue
+            try:
+                await ctx.bot.send_message(
+                    ADMIN_ID,
+                    f"🔑 *পাসওয়ার্ড অটো বদল হয়েছে*\n\n📸 {t.get('name')}\n"
+                    f"নতুন Password: `{new_pw}`", parse_mode="Markdown")
+            except Exception:
+                pass
+    except Exception as e:
+        log.debug(f"[IG-PW] job: {e}")
+
+
+async def job_ig_export(ctx):
+    """নির্ধারিত সময়ে প্রতি টাস্কের আলাদা CSV অ্যাডমিনকে।"""
+    try:
+        now_bd = datetime.now(BD_TZ)
+        hhmm = now_bd.strftime("%H:%M")
+        today = now_bd.strftime("%Y-%m-%d")
+        for t in await asyncio.to_thread(_ig_active_tasks):
+            if (t.get("export_time") or "").strip() != hhmm:
+                continue
+            if str(t.get("last_export_at") or "").startswith(today):
+                continue
+            data, fname = await asyncio.to_thread(_ig_csv_bytes, t)
+            try:
+                await ctx.bot.send_document(
+                    ADMIN_ID, document=data, filename=fname,
+                    caption=f"📊 {t.get('name')} — Google Sheet (CSV)")
+                with _c() as c:
+                    c.execute("UPDATE ig_tasks SET last_export_at=%s WHERE id=%s",
+                              (now_bd.strftime("%Y-%m-%d %H:%M"), t["id"]))
+            except Exception as e:
+                log.warning(f"[IG-EXPORT] task {t.get('id')}: {e}")
+    except Exception as e:
+        log.debug(f"[IG-EXPORT] job: {e}")
+
+
+# ─────────────────────── অ্যাডমিন (বট) কুইক ভিউ ───────────────────────
+async def adm_ig_list(q, uid):
+    tasks = await asyncio.to_thread(_ig_active_tasks)
+    if not tasks:
+        await q.message.reply_text("📸 কোনো Instagram Task নেই — ওয়েব প্যানেলে যোগ করুন।")
+        return
+    lines = ["📸 *Instagram Tasks*"]
+    rows = []
+    for t in tasks:
+        total, _m = await asyncio.to_thread(_ig_counts, int(t["id"]), None)
+        mx = int(t.get("max_accounts") or 0)
+        lines.append(f"• *{t.get('name')}* — {total}/{mx or '∞'}"
+                     + ("  🔑 auto" if int(t.get("password_auto") or 0) else ""))
+        rows.append([InlineKeyboardButton(f"⬇️ {str(t.get('name'))[:26]} (CSV)",
+                                          callback_data=f"igx:{t['id']}")])
+    rows.append([InlineKeyboardButton("🔄 রিফ্রেশ", callback_data="adm_ig")])
+    await q.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=_ig_kb(rows))
+
+
+async def adm_ig_export(q, uid, tid):
+    task = await asyncio.to_thread(_ig_task, tid)
+    if not task:
+        await q.answer("❌ নেই")
+        return
+    data, fname = await asyncio.to_thread(_ig_csv_bytes, task)
+    await q.message.reply_document(document=data, filename=fname,
+                                   caption=f"📊 {task.get('name')} — CSV")
+    await q.answer("✅ পাঠানো হলো")
+
+
+# ─── IG Task ক্যালব্যাক রাউটার ───
+async def ig_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """igt_list / igtn:<id> / igtr:<id> / igts:<id> / igt_cancel / igu:<id> / igc:<id> /
+    adm_ig / igx:<id>"""
+    q = update.callback_query
+    uid = q.from_user.id
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    data = q.data or ''
+    try:
+        _u = await asyncio.to_thread(get_user, uid)
+        if _u and int(_u.get('is_banned') or 0):
+            await q.message.reply_text('🚫 আপনি ব্যান হয়েছেন।')
+            return
+    except Exception:
+        pass
+    try:
+        if data == 'igt_list':
+            await ig_show_list(q, uid)
+        elif data.startswith('igtn:'):
+            await ig_task_name(q, uid, int(data.split(':', 1)[1]))
+        elif data.startswith('igtr:'):
+            await ig_task_rules(q, uid, int(data.split(':', 1)[1]))
+        elif data.startswith('igts:'):
+            await ig_task_start(q, uid, int(data.split(':', 1)[1]))
+        elif data == 'igt_cancel':
+            await ig_cancel(q, uid)
+        elif data.startswith('igu:'):
+            await ig_retry(q, uid)
+        elif data.startswith('igd:'):
+            await ig_done(q, uid)
+        elif data.startswith('igc:'):
+            await ig_send_2fa(q, uid, int(data.split(':', 1)[1]))
+        elif data == 'adm_ig':
+            if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
+                return
+            await adm_ig_list(q, uid)
+        elif data.startswith('igx:'):
+            if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
+                return
+            await adm_ig_export(q, uid, int(data.split(':', 1)[1]))
+    except Exception as e:
+        log.warning(f'[IG-TASK] callback {data}: {e}')
+
+
+def _ig_state_filter(update) -> bool:
+    try:
+        return bool(update.effective_user and update.effective_user.id in _IG_STATE)
+    except Exception:
+        return False
+
+
+
+
+
 def main():
     # ── ProxyError fix: httpx যেন system proxy ignore করে (503 এড়াতে) ───
     for _pvar in ("HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy","ALL_PROXY","all_proxy"):
@@ -18168,6 +20768,8 @@ def main():
                 await asyncio.to_thread(get_all_btns, "bn")
                 await asyncio.to_thread(get_all_btns, "en")
                 await asyncio.to_thread(get_setting, "bot_status")
+                await asyncio.to_thread(_ensure_indexes)      # একবারই — বাকি সময় ফ্ল্যাগ
+                await asyncio.to_thread(_backfill_devices)    # পুরোনো হ্যাশ → devices
                 log.info("🔥 [WARMUP] DB pool + caches প্রস্তুত")
             except Exception as _we:
                 log.warning(f"[WARMUP] ব্যর্থ: {_we}")
@@ -18270,6 +20872,14 @@ def main():
             _wadm_mod.set_settings_hook(_web_settings_hook)
             _wadm_mod.set_user_hook(_web_user_hook)
             log.info("✅ [WEB] settings/user cache hook রেজিস্টার্ড")
+            # প্যানেলে FB/IG approve-reject চাপা মাত্রই বটের job (আর ২০s অপেক্ষা নয়)
+            try:
+                _REVIEW_LOOP[0] = asyncio.get_running_loop()
+                _REVIEW_CTX[0]  = type("ReviewCtx", (), {"bot": application.bot})()
+                _wadm_mod.set_review_hook(_kick_review)
+                log.info("✅ [WEB] review→bot instant hook রেজিস্টার্ড")
+            except Exception as _rh:
+                log.warning(f"[WEB] review hook ব্যর্থ: {_rh}")
         except Exception as _wh:
             log.warning(f"[WEB] hook রেজিস্টার ব্যর্থ: {_wh}")
 
@@ -18312,6 +20922,18 @@ def main():
                 first=300,
                 name="health_check"
             )
+            application.job_queue.run_repeating(
+                job_fb_sheet_sync, interval=300, first=120, name="fb_sheet_sync")
+            application.job_queue.run_repeating(
+                job_fb_password_rotate, interval=60, first=45, name="fb_pw_rotate")
+            application.job_queue.run_repeating(
+                job_fb_export, interval=60, first=75, name="fb_export")
+            application.job_queue.run_repeating(
+                job_ig_sheet_sync, interval=300, first=150, name="ig_sheet_sync")
+            application.job_queue.run_repeating(
+                job_ig_password_rotate, interval=60, first=50, name="ig_pw_rotate")
+            application.job_queue.run_repeating(
+                job_ig_export, interval=60, first=80, name="ig_export")
             application.job_queue.run_repeating(
                 job_clean_stuck_states,
                 interval=1800,
@@ -18419,6 +21041,11 @@ def main():
                     BACKUP_INTERVAL_HOURS * 3600, first_sec=BACKUP_INTERVAL_HOURS * 3600)),
                 asyncio.create_task(_run_periodically(job_lb_adm_update,    600,  first_sec=600)),
                 asyncio.create_task(_run_periodically(job_bio_realtime_monitor, 60, first_sec=30)),
+                asyncio.create_task(_run_periodically(job_ig_sheet_sync,     300, first_sec=150)),
+                asyncio.create_task(_run_periodically(job_ig_password_rotate, 60, first_sec=50)),
+                asyncio.create_task(_run_periodically(job_ig_export,          60, first_sec=80)),
+                # instant hook আছেই — এই ৬০s শুধু ব্যাকআপ (DB চাপ কম)
+                asyncio.create_task(_run_periodically(job_fb_ig_review,       60, first_sec=25)),
                 asyncio.create_task(_run_daily_at(job_bio_task_check,   0, 5, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_post_leaderboard, 0, 0, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_winback,        14, 0, BD_TZ)),
@@ -18497,11 +21124,16 @@ def main():
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
     app.add_handler(CallbackQueryHandler(sec_callback, pattern=r"^sec_(unban|ignore)_\d+$"))
     app.add_handler(CallbackQueryHandler(on_resetall_cb, pattern=r"^resetall_(yes|no)$"))
+    app.add_handler(CallbackQueryHandler(fb_callback, pattern=r"^(fbt_list|fbtn:\d+|fbr:\d+|fbs:\d+|fbc:\d+|fbt_cancel|adm_fb|fbx:\d+)$"))
+    app.add_handler(CallbackQueryHandler(ig_callback, pattern=r"^(igt_list|igtn:\d+|igtr:\d+|igts:\d+|igc:\d+|igt_cancel|igu:\d+|igd:\d+|adm_ig|igx:\d+)$"))
     app.add_handler(CallbackQueryHandler(on_callback))
     # ~filters.VIA_BOT → inline-bot দিয়ে পাঠানো message ignore করো
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_photo, "ph")))
     app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_video, "vid")))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_document, "doc")))
+    # FB Task ইনপুট — শুধু যাদের ফ্লো চলছে, বাকিরা সাধারণ on_message
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT & filters.ChatType.PRIVATE & _fb_state_filter, fb_on_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT & filters.ChatType.PRIVATE & _ig_state_filter, ig_on_text))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT, on_message))
     app.add_error_handler(_smart_error_handler)
     log.info("✅ Task Earn Bot started!")
