@@ -41,6 +41,26 @@ from telegram.ext import (
 from telegram.constants import ChatMemberStatus
 from telegram.error import TelegramError, RetryAfter as TgRetryAfter, BadRequest as TgBadRequest
 
+class _StateFilter(filters.UpdateFilter):
+    """সাধারণ ফাংশনকে সত্যিকারের PTB ফিল্টার বানায়।
+
+    PTB-তে `filters.TEXT & my_func` লিখলে `_MergedFilter` ওই ফাংশনের
+    `data_filter` অ্যাট্রিবিউট খোঁজে → "'function' object has no attribute
+    'data_filter'" দিয়ে বট ক্র্যাশ করে। তাই ফাংশনটা এই ক্লাসে মুড়ে দিতে হয়।
+    """
+
+    __slots__ = ("_fn",)
+
+    def __init__(self, fn, name="state"):
+        super().__init__(name=name, data_filter=True)
+        self._fn = fn
+
+    def filter(self, update) -> bool:
+        try:
+            return bool(self._fn(update))
+        except Exception:
+            return False
+
 # ──────────────────────────── CONFIG ────────────────────────────
 # প্রথমে Environment Variable থেকে নেওয়ার চেষ্টা করো,
 # না পেলে টার্মিনালে input() দিয়ে চাও — কোনো .env ফাইল লাগবে না।
@@ -19681,6 +19701,7 @@ def _fb_state_filter(update) -> bool:
     except Exception:
         return False
 
+
 # ═══════════════════ INSTAGRAM TASK (Taksly-style) ═══════════════════
 # অ্যাডমিন সব সেটিংস দেয় ওয়েব প্যানেল থেকে: /admin/igtasks
 # ফেসবুক টাস্কের মতোই, শুধু UID-র বদলে Instagram Username:
@@ -20727,6 +20748,7 @@ def _ig_state_filter(update) -> bool:
 
 
 
+
 def main():
     # ── ProxyError fix: httpx যেন system proxy ignore করে (503 এড়াতে) ───
     for _pvar in ("HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy","ALL_PROXY","all_proxy"):
@@ -21131,9 +21153,12 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_photo, "ph")))
     app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_video, "vid")))
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_document, "doc")))
+    # টাস্ক স্টেট ফিল্টার — ফাংশন নয়, আসল ফিল্টার অবজেক্ট (নাহলে PTB ক্র্যাশ করে)
+    _FB_STATE_F = _StateFilter(_fb_state_filter, "fb_state")
+    _IG_STATE_F = _StateFilter(_ig_state_filter, "ig_state")
     # FB Task ইনপুট — শুধু যাদের ফ্লো চলছে, বাকিরা সাধারণ on_message
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT & filters.ChatType.PRIVATE & _fb_state_filter, fb_on_text))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT & filters.ChatType.PRIVATE & _ig_state_filter, ig_on_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT & filters.ChatType.PRIVATE & _FB_STATE_F, fb_on_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT & filters.ChatType.PRIVATE & _IG_STATE_F, ig_on_text))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT, on_message))
     app.add_error_handler(_smart_error_handler)
     log.info("✅ Task Earn Bot started!")
