@@ -561,7 +561,8 @@ def settings():
         return g
     keys = ["verify_enabled", "sec_device_limit", "sec_ip_limit", "sec_auto_ban",
             "sec_ip_retention_days", "notify_security", "bot_status",
-            "points_on", "points_block", "reset_on_update"]
+            "points_on", "points_block", "reset_on_update",
+            "pt_max", "pt_start", "pt_approve", "pt_reject", "pt_dup"]
     vals = {k: settings_get(k, "") for k in keys}
     body = (
         f"<div class='grid g2'>"
@@ -613,13 +614,32 @@ def settings():
         "</select>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>বন্ধ থাকলে পয়েন্ট ০ হলেও Task করা যাবে। "
         "চালু করলে আগের মতো ২ দিন ব্লক হবে।</p></div>"
-        "<div class='form'><label>Update reset — নতুন build-এ সবাই আবার verify করবে</label>"
+        "<div class='form'><label>Update reset — নতুন build-এ সবাই আবার verify করবে (অটো)</label>"
         "<select name='reset_on_update'>"
-        f"<option value='on' {'selected' if vals['reset_on_update'] != 'off' else ''}>চালু</option>"
-        f"<option value='off' {'selected' if vals['reset_on_update'] == 'off' else ''}>বন্ধ</option>"
+        f"<option value='off' {'selected' if vals.get('reset_on_update') != 'on' else ''}>বন্ধ (ডিফল্ট)</option>"
+        f"<option value='on' {'selected' if vals.get('reset_on_update') == 'on' else ''}>চালু</option>"
         "</select>"
-        "<p class='mut' style='font-size:11px;margin:6px 0 0'>ব্যালান্স/পয়েন্ট মোছা হয় না — শুধু verify আবার করতে হয়।</p></div>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>ব্যালান্স/পয়েন্ট মোছা হয় না — শুধু verify আবার করতে হয়। "
+        "⚠️ নোটিশ কখনো অটো যায় না: বট /resetall (বা বিল্ড আপডেটের মেসেজে বাটন) চাপলে তখনই সবাইকে যায়, এক বিল্ডে একবার।</p></div>"
         "<button type='submit' style='margin-top:10px'>Save System</button></form></div>"
+        "<div class='card'><h3>" + icon("trend") + " পয়েন্ট সেটিংস</h3>"
+        "<form method='post' action='/admin/do/settings'>"
+        "<div class='form'><label>সর্বোচ্চ পয়েন্ট (স্কোর)</label>"
+        f"<input name='pt_max' type='number' min='1' max='100000' value='{esc(vals.get('pt_max') or 50)}'>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>এটাই পয়েন্টের ছাদ — এর বেশি বাড়বে না। ডিফল্ট ৫০।</p></div>"
+        "<div class='form'><label>নতুন ইউজারের শুরুর পয়েন্ট</label>"
+        f"<input name='pt_start' type='number' min='0' max='100000' value='{esc(vals.get('pt_start') or 50)}'>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>সর্বোচ্চের বেশি দিলে সর্বোচ্চই ধরা হবে। ডিফল্ট ৫০।</p></div>"
+        "<div class='form'><label>Task approve হলে কত পয়েন্ট বাড়বে (+)</label>"
+        f"<input name='pt_approve' type='number' min='0' max='100000' value='{esc(vals.get('pt_approve') or 5)}'>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>ডিফল্ট +৫।</p></div>"
+        "<div class='form'><label>Task reject হলে কত পয়েন্ট কমবে (−)</label>"
+        f"<input name='pt_reject' type='number' min='0' max='100000' value='{esc(vals.get('pt_reject') or 10)}'>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>ডিফল্ট −১০।</p></div>"
+        "<div class='form'><label>একই ছবি আবার দিলে কত কমবে (−)</label>"
+        f"<input name='pt_dup' type='number' min='0' max='100000' value='{esc(vals.get('pt_dup') or 3)}'>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>ডিফল্ট −৩। বদলালে সাথে সাথে বটে কার্যকর (ক্যাশ ১০ মিনিট)।</p></div>"
+        "<button type='submit' style='margin-top:10px'>Save Points</button></form></div>"
         "</div>"
     )
     return page("Settings", body, "settings", toast=_toast())
@@ -644,6 +664,11 @@ def settings_save():
     for k in ("sec_device_limit", "sec_ip_limit", "sec_ip_retention_days"):
         v = (request.form.get(k) or "").strip()
         if v.isdigit():
+            settings_set(k, v)
+            saved.append(k)
+    for k in ("pt_max", "pt_start", "pt_approve", "pt_reject", "pt_dup"):
+        v = (request.form.get(k) or "").strip()
+        if v.isdigit() and int(v) <= 100000 and (int(v) >= 1 if k == "pt_max" else True):
             settings_set(k, v)
             saved.append(k)
     log_admin("settings_save", 0, ",".join(saved))

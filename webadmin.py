@@ -1052,6 +1052,11 @@ def user_detail(uid):
         "<button class='red' type='submit'>Ban</button></form>"
         f"<form class='row' method='post' action='/admin/do/unban/{uid}'>"
         "<button class='ok' type='submit'>Unban / Approve</button></form>"
+        f"<form class='row' method='post' action='/admin/do/restart/{uid}' "
+        "data-confirm='এই ইউজারকে শুরু থেকে চালু করবেন? আবার verify করতে হবে — "
+        "টাকা/পয়েন্ট/রেফারেল/ব্যান অক্ষত থাকবে।'>"
+        "<button class='gray' type='submit'>🔄 শুরু থেকে চালু</button>"
+        "<span class='mut' style='font-size:11.5px'>এখন /start দিলে নতুন ইউজারের মতো</span></form>"
         f"<form class='row' method='post' action='/admin/do/review/{uid}'>"
         "<button class='gray' type='submit'>Mark Reviewed (clear suspicious)</button></form>"
         + (f"<form class='row' method='post' action='/admin/do/ipban/{uid}'>"
@@ -1117,7 +1122,7 @@ def user_detail(uid):
                   esc(str(r["created_at"] or "")[:19])] for r in alerts])
         + "</div>"
     )
-    return page(f"User {uid}", body, "users")
+    return page(f"User {uid}", body, "users", toast=request.args.get("ok"))
 
 
 # ───────────────────────────── actions ─────────────────────────────
@@ -1175,6 +1180,23 @@ def act_unban(uid):
     log_admin("unban", uid)
     _fire_user_changed(uid)
     return back(uid)
+
+
+@wadm.route("/admin/do/restart/<int:uid>", methods=["POST"])
+def act_restart(uid):
+    """একজন ইউজারকে শুরু থেকে চালু — শুধু verification/onboarding state।
+    ⚠️ balance, points, referred_by/রেফারেল, task/withdraw ইতিহাস, ban, ডিভাইস/IP — কিছুই মোছা হয় না।"""
+    g = guard()
+    if g:
+        return g
+    try:
+        _x("UPDATE users SET vrf_pass=0, verified=0, verified_at='', "
+           "vrf_notice_build='' WHERE user_id=%s", (uid,))
+    except Exception as e:
+        return back(uid, msg="restartfail")
+    log_admin("restart_flow", uid, "start from scratch (money/points/referral kept)")
+    _fire_user_changed(uid)      # বটের ক্যাশে সাথে সাথে — পরের /start-এ নতুন ফ্লো
+    return back(uid, msg="restarted")
 
 
 @wadm.route("/admin/do/review/<int:uid>", methods=["POST"])

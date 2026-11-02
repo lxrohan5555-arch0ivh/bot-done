@@ -283,16 +283,16 @@ MSGS = {
         'point_cmd': (
             "🎯 *আপনার Trust Points*\n\n"
             "━━━━━━━━━━━━━━━━\n"
-            "🔵 *পয়েন্ট:* `{pts}/50`\n"
+            "🔵 *পয়েন্ট:* `{pts}/{max_pts}`\n"
             "🛡 *অবস্থা:* {status}\n"
             "{block_line}"
             "━━━━━━━━━━━━━━━━\n\n"
             "📜 *পয়েন্ট নিয়মাবলী:*\n"
-            "• শুরুতে সবার পয়েন্ট: `50`\n"
+            "• শুরুতে সবার পয়েন্ট: `{start_pts}`\n"
             "• Task *reject* হলে: `-{reject_pts}` পয়েন্ট\n"
             "• Task *approve* হলে: `+{approve_pts}` পয়েন্ট\n"
             "• {block_rule}\n"
-            "• পয়েন্ট সর্বোচ্চ `50` পর্যন্ত যাবে\n\n"
+            "• পয়েন্ট সর্বোচ্চ `{max_pts}` পর্যন্ত যাবে\n\n"
             "💡 সঠিক নিয়মে Task করলে পয়েন্ট বাড়বে!"
         ),
     },
@@ -381,16 +381,16 @@ MSGS = {
         'point_cmd': (
             "🎯 *Your Trust Points*\n\n"
             "━━━━━━━━━━━━━━━━\n"
-            "🔵 *Points:* `{pts}/50`\n"
+            "🔵 *Points:* `{pts}/{max_pts}`\n"
             "🛡 *Status:* {status}\n"
             "{block_line}"
             "━━━━━━━━━━━━━━━━\n\n"
             "📜 *Points Rules:*\n"
-            "• Starting points: `50`\n"
+            "• Starting points: `{start_pts}`\n"
             "• Task *rejected*: `-{reject_pts}` points\n"
             "• Task *approved*: `+{approve_pts}` points\n"
             "• {block_rule}\n"
-            "• Maximum points: `50`\n\n"
+            "• Maximum points: `{max_pts}`\n\n"
             "💡 Follow the rules correctly to keep your points high!"
         ),
     }
@@ -1109,6 +1109,7 @@ def init_security_db():
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason TEXT DEFAULT ''",
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS approved INTEGER DEFAULT 1",
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS vrf_pass INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS vrf_notice_build TEXT DEFAULT ''",
             ):
                 try:
                     c.execute(_alt)
@@ -2569,10 +2570,14 @@ def get_user(uid):
     return u
 
 def ensure_user(uid, username, full_name, ref_by=None):
+    try:
+        _st = pt_start()          # Settings → পয়েন্ট সেটিংস (ডিফল্ট ৫০)
+    except Exception:
+        _st = POINT_START
     with _c() as c:
         cur = c.execute(
-            "INSERT INTO users (user_id,username,full_name,referred_by,joined_at,lang,country) VALUES (%s,%s,%s,%s,%s,'','BD') ON CONFLICT DO NOTHING",
-            (uid, username or "", full_name or "", ref_by, now())
+            "INSERT INTO users (user_id,username,full_name,referred_by,joined_at,lang,country,points) VALUES (%s,%s,%s,%s,%s,'','BD',%s) ON CONFLICT DO NOTHING",
+            (uid, username or "", full_name or "", ref_by, now(), _st)
         )
         if cur.rowcount:  # নতুন user যোগ হলে
             _invalidate_user_cache(uid)
@@ -2662,7 +2667,7 @@ POINT_DUP_PHOTO   = 3    # একই ছবি ২য়বার = −৩ প�
 POINT_BLOCK_AT    = 0    # পয়েন্ট ০ হলেই block (০ ছাড়া আর কিছুতে block নয়)
 
 # ── বিল্ড ট্যাগ: এই মান বদলালেই পরের বার বট চালু হলে সব ইউজার আবার নতুন করে শুরু করবে ──
-BOT_BUILD = "2026-11-01.4"
+BOT_BUILD = "2026-11-02.6"
 POINT_BLOCK_DAYS  = 2    # ০ হলে ২ দিন task বন্ধ
 WALLET_CHANGE_HOLD_HOURS = 6   # ওয়ালেট বদলের পর এত ঘণ্টা payout hold
 WINBACK_INACTIVE_DAYS    = 14  # এত দিন না আসলে উইনব্যাক মেসেজ
@@ -2698,24 +2703,55 @@ def is_task_blocked(uid):
     except Exception:
         return False, None
 
+# ── পয়েন্টের সংখ্যা Settings থেকে (খালি/ভুল হলে কোডের ডিফল্ট) ──
+def _pt_num(key, default, lo=0, hi=100000):
+    """Settings-এর সংখ্যা; না থাকলে ডিফল্ট। get_setting-এর নিজের ৬০০s ক্যাশ আছে।"""
+    try:
+        v = int(float(str(get_setting(key) or "").strip()))
+    except Exception:
+        return default
+    return max(lo, min(hi, v))
+
+def pt_max():
+    """সর্বোচ্চ পয়েন্ট (স্কোর 0–এই সংখ্যা)। ডিফল্ট ৫০।"""
+    return _pt_num("pt_max", POINT_START, 1, 100000)
+
+def pt_start():
+    """নতুন ইউজারের শুরুর পয়েন্ট — সর্বোচ্চের বেশি হতে পারবে না।"""
+    return min(_pt_num("pt_start", POINT_START, 0, 100000), pt_max())
+
+def pt_approve():
+    """Task approve হলে কত পয়েন্ট বাড়বে।"""
+    return _pt_num("pt_approve", POINT_PER_APPROVE, 0, 100000)
+
+def pt_reject():
+    """Task reject হলে কত পয়েন্ট কমবে।"""
+    return _pt_num("pt_reject", POINT_PER_REJECT, 0, 100000)
+
+def pt_dup():
+    """একই ছবি আবার দিলে কত পয়েন্ট কমবে।"""
+    return _pt_num("pt_dup", POINT_DUP_PHOTO, 0, 100000)
+
+
 def add_points(uid, delta):
-    """Points বাড়াও/কমাও। 0–50 clamp। ≤ POINT_BLOCK_AT হলে block করো।
+    """Points বাড়াও/কমাও। 0..pt_max() clamp (ডিফল্ট ০–৫০)। ≤ POINT_BLOCK_AT হলে block করো।
     Atomic single-statement UPDATE — race condition নেই।
     পয়েন্ট সিস্টেম বন্ধ থাকলে (settings: points_on=off) কিছুই বদলায় না।"""
     if not points_on():
         try:
             with _c() as c:
                 r = c.execute("SELECT points FROM users WHERE user_id=%s", (uid,)).fetchone()
-            return int(r["points"] or 0) if r else POINT_START
+            return int(r["points"] or 0) if r else pt_start()
         except Exception:
-            return POINT_START
+            return pt_start()
+    _mx, _st = pt_max(), pt_start()   # Settings → পয়েন্ট সেটিংস
     with _c() as c:
         r = c.execute(
             "UPDATE users SET points=GREATEST(0, LEAST(%s, COALESCE(points,%s)+%s)) "
             "WHERE user_id=%s RETURNING points",
-            (POINT_START, POINT_START, delta, uid)
+            (_mx, _st, delta, uid)
         ).fetchone()
-        new_pts = r["points"] if r else POINT_START
+        new_pts = r["points"] if r else _st
         if delta < 0 and new_pts <= POINT_BLOCK_AT and points_block_on():
             block_dt      = datetime.now(timezone.utc) + timedelta(days=POINT_BLOCK_DAYS)
             c.execute("UPDATE users SET blocked_until=%s WHERE user_id=%s",
@@ -3063,6 +3099,36 @@ def _reset_onboarding_sync(keep_admin=True):
         except Exception:
             pass
     return n
+
+
+def _restart_user_flow(uid):
+    """একজন ইউজারকে আবার শুরু থেকে — শুধু verification/onboarding state রিসেট।
+    ⚠️ balance, points, referred_by/রেফারেল, task ও withdraw ইতিহাস, ban, ডিভাইস/IP —
+    কোনো ডেটা ছোঁয়া হয় না। এর পর ওই ইউজার /start চাপলে নতুন ইউজারের মতো ফ্লো পাবে।"""
+    try:
+        uid = int(uid)
+    except Exception:
+        return False
+    if uid <= 0:
+        return False
+    try:
+        with _c() as c:
+            c.execute("UPDATE users SET vrf_pass=0, verified=0, verified_at='', "
+                      "vrf_notice_build='' WHERE user_id=%s", (uid,))
+    except Exception as e:
+        log.warning(f"[RESTART] uid={uid} রিসেট ব্যর্থ: {e}")
+        return False
+    for _d in (_user_cache, _lang_cache, _VRF_PROMPT_TS, _VRF_WELCOME_TS, _VRF_SILENT_MEMO):
+        try:
+            _d.pop(uid, None)
+        except Exception:
+            pass
+    try:
+        _vrf_mark_signals_done(uid)   # পুরোনো 'verify শেষ' সিগন্যাল আগে মেনু পাঠাবে না
+    except Exception:
+        pass
+    log.info(f"[RESTART] uid={uid} শুরু থেকে চালু (টাকা/পয়েন্ট/রেফার অক্ষত)")
+    return True
 
 def bot_is_on():
     """bot_status — get_setting cache ব্যবহার করে (60s TTL, set_setting এ invalidate হয়)।
@@ -3599,14 +3665,14 @@ async def _auto_reject_duplicate_photo(update, ctx, uid, task_name, prev_sub, la
     """ক্রস-ইউজার ডুপ্লিকেট ছবি — insert-এর আগে ডাকো।
     ইউজারকে reject জানাও + পয়েন্ট কাটো + অ্যাডমিনকে অ্যালার্ট দাও।
     DB তে নতুন row/slot খরচ হয় না (কিছুই লেখা হয় না), শুধু পয়েন্ট কমে।"""
-    new_pts = await asyncio.to_thread(add_points, uid, -POINT_DUP_PHOTO)
+    new_pts = await asyncio.to_thread(add_points, uid, -pt_dup())
     if lang == 'en':
         _blk = (f"\n🚫 *Points reached 0! Tasks blocked for {POINT_BLOCK_DAYS} days.*"
                 if new_pts <= POINT_BLOCK_AT else "")
         user_msg = (
             "❌ *Photo Rejected — Duplicate!*\n\n"
             "⚠️ This photo was already submitted from another account.\n\n"
-            f"🔴 *Points:* `{new_pts}/50` *(-{POINT_DUP_PHOTO})*"
+            f"🔴 *Points:* `{new_pts}/{pt_max()}` *(-{pt_dup()})*"
             f"{_blk}\n\n"
             "💡 Submit your own screenshot/photo and try again."
         )
@@ -3616,7 +3682,7 @@ async def _auto_reject_duplicate_photo(update, ctx, uid, task_name, prev_sub, la
         user_msg = (
             "❌ *ছবি Reject — ডুপ্লিকেট!*\n\n"
             "⚠️ এই ছবিটি আগেই অন্য একটি অ্যাকাউন্ট থেকে জমা হয়েছিল।\n\n"
-            f"🔴 *পয়েন্ট:* `{new_pts}/50` *(-{POINT_DUP_PHOTO})*"
+            f"🔴 *পয়েন্ট:* `{new_pts}/{pt_max()}` *(-{pt_dup()})*"
             f"{_blk}\n\n"
             "💡 নিজের স্ক্রিনশট/ছবি দিয়ে আবার চেষ্টা করুন।"
         )
@@ -3643,7 +3709,7 @@ async def _auto_reject_duplicate_photo(update, ctx, uid, task_name, prev_sub, la
             f"⛔ *এই ছবি আগে ব্যবহার হয়েছে:*\n"
             f"┌ 🔖 Sub: `#{prev_sub.get('id')}` — user `{prev_sub.get('user_id')}`\n"
             f"└ ⏳ Status: `{_ps_status}`\n\n"
-            f"🔴 *Points:* `{new_pts}/50` *(-{POINT_DUP_PHOTO})*"
+            f"🔴 *Points:* `{new_pts}/{pt_max()}` *(-{pt_dup()})*"
         )
         await notify_full_admins(ctx.bot, admin_msg)
     except Exception as _ae:
@@ -6981,72 +7047,6 @@ async def receive_wd_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(err_msg, parse_mode="Markdown")
         return
 
-    # ── Duplicate address check: সেম address অন্য user আগে use করেছে কিনা ──
-    def _db_3976():
-        addr_owner = None
-        with _c() as c:
-            addr_owner = c.execute(
-                "SELECT DISTINCT user_id FROM withdrawals WHERE address=%s AND user_id!=%s",
-                (address, uid)
-            ).fetchone()
-        return addr_owner
-    addr_owner = await asyncio.to_thread(_db_3976)
-    if addr_owner:
-        owner_id = addr_owner['user_id']
-        # ── শুধু নতুন user (এখনো কোনো approved task নেই) কে ব্যান করো ──
-        # পুরনো/বিশ্বস্ত user ভুল করলে শুধু address টা নেওয়া হবে না, ব্যান হবে না।
-        def _db_approved_cnt():
-            with _c() as _ac:
-                return _count(_ac.execute(
-                    "SELECT COUNT(*) FROM gmails WHERE user_id=%s AND status='approved'", (uid,)
-                ).fetchone())
-        _approved_tasks = await asyncio.to_thread(_db_approved_cnt)
-        _is_new_user = (_approved_tasks == 0)
-        if _is_new_user:
-            await asyncio.to_thread(ban_user, uid, 1)
-            for k in ("state", "wd_addr", "wd_amt"):
-                ctx.user_data.pop(k, None)
-            warn_msg = (
-                "🚫 *আপনার একাউন্ট ব্যান করা হয়েছে!*\n\n"
-                "⚠️ *কারণ:* আপনি এমন একটি Wallet Address দিয়েছেন যা আগে অন্য একটি একাউন্ট থেকে ব্যবহার করা হয়েছে।\n\n"
-                "❌ একটি Wallet Address একটিমাত্র Account থেকে ব্যবহার করা যাবে।\n\n"
-                "📞 *আপিল করতে:* @inkamxbd"
-                if lang == 'bn' else
-                "🚫 *Your account has been banned!*\n\n"
-                "⚠️ *Reason:* The wallet address you provided has already been used by another account.\n\n"
-                "❌ One wallet address can only be linked to one account.\n\n"
-                "📞 *To appeal:* @inkamxbd"
-            )
-            await update.message.reply_text(warn_msg, parse_mode="Markdown",
-                                            reply_markup=ReplyKeyboardRemove())
-        else:
-            # পুরনো user — ব্যান নয়, শুধু এই address গ্রহণ করা হলো না
-            ctx.user_data["state"] = "wd_addr"
-            _reuse_msg = (
-                "❌ *এই Wallet Address ব্যবহার করা যাবে না।*\n\n"
-                "⚠️ এই address আগে অন্য একটি একাউন্ট থেকে ব্যবহার করা হয়েছে।\n\n"
-                "📝 অন্য একটি USDT-BEP20 address পাঠান, অথবা /cancel লিখুন।"
-                if lang == 'bn' else
-                "❌ *This wallet address can't be used.*\n\n"
-                "⚠️ This address has already been used by another account.\n\n"
-                "📝 Send a different USDT-BEP20 address, or type /cancel."
-            )
-            await update.message.reply_text(_reuse_msg, parse_mode="Markdown")
-        # ── Admin কে notify করো ──
-        user = update.effective_user
-        uname_str = _md_esc(f"@{user.username}") if user.username else _md_esc(user.full_name or "")
-        _ban_line = ("✅ নতুন user — auto-ban হয়েছে।" if _is_new_user
-                     else "ℹ️ পুরনো user — ব্যান হয়নি, শুধু address প্রত্যাখ্যান করা হয়েছে।")
-        admin_msg = (
-            f"🚨 *Duplicate Wallet*\n\n"
-            f"👤 *User:* [{uname_str}](tg://user?id={uid}) (`{uid}`)\n"
-            f"🔗 *Address:* `{address}`\n"
-            f"⚠️ *এই Address আগে ব্যবহার করেছে:* `{owner_id}`\n\n"
-            f"{_ban_line}"
-        )
-        await notify_full_admins(ctx.bot, admin_msg)
-        return
-
     ctx.user_data["wd_addr"] = address
     ctx.user_data["state"]   = "wd_amt"
     # ── Wallet auto-save + বদল হলে ৬ ঘণ্টা payout hold নোটিশ ─────
@@ -7467,11 +7467,12 @@ async def cmd_point(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             status_txt  = "🔴 Task Blocked"
             block_line  = f"🔓 *Block lifts on:* `{until_str}`\n"
     else:
-        if pts >= 40:
+        _mx_sc = await asyncio.to_thread(pt_max)   # টায়ারও স্কোরের অনুপাতে (৫০ → ৪০/৩০/২০)
+        if pts >= _mx_sc * 0.8:
             status_txt = "🟢 Excellent" if lang == 'en' else "🟢 চমৎকার"
-        elif pts >= 30:
+        elif pts >= _mx_sc * 0.6:
             status_txt = "🟡 Good" if lang == 'en' else "🟡 ভালো"
-        elif pts >= 20:
+        elif pts >= _mx_sc * 0.4:
             status_txt = "🟠 Fair" if lang == 'en' else "🟠 মোটামুটি"
         else:
             status_txt = "🔴 Low — Be careful!" if lang == 'en' else "🔴 কম — সাবধান!"
@@ -7491,8 +7492,10 @@ async def cmd_point(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
           status=status_txt,
           block_line=block_line,
           block_rule=rule_txt,
-          reject_pts=POINT_PER_REJECT,
-          approve_pts=POINT_PER_APPROVE),
+          reject_pts=pt_reject(),
+          approve_pts=pt_approve(),
+          start_pts=pt_start(),
+          max_pts=pt_max()),
         parse_mode="Markdown"
     )
 
@@ -8505,14 +8508,51 @@ async def cmd_unban_iponly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ═════════════ নতুন বিল্ডে সবাই আবার শুরু (auto reset) ═════════════
+def _vrf_notice_backfill():
+    """একবারই চলে (settings: vrf_notice_v1) — যার কাছে বর্তমান বিল্ডের নোটিশ ইতিমধ্যে
+    গেছে তাকে মার্ক করে রাখে, যাতে /resetall বা বট আবার চালু করলে একই নোটিশ আবার না যায়।
+    ⚠️ শুধু `vrf_notice_build` কলাম বদলায় — টাকা/পয়েন্ট/রেফারেল/verify কিছুই ছোঁয় না।"""
+    try:
+        if (get_setting("vrf_notice_v1") or "") == "done":
+            return 0
+        stored = (get_setting("bot_build") or "").strip()
+        n = 0
+        if stored:
+            with _c() as c:
+                cur = c.execute(
+                    "UPDATE users SET vrf_notice_build=%s WHERE COALESCE(vrf_notice_build,'')=''",
+                    (stored,))
+                n = int(cur.rowcount or 0)
+        set_setting("vrf_notice_v1", "done")
+        log.info(f"[NOTICE] এককালীন ব্যাকফিল: {n} জন এই বিল্ডে আগেই নোটিশ পেয়েছে")
+        return n
+    except Exception as _e:
+        log.warning(f"[NOTICE] backfill ব্যর্থ: {_e}")
+        return 0
+
+
 async def _notify_reverify(bot, build=""):
-    """রিসেটের পর সব ইউজারকে একবার জানাও — /start চাপতে হবে (রেট-লিমিট মেনে)।"""
+    """রিসেটের পর সব ইউজারকে জানাও — /start চাপতে হবে (রেট-লিমিট মেনে)।
+    ⚠️ এক ইউজার এক বিল্ডে মাত্র একবার (users.vrf_notice_build মার্ক);
+    verify করে ফিরেও একই বিল্ডে আবার নোটিশ যাবে না, নতুন বিল্ডে একবার আবার যাবে।"""
     def _uids():
         with _c() as c:
             rows = c.execute(
-                "SELECT user_id FROM users WHERE user_id<>%s ORDER BY user_id", (ADMIN_ID,)
+                "SELECT user_id FROM users WHERE user_id<>%s "
+                "AND COALESCE(vrf_notice_build,'') <> %s ORDER BY user_id",
+                (ADMIN_ID, build or "")
             ).fetchall()
         return [int(r["user_id"]) for r in rows][:4000]
+
+    def _mark_sent(uids):
+        """সফলভাবে যাদের পাঠানো হলো — ওদের মার্ক, আবার যাবে না।"""
+        if not uids:
+            return 0
+        with _c() as c:
+            cur = c.execute(
+                "UPDATE users SET vrf_notice_build=%s WHERE user_id = ANY(%s)",
+                (build or "", list(uids)))
+            return int(cur.rowcount or 0)
 
     try:
         uids = await asyncio.to_thread(_uids)
@@ -8520,10 +8560,22 @@ async def _notify_reverify(bot, build=""):
         log.warning(f"[RESET] ইউজার লিস্ট ব্যর্থ: {e}")
         return
     if not uids:
+        # সবার কাছে এই বিল্ডে নোটিশ ইতিমধ্যে গেছে → আবার যাবে না
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                "✅ *নতুন নোটিশ পাঠানো হয়নি*\n\n"
+                "সবার কাছে এই বিল্ডের নোটিশ ইতিমধ্যে গেছে — এক ইউজার এক বিল্ডে একবারই।\n"
+                "নতুন বিল্ডে সবাই একবার আবার পাবে।\n"
+                "(রিসেট কাজ করেছে — তারা /start চাপলেই verify করতে পারবে)",
+                parse_mode="Markdown")
+        except Exception:
+            pass
         return
     log.info(f"[RESET] {len(uids)} জনকে re-verify নোটিশ পাঠাচ্ছি…")
     sem = asyncio.Semaphore(6)
     sent = [0]
+    done: list[int] = []   # যাদের পাঠানো হয়েছে (আঠারো batch ধরে ব্যাচ-স্কোপ)
 
     async def _one(uid):
         async with sem:
@@ -8541,12 +8593,18 @@ async def _notify_reverify(bot, build=""):
                            "✅ আপনার ব্যালান্স, পয়েন্ট, রেফারেল — সব অক্ষত আছে।")
                 await bot.send_message(uid, txt, parse_mode="Markdown")
                 sent[0] += 1
+                done.append(uid)
             except Exception:
                 pass
             await asyncio.sleep(0.04)
 
     for i in range(0, len(uids), 40):
+        done = []                      # এই ব্যাচে সফল হলেই মার্ক — আবার যাবে না
         await asyncio.gather(*[_one(x) for x in uids[i:i + 40]], return_exceptions=True)
+        try:
+            await asyncio.to_thread(_mark_sent, done)
+        except Exception as _me:
+            log.warning(f"[RESET] notice mark ব্যর্থ: {_me}")
         await asyncio.sleep(0.5)
     log.info(f"[RESET] re-verify নোটিশ গেছে {sent[0]}/{len(uids)} জনকে")
     try:
@@ -8558,27 +8616,38 @@ async def _notify_reverify(bot, build=""):
 
 
 async def _maybe_reset_on_update(bot):
-    """বটের বিল্ড বদলালে সব ইউজার আবার নতুন করে শুরু করবে (প্রতি বিল্ডে একবারই)।"""
+    """বিল্ড বদলালে শুধু অ্যাডমিনকে জানায় — *নোটিশ কখনো অটো যায় না*।
+    আপনি যখন চাপবেন (/resetall বা নিচের বাটন) তখনই সবাই রিসেট + নতুন verify নোটিশ পাবে।
+    (Settings → Update reset = on থাকলে শুধু রিসেট অটো হয়, নোটিশ তবুও ম্যানুয়াল।)"""
     try:
         await asyncio.sleep(10)   # বট পুরোপুরি চালু হতে দাও
         stored = await asyncio.to_thread(get_setting, "bot_build")
         if (stored or "") == BOT_BUILD:
             return
-        enabled = (await asyncio.to_thread(get_setting, "reset_on_update") or "on") != "off"
+        auto = (str(await asyncio.to_thread(get_setting, "reset_on_update") or "off")
+                .strip().lower() in ("on", "1", "yes", "true"))
         n = 0
-        if enabled:
+        if auto:
             n = await asyncio.to_thread(_reset_onboarding_sync, True)
         await asyncio.to_thread(set_setting, "bot_build", BOT_BUILD)
-        head = "🔄 *নতুন আপডেট — সবাই আবার শুরু থেকে*" if enabled else "ℹ️ *নতুন আপডেট*"
-        txt = (f"{head}\n\nbuild: `{BOT_BUILD}`\nআগের build: `{stored or '-'}`\n\n"
-               + (f"♻️ {n} জন ইউজারকে আবার verify করতে হবে।\n"
-                  "💰 ব্যালান্স, পয়েন্ট, রেফারেল — কিছুই মোছা হয়নি।\n"
-                  "📣 সবাইকে নোটিশ পাঠানো হচ্ছে।" if enabled else
-                  "⏭ ইউজার রিসেট বন্ধ আছে (Settings → Update reset)।"))
-        log.info(f"[RESET] build {stored or '-'} → {BOT_BUILD}, reset={enabled}, users={n}")
-        await bot.send_message(ADMIN_ID, txt, parse_mode="Markdown")
-        if enabled and n:
-            await _notify_reverify(bot, BOT_BUILD)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("♻️ রিসেট + সবাইকে নোটিশ পাঠাও", callback_data="resetall_yes")],
+            [InlineKeyboardButton("⏭ এখন না", callback_data="resetall_no")],
+        ])
+        if auto:
+            head = "🔄 *নতুন বিল্ড — অটো রিসেট হয়েছে*"
+            body = (f"♻️ {n} জন ইউজারকে আবার verify করতে হবে।\n"
+                    "💰 ব্যালান্স, পয়েন্ট, রেফারেল — কিছুই মোছা হয়নি।\n\n"
+                    "📣 *নোটিশ পাঠানো হয়নি* — আপনি যখন চাইবেন তখন নিচের বাটনে চাপুন।")
+        else:
+            head = "🆕 *নতুন বিল্ড আপলোড হয়েছে*"
+            body = ("কাউকে রিসেট করা হয়নি, কোনো নোটিশও যায়নি।\n"
+                    "যখন সবাইকে আবার verify করাতে চান — নিচের বাটনে চাপুন (বা /resetall)।\n\n"
+                    "• সবাই আবার একবার verify করবে\n"
+                    "• 💰 ব্যালান্স, পয়েন্ট, রেফারেল — কিছুই মোছা হবে না")
+        log.info(f"[RESET] build {stored or '-'} → {BOT_BUILD}, auto_reset={auto}, users={n}")
+        await bot.send_message(ADMIN_ID, f"{head}\n\nbuild: `{BOT_BUILD}`\nআগের: `{stored or '-'}`\n\n{body}",
+                               parse_mode="Markdown", reply_markup=kb)
     except Exception as e:
         log.warning(f"[RESET] build reset ব্যর্থ: {e}")
 
@@ -8858,6 +8927,62 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await asyncio.to_thread(is_admin, uid):
         return  # non-admin কে কোনো reply নেই — command সম্পূর্ণ invisible
     await send_admin_panel(update.message, uid)
+
+
+async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin — একজন ইউজারকে এখনই শুরু থেকে চালু (টাকা/পয়েন্ট/রেফারেল অক্ষত)।"""
+    u = update.effective_user
+    if not u:
+        return
+    try:
+        if not await asyncio.to_thread(is_admin, u.id):
+            return
+    except Exception:
+        return
+    args = ctx.args or []
+    if not args or not (args[0] or "").strip().isdigit():
+        await update.message.reply_text(
+            "🔄 *একজন ইউজারকে শুরু থেকে চালু*\n\n"
+            "ব্যবহার: `/restart <user_id>`\n\n"
+            "• ওই ইউজার আবার verify করবে\n"
+            "• বটে /start দিলে নতুন ইউজারের মতো শুরু হবে\n"
+            "• *টাকা, পয়েন্ট, রেফারেল, টাস্ক হিস্ট্রি — কিছুই মুছবে না*\n\n"
+            "উদাহরণ: `/restart 123456789`", parse_mode="Markdown")
+        return
+    tgt = int(args[0])
+    if tgt == int(u.id):
+        await update.message.reply_text("❌ নিজের অ্যাকাউন্ট রিসেট করার দরকার নেই।")
+        return
+    row = await asyncio.to_thread(get_user, tgt)
+    if not row:
+        await update.message.reply_text(f"❌ ইউজার `{tgt}` পাওয়া যায়নি।", parse_mode="Markdown")
+        return
+    ok = await asyncio.to_thread(_restart_user_flow, tgt)
+    if not ok:
+        await update.message.reply_text("❌ রিসেট ব্যর্থ — লগ দেখুন।")
+        return
+    try:
+        lang = await asyncio.to_thread(get_lang, tgt)
+    except Exception:
+        lang = "bn"
+    msg = ("🔄 *আপনার অ্যাকাউন্ট শুরু থেকে চালু হয়েছে*\n\n"
+           "👉 এখন /start চাপুন — নতুন ইউজারের মতোই আবার verify করবেন।\n"
+           "💰 আপনার টাকা, পয়েন্ট ও রেফারেল সব সুরক্ষিত আছে।" if lang != "en" else
+           "🔄 *Your account has been restarted*\n\n"
+           "👉 Press /start — you will verify again like a new user.\n"
+           "💰 Your balance, points and referrals are safe.")
+    sent = True
+    try:
+        await ctx.bot.send_message(tgt, msg, parse_mode="Markdown")
+    except Exception as e:
+        sent = False
+        log.debug(f"[RESTART] ইউজারকে জানানো যায়নি uid={tgt}: {e}")
+    await update.message.reply_text(
+        f"✅ ইউজার `{tgt}` শুরু থেকে চালু হয়েছে।\n"
+        f"• আবার verify করতে হবে, /start দিলে নতুন ইউজারের মতো চলবে\n"
+        f"• টাকা / পয়েন্ট / রেফারেল অক্ষত\n"
+        f"• ইউজারকে {'মেসেজ পাঠানো হয়েছে' if sent else 'মেসেজ পাঠানো যায়নি (বট ব্লক?)'}",
+        parse_mode="Markdown")
 
 async def _show_perm_picker(msg, tgt_uid: int, ctx):
     """Show permission checkbox picker for tgt_uid."""
@@ -9698,7 +9823,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         _q_answered = False
         # bal_ok সবসময় True — user না থাকলে auto-create হয়ে balance দেওয়া হয়
         _, ref = await asyncio.gather(
-            asyncio.to_thread(add_points, guser, POINT_PER_APPROVE),
+            asyncio.to_thread(add_points, guser, pt_approve()),
             asyncio.to_thread(get_referred_by, guser),
         )
         if ref:
@@ -12638,12 +12763,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _row_ticon    = task_type_icon(_row_ttype)
         _task_display = f"{_row_ticon} {_md_esc(str(row['task_name'] or ''))}"
         # ── Point deduction ─────────────────────────────────────
-        new_pts  = await asyncio.to_thread(add_points, guser, -POINT_PER_REJECT)
+        new_pts  = await asyncio.to_thread(add_points, guser, -pt_reject())
         blocked  = new_pts <= POINT_BLOCK_AT
         # ── Notify user ─────────────────────────────────────────
         u_lang = await asyncio.to_thread(get_lang, guser)
         if u_lang == 'bn':
-            pt_line  = f"🔴 *পয়েন্ট:* `{new_pts}/50` *(-{POINT_PER_REJECT})*"
+            pt_line  = f"🔴 *পয়েন্ট:* `{new_pts}/{pt_max()}` *(-{pt_reject()})*"
             blk_line = f"\n⛔ *পয়েন্ট ০ হয়ে গেছে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*" if blocked else "\nℹ️ নিয়মগুলো পড়ে পুনরায় চেষ্টা করুন।"
             rej_msg  = (
                 f"❌ *আপনার Submission Reject হয়েছে।*\n\n"
@@ -12652,7 +12777,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"{pt_line}{blk_line}"
             )
         else:
-            pt_line  = f"🔴 *Points:* `{new_pts}/50` *(-{POINT_PER_REJECT})*"
+            pt_line  = f"🔴 *Points:* `{new_pts}/{pt_max()}` *(-{pt_reject()})*"
             blk_line = f"\n⛔ *Points reached 0! Tasks blocked for {POINT_BLOCK_DAYS} days.*" if blocked else "\nℹ️ Please re-read the rules and try again."
             rej_msg  = (
                 f"❌ *Your Submission has been Rejected.*\n\n"
@@ -12719,7 +12844,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📌 *Task:* {_md_esc(str(row['task_name'] or ''))}\n"
             f"👤 *User:* `{guser}`\n"
             f"📝 *কারণ:* {_md_esc(str(reason))}\n"
-            f"🎯 *User এর পয়েন্ট:* `{new_pts}/50`"
+            f"🎯 *User এর পয়েন্ট:* `{new_pts}/{pt_max()}`"
             + (f"\n⛔ *User {POINT_BLOCK_DAYS} দিন Block হয়েছে।*" if blocked else ""),
             parse_mode="Markdown"
         )
@@ -13433,7 +13558,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if _aid_already:
                     await update.message.reply_text(f"⚠️ *Sub `#{gid}` ইতিমধ্যে approve/reject হয়েছে।*", parse_mode="Markdown")
                     ctx.user_data.pop("state", None); return
-                await asyncio.to_thread(add_points, guser, POINT_PER_APPROVE)
+                await asyncio.to_thread(add_points, guser, pt_approve())
                 ref = await asyncio.to_thread(get_referred_by, guser)
                 if ref:
                     await _pay_commission(ctx.bot, ref, guser, price, row.get('task_name', ''))
@@ -13508,14 +13633,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 _rid_ttype = _rget(row, 'task_type', 'other')
                 _rid_ticon = task_type_icon(_rid_ttype)
                 _rid_task_display = f"{_rid_ticon} {_md_esc(str(row['task_name'] or ''))}"
-                _rid_new_pts = await asyncio.to_thread(add_points, guser, -POINT_PER_REJECT)
+                _rid_new_pts = await asyncio.to_thread(add_points, guser, -pt_reject())
                 _rid_blocked = _rid_new_pts <= POINT_BLOCK_AT
                 u_lang = await asyncio.to_thread(get_lang, guser)
                 if u_lang == 'bn':
                     _rid_msg = (
                         f"❌ *আপনার Submission Reject হয়েছে।*\n\n"
                         f"📌 *Task:* {_rid_task_display}\n\n"
-                        f"🔴 *পয়েন্ট:* `{_rid_new_pts}/50` *(-{POINT_PER_REJECT})*"
+                        f"🔴 *পয়েন্ট:* `{_rid_new_pts}/{pt_max()}` *(-{pt_reject()})*"
                         + (f"\n⛔ *পয়েন্ট ০ হয়ে গেছে! {POINT_BLOCK_DAYS} দিনের জন্য Task বন্ধ।*" if _rid_blocked
                            else "\nℹ️ নিয়মগুলো পড়ে পুনরায় চেষ্টা করুন।")
                     )
@@ -13523,7 +13648,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     _rid_msg = (
                         f"❌ *Your Submission has been Rejected.*\n\n"
                         f"📌 *Task:* {_rid_task_display}\n\n"
-                        f"🔴 *Points:* `{_rid_new_pts}/50` *(-{POINT_PER_REJECT})*"
+                        f"🔴 *Points:* `{_rid_new_pts}/{pt_max()}` *(-{pt_reject()})*"
                         + (f"\n⛔ *Points reached 0! Tasks blocked for {POINT_BLOCK_DAYS} days.*" if _rid_blocked
                            else "\nℹ️ Please re-read the rules and try again.")
                     )
@@ -18106,6 +18231,12 @@ def main():
         except Exception as _p3:
             log.debug(f"[SEC2] policy v3 ব্যর্থ: {_p3}")
 
+        # ── নোটিশ ডি-ডুপ: যার কাছে এই বিল্ডে নোটিশ গেছে আর যাবে না (একবারই) ──
+        try:
+            await asyncio.to_thread(_vrf_notice_backfill)
+        except Exception as _nb:
+            log.warning(f"[NOTICE] backfill: {_nb}")
+
         # ── নতুন বিল্ডে সব ইউজার আবার শুরু থেকে (auto reset) ──
         _reset_task = asyncio.create_task(_maybe_reset_on_update(application.bot))
         _background_tasks.add(_reset_task)
@@ -18348,6 +18479,7 @@ def main():
     app.add_handler(CommandHandler("unban_iponly", _gate(cmd_unban_iponly)))
     app.add_handler(CommandHandler("btest",       _gate(cmd_btest)))
     app.add_handler(CommandHandler("resetall",    _gate(cmd_resetall)))
+    app.add_handler(CommandHandler("restart",     _gate(cmd_restart)))
     app.add_handler(CommandHandler("vrfdiag",     _gate(cmd_vrfdiag)))
     app.add_handler(CommandHandler("admin",       _gate(cmd_admin)))
     app.add_handler(CommandHandler("cancel",      _gate(cmd_cancel)))

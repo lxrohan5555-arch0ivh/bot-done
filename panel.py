@@ -235,7 +235,23 @@ def _device_hash(payload: dict, with_did: bool = True) -> str:
     return hashlib.sha256(("|".join(parts) + "|te-v1").encode("utf-8", "ignore")).hexdigest()
 
 
-def _limit_check(uid: int, ip: str, hashes):
+def _coarse_hash(payload: dict) -> str:
+    """একই ফোন চেনার মোটা ফিঙ্গারপ্রিন্ট — ব্রাউজার/UA/localStorage did বাদ।
+    একই ফোনে ভিন্ন ব্রাউজার বা Telegram-এর ইন-অ্যাপ ব্রাউজার দিয়ে verify করলেও
+    platform+screen+dpr+cores+mem+gpu একই থাকে → ধরা পড়ে।
+    (শুধু same-IP এর সাথে মিলিয়ে ব্যবহার হয়, তাই ভিন্ন লোকের ফোন ভুলে আটকাবে না।)"""
+    parts = [
+        str(payload.get("platform", "")),
+        str(payload.get("screen", "")),
+        str(payload.get("dpr", "")),
+        str(payload.get("hw", "")),
+        str(payload.get("mem", "")),
+        str(payload.get("gpu", ""))[:90],
+    ]
+    return hashlib.sha256(("|".join(parts) + "|te-coarse-v1").encode("utf-8", "ignore")).hexdigest()
+
+
+def _limit_check(uid: int, ip: str, hashes, coarse: str = ""):
     """এক ফোন = এক অ্যাকাউন্ট, এক IP-তে সর্বোচ্চ ২ — ভাঙলে কারণ ফেরত দেয়।
     কোনো query ব্যর্থ হলে None (কাউকে ভুলভাবে আটকাবে না)।"""
     try:
@@ -259,6 +275,15 @@ def _limit_check(uid: int, ip: str, hashes):
                         (dh, uid)).fetchone()
                     n_dev = int((r2 or {}).get("n") or 0)
                 if n_dev >= max(1, dlim):
+                    return "device"
+            # ── ফলব্যাক: একই IP + একই ফোন প্রোফাইল = একই ফোন ──
+            # (ভিন্ন ব্রাউজার/ইন-অ্যাপ ব্রাউজারে localStorage did আলাদা হলেও ধরা পড়বে)
+            if coarse and ip:
+                r5 = cur.execute(
+                    "SELECT COUNT(DISTINCT user_id) AS n FROM devices "
+                    "WHERE device_hash=%s AND ip=%s AND user_id<>%s",
+                    (coarse, ip, uid)).fetchone()
+                if int((r5 or {}).get("n") or 0) >= max(1, dlim):
                     return "device"
             if ip:
                 r3 = cur.execute(
@@ -333,14 +358,18 @@ def _mark_verified(uid: int, ip: str, payload: dict):
             )
     except Exception as e:
         print(f"[verify] verifications skip uid={uid}: {e}")
-    if dev_hash:
+    try:
+        _coarse_save = _coarse_hash(payload or {})
+    except Exception:
+        _coarse_save = ""
+    for _dh in [h for h in (dev_hash, _coarse_save) if h]:
         try:
             with _db() as cur:
                 cur.execute(
                     "INSERT INTO devices (user_id, device_hash, ua, platform, first_seen, last_seen, ip) "
                     "VALUES (%s,%s,%s,%s,%s,%s,%s) "
                     "ON CONFLICT (user_id, device_hash) DO UPDATE SET last_seen=EXCLUDED.last_seen, ip=EXCLUDED.ip",
-                    (uid, dev_hash, str((payload or {}).get("ua", ""))[:300],
+                    (uid, _dh, str((payload or {}).get("ua", ""))[:300],
                      str((payload or {}).get("platform", ""))[:60], now_s, now_s, ip),
                 )
         except Exception as e:
@@ -689,11 +718,13 @@ def verify_done(token):
         return jsonify({"ok": True, "already": True})
     # ── ১ ফোন = ১ অ্যাকাউন্ট, এক IP-তে ২ — ভাঙলে verify হবে না ──
     _hashes = []
+    _coarse = ""
     try:
         _hashes = [_device_hash(payload), _device_hash(payload, with_did=False)]
+        _coarse = _coarse_hash(payload)
     except Exception:
         _hashes = []
-    _block = _limit_check(uid, ip, _hashes)
+    _block = _limit_check(uid, ip, _hashes, _coarse)
     if _block:
         try:
             with _db() as cur:
