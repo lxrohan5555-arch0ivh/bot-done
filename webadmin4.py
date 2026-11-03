@@ -11,7 +11,7 @@ from flask import request, redirect, Response
 from webadmin import (
     wadm, page, guard, table, badge, esc, icon, num, money, one, many, scal, _x,
     log_admin, pager, st_badge, review_card, review_tokens, review_apply,
-    review_counts, review_kpi,
+    review_counts, review_kpi, _fire_settings_changed, _fire_review_changed,
 )
 
 _DDL = (
@@ -58,6 +58,7 @@ _DDL = (
     "ALTER TABLE ig_submissions ADD COLUMN IF NOT EXISTS paid INTEGER DEFAULT 1",
     "ALTER TABLE ig_submissions ADD COLUMN IF NOT EXISTS notified INTEGER DEFAULT 1",
     "ALTER TABLE ig_submissions ADD COLUMN IF NOT EXISTS reviewed_at TEXT DEFAULT ''",
+    "ALTER TABLE ig_tasks ADD COLUMN IF NOT EXISTS video_url TEXT DEFAULT ''",
 )
 _READY = [False]
 
@@ -145,7 +146,7 @@ def _text_to_fields(txt):
     return out or DEFAULT_FIELDS
 
 
-_NAME_MODES = ("fixed", "upload", "random")
+_NAME_MODES = ("auto", "fixed", "upload", "random")
 
 
 def _mode(v):
@@ -209,14 +210,19 @@ def _form(task=None):
     esc(t.get('rules_bn') or '')}</textarea></div>
 <div class='form'><label>Rules (English) — খালি রাখলে বাংলাটাই দেখাবে</label>
   <textarea name='rules_en' rows='4'>{esc(t.get('rules_en') or '')}</textarea></div>
+<div class='form'><label>📽 Video instruction — লিংক (YouTube/Drive)</label>
+  <input name='video_url' value='{v('video_url')}' placeholder='https://youtu.be/...'>
+  <p class='mut' style='font-size:11px'>ইউজার Rules স্ক্রিনে “📽 Video instruction” বাটন দেখবে, চাপলে এই লিংক খুলবে।
+    খালি রাখলে বাটনটাই দেখাবে না।</p></div>
 
 <h3 style='margin-top:16px'>👤 ইউজারকে দেওয়া Username (বট দেয়)</h3>
 <p class='mut' style='font-size:11px'>বট এই লিস্ট থেকে Username বেছে ইউজারকে দেয় — দেওয়ার <b>আগেই</b> চেক করে ওই নামে Instagram-এ অ্যাকাউন্ট আছে কি না (থাকলে পরের নাম নেয়া হয়) এবং এই টাস্কে আগে জমা হয়েছে কি না। ইউজার চাইলে নিচের 🔄 বাটনে <b>১ বার</b> বদলাতে পারে।</p>
 <div class='grid g2'>
   <div class='form'><label>Username — মোড</label><select name='username_mode'>
-    <option value='fixed' {'selected' if (t.get('username_mode') or 'fixed') == 'fixed' else ''}>Fixed (সবাই একই)</option>
-    <option value='upload' {'selected' if (t.get('username_mode') or '') == 'upload' else ''}>আপলোড (লিস্ট ধরে ধরে, ঘুরে ঘুরে)</option>
-    <option value='random' {'selected' if (t.get('username_mode') or '') == 'random' else ''}>Random (লিস্ট থেকে এলোমেলো)</option>
+    <option value='auto' {'selected' if (t.get('username_mode') or 'auto') == 'auto' else ''}>🤖 Auto — বট নিজেই ইউজারনেম বানাবে (কিছু লিখতে হবে না)</option>
+    <option value='fixed' {'selected' if (t.get('username_mode') or 'auto') == 'fixed' else ''}>Fixed (সবাই একই)</option>
+    <option value='upload' {'selected' if (t.get('username_mode') or 'auto') == 'upload' else ''}>আপলোড (লিস্ট ধরে ধরে, ঘুরে ঘুরে)</option>
+    <option value='random' {'selected' if (t.get('username_mode') or 'auto') == 'random' else ''}>Random (লিস্ট থেকে এলোমেলো)</option>
   </select></div>
   <div class='form'><label>Username (fixed হলে)</label>
     <input name='username' value='{v('username')}' placeholder='johhrpv67'></div>
@@ -260,7 +266,7 @@ def _form(task=None):
 <div class='grid g2'>
   <div class='form'><label>সর্বোচ্চ মোট অ্যাকাউন্ট (0 = আনলিমিটেড)</label>
     <input name='max_accounts' type='number' min='0' value='{v('max_accounts', '0')}'></div>
-  <div class='form'><label>প্রতি ইউজার সর্বোচ্চ অ্যাকাউন্ট</label>
+  <div class='form'><label>প্রতি ইউজার সর্বোচ্চ অ্যাকাউন্ট (0 = আনলিমিটেড)</label>
     <input name='per_user_limit' type='number' min='0' value='{v('per_user_limit', '1')}'></div>
 </div>
 
@@ -270,7 +276,9 @@ def _form(task=None):
   <p class='mut' style='font-size:11px'>যে কলাম চান না সেটার ঘর <b>ফাঁকা</b> রাখুন। একই নাম্বার দুইবার দিলে
     তালিকার ক্রম অনুযায়ী সাজবে। Sheet/CSV-র হেডার হবে ঠিক এই ক্রমেই।</p></div>
 <div class='form'><label>Google Sheet Web App URL (Apps Script — খালি রাখলে শুধু CSV/ফাইল)</label>
-  <input name='sheet_url' value='{v('sheet_url')}' placeholder='https://script.google.com/macros/s/.../exec'></div>
+  <input name='sheet_url' value='{v('sheet_url')}' placeholder='https://script.google.com/macros/s/.../exec'>
+  <p class='mut' style='font-size:11px'>লিংক বানানোর রেডি কোড + ধাপ: <a href='/admin/sheethelp'
+    target='_blank'><b>📄 Apps Script কোড দেখুন / কপি করুন</b></a></p></div>
 <div class='form'><label>প্রতিদিন অটো ফাইল পাঠানোর সময় (খালি = বন্ধ)</label>
   <input name='export_time' type='time' value='{esc(t.get('export_time') or '')}'></div>
 
@@ -383,6 +391,7 @@ def _save(tid=None):
         "name": (f.get("name") or "").strip(),
         "rules_bn": (f.get("rules_bn") or "").strip(),
         "rules_en": (f.get("rules_en") or "").strip(),
+        "video_url": (f.get("video_url") or "").strip(),
         "price": float(f.get("price") or 0),
         "username_mode": _mode(f.get("username_mode")),
         "username": _clean_user(f.get("username")),
@@ -402,8 +411,17 @@ def _save(tid=None):
     if not data["name"]:
         return None
     if tid:
+        _old = one("SELECT password FROM ig_tasks WHERE id=%s", (tid,)) or {}
+        _old_pw = str(_old.get("password") or "")
         sets = ", ".join(f"{k}=%s" for k in data)
         _x(f"UPDATE ig_tasks SET {sets} WHERE id=%s", tuple(data.values()) + (tid,))
+        # পাসওয়ার্ড বদলালে pending জমাগুলোও নতুন পাসওয়ার্ড পাবে → শিটে নতুন সারি যাবে
+        if _old_pw != str(data.get("password") or ""):
+            try:
+                _x("UPDATE ig_submissions SET ig_password=%s, synced=0 "
+                   "WHERE task_id=%s AND status='pending'", (data.get("password"), tid))
+            except Exception:
+                pass
         return tid
     cols = ", ".join(data.keys())
     ph = ", ".join(["%s"] * len(data))
@@ -460,6 +478,7 @@ def igtask_new():
         if not tid:
             return page("New Instagram Task", _form(), "igtasks", err="নাম দিন")
         log_admin("igtask_add", tid, "instagram task created")
+        _fire_settings_changed(["ig_task"])
         return redirect(f"/admin/igtask/{tid}?ok=সেভ হয়েছে")
     return page("New Instagram Task", _form(), "igtasks")
 
@@ -473,6 +492,7 @@ def igtask_edit(tid):
     if request.method == "POST":
         if _save(tid):
             log_admin("igtask_edit", tid, "instagram task updated")
+            _fire_settings_changed(["ig_task"])
             return redirect(f"/admin/igtask/{tid}?ok=সেভ হয়েছে")
         return page("Edit Instagram Task", _form(one("SELECT * FROM ig_tasks WHERE id=%s", (tid,))),
                     "igtasks", err="নাম দিন")
@@ -510,6 +530,7 @@ def igtask_toggle(tid):
         _x("UPDATE ig_tasks SET is_active=%s WHERE id=%s",
            (0 if int(t["is_active"] or 0) else 1, tid))
         log_admin("igtask_toggle", tid, "instagram task toggled")
+        _fire_settings_changed(["ig_task"])
     return redirect(f"/admin/igtask/{tid}?ok=আপডেট হয়েছে")
 
 
@@ -521,6 +542,7 @@ def igtask_delete(tid):
     _x("DELETE FROM ig_submissions WHERE task_id=%s", (tid,))
     _x("DELETE FROM ig_tasks WHERE id=%s", (tid,))
     log_admin("igtask_delete", tid, "instagram task deleted")
+    _fire_settings_changed(["ig_task"])
     return redirect("/admin/igtasks?ok=মুছে ফেলা হয়েছে")
 
 

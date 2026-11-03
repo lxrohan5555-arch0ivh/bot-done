@@ -10,7 +10,7 @@ from flask import request, redirect, Response
 from webadmin import (
     wadm, page, guard, table, badge, esc, icon, num, money, one, many, scal, _x,
     log_admin, pager, st_badge, review_card, review_tokens, review_apply,
-    review_counts, review_kpi,
+    review_counts, review_kpi, _fire_settings_changed, _fire_review_changed,
 )
 
 _DDL = (
@@ -61,6 +61,7 @@ _DDL = (
     "ALTER TABLE fb_submissions ADD COLUMN IF NOT EXISTS paid INTEGER DEFAULT 1",
     "ALTER TABLE fb_submissions ADD COLUMN IF NOT EXISTS notified INTEGER DEFAULT 1",
     "ALTER TABLE fb_submissions ADD COLUMN IF NOT EXISTS reviewed_at TEXT DEFAULT ''",
+    "ALTER TABLE fb_tasks ADD COLUMN IF NOT EXISTS video_url TEXT DEFAULT ''",
 )
 _READY = [False]
 
@@ -84,7 +85,7 @@ DEFAULT_FIELDS = [
 # কলামের ছোট নাম — Sheet-এ হেডারও এটাই হবে
 COLUMN_CHOICES = [
     ("uid", "uid"), ("pass", "pass"), ("2fa", "2fa"), ("coki", "coki"),
-    ("sl", "SL"), ("date", "Date"), ("user_id", "Telegram ID"), ("username", "Username"),
+    ("sl", "SL"), ("date", "Date"), ("user_id", "Telegram ID"),
     ("first", "First Name"), ("last", "Last Name"), ("task", "Task"),
     ("account_no", "Account No"), ("status", "Status"),
 ]
@@ -105,6 +106,51 @@ def guess_type(key):
     if "mail" in k:
         return "email"
     return "text"
+
+_DEFAULT_COLS = ["sl", "date", "uid", "pass", "2fa", "coki", "user_id", "login_first",
+                 "login_last"]
+
+
+def _task_fields(task):
+    """এই টাস্কের ফিল্ডের লিস্ট (DB-র `fields` JSON থেকে)।"""
+    try:
+        return _text_to_fields(_fields_to_text((task or {}).get("fields")))
+    except Exception:
+        return []
+
+
+def _fld_key(task, typ):
+    """এই টাইপের ফিল্ডের key (cookies / 2fa) — না থাকলে টাইপের নামই।"""
+    for f in _task_fields(task):
+        if str(f.get("type") or guess_type(f.get("key"))) == typ:
+            return str(f.get("key") or "")
+    return typ
+
+
+def _fb_norm_cols(task, cols):
+    """FB কলাম ঠিক করো — Facebook-এ কোনো username থাকে না, আর টাস্কে 2fa/cookies
+    নেওয়া হলে সে দুটো কলাম সবসময় থাকবে (আগে না থাকায় ফাঁকা কলাম হয়ে যেত)।"""
+    cols = [str(c) for c in cols if str(c).strip()]
+    if not cols:
+        return list(_DEFAULT_COLS)
+    cols = [c for c in cols if str(c).lower() != "username"]
+    types = set()
+    for f in _task_fields(task):
+        t = str(f.get("type") or "").strip()
+        if not t:
+            k = str(f.get("key") or "").lower()
+            t = "cookies" if "cookie" in k else ("2fa" if ("2fa" in k or "totp" in k) else "")
+        types.add(t)
+    for tok in ("coki", "2fa"):
+        if tok in cols:
+            continue
+        if (tok == "coki" and "cookies" not in types) or (tok == "2fa" and "2fa" not in types):
+            continue
+        i = (cols.index("pass") + 1 if "pass" in cols
+             else (cols.index("uid") + 1 if "uid" in cols else len(cols)))
+        cols.insert(i, tok)
+    return cols or list(_DEFAULT_COLS)
+
 
 def _fields_to_text(raw):
     try:
@@ -146,7 +192,7 @@ def _tok(col):
     return c
 
 
-_NAME_MODES = ("fixed", "upload", "random")
+_NAME_MODES = ("auto", "fixed", "upload", "random")
 
 
 def _mode(v):
@@ -208,13 +254,18 @@ def _form(task=None):
     esc(t.get('rules_bn') or '')}</textarea></div>
 <div class='form'><label>Rules (English) — খালি রাখলে বাংলাটাই দেখাবে</label>
   <textarea name='rules_en' rows='4'>{esc(t.get('rules_en') or '')}</textarea></div>
+<div class='form'><label>📽 Video instruction — লিংক (YouTube/Drive)</label>
+  <input name='video_url' value='{v('video_url')}' placeholder='https://youtu.be/...'>
+  <p class='mut' style='font-size:11px'>ইউজার Rules স্ক্রিনে “📽 Video instruction” বাটন দেখবে, চাপলে এই লিংক খুলবে।
+    খালি রাখলে বাটনটাই দেখাবে না।</p></div>
 
 <h3 style='margin-top:16px'>👤 নাম</h3>
 <div class='grid g2'>
   <div class='form'><label>First name — মোড</label><select name='first_name_mode'>
-    <option value='fixed' {'selected' if (t.get('first_name_mode') or 'fixed') == 'fixed' else ''}>Fixed (সবাই একই)</option>
-    <option value='upload' {'selected' if (t.get('first_name_mode') or '') == 'upload' else ''}>আপলোড (লিস্ট ধরে ধরে, ঘুরে ঘুরে)</option>
-    <option value='random' {'selected' if (t.get('first_name_mode') or '') == 'random' else ''}>Random (লিস্ট থেকে এলোমেলো)</option>
+    <option value='auto' {'selected' if (t.get('first_name_mode') or 'auto') == 'auto' else ''}>🤖 Auto — বট নিজেই নাম বানাবে (লিস্ট দিলে সেটাই ঘুরে ঘুরে)</option>
+    <option value='fixed' {'selected' if (t.get('first_name_mode') or 'auto') == 'fixed' else ''}>Fixed (সবাই একই)</option>
+    <option value='upload' {'selected' if (t.get('first_name_mode') or 'auto') == 'upload' else ''}>আপলোড (লিস্ট ধরে ধরে, ঘুরে ঘুরে)</option>
+    <option value='random' {'selected' if (t.get('first_name_mode') or 'auto') == 'random' else ''}>Random (লিস্ট থেকে এলোমেলো)</option>
   </select></div>
   <div class='form'><label>First name (fixed হলে)</label>
     <input name='first_name' value='{v('first_name')}' placeholder='Clayton'></div>
@@ -227,9 +278,10 @@ def _form(task=None):
     (এক লাইনে একটা, বা CSV-র প্রথম কলাম)। ১০০ নাম দিলে ১০০টি কাজ আলাদা নাম পাবে, পরেরগুলো আবার শুরু থেকে।</p></div>
 <div class='grid g2'>
   <div class='form'><label>Last name — মোড</label><select name='last_name_mode'>
-    <option value='fixed' {'selected' if (t.get('last_name_mode') or 'fixed') == 'fixed' else ''}>Fixed</option>
-    <option value='upload' {'selected' if (t.get('last_name_mode') or '') == 'upload' else ''}>আপলোড (ঘুরে ঘুরে)</option>
-    <option value='random' {'selected' if (t.get('last_name_mode') or '') == 'random' else ''}>Random</option>
+    <option value='auto' {'selected' if (t.get('last_name_mode') or 'auto') == 'auto' else ''}>🤖 Auto — বট নিজেই (লিস্ট দিলে সেটাই)</option>
+    <option value='fixed' {'selected' if (t.get('last_name_mode') or 'auto') == 'fixed' else ''}>Fixed</option>
+    <option value='upload' {'selected' if (t.get('last_name_mode') or 'auto') == 'upload' else ''}>আপলোড (ঘুরে ঘুরে)</option>
+    <option value='random' {'selected' if (t.get('last_name_mode') or 'auto') == 'random' else ''}>Random</option>
   </select></div>
   <div class='form'><label>Last name (fixed হলে)</label>
     <input name='last_name' value='{v('last_name')}' placeholder='Chambers'></div>
@@ -267,7 +319,7 @@ def _form(task=None):
 <div class='grid g2'>
   <div class='form'><label>সর্বোচ্চ মোট অ্যাকাউন্ট (0 = আনলিমিটেড)</label>
     <input name='max_accounts' type='number' min='0' value='{v('max_accounts', '0')}'></div>
-  <div class='form'><label>প্রতি ইউজার সর্বোচ্চ অ্যাকাউন্ট</label>
+  <div class='form'><label>প্রতি ইউজার সর্বোচ্চ অ্যাকাউন্ট (0 = আনলিমিটেড)</label>
     <input name='per_user_limit' type='number' min='0' value='{v('per_user_limit', '1')}'></div>
 </div>
 
@@ -276,8 +328,12 @@ def _form(task=None):
   {col_grid}
   <p class='mut' style='font-size:11px'>যে কলাম চান না সেটার ঘর <b>ফাঁকা</b> রাখুন। একই নাম্বার দুইবার দিলে
     তালিকার ক্রম অনুযায়ী সাজবে। Sheet/CSV-র হেডার হবে ঠিক এই ক্রমেই।</p></div>
-<div class='form'><label>Google Sheet Web App URL (Apps Script — খালি রাখলে শুধু CSV/ফাইল)</label>
-  <input name='sheet_url' value='{v('sheet_url')}' placeholder='https://script.google.com/macros/s/.../exec'></div>
+<div class='form'><label>Google Sheet Web App URL — (ঐচ্ছিক, খালি রাখলেও চলবে)</label>
+  <input name='sheet_url' value='{v('sheet_url')}' placeholder='https://script.google.com/macros/s/.../exec'>
+  <p class='mut' style='font-size:11px'>🛑 লিংক দিতে হবে না — জমা তথ্য <b>বটেই অটো সেভ</b> থাকে।
+    দেখতে/নিতে সাবমিশন পেজের <b>⬇️ ডাউনলোড</b> চাপলেই হবে (UID, Password, Cookies, 2FA সহ)।</p>
+  <p class='mut' style='font-size:11px'>লিংক বানানোর রেডি কোড + ধাপ: <a href='/admin/sheethelp'
+    target='_blank'><b>📄 Apps Script কোড দেখুন / কপি করুন</b></a></p></div>
 <div class='form'><label>প্রতিদিন অটো ফাইল পাঠানোর সময় (খালি = বন্ধ)</label>
   <input name='export_time' type='time' value='{esc(t.get('export_time') or '')}'></div>
 
@@ -306,9 +362,10 @@ def _col_rows(task):
     """Sheet-এর কলামের তালিকা — প্রতিটির সাথে "ক্রম" নাম্বার (১ = প্রথম কলাম)।"""
     t = task or {}
     try:
-        cols = [str(c) for c in json.loads(t.get("sheet_columns") or "[]")]
+        _raw = [str(c) for c in json.loads(t.get("sheet_columns") or "[]")]
     except Exception:
-        cols = []
+        _raw = []
+    cols = _fb_norm_cols(t, _raw)
     rows, seen = [], set()
 
     def add(tok, label, hint=""):
@@ -378,6 +435,7 @@ def _save(tid=None):
         "name": (f.get("name") or "").strip(),
         "rules_bn": (f.get("rules_bn") or "").strip(),
         "rules_en": (f.get("rules_en") or "").strip(),
+        "video_url": (f.get("video_url") or "").strip(),
         "price": float(f.get("price") or 0),
         "first_name_mode": _mode(f.get("first_name_mode")),
         "first_name": (f.get("first_name") or "").strip(),
@@ -401,8 +459,17 @@ def _save(tid=None):
     if not data["name"]:
         return None
     if tid:
+        _old = one("SELECT password FROM fb_tasks WHERE id=%s", (tid,)) or {}
+        _old_pw = str(_old.get("password") or "")
         sets = ", ".join(f"{k}=%s" for k in data)
         _x(f"UPDATE fb_tasks SET {sets} WHERE id=%s", tuple(data.values()) + (tid,))
+        # পাসওয়ার্ড বদলালে pending জমাগুলোও নতুন পাসওয়ার্ড পাবে → শিটে নতুন সারি যাবে
+        if _old_pw != str(data.get("password") or ""):
+            try:
+                _x("UPDATE fb_submissions SET fb_password=%s, synced=0 "
+                   "WHERE task_id=%s AND status='pending'", (data.get("password"), tid))
+            except Exception:
+                pass
         return tid
     cols = ", ".join(data.keys())
     ph = ", ".join(["%s"] * len(data))
@@ -459,6 +526,7 @@ def fbtask_new():
         if not tid:
             return page("New Facebook Task", _form(), "fbtasks", err="নাম দিন")
         log_admin("fbtask_add", tid, "facebook task created")
+        _fire_settings_changed(["fb_task"])
         return redirect(f"/admin/fbtask/{tid}?ok=সেভ হয়েছে")
     return page("New Facebook Task", _form(), "fbtasks")
 
@@ -472,6 +540,7 @@ def fbtask_edit(tid):
     if request.method == "POST":
         if _save(tid):
             log_admin("fbtask_edit", tid, "facebook task updated")
+            _fire_settings_changed(["fb_task"])      # বটে সাথে সাথে কার্যকর
             return redirect(f"/admin/fbtask/{tid}?ok=সেভ হয়েছে")
         return page("Edit Facebook Task", _form(one("SELECT * FROM fb_tasks WHERE id=%s", (tid,))),
                     "fbtasks", err="নাম দিন")
@@ -490,7 +559,7 @@ def fbtask_edit(tid):
     links = (
         f"<div class='card'><div class='row'><a class='btn gray' href='/admin/fbtask/{tid}/subs'>"
         "📋 জমা তথ্য দেখুন</a>"
-        f"<a class='btn gray' href='/admin/fbtask/{tid}/export.csv'>⬇️ CSV Download</a>"
+        f"<a class='btn gray' href='/admin/fbtask/{tid}/export.csv'>⬇️ ডাউনলোড (CSV)</a>"
         "<form method='post' action='/admin/do/fbtask/%d/toggle' style='display:inline'>"
         "<button class='btn gray'>%s</button></form></div></div>"
         % (tid, "⏸ বন্ধ করুন" if int(t.get("is_active") or 0) else "▶️ চালু করুন")
@@ -508,6 +577,7 @@ def fbtask_toggle(tid):
         _x("UPDATE fb_tasks SET is_active=%s WHERE id=%s",
            (0 if int(t["is_active"] or 0) else 1, tid))
         log_admin("fbtask_toggle", tid, "facebook task toggled")
+        _fire_settings_changed(["fb_task"])
     return redirect(f"/admin/fbtask/{tid}?ok=আপডেট হয়েছে")
 
 
@@ -519,6 +589,7 @@ def fbtask_delete(tid):
     _x("DELETE FROM fb_submissions WHERE task_id=%s", (tid,))
     _x("DELETE FROM fb_tasks WHERE id=%s", (tid,))
     log_admin("fbtask_delete", tid, "facebook task deleted")
+    _fire_settings_changed(["fb_task"])
     return redirect("/admin/fbtasks?ok=মুছে ফেলা হয়েছে")
 
 
@@ -541,6 +612,11 @@ def fbtask_subs(tid):
         "ORDER BY s.id DESC LIMIT 100 OFFSET %s", (tid, (p - 1) * 100))
     trs = []
     for s in rows:
+        try:
+            _d = json.loads(s.get("data") or "{}")
+        except Exception:
+            _d = {}
+        _ck = str(_d.get(_fld_key(t, "cookies"), "") or _d.get("cookies", "") or "")
         trs.append([
             f"<span class='mono'>{esc(str(s.get('created_at') or ''))}</span>",
             f"<a class='mono' href='/admin/user/{int(s['user_id'])}'>{int(s['user_id'])}</a>"
@@ -548,6 +624,8 @@ def fbtask_subs(tid):
             num(s.get("account_no") or 0),
             f"<span class='mono'>{esc(s.get('fb_uid') or '-')}</span>",
             f"<span class='mono'>{esc(s.get('fb_password') or '-')}</span>",
+            (f"<span class='mono' style='font-size:11px' title='{esc(_ck)}'>"
+             f"{esc(_ck[:24] + ('…' if len(_ck) > 24 else '')) or '-'}</span>"),
             esc(f"{s.get('login_first') or ''} {s.get('login_last') or ''}".strip() or "-"),
             f"<span class='mono'>{esc(s.get('login_password') or '-')}</span>",
             st_badge(s.get("status")),
@@ -560,8 +638,8 @@ def fbtask_subs(tid):
         + review_card(tid, "fb")
         + f"<div class='card'><div class='row' style='justify-content:space-between'>"
         f"<h3>{esc(t['name'])} — জমা তথ্য</h3>"
-        f"<a class='btn gray sm' href='/admin/fbtask/{tid}/export.csv'>⬇️ CSV</a></div>"
-        + table(["Date", "User", "Acc#", "Facebook UID", "FB Password",
+        f"<a class='btn gray sm' href='/admin/fbtask/{tid}/export.csv'>⬇️ ডাউনলোড</a></div>"
+        + table(["Date", "User", "Acc#", "Facebook UID", "FB Password", "Cookies",
                  "Login Name", "Login Pass", "Status", "Sheet", ""], trs,
                 "এখনো কোনো জমা নেই")
         + pager(f"/admin/fbtask/{tid}/subs", p, len(rows) == 100)
@@ -620,19 +698,48 @@ def fbtask_export(tid):
         return page("Not found", "<div class='card'>Task নেই</div>", "fbtasks", status=404)
     import csv, io
     try:
-        cols = json.loads(t.get("sheet_columns") or "[]")
+        _raw = json.loads(t.get("sheet_columns") or "[]")
     except Exception:
-        cols = []
-    cols = [str(c) for c in cols if str(c).strip()] or [
-        "sl", "date", "uid", "password", "user_id", "username",
-        "login_first", "login_last", "login_password"]
-    labels = {"sl": "SL", "date": "Date", "user_id": "Telegram ID", "username": "Username",
-              "task": "Task", "account_no": "Account No", "login_first": "First Name",
-              "login_last": "Last Name", "login_password": "Login Password",
-              "uid": "Facebook UID", "password": "Facebook Password", "status": "Status"}
+        _raw = []
+    cols = _fb_norm_cols(t, _raw)          # username বাদ, 2fa/coki যোগ
+    labels = {"sl": "SL", "date": "Date", "user_id": "Telegram ID",
+              "tg_username": "Username", "task": "Task", "account_no": "Account No",
+              "login_first": "First Name", "login_last": "Last Name",
+              "login_password": "Login Password", "uid": "Facebook UID",
+              "pass": "Password", "password": "Facebook Password",
+              "2fa": "2FA", "coki": "Cookies", "cookies": "Cookies", "status": "Status"}
     subs = many(
         "SELECT s.*, COALESCE(u.username,'') AS username FROM fb_submissions s "
         "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s ORDER BY s.id ASC", (tid,))
+
+    def _val(c, i, s, data):
+        if c.startswith("f:"):
+            return data.get(c[2:], "")
+        cl = c.lower()
+        if cl == "sl":
+            return i
+        if cl == "task":
+            return t.get("name", "")
+        if cl in ("uid", "fb_uid"):
+            return s.get("fb_uid", "") or data.get("uid", "")
+        if cl in ("pass", "password", "pw", "fb_pass"):
+            return s.get("fb_password", "") or s.get("login_password", "")
+        if cl in ("2fa", "totp"):
+            return data.get(_fld_key(t, "2fa"), "") or data.get("2fa", "")
+        if cl in ("coki", "cookies", "cookie"):
+            return data.get(_fld_key(t, "cookies"), "") or data.get("cookies", "")
+        if cl in ("date", "created_at"):
+            return s.get("created_at", "")
+        if cl in ("first", "login_first", "fname"):
+            return s.get("login_first", "")
+        if cl in ("last", "login_last", "lname"):
+            return s.get("login_last", "")
+        if cl in ("username", "tg_username"):
+            return s.get("username", "")
+        if cl == "user_id":
+            return s.get("user_id", "")
+        return s.get(c, "") or data.get(c, "")
+
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow([labels.get(c, c[2:].replace("_", " ").title() if c.startswith("f:") else c)
@@ -642,23 +749,7 @@ def fbtask_export(tid):
             data = json.loads(s.get("data") or "{}")
         except Exception:
             data = {}
-        out = []
-        for c in cols:
-            if c.startswith("f:"):
-                out.append(data.get(c[2:], ""))
-            elif c == "sl":
-                out.append(i)
-            elif c == "task":
-                out.append(t.get("name", ""))
-            elif c == "uid":
-                out.append(s.get("fb_uid", ""))
-            elif c == "password":
-                out.append(s.get("fb_password", ""))
-            elif c == "username":
-                out.append(s.get("username", ""))
-            else:
-                out.append(s.get(c, ""))
-        w.writerow(out)
+        w.writerow([_val(c, i, s, data) for c in cols])
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(t.get("name") or tid))[:40]
     data = ("\ufeff" + buf.getvalue()).encode("utf-8")
     return Response(data, mimetype="text/csv",
@@ -674,3 +765,83 @@ try:
         _MENU.insert(_idx + 1, ("fbtasks", "/admin/fbtasks", "Facebook Tasks", "task", ""))
 except Exception:
     pass
+
+
+# ══════════════════ Google Sheet — রেডি Apps Script (প্যানেলেই কপি) ══════════════════
+SHEET_SCRIPT = """function doPost(e) {
+  var d = JSON.parse(e.postData.contents);
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var name = (d.sheet || d.task || 'Sheet1').substring(0, 95);
+  var sh = ss.getSheetByName(name) || ss.insertSheet(name);
+  var cols = d.columns || [], row = d.row || [];
+  sh.getRange(1, 1, 1, cols.length).setValues([cols]);
+  sh.getRange(sh.getLastRow() + 1, 1, 1, row.length).setValues([row]);
+  sh.setFrozenRows(1);
+  return ContentService.createTextOutput('{"ok":true}')
+    .setMimeType(ContentService.MimeType.JSON);
+}
+"""
+
+
+def _sheet_help_body():
+    """Apps Script কোড + ধাপে ধাপে নির্দেশ (কপি বাটনসহ)।"""
+    steps = (
+        "<ol style='line-height:1.9;font-size:13px;padding-left:20px'>"
+        "<li>যে Google Sheet-এ ডেটা যাবে সেটা খুলুন।</li>"
+        "<li>মেনু থেকে <b>Extensions → Apps Script</b>।</li>"
+        "<li>ভেতরের সব মুছে <b>উপরের কোডটা পেস্ট</b> করুন → <b>Save</b>।</li>"
+        "<li><b>Deploy → New deployment</b> → gear ⚙️ → <b>Web app</b>।"
+        "<br>Execute as: <b>Me</b> · Who has access: <b>Anyone</b> → <b>Deploy</b> → Allow।</li>"
+        "<li>যে লিংক (<code>.../exec</code>) আসবে কপি করুন।</li>"
+        "<li>এই পেজ থেকে ফিরে টাস্কের <b>Google Sheet Web App URL</b> ঘরে লিংকটা পেস্ট করে Save।</li>"
+        "<li>বটে <code>/sheettest fb &lt;id&gt;</code> দিয়ে যাচাই করুন।</li>"
+        "</ol>"
+        "<p class='mut' style='font-size:12px'>কোড বদলালে: <b>Deploy → Manage deployments → "
+        "✏️ Edit → Version: New version → Deploy</b> (লিংক একই থাকে)।</p>"
+    )
+    return (
+        "<div class='card'><h3>" + icon('task') + " Google Sheet — Apps Script কোড</h3>"
+        "<p class='mut' style='font-size:12px'>এই কোডটা <b>বটের ভেতরে নয়</b> — শুধু Google "
+        "Sheet-এর Apps Script-এ একবার বসাতে হয়। তারপর প্রতিটা টাস্কের Sheet URL ঘরে লিংক দিলেই "
+        "কলাম-অর্ডার অনুযায়ী সারি জমা হবে (পাসওয়ার্ড বদলের তারিখে নতুন ট্যাব)।</p>"
+        "<button class='btn' onclick=\"navigator.clipboard.writeText("
+        "document.getElementById('sheet-script').innerText);"
+        "this.innerText='✅ কপি হয়েছে'\">📋 কোড কপি করুন</button>"
+        "<pre id='sheet-script' style='white-space:pre-wrap;background:#0f172a;color:#e2e8f0;"
+        "padding:14px;border-radius:10px;font-size:12px;line-height:1.6;margin-top:12px;"
+        "overflow:auto'>" + esc(SHEET_SCRIPT) + "</pre></div>"
+        "<div class='card'><h3>📋 ধাপে ধাপে</h3>" + steps + "</div>"
+    )
+
+
+@wadm.route("/admin/sheethelp", methods=["GET", "POST"])
+def sheethelp():
+    g = guard()
+    if g:
+        return g
+    ok = request.args.get("ok")
+    if request.method == "POST":
+        _url = (request.form.get("sheet_default_url") or "").strip()
+        try:
+            _x("INSERT INTO settings (key, value) VALUES ('sheet_default_url', %s) "
+               "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (_url,))
+            log_admin("sheet_default_url", _url[:120])
+        except Exception:
+            pass
+        return redirect("/admin/sheethelp?ok=1")
+    try:
+        _cur = (one("SELECT value FROM settings WHERE key='sheet_default_url'") or {}).get("value") or ""
+    except Exception:
+        _cur = ""
+    _form = (
+        "<div class='card'><h3>🔗 সব টাস্কের জন্য একটাই Sheet URL</h3>"
+        "<p class='mut' style='font-size:12px'>এখানে লিংকটা একবার দিলে <b>যে টাস্কে আলাদা "
+        "URL দেওয়া নেই</b> সেগুলোর সব ডেটা এই লিংকেই যাবে (প্রতিটা টাস্কের নিজের ট্যাব হবে)। "
+        "টাস্কে আলাদা URL দিলে সেটাই আগে ব্যবহার হবে।</p>"
+        "<form method='post'><div class='form'><label>Default Sheet URL</label>"
+        "<input name='sheet_default_url' value='" + esc(_cur) + "' "
+        "placeholder='https://script.google.com/macros/s/.../exec'></div>"
+        "<button class='btn' type='submit'>💾 সেভ করুন</button></form></div>"
+    )
+    return page("Sheet Script", _form + _sheet_help_body(), "fbtasks",
+                toast=("✅ সেভ হয়েছে" if ok else None))

@@ -121,7 +121,8 @@ def _setting(cur, key, default=None):
     if hit and now_ts - hit[1] < _PAGE_CACHE_SECONDS:
         return hit[0]
     try:
-        row = cur.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
+        cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
+        row = cur.fetchone()
         val = row["value"] if row else None
     except Exception:
         val = None
@@ -228,9 +229,10 @@ def _geo_cached(cur, ip: str):
     if _is_private_ip(ip):
         return None
     try:
-        row = cur.execute(
+        cur.execute(
             "SELECT country_code, country, city, isp FROM ip_geo_cache WHERE ip=%s", (ip,)
-        ).fetchone()
+        )
+        row = cur.fetchone()
     except Exception:
         row = None
     if row:
@@ -311,14 +313,16 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = "", ua: str = ""):
             except Exception:
                 ilim = 2
             for dh in [h for h in (hashes or []) if h]:
-                r1 = cur.execute(
+                cur.execute(
                     "SELECT COUNT(DISTINCT user_id) AS n FROM devices "
-                    "WHERE device_hash=%s AND user_id<>%s", (dh, uid)).fetchone()
+                    "WHERE device_hash=%s AND user_id<>%s", (dh, uid))
+                r1 = cur.fetchone()
                 n_dev = int((r1 or {}).get("n") or 0)
                 if n_dev == 0:
-                    r2 = cur.execute(
+                    cur.execute(
                         "SELECT COUNT(*) AS n FROM users WHERE device_hash=%s AND user_id<>%s",
-                        (dh, uid)).fetchone()
+                        (dh, uid))
+                    r2 = cur.fetchone()
                     n_dev = int((r2 or {}).get("n") or 0)
                 if n_dev >= max(1, dlim):
                     return "device"
@@ -329,28 +333,32 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = "", ua: str = ""):
             except Exception:
                 strict_on = True
             if strict_on and coarse and ua:
-                r6 = cur.execute(
+                cur.execute(
                     "SELECT COUNT(DISTINCT user_id) AS n FROM devices "
                     "WHERE device_hash=%s AND ua=%s AND user_id<>%s",
-                    (coarse, ua, uid)).fetchone()
+                    (coarse, ua, uid))
+                r6 = cur.fetchone()
                 if int((r6 or {}).get("n") or 0) >= max(1, dlim):
                     return "device"
             # ── ফলব্যাক: একই IP + একই ফোন প্রোফাইল = একই ফোন ──
             # (ভিন্ন ব্রাউজার/ইন-অ্যাপ ব্রাউজারে localStorage did আলাদা হলেও ধরা পড়বে)
             if coarse and ip:
-                r5 = cur.execute(
+                cur.execute(
                     "SELECT COUNT(DISTINCT user_id) AS n FROM devices "
                     "WHERE device_hash=%s AND ip=%s AND user_id<>%s",
-                    (coarse, ip, uid)).fetchone()
+                    (coarse, ip, uid))
+                r5 = cur.fetchone()
                 if int((r5 or {}).get("n") or 0) >= max(1, dlim):
                     return "device"
             if ip:
-                r3 = cur.execute(
+                cur.execute(
                     "SELECT COUNT(DISTINCT user_id) AS n FROM user_ips "
-                    "WHERE ip=%s AND user_id<>%s", (ip, uid)).fetchone()
-                r4 = cur.execute(
+                    "WHERE ip=%s AND user_id<>%s", (ip, uid))
+                r3 = cur.fetchone()
+                cur.execute(
                     "SELECT COUNT(*) AS n FROM users WHERE (last_ip=%s OR reg_ip=%s) "
-                    "AND user_id<>%s", (ip, ip, uid)).fetchone()
+                    "AND user_id<>%s", (ip, ip, uid))
+                r4 = cur.fetchone()
                 n_ip = max(int((r3 or {}).get("n") or 0), int((r4 or {}).get("n") or 0))
                 if n_ip >= max(2, ilim):
                     try:
@@ -451,13 +459,14 @@ def _mark_verified(uid: int, ip: str, payload: dict):
             _ua_s = str((payload or {}).get("ua", ""))[:300]
             _plat_s = str((payload or {}).get("platform", ""))[:60]
             with _db() as cur:
-                _upd = cur.execute(
+                cur.execute(
                     "UPDATE devices SET last_seen=%s, ip=%s, "
                     "ua=CASE WHEN COALESCE(ua,'')='' THEN %s ELSE ua END, "
                     "platform=CASE WHEN COALESCE(platform,'')='' THEN %s ELSE platform END "
                     "WHERE user_id=%s AND device_hash=%s",
                     (now_s, ip, _ua_s, _plat_s, uid, _dh),
                 )
+                _upd = cur
                 if int(getattr(_upd, "rowcount", 0) or 0) == 0:
                     cur.execute(
                         "INSERT INTO devices (user_id, device_hash, ua, platform, "
@@ -504,7 +513,8 @@ def _mark_pass(uid: int):
 def _already_verified(uid: int) -> bool:
     try:
         with _db() as cur:
-            row = cur.execute("SELECT verified FROM users WHERE user_id=%s", (uid,)).fetchone()
+            cur.execute("SELECT verified FROM users WHERE user_id=%s", (uid,))
+            row = cur.fetchone()
         return bool(row and int(row["verified"] or 0) == 1)
     except Exception:
         return False
@@ -517,7 +527,8 @@ def _ip_banned(ip: str) -> bool:
         return False
     try:
         with _db() as cur:
-            row = cur.execute("SELECT 1 AS x FROM ip_bans WHERE ip=%s", (ip,)).fetchone()
+            cur.execute("SELECT 1 AS x FROM ip_bans WHERE ip=%s", (ip,))
+            row = cur.fetchone()
         return bool(row)
     except Exception:
         return False

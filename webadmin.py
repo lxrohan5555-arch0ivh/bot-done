@@ -459,7 +459,22 @@ def set_review_hook(fn):
     _REVIEW_HOOK = fn
 
 
+def _bump_sync(kind, val=""):
+    """বটের কাছে সিঙ্ক-সিগন্যাল (bot_meta-তে version stamp)।
+
+    hook কাজ না করলেও (আলাদা প্রসেস/রিস্টার্ট-মাঝে) বট এই stamp দেখে ৫ সেকেন্ডে
+    নিজের cache পরিষ্কার করে — তাই ওয়েবে বদলানো সব কিছু বটে ১০০% কাজ করে।
+    """
+    try:
+        _x("INSERT INTO bot_meta (key,value) VALUES (%s,%s) "
+           "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+           (kind, str(val or int(time.time() * 1000))))
+    except Exception:
+        pass
+
+
 def _fire_review_changed():
+    _bump_sync("review_ver")
     if _REVIEW_HOOK:
         try:
             _REVIEW_HOOK()
@@ -468,6 +483,7 @@ def _fire_review_changed():
 
 
 def _fire_settings_changed(keys=None):
+    _bump_sync("cfg_ver")
     agg_clear()
     _CHROME.pop("key", None)     # admin key বদলালে ক্যাশেও সাথে সাথে
     try:
@@ -486,6 +502,7 @@ def _fire_settings_changed(keys=None):
 
 
 def _fire_user_changed(uid):
+    _bump_sync("user_ver", f"{int(uid)}:{int(time.time() * 1000)}")
     agg_clear()
     if _USER_HOOK:
         try:
@@ -620,6 +637,153 @@ def guard():
     return None if authed() else login_page()
 
 
+# ───────────────── panel security (gate · throttle · headers) ─────────────────
+COOKIE_GATE     = "teb_gate"
+_GATE_LABEL     = "teb-panel-gate-v1"
+_LOGIN_FAILS    = {}          # ip → {"n": ভুল সংখ্যা, "until": lock শেষ সময়}
+_LOGIN_LOCK     = threading.Lock()
+LOGIN_MAX_FAILS = 5           # ৫ বার ভুল → ১৫ মিনিট লক
+LOGIN_LOCK_MIN  = 15
+
+
+def _is_https():
+    try:
+        if request.is_secure:
+            return True
+        return (request.headers.get("X-Forwarded-Proto") or "").lower() == "https"
+    except Exception:
+        return False
+
+
+def panel_secret():
+    """প্যানেলের গোপন এন্ট্রি-কী — `/admin?k=<secret>` ছাড়া প্যানেল খোলে না।"""
+    s = (os.environ.get("PANEL_URL_SECRET") or "").strip()
+    if s:
+        return s
+    _ck, _ts = _CHROME.get("psecret", ("", 0.0))
+    if _ck and (time.time() - _ts) < _CHROME_KEY_TTL:
+        return _ck
+    try:
+        r = one("SELECT value FROM settings WHERE key=%s", ("panel_url_secret",))
+        s = ((r["value"] if r else "") or "").strip()
+        if not s:
+            s = base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
+            _x("INSERT INTO settings (key,value) VALUES ('panel_url_secret',%s) "
+               "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (s,))
+        _CHROME["psecret"] = (s, time.time())
+        return s
+    except Exception:
+        return ""
+
+
+def _gate_token(secret):
+    return hmac.new(secret.encode(), _GATE_LABEL.encode(), hashlib.sha256).hexdigest()
+
+
+def _gate_ok():
+    try:
+        s = panel_secret()
+        if not s:
+            return True
+        c = request.cookies.get(COOKIE_GATE, "")
+        return bool(c) and hmac.compare_digest(c, _gate_token(s))
+    except Exception:
+        return True          # DB সমস্যায় অ্যাডমিন যেন লকআউট না হয়
+
+
+def _login_blocked(ip):
+    """লক থাকলে কত মিনিট বাকি — 0 মানে ব্লক নেই।"""
+    with _LOGIN_LOCK:
+        e = _LOGIN_FAILS.get(ip)
+        if not e:
+            return 0
+        left = int(e.get("until", 0) - time.time())
+    return (left // 60) + 1 if left > 0 else 0
+
+
+def _login_fail(ip):
+    with _LOGIN_LOCK:
+        if len(_LOGIN_FAILS) > 2000:
+            _LOGIN_FAILS.clear()
+        e = _LOGIN_FAILS.setdefault(ip, {"n": 0, "until": 0.0})
+        e["n"] = int(e.get("n", 0)) + 1
+        if e["n"] >= LOGIN_MAX_FAILS:
+            e["until"] = time.time() + LOGIN_LOCK_MIN * 60
+        return e["n"], e["n"] >= LOGIN_MAX_FAILS
+
+
+def _login_ok(ip):
+    with _LOGIN_LOCK:
+        _LOGIN_FAILS.pop(ip, None)
+
+
+@wadm.before_request
+def _panel_security_gate():
+    """১) গোপন লিংক (?k=) ২) CSRF (cross-site POST ব্লক)।"""
+    if not request.path.startswith("/admin"):
+        return None
+    secret = ""
+    try:
+        secret = panel_secret()
+    except Exception:
+        secret = ""
+    if secret:
+        got = (request.args.get("k") or "").strip()
+        if got and hmac.compare_digest(got, secret):
+            args = request.args.to_dict(flat=True)
+            args.pop("k", None)
+            from urllib.parse import urlencode
+            qs = urlencode(args)
+            resp = redirect(request.path + (("?" + qs) if qs else ""))
+            resp.set_cookie(COOKIE_GATE, _gate_token(secret), max_age=365 * 86400,
+                            httponly=True, samesite="Strict",
+                            secure=_is_https(), path="/")
+            try:
+                log_admin("panel_gate_open", 0, client_ip())
+            except Exception:
+                pass
+            return resp
+        if not _gate_ok():
+            # ভুল/গায়েব লিংক → 404 (প্যানেল আছে বোঝাও যাবে না)
+            return Response("Not Found", status=404, mimetype="text/plain")
+    if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+        org = (request.headers.get("Origin") or request.headers.get("Referer") or "")
+        if org:
+            try:
+                from urllib.parse import urlparse
+                netloc = (urlparse(org).netloc or "").lower()
+            except Exception:
+                netloc = ""
+            if netloc and netloc != (request.host or "").lower():
+                return Response("Forbidden — cross-site request blocked",
+                                status=403, mimetype="text/plain")
+    return None
+
+
+@wadm.after_request
+def _panel_security_headers(resp):
+    if not request.path.startswith("/admin"):
+        return resp
+    try:
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        resp.headers.setdefault("Permissions-Policy",
+                                "camera=(), microphone=(), geolocation=()")
+        resp.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; connect-src 'self'; "
+            "frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        resp.headers.setdefault("Cache-Control", "no-store, max-age=0, must-revalidate")
+        if _is_https():
+            resp.headers.setdefault("Strict-Transport-Security",
+                                    "max-age=31536000; includeSubDomains")
+    except Exception:
+        pass
+    return resp
+
+
 # ───────────────────────────── layout ─────────────────────────────
 MENU = [
     ("MAIN", []),
@@ -749,16 +913,38 @@ def root():
 
 @wadm.route("/admin/login", methods=["POST"])
 def login():
+    ip = client_ip()
+    wait = _login_blocked(ip)
+    if wait:
+        return login_page(f"অনেকবার ভুল হয়েছে — {wait} মিনিট পর আবার চেষ্টা করুন।", status=429)
     u = (request.form.get("username") or "").strip()
     p = (request.form.get("password") or "").strip()
-    if u.lower() not in (admin_user().lower(), "admin") or not hmac.compare_digest(p, admin_key()):
-        return login_page("ভুল username বা password।")
+    ok_user = u.lower() in (admin_user().lower(), "admin")
+    ok_pass = False
+    try:
+        ok_pass = hmac.compare_digest(p, admin_key())
+    except Exception:
+        ok_pass = False
+    if not (ok_user and ok_pass):
+        time.sleep(0.5)                      # brute-force ধীর করো
+        n, locked = _login_fail(ip)
+        left = max(0, LOGIN_MAX_FAILS - n)
+        if locked:
+            msg = f"অনেকবার ভুল — {LOGIN_LOCK_MIN} মিনিটের জন্য ব্লক করা হলো।"
+        else:
+            msg = f"ভুল username বা password। আর {left} বার ভুল হলে {LOGIN_LOCK_MIN} মিনিট ব্লক হবে।"
+        try:
+            log_admin("web_login_fail", 0, ip)
+        except Exception:
+            pass
+        return login_page(msg, status=429 if locked else 401)
+    _login_ok(ip)
     days = 7 if request.form.get("remember") else SESSION_HOURS / 24
     exp = int(time.time()) + int(days * 86400)
     r = make_response(redirect("/admin/"))
     r.set_cookie(COOKIE, f"{exp}.{_sign(exp)}", max_age=int(days * 86400),
-                 httponly=True, samesite="Lax")
-    log_admin("web_login", 0, client_ip())
+                 httponly=True, samesite="Strict", secure=_is_https(), path="/")
+    log_admin("web_login", 0, ip)
     return r
 
 

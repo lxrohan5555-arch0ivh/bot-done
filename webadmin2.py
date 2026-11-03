@@ -1,6 +1,7 @@
 """Admin Panel বাকি পাতা — devices, ips, countries, alerts, tasks, earnings,
 withdrawals, referrals, logs, settings। একই blueprint-এ যোগ হয় (wadm)।
 """
+import os
 import time
 
 from flask import request, redirect, Response
@@ -493,6 +494,8 @@ def withdrawals():
                 + where + " ORDER BY w.id DESC LIMIT 120", args)
     counts = {k: scal("SELECT COUNT(*) FROM withdrawals WHERE status=%s", (k,))
               for k in ("pending", "approved", "rejected")}
+    # "All" ট্যাবের কাউন্ট (counts[''] না থাকায় পেজটা KeyError-এ 500 হতো)
+    counts[""] = scal("SELECT COUNT(*) FROM withdrawals")
     sums = {k: sfloat("SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE status=%s", (k,))
             for k in ("pending", "approved", "rejected")}
     trs = [[f"#{int(r['id'])}",
@@ -579,6 +582,16 @@ def logs():
 
 
 # ───────────────────────── settings ─────────────────────────
+def _secret_link():
+    """প্যানেলের গোপন এন্ট্রি-লিংক (সেটিংস পেজে দেখানোর জন্য)।"""
+    try:
+        from webadmin import panel_secret
+        sec = (panel_secret() or "").strip()
+        if not sec:
+            return request.host_url.rstrip("/") + "/admin"
+        return request.host_url.rstrip("/") + "/admin?k=" + sec
+    except Exception:
+        return request.host_url.rstrip("/") + "/admin"
 @wadm.route("/admin/settings", methods=["GET"])
 def settings():
     g = guard()
@@ -600,6 +613,10 @@ def settings():
         "</div>"
         "<div class='form'><label>Username</label>"
         f"<input value='{esc(__import__('os').environ.get('ADMIN_WEB_USER') or 'admin')}' disabled></div>"
+        "<div class='form'><label>🔒 গোপন লিংক (এটা ছাড়া প্যানেল খোলে না)</label>"
+        f"<input value='{esc(_secret_link())}' readonly onclick='this.select()'>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>এই লিংক কারো সাথে শেয়ার করবেন না। "
+        "ভুলে গেলে বটে <b>/webadmin</b> পাঠালে আবার পাবেন।</p></div>"
         "<button type='submit' style='margin-top:10px'>Save Access</button></form></div>"
         "<div class='card'><h3>" + icon("shield") + " Verification & Security</h3>"
         "<form method='post' action='/admin/do/settings'>"
@@ -749,3 +766,281 @@ def settings_save():
         saved.append("task_notify_daily_max")
     log_admin("settings_save", 0, ",".join(saved))
     return redirect("/admin/settings?ok=Settings+saved")
+# ───────────────── Task Logs — কে কখন কী জমা দিয়েছে + বাল্ক ডিলিট ─────────────────
+# • approve/reject হওয়ার সাথে সাথে জমার ভেতরের ডেটা (পাসওয়ার্ড/কুকি/ইমেইল/ফটো) মুছে যায়
+# • এখানে থেকে যায়: কে, কবে/কখন জমা, কখন approve, কোন টাস্ক, কোনটা approved/rejected
+# • ☑️ দিয়ে বেছে একবারে ৫০টা ডিলিট করা যায় → ডেটাবেস ছোট থাকে
+# • পুরো পেজে মাত্র ২টা DB query (list + per-task summary) — DB/RAM চাপ কম
+_UNION = (
+    "SELECT * FROM ("
+    "SELECT 'gmail' AS k, id, user_id, COALESCE(task_name,'Gmail Task') AS task, "
+    "COALESCE(amount,0) AS amount, COALESCE(status,'pending') AS status, "
+    "COALESCE(submitted_at,'') AS ts, COALESCE(NULLIF(approved_at,''),'') AS rev, '' AS ident "
+    "FROM gmails "
+    "UNION ALL "
+    "SELECT 'fb', s.id, s.user_id, COALESCE(t.name,'Facebook Task'), COALESCE(t.price,0), "
+    "COALESCE(s.status,'pending'), COALESCE(s.created_at,''), "
+    "COALESCE(NULLIF(s.reviewed_at,''),''), COALESCE(s.fb_uid,'') "
+    "FROM fb_submissions s LEFT JOIN fb_tasks t ON t.id=s.task_id "
+    "UNION ALL "
+    "SELECT 'ig', s.id, s.user_id, COALESCE(t.name,'Instagram Task'), COALESCE(t.price,0), "
+    "COALESCE(s.status,'pending'), COALESCE(s.created_at,''), "
+    "COALESCE(NULLIF(s.reviewed_at,''),''), COALESCE(s.ig_username,'') "
+    "FROM ig_submissions s LEFT JOIN ig_tasks t ON t.id=s.task_id "
+    "UNION ALL "
+    "SELECT 'tg', c.id, c.user_id, COALESCE(t.name,'TG Task'), COALESCE(t.price,0), "
+    "'approved', COALESCE(c.done_at,''), COALESCE(c.done_at,''), '' "
+    "FROM tg_task_completions c LEFT JOIN tg_tasks t ON t.id=c.task_id"
+    ") u"
+)
+_LOG_TBLS = {"gmail": "gmails", "fb": "fb_submissions",
+             "ig": "ig_submissions", "tg": "tg_task_completions"}
+_LOG_LABEL = {"gmail": "📧 Gmail", "fb": "📘 Facebook",
+              "ig": "📸 Instagram", "tg": "✈️ Telegram"}
+_LOG_MAX_DEL = 50        # একবারে সর্বোচ্চ ৫০টা ডিলিট
+_LOG_ROWS    = 120       # এক পাতায় সর্বোচ্চ কত সারি (মেমরি কম রাখতে)
+_LOG_TASKS   = 40        # per-task summary-তে সর্বোচ্চ কত টাস্ক
+
+
+def _log_rows(kind, st):
+    """সব টাইপ একসাথে এক query-তে — kind/status ফিল্টারও DB-তেই।"""
+    sql = ("SELECT * FROM (" + _UNION + ") w "
+           "WHERE (%s='all' OR w.k=%s) AND (%s='all' OR w.status=%s) "
+           "ORDER BY w.ts DESC LIMIT %s")
+    return many(sql, (kind, kind, st, st, _LOG_ROWS))
+
+
+def _log_summary():
+    """(per-status counts, per-type counts, per-task rows) — এক query-তেই।"""
+    rows = many_cached("tasklogs_sum",
+                       "SELECT k, task, status, COUNT(*) AS n FROM (" + _UNION + ") w "
+                       "GROUP BY k, task, status")
+    cnt = {"pending": 0, "approved": 0, "rejected": 0}
+    per = {}
+    tasks = {}
+    for r in rows:
+        k = str(r.get("k") or "")
+        stt = str(r.get("status") or "pending").strip().lower()
+        n = int(r.get("n") or 0)
+        cnt[stt] = cnt.get(stt, 0) + n
+        per[k] = per.get(k, 0) + n
+        key = (k, str(r.get("task") or "-"))
+        t = tasks.setdefault(key, {"total": 0, "pending": 0, "approved": 0, "rejected": 0})
+        t["total"] += n
+        t[stt] = t.get(stt, 0) + n
+    trows = sorted(tasks.items(), key=lambda x: x[1]["total"], reverse=True)[:_LOG_TASKS]
+    return cnt, per, trows
+
+
+_LOG_TABLES = {"gmail": ("gmails", "submitted_at"),
+               "fb": ("fb_submissions", "created_at"),
+               "ig": ("ig_submissions", "created_at"),
+               "tg": ("tg_task_completions", "done_at")}
+_LOG_ARCH = {
+    "gmail": ("CASE WHEN COALESCE(status,'')='approved' THEN 1 ELSE 0 END",
+              "CASE WHEN COALESCE(status,'')='rejected' THEN 1 ELSE 0 END"),
+    "fb": ("CASE WHEN COALESCE(status,'')='approved' THEN 1 ELSE 0 END",
+           "CASE WHEN COALESCE(status,'')='rejected' THEN 1 ELSE 0 END"),
+    "ig": ("CASE WHEN COALESCE(status,'')='approved' THEN 1 ELSE 0 END",
+           "CASE WHEN COALESCE(status,'')='rejected' THEN 1 ELSE 0 END"),
+    "tg": ("1", "0"),
+}
+
+
+def _archive_selected(k, ids):
+    """ডিলিটের *আগে* কাউন্ট archive — লিডারবোর্ড/রেফার/প্রোমোর হিসাব কমবে না।"""
+    tbl, tsc = _LOG_TABLES[k]
+    day = "LEFT(COALESCE(" + tsc + ",''),10)"
+    ok, rj = _LOG_ARCH[k]
+    ph = ",".join(["%s"] * len(ids))
+    _x("INSERT INTO task_archive_counts (user_id,day,kind,n_approved,n_rejected,updated_at) "
+       "SELECT user_id, " + day + ", %s, SUM(" + ok + "), SUM(" + rj + "), %s FROM " + tbl +
+       " WHERE id IN (" + ph + ") AND COALESCE(user_id,0) <> 0 "
+       "GROUP BY user_id, " + day +
+       " HAVING SUM(" + ok + ") + SUM(" + rj + ") > 0 "
+       "ON CONFLICT (user_id,day,kind) DO UPDATE SET "
+       "n_approved = task_archive_counts.n_approved + EXCLUDED.n_approved, "
+       "n_rejected = task_archive_counts.n_rejected + EXCLUDED.n_rejected, "
+       "updated_at = EXCLUDED.updated_at", (k, now()) + tuple(ids))
+
+
+def _tg_notify(text):
+    """অ্যাডমিনদের টেলিগ্রাম DM — সরাসরি Bot API (নতুন dependency নেই)।"""
+    import json as _json
+    import urllib.request as _ur
+    tok = (os.environ.get("BOT_TOKEN") or "").strip()
+    if not tok:
+        return 0
+    ids = set()
+    try:
+        for r in many("SELECT user_id FROM admins"):
+            ids.add(int(r["user_id"]))
+    except Exception:
+        pass
+    try:
+        import bot as _b          # একই প্রসেসে লোড থাকে — owner id
+        ids.add(int(_b.ADMIN_ID))
+    except Exception:
+        pass
+    sent = 0
+    for uid in ids:
+        try:
+            body = _json.dumps({"chat_id": uid, "text": text}).encode("utf-8")
+            req = _ur.Request("https://api.telegram.org/bot" + tok + "/sendMessage",
+                              data=body, headers={"Content-Type": "application/json"})
+            _ur.urlopen(req, timeout=8).read()
+            sent += 1
+        except Exception:
+            continue
+    return sent
+
+
+@wadm.route("/admin/task-logs", methods=["GET"])
+def task_logs():
+    g = guard()
+    if g:
+        return g
+    kind = (request.args.get("t") or "all").strip().lower()
+    if kind not in ("all", "gmail", "fb", "ig", "tg"):
+        kind = "all"
+    st = (request.args.get("st") or "all").strip().lower()
+    if st not in ("all", "pending", "approved", "rejected"):
+        st = "all"
+    cnt, per, trows = _log_summary()
+    rows = _log_rows(kind, st)
+
+    st_map = {"approved": ("ok", "Approved"), "rejected": ("err", "Rejected"),
+              "pending": ("warn", "Pending")}
+    trs = []
+    for r in rows:
+        _st = str(r.get("status") or "").lower()
+        cls, lbl = st_map.get(_st, ("mut", _st or "-"))
+        uid = int(r.get("user_id") or 0)
+        ident = str(r.get("ident") or "")
+        task_cell = esc(str(r.get("task") or "-"))
+        if ident:
+            task_cell += ("<br><span class='mono mut' style='font-size:11px'>"
+                          + esc(ident[:28]) + "</span>")
+        trs.append([
+            ("<input type='checkbox' name='sel' value='"
+             + str(r.get("k") or "") + ":" + str(int(r.get("id") or 0)) + "'>"),
+            _LOG_LABEL.get(str(r.get("k") or ""), str(r.get("k") or "")),
+            task_cell,
+            "<a class='mono' href='/admin/user/" + str(uid) + "'>#" + str(uid) + "</a>",
+            "<span class='mut'>" + esc(str(r.get("ts") or "-")[:16]) + "</span>",
+            "<span class='mut'>" + esc(str(r.get("rev") or "-")[:16]) + "</span>",
+            badge(lbl, cls),
+            money(r.get("amount")),
+        ])
+
+    ttrs = []
+    for (k, tname), c in trows:
+        ttrs.append([
+            _LOG_LABEL.get(k, k),
+            esc(tname[:40]),
+            num(c["total"]),
+            num(c.get("pending", 0)),
+            num(c.get("approved", 0)),
+            num(c.get("rejected", 0)),
+        ])
+
+    total_all = sum(per.values()) or sum(cnt.values())
+    tab_kind = "".join(
+        "<a class='" + ("on" if kind == k else "") + "' href='/admin/task-logs?t=" + k + "&st=" + st + "'>"
+        + (_LOG_LABEL.get(k, k) if k != "all" else "📋 All")
+        + " (" + num(total_all if k == "all" else per.get(k, 0)) + ")</a>"
+        for k in ("all", "gmail", "fb", "ig", "tg"))
+    tab_st = "".join(
+        "<a class='" + ("on" if st == k else "") + "' href='/admin/task-logs?t=" + kind + "&st=" + k + "'>"
+        + lbl + " (" + num(sum(cnt.values()) if k == "all" else cnt.get(k, 0)) + ")</a>"
+        for k, lbl in (("all", "All"), ("pending", "Pending"),
+                       ("approved", "Approved"), ("rejected", "Rejected")))
+
+    kpis = "".join([
+        kpi("Total", num(sum(cnt.values())), "সব টাস্ক মিলিয়ে", "logs", "#7c5cff"),
+        kpi("Pending", num(cnt.get("pending", 0)), "রিভিউ বাকি", "clock", "#f59e0b"),
+        kpi("Approved", num(cnt.get("approved", 0)), "পেইড", "check", "#22c55e"),
+        kpi("Rejected", num(cnt.get("rejected", 0)), "বাতিল", "x", "#ef4444"),
+    ])
+    js = ("<script>function tlAll(el){var n=document.querySelectorAll(\"input[name='sel']\");"
+          "for(var i=0;i<n.length;i++){n[i].checked=el.checked;}}</script>")
+    note = ("approve/reject হওয়ার সাথে সাথেই জমার ভেতরের ডেটা (পাসওয়ার্ড, কুকি, 2FA, ইমেইল, ফটো) "
+            "মুছে যায় — শুধু এই লগ থাকে: কে, কবে কখন জমা দিল, কখন approve হলো, কোন টাস্ক, "
+            "কোনটা approved/rejected। ☑️ দিয়ে বেছে <b>Delete selected</b> চাপলে এই লগও ডিলিট হবে "
+            "(একবারে সর্বোচ্চ " + str(_LOG_MAX_DEL) + "টা) — ডেটাবেস ছোট থাকবে।")
+    body = (
+        "<div class='grid g-kpi'>" + kpis + "</div>"
+        "<div class='card' style='margin-top:14px'><h3>" + icon("trend") + " কোন টাস্ক কত জন করলো</h3>"
+        + table(["Type", "Task", "Total", "Pending", "Approved", "Rejected"], ttrs,
+                "কোনো টাস্ক ডেটা নেই")
+        + "</div>"
+        "<div class='card' style='margin-top:14px'><h3>" + icon("logs") + " Task Logs</h3>"
+        "<p class='mut' style='font-size:11.5px'>" + note + "</p>"
+        "<div class='seg'>" + tab_kind + "</div>"
+        "<div class='seg' style='margin-top:8px'>" + tab_st + "</div>"
+        + js +
+        "<form method='post' action='/admin/task-logs/delete' style='margin-top:10px'>"
+        "<label class='chk' style='display:inline-block;margin-bottom:8px'>"
+        "<input type='checkbox' onclick='tlAll(this)'> সব সিলেক্ট</label>"
+        + table(["", "Type", "Task", "User", "Submitted", "Approved", "Status", "Amount"], trs,
+                "কোনো জমার লগ নেই")
+        + "<div style='margin-top:10px'>"
+          "<button class='err' type='submit'>🗑 Delete selected</button></div>"
+          "</form></div>"
+    )
+    return page("Task Logs", body, "tasklogs")
+
+
+@wadm.route("/admin/task-logs/delete", methods=["POST"])
+def task_logs_delete():
+    g = guard()
+    if g:
+        return g
+    sels = request.form.getlist("sel")
+    if not sels:
+        return redirect("/admin/task-logs?e=কিছু+সিলেক্ট+করেননি")
+    sels = sels[:_LOG_MAX_DEL]
+    groups = {}
+    for it in sels:
+        k, _, i = str(it).partition(":")
+        if k in _LOG_TBLS and i.isdigit():
+            groups.setdefault(k, []).append(int(i))
+    deleted = {}
+    for k, ids in groups.items():
+        tbl = _LOG_TBLS[k]
+        ph = ",".join(["%s"] * len(ids))
+        try:
+            _archive_selected(k, ids)      # কাউন্ট জমা রাখো (হিসাব অটুট)
+            n = scal("SELECT COUNT(*) FROM " + tbl + " WHERE id IN (" + ph + ")", tuple(ids))
+            _x("DELETE FROM " + tbl + " WHERE id IN (" + ph + ")", tuple(ids))
+            deleted[k] = int(n or 0)
+        except Exception as _e:
+            print("[task-logs] delete " + k + ": " + str(_e))
+    total = sum(deleted.values())
+    try:
+        from webadmin import agg_clear
+        agg_clear()
+    except Exception:
+        pass
+    log_admin("task_logs_delete", 0, ", ".join(k + "=" + str(v) for k, v in deleted.items()) or "0")
+    if total:
+        txt = "🗑 Task Logs ডিলিট\n\n" + "\n".join(
+            "• " + _LOG_LABEL.get(k, k) + ": " + str(v) + "টা" for k, v in deleted.items())
+        txt += "\n\n✅ মোট " + str(total) + "টা রেকর্ড ডিলিট হয়েছে (প্যানেলও আপডেট হয়েছে)।"
+        try:
+            _tg_notify(txt)
+        except Exception:
+            pass
+    msg = (str(total) + "+রেকর্ড+ডিলিট+হয়েছে") if total else "কিছু+ডিলিট+হয়নি"
+    return redirect("/admin/task-logs?ok=" + msg)
+
+
+# ── মেনুতে যোগ (Task Statistics এর পরে) ──
+try:
+    from webadmin import MENU as _MENU_TL
+    if not any(isinstance(r, tuple) and len(r) == 5 and r[0] == "tasklogs" for r in _MENU_TL):
+        _i = next((i for i, r in enumerate(_MENU_TL)
+                   if isinstance(r, tuple) and r[0] == "taskstats"), len(_MENU_TL))
+        _MENU_TL.insert(_i + 1, ("tasklogs", "/admin/task-logs", "Task Logs", "logs", ""))
+except Exception:
+    pass
