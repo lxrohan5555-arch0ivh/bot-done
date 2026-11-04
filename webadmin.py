@@ -957,6 +957,10 @@ def _panel_security_gate():
     """১) গোপন লিংক (?k=) ২) CSRF (cross-site POST ব্লক)।"""
     if not request.path.startswith("/admin"):
         return None
+    try:
+        request.environ["_teb_t0"] = time.time()     # ⏱️ স্লো পেজ খুঁজতে
+    except Exception:
+        pass
     secret = ""
     try:
         secret = panel_secret()
@@ -999,6 +1003,14 @@ def _panel_security_gate():
 def _panel_security_headers(resp):
     if not request.path.startswith("/admin"):
         return resp
+    try:
+        _t0p = request.environ.get("_teb_t0")
+        if _t0p:
+            _dtp = time.time() - _t0p
+            if _dtp > 1.5:
+                print(f"[SLOW] panel {request.method} {request.path} {_dtp:.2f}s")
+    except Exception:
+        pass
     try:
         resp.headers.setdefault("X-Frame-Options", "DENY")
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -1305,6 +1317,47 @@ def badge(text, kind="mut"):
     return f"<span class='badge b-{kind}'>{esc(text)}</span>"
 
 
+def queue_task_notify(kind, task_id):
+    """বটকে বলি — এই টাস্কের আপডেট সব verified ইউজারকে জানাও (queue টেবিলে row)।"""
+    try:
+        _x("CREATE TABLE IF NOT EXISTS task_notify_queue (id BIGSERIAL PRIMARY KEY, "
+           "kind TEXT DEFAULT '', task_id BIGINT DEFAULT 0, created_at TEXT DEFAULT '', "
+           "processed INTEGER DEFAULT 0)")
+    except Exception:
+        pass
+    try:
+        _x("INSERT INTO task_notify_queue (kind, task_id, created_at, processed) "
+           "VALUES (%s,%s,%s,0)",
+           (str(kind), int(task_id), time.strftime("%Y-%m-%d %H:%M:%S")))
+        return True
+    except Exception:
+        return False
+
+
+def _rget(row, key, default=None):
+    """row থেকে নিরাপদে মান — কলাম না থাকলেও ক্র্যাশ নয়।"""
+    try:
+        v = row[key]
+        return default if v is None else v
+    except Exception:
+        return default
+
+
+def ip_tag(mobile=-1, vpn=-1):
+    """IP-এর পাশে ধরন — 🛡️ VPN / 📶 মোবাইল / 🏠 Wi-Fi (অজানা হলে কিছুই না)।"""
+    try:
+        mobile, vpn = int(mobile), int(vpn)
+    except Exception:
+        return ""
+    if vpn == 1:
+        return " " + badge("VPN ব্যবহার করছে", "err")
+    if mobile == 1:
+        return " " + badge("মোবাইল", "mut")
+    if mobile == 0 and vpn == 0:
+        return " " + badge("Wi-Fi", "ok")
+    return ""
+
+
 def spark(values, color="#7c5cff"):
     vals = [float(v or 0) for v in values] or [0]
     n = len(vals)
@@ -1378,13 +1431,19 @@ def pager(base, page_no, has_next, q="", extra=""):
 
 # ───────────────────────────── dashboard ─────────────────────────────
 def user_rows(where="", args=(), limit=50, offset=0):
-    return many(
-        "SELECT user_id, username, full_name, balance, points, is_banned, verified, vrf_pass, "
-        "COALESCE(NULLIF(country,''),'??') AS country, COALESCE(last_ip,'') AS last_ip, "
-        "joined_at, last_seen, COALESCE(is_suspicious,0) AS is_suspicious, "
-        "COALESCE(device_hash,'') AS device_hash "
-        "FROM users " + where + " ORDER BY user_id DESC LIMIT %s OFFSET %s",
-        tuple(args) + (limit, offset))
+    base = ("SELECT user_id, username, full_name, balance, points, is_banned, verified, vrf_pass, "
+            "COALESCE(NULLIF(country,''),'??') AS country, COALESCE(last_ip,'') AS last_ip, ")
+    tail = ("joined_at, last_seen, COALESCE(is_suspicious,0) AS is_suspicious, "
+            "COALESCE(device_hash,'') AS device_hash ")
+    a = tuple(args) + (limit, offset)
+    try:
+        return many(base + tail + ", COALESCE(last_ip_mobile,-1) AS last_ip_mobile, "
+                    "COALESCE(last_ip_vpn,-1) AS last_ip_vpn FROM users " + where +
+                    " ORDER BY user_id DESC LIMIT %s OFFSET %s", a)
+    except Exception:
+        # পুরোনো DB (কলাম এখনো তৈরি হয়নি) — আগের কোয়েরিতেই চলবে
+        return many(base + tail + "FROM users " + where +
+                    " ORDER BY user_id DESC LIMIT %s OFFSET %s", a)
 
 
 def task_count(uid_map=True):
@@ -1488,8 +1547,9 @@ def dashboard():
         "SELECT user_id, username, full_name, balance, points, is_banned, verified, vrf_pass, "
         "COALESCE(NULLIF(country,''),'??') AS country, COALESCE(last_ip,'') AS last_ip, "
         "joined_at, last_seen, COALESCE(is_suspicious,0) AS is_suspicious, "
-        "COALESCE(device_hash,'') AS device_hash FROM users "
-        "ORDER BY user_id DESC LIMIT 10 OFFSET 0")
+        "COALESCE(device_hash,'') AS device_hash, "
+        "COALESCE(last_ip_mobile,-1) AS last_ip_mobile, COALESCE(last_ip_vpn,-1) AS last_ip_vpn "
+        "FROM users ORDER BY user_id DESC LIMIT 10 OFFSET 0")
     rows = []
     for r in recent:
         uid = int(r["user_id"])
@@ -1502,7 +1562,8 @@ def dashboard():
             f"<a href='/admin/user/{uid}'>{esc(r['full_name'] or 'User')}</a>"
             f"<div class='mut' style='font-size:11px'>@{esc(r['username'] or '-')}</div>",
             f"{flag(r['country'])} <span class='mono'>{esc(r['country'])}</span>",
-            f"<span class='mono'>{esc(r['last_ip'] or '-')}</span>",
+            f"<span class='mono'>{esc(r['last_ip'] or '-')}</span>"
+            + ip_tag(_rget(r, "last_ip_mobile", -1), _rget(r, "last_ip_vpn", -1)),
             st, dev, money(r["balance"]),
             num(r["points"]),
             f"<a class='btn gray sm' href='/admin/user/{uid}'>Open</a>",
@@ -1552,7 +1613,8 @@ def users_page(title, active, where="", args=(), q=""):
             f"<a href='/admin/user/{uid}'>{esc(r['full_name'] or 'User')}</a>"
             f"<div class='mut' style='font-size:11px'>@{esc(r['username'] or '-')}</div>",
             f"{flag(r['country'])} {esc(r['country'])}",
-            f"<span class='mono'>{esc(r['last_ip'] or '-')}</span>",
+            f"<span class='mono'>{esc(r['last_ip'] or '-')}</span>"
+            + ip_tag(_rget(r, "last_ip_mobile", -1), _rget(r, "last_ip_vpn", -1)),
             st, money(r["balance"]), num(r["points"]),
             f"<span class='mut'>{esc(str(r['joined_at'] or '')[:10])}</span>",
             f"<a class='btn gray sm' href='/admin/user/{uid}'>Open</a>",

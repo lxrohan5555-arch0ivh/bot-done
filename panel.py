@@ -225,32 +225,135 @@ def _geo_lookup(ip: str):
         return None
 
 
+def _ip_flags(ip: str):
+    """IP মোবাইল নেটওয়ার্ক কি না / VPN-Proxy-Datacenter কি না।
+
+    ফেরে {"mobile": 0/1, "vpn": 0/1}; ব্যর্থ হলে None (কিছুই আটকাবে না)।
+    ip-api.com free — key লাগে না, 45 req/min; ফলাফল DB-তে ক্যাশ হয়।
+    """
+    if _is_private_ip(ip):
+        return None
+    try:
+        url = ("http://ip-api.com/json/" + urllib.parse.quote(ip)
+               + "?fields=status,proxy,hosting,mobile")
+        req = urllib.request.Request(url, headers={"User-Agent": "task-earn-bot/1.0"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            d = json.loads(resp.read().decode("utf-8", "ignore"))
+        if d.get("status") != "success":
+            return None
+        return {
+            "mobile": 1 if d.get("mobile") else 0,
+            # proxy/VPN বা datacenter IP = VPN ধরনের ট্রাফিক
+            "vpn": 1 if (d.get("proxy") or d.get("hosting")) else 0,
+        }
+    except Exception:
+        return None
+
+
 def _geo_cached(cur, ip: str):
     if _is_private_ip(ip):
         return None
     try:
         cur.execute(
-            "SELECT country_code, country, city, isp FROM ip_geo_cache WHERE ip=%s", (ip,)
+            "SELECT country_code, country, city, isp, is_mobile, is_vpn "
+            "FROM ip_geo_cache WHERE ip=%s", (ip,)
         )
         row = cur.fetchone()
     except Exception:
         row = None
     if row:
+        try:
+            _m = int(row["is_mobile"]) if row["is_mobile"] is not None else -1
+        except Exception:
+            _m = -1
+        try:
+            _v = int(row["is_vpn"]) if row["is_vpn"] is not None else -1
+        except Exception:
+            _v = -1
+        if _m == -1 and _v == -1:      # ধরন এখনো চেক করা হয়নি
+            _fl = _ip_flags(ip)
+            if _fl:
+                _m, _v = _fl["mobile"], _fl["vpn"]
+                try:
+                    cur.execute("UPDATE ip_geo_cache SET is_mobile=%s, is_vpn=%s WHERE ip=%s",
+                                (_m, _v, ip))
+                except Exception:
+                    pass
         return {"code": row["country_code"] or "", "name": row["country"] or "",
-                "city": row["city"] or "", "isp": row["isp"] or ""}
-    geo = _geo_lookup(ip)
+                "city": row["city"] or "", "isp": row["isp"] or "",
+                "mobile": _m, "vpn": _v}
+    geo = _geo_lookup(ip) or {}
+    _fl = _ip_flags(ip) or {}
+    _m = int(_fl.get("mobile", -1))
+    _v = int(_fl.get("vpn", -1))
     try:
         cur.execute(
-            "INSERT INTO ip_geo_cache (ip, country_code, country, city, isp, created_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (ip) DO UPDATE SET "
+            "INSERT INTO ip_geo_cache (ip, country_code, country, city, isp, is_mobile, "
+            "is_vpn, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (ip) DO UPDATE SET "
             "country_code=EXCLUDED.country_code, country=EXCLUDED.country, "
-            "city=EXCLUDED.city, isp=EXCLUDED.isp",
-            (ip, (geo or {}).get("code", ""), (geo or {}).get("name", ""),
-             (geo or {}).get("city", ""), (geo or {}).get("isp", ""), str(int(time.time()))),
+            "city=EXCLUDED.city, isp=EXCLUDED.isp, "
+            "is_mobile=EXCLUDED.is_mobile, is_vpn=EXCLUDED.is_vpn",
+            (ip, geo.get("code", ""), geo.get("name", ""), geo.get("city", ""),
+             geo.get("isp", ""), _m, _v, str(int(time.time()))),
         )
     except Exception:
         pass
-    return geo
+    return {"code": geo.get("code", ""), "name": geo.get("name", ""),
+            "city": geo.get("city", ""), "isp": geo.get("isp", ""),
+            "mobile": _m, "vpn": _v}
+
+
+def _ip_type(ip: str, fetch: bool = False) -> str:
+    """'vpn' | 'mobile' | 'wifi' | '' — ip_geo_cache থেকে।
+
+    ⚡ fetch=False (ডিফল্ট) মানে শুধু ক্যাশ — পেজ লোড কখনো নেটওয়ার্কে আটকাবে না।
+    fetch=True হলে একবার ip-api-তে চেক করে ক্যাশে লিখে দেয় (ব্যাকগ্রাউন্ড থ্রেডে চলে)।
+    """
+    if not ip or _is_private_ip(ip):
+        return ""
+    try:
+        _p = ip.split(".")
+        if len(_p) == 4 and _p[0] == "100" and 64 <= int(_p[1]) <= 127:
+            return "mobile"          # CGNAT — মোবাইল ক্যারিয়ার
+    except Exception:
+        pass
+    _m, _v = -1, -1
+    try:
+        with _db() as cur:
+            cur.execute("SELECT is_mobile, is_vpn FROM ip_geo_cache WHERE ip=%s", (ip,))
+            r = cur.fetchone()
+        if not r and fetch:
+            _fl = _ip_flags(ip)
+            if _fl:
+                _m, _v = _fl["mobile"], _fl["vpn"]
+                with _db() as cur2:
+                    cur2.execute(
+                        "INSERT INTO ip_geo_cache (ip, is_mobile, is_vpn, created_at) "
+                        "VALUES (%s,%s,%s,%s) ON CONFLICT (ip) DO UPDATE SET "
+                        "is_mobile=EXCLUDED.is_mobile, is_vpn=EXCLUDED.is_vpn",
+                        (ip, _m, _v, str(int(time.time()))))
+        if r:
+            _m = int(r["is_mobile"]) if r["is_mobile"] is not None else -1
+            _v = int(r["is_vpn"]) if r["is_vpn"] is not None else -1
+            if _m == -1 and _v == -1 and fetch:
+                _fl = _ip_flags(ip)
+                if _fl:
+                    _m, _v = _fl["mobile"], _fl["vpn"]
+                    with _db() as cur2:
+                        cur2.execute(
+                            "INSERT INTO ip_geo_cache (ip, is_mobile, is_vpn, created_at) "
+                            "VALUES (%s,%s,%s,%s) ON CONFLICT (ip) DO UPDATE SET "
+                            "is_mobile=EXCLUDED.is_mobile, is_vpn=EXCLUDED.is_vpn",
+                            (ip, _m, _v, str(int(time.time()))))
+    except Exception:
+        pass
+    if _v == 1:
+        return "vpn"
+    if _m == 1:
+        return "mobile"
+    if _m == 0 and _v == 0:
+        return "wifi"
+    return ""
 
 
 def _known_country(code: str) -> str:
@@ -304,6 +407,15 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = "", ua: str = ""):
     কোনো query ব্যর্থ হলে None (কাউকে ভুলভাবে আটকাবে না)।"""
     try:
         with _db() as cur:
+            # /restart করা ইউজার — একবারের জন্য ডিভাইস/IP চেক বাইপাস
+            try:
+                cur.execute("SELECT COALESCE(vrf_force,0) AS f FROM users WHERE user_id=%s", (uid,))
+                _f = cur.fetchone()
+                if _f and int(_f.get("f") or 0) == 1:
+                    print(f"[verify] vrf_force bypass uid={uid}")
+                    return None
+            except Exception:
+                pass
             try:
                 dlim = int(str(_setting(cur, "sec_device_limit", "1")).strip() or 1)
             except Exception:
@@ -409,9 +521,13 @@ def _mark_verified(uid: int, ip: str, payload: dict):
     now_s = str(int(time.time()))
     dev_hash = _device_hash(payload or {}) if "_device_hash" in globals() else ""
 
-    # ১) মূল কাজ — শুধু গ্যারান্টিড কলাম
+    # ১) মূল কাজ — শুধু গ্যারান্টিড কলাম (bypass ফ্ল্যাগও পরিষ্কার)
     with _db() as cur:
         cur.execute("UPDATE users SET verified=1, vrf_pass=1 WHERE user_id=%s", (uid,))
+        try:
+            cur.execute("UPDATE users SET vrf_force=0 WHERE user_id=%s", (uid,))
+        except Exception:
+            pass
 
     # ২) বাকি সব সিগন্যাল — প্রতিটা আলাদা, ব্যর্থ হলেও verification সফল
     geo = {}
@@ -429,8 +545,12 @@ def _mark_verified(uid: int, ip: str, payload: dict):
                 "reg_country=COALESCE(NULLIF(%s,''), reg_country), "
                 "country=CASE WHEN COALESCE(country,'') IN ('','BD') AND %s <> '' THEN %s "
                 "ELSE country END, device_hash=COALESCE(device_hash, %s), "
+                "last_ip_mobile=%s, last_ip_vpn=%s, "
                 "last_seen=COALESCE(NULLIF(last_seen,''), %s) WHERE user_id=%s",
-                (now_s, ip, ip, country, country, country, dev_hash, now_s, uid),
+                (now_s, ip, ip, country, country, country, dev_hash,
+                 int(geo.get("mobile", -1) or -1) if geo else -1,
+                 int(geo.get("vpn", -1) or -1) if geo else -1,
+                 now_s, uid),
             )
     except Exception as e:
         print(f"[verify] user signal skip uid={uid}: {e}")
@@ -661,7 +781,8 @@ def _page_countdown(token: str, seconds: int) -> str:
   function fail(err){
     var m={device:'এই ফোনে ইতিমধ্যে একটি অ্যাকাউন্ট আছে। এক ফোনে একটির বেশি অ্যাকাউন্ট চলবে না।',
            ip:'এই ইন্টারনেট (IP) দিয়ে ইতিমধ্যে ২টি অ্যাকাউন্ট খোলা হয়েছে। Wi-Fi বন্ধ করে মোবাইল ডেটা দিয়ে চেষ্টা করুন।',
-           rate:'অনেকবার চেষ্টা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।'};
+           rate:'অনেকবার চেষ্টা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।',
+           vpn:'VPN/Proxy ব্যবহার করা যাচ্ছে না। VPN বন্ধ করে আবার verify করুন।'};
     title.textContent='Verification Blocked';
     title.className='warn';
     sub.textContent=m[err]||'Something went wrong. Please reopen the link.';
@@ -782,6 +903,13 @@ def verify_page(token):
         return resp
     if not uid:
         return Response(_page_invalid(), status=400, mimetype="text/html")
+    try:
+        _pg_ip = _client_ip()
+        # ধরন (মোবাইল/VPN) ক্যাশে না থাকলে ব্যাকগ্রাউন্ডে চেক — পেজ আটকাবে না
+        if not _ip_type(_pg_ip):
+            threading.Thread(target=lambda: _ip_type(_pg_ip, True), daemon=True).start()
+    except Exception:
+        pass
     if _already_verified(uid):
         _mark_pass(uid)   # পুরোনো verified ইউজারও যাতে বট চালু করতে পারে
         return Response(_page_already(), status=200, mimetype="text/html")
@@ -808,6 +936,10 @@ def verify_done(token):
     ip = _client_ip()
     if not _rate_ok(ip):
         return jsonify({"ok": False, "error": "rate"}), 429
+    _kind = _ip_type(ip, True)         # ক্যাশ না থাকলে একবার চেক (ip_geo_cache-এ জমা)
+    if _kind == "vpn":
+        # 🛡️ VPN/Proxy দিয়ে verify নয় — বন্ধ করে আবার চেষ্টা করতে বলি
+        return jsonify({"ok": False, "error": "vpn", "ip": ip}), 403
     payload = {}
     try:
         payload = request.get_json(silent=True) or {}

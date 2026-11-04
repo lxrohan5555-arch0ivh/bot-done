@@ -12,7 +12,7 @@ from webadmin import (
     wadm, page, guard, table, badge, esc, icon, num, money, one, many, scal, _x,
     log_admin, pager, st_badge, review_card, review_tokens, review_apply,
     review_counts, review_kpi, _fire_settings_changed, _fire_review_changed,
-    xlsx_bytes,
+    xlsx_bytes, queue_task_notify,
 )
 
 _DDL = (
@@ -288,6 +288,13 @@ def _form(task=None):
   <option value='0' {'selected' if not int(t.get('is_active', 1) or 0) else ''}>বন্ধ</option>
 </select></div>
 
+<div class='form'><label>📢 ইউজারদের নোটিফাই</label>
+  <label style='display:flex;gap:8px;align-items:center;font-weight:400'>
+    <input type='checkbox' name='notify' value='1' {'checked' if not task else ''}>
+    সেভ করার পর সব verified ইউজারকে এই টাস্কের আপডেট পাঠাও
+  </label>
+  <p class='mut' style='font-size:11px'>দাম বাড়ানো, নাম/নিয়ম বদলানো বা নতুন টাস্ক — নিজের ইচ্ছেমতো টিক দিন।</p></div>
+
 <div class='row' style='margin-top:14px'>
   <button type='submit'>💾 Save</button>
   <a class='btn gray' href='/admin/igtasks'>Cancel</a>
@@ -481,6 +488,8 @@ def igtask_new():
             return page("New Instagram Task", _form(), "igtasks", err="নাম দিন")
         log_admin("igtask_add", tid, "instagram task created")
         _fire_settings_changed(["ig_task"])
+        if (request.form.get("notify") or "").strip() == "1":
+            queue_task_notify("ig", tid)      # সব ইউজারকে নতুন টাস্কের নোটিফিকেশন
         return redirect(f"/admin/igtask/{tid}?ok=সেভ হয়েছে")
     return page("New Instagram Task", _form(), "igtasks")
 
@@ -495,6 +504,8 @@ def igtask_edit(tid):
         if _save(tid):
             log_admin("igtask_edit", tid, "instagram task updated")
             _fire_settings_changed(["ig_task"])
+            if (request.form.get("notify") or "").strip() == "1":
+                queue_task_notify("ig", tid)          # ইউজারদের জানাও (ঐচ্ছিক)
             return redirect(f"/admin/igtask/{tid}?ok=সেভ হয়েছে")
         return page("Edit Instagram Task", _form(one("SELECT * FROM ig_tasks WHERE id=%s", (tid,))),
                     "igtasks", err="নাম দিন")
