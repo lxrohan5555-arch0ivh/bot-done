@@ -5936,6 +5936,98 @@ async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str
 # ── Task Menu → Reply Keyboard (নিচের কিবোর্ড) — uid → {বাটনের লেখা: callback data} ──
 _TASK_REPLY_KB = {}
 
+# ── টাস্ক সেশন: ১৫ মিনিটে জমা না দিলে অটো-বাতিল + পাঠানো তথ্য ডিলিট ──
+_TASK_SESS      = {}            # uid → {kind, task_id, start, deadline, msgs, keep, ud}
+_TASK_COOL      = {}            # uid → শেষবার টাস্ক Start করার সময়
+_TASK_EXPIRE_SEC = 15 * 60      # ১৫ মিনিট
+_TASK_COOL_SEC   = 15           # এক টাস্ক নেওয়ার পর ১৫ সেকেন্ড বিরতি
+
+
+def _sess_begin(uid, kind, task_id=0, ud=None):
+    """নতুন টাস্ক সেশন শুরু — সাথে ১৫ সেকেন্ড কুলডাউন সেট।"""
+    now = _time.time()
+    _old = _TASK_SESS.pop(int(uid), None)
+    # আগের (অসম্পূর্ণ) সেশনের মেসেজগুলোও পরে ডিলিট হওয়ার জন্য সাথে রাখি
+    _msgs = list((_old or {}).get("msgs") or [])
+    s = {"kind": kind, "task_id": int(task_id or 0), "start": now,
+         "deadline": now + _TASK_EXPIRE_SEC, "msgs": _msgs, "keep": set(), "ud": ud}
+    _TASK_SESS[int(uid)] = s
+    _TASK_COOL[int(uid)] = now
+    return s
+
+
+def _sess_track(uid, msg, keep=False):
+    """সেশনের একটা মেসেজ মনে রাখো — পরে ডিলিট করার জন্য।"""
+    s = _TASK_SESS.get(int(uid))
+    if not s or msg is None:
+        return
+    mid = getattr(msg, "message_id", None)
+    if mid is None:
+        return
+    try:
+        mid = int(mid)
+    except (TypeError, ValueError):
+        return
+    ch = getattr(getattr(msg, "chat", None), "id", 0) or uid
+    try:
+        ch = int(ch)
+    except (TypeError, ValueError):
+        ch = int(uid)
+    if keep:
+        s["keep"].add(mid)
+    s["msgs"].append((ch, mid))
+
+
+def _sess_bot(msg):
+    try:
+        return msg.get_bot()
+    except Exception:
+        return None
+
+
+async def _sess_purge(uid, bot=None, keep=None):
+    """সেশনের সব মেসেজ ডিলিট করে সেশন বন্ধ — keep (যেমন রিসিপ্ট) বাদে।"""
+    s = _TASK_SESS.pop(int(uid), None)
+    if not s:
+        return 0
+    _keep = set(s.get("keep") or ())
+    if keep is not None:
+        _km = getattr(keep, "message_id", None)
+        try:
+            if _km:
+                _keep.add(int(_km))
+        except (TypeError, ValueError):
+            pass
+    if bot is None:
+        return 0
+    n = 0
+    for ch, mid in (s.get("msgs") or []):
+        if mid in _keep:
+            continue
+        try:
+            await bot.delete_message(ch, mid)
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+async def _task_cool_blocked(q, uid):
+    """১৫ সেকেন্ড হয়নি? → True (ইউজারকে জানিয়ে দেয়, নতুন টাস্ক নিতে দেয় না)।"""
+    last = _TASK_COOL.get(int(uid)) or 0
+    left = int(round(_TASK_COOL_SEC - (_time.time() - last)))
+    if left <= 0:
+        return False
+    lang = await asyncio.to_thread(get_lang, uid)
+    try:
+        await q.message.reply_text(
+            f"⏳ আর {left} সেকেন্ড অপেক্ষা করুন — তারপর নতুন টাস্ক নিতে পারবেন।"
+            if lang != 'en' else
+            f"⏳ Please wait {left} more second(s) — then you can take another task.")
+    except Exception:
+        pass
+    return True
+
 
 class _TaskKbQuery:
     """Reply-keyboard বাটন চাপলে callback handler-গুলোকে একইভাবে চালানোর shim।"""
@@ -5958,13 +6050,17 @@ class _TaskKbQuery:
 
 
 class _TaskKbUpdate:
-    __slots__ = ("callback_query", "effective_user", "effective_message", "effective_chat")
+    __slots__ = ("callback_query", "effective_user", "effective_message",
+                 "effective_chat", "message")
 
     def __init__(self, q, user, message):
         self.callback_query = q
         self.effective_user = user
         self.effective_message = message
         self.effective_chat = getattr(message, "chat", None)
+        # PTB-র Update-এ callback-এ .message থাকে না — guard()-এর মতো কোড
+        # AttributeError না পায়, তাই None হিসেবে রাখা হলো
+        self.message = None
 
 
 async def show_tasks(update, ctx):
@@ -6191,7 +6287,7 @@ async def show_tg_tasks_list(update, ctx):
         btns.append([InlineKeyboardButton(label, callback_data=f"tgt_{t['id']}")])
     btns.append([InlineKeyboardButton("🔙 Back" if lang=='en' else "🔙 ফিরে যান", callback_data="task_cancel")])
     title = "📲 *Telegram Tasks*\n\nChoose a task:" if lang=='en' else "📲 *Telegram Tasks*\n\nএকটি Task বেছে নিন:"
-    await q.message.reply_text(title, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
+    await _task_reply_ui(q, uid, title, btns, parse_mode="Markdown", lang=lang)
 
 
 
@@ -6246,7 +6342,7 @@ async def show_category_tasks(update, ctx, cat_id):
         title = f"🗂️ *{_cat_tn_esc}*\n\n📋 Total: `{total_tasks}` tasks  •  ✅ Available: `{avail}`\n\n👇 Choose a task below:"
     else:
         title = f"🗂️ *{_cat_tn_esc}*\n\n📋 মোট: `{total_tasks}` টি Task  •  ✅ পাওয়া যাচ্ছে: `{avail}` টি\n\n👇 নিচে থেকে একটি Task বেছে নিন:"
-    await q.message.reply_text(title, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
+    await _task_reply_ui(q, uid, title, btns, parse_mode="Markdown", lang=lang)
 
 
 async def show_category_task_rules(update, ctx, task):
@@ -6334,9 +6430,8 @@ async def show_category_task_rules(update, ctx, task):
     if _has_vid:
         _vid_lbl = "📹 ভিডিও দেখুন" if lang == 'bn' else "📹 Watch Video"
         _kb_rows.append([InlineKeyboardButton(_vid_lbl, callback_data=f"ctask_watch_video_{tid}")])
-    _kb_rows.append([InlineKeyboardButton(sub_btn, callback_data=f"ctask_submit_{tid}"),
-                     InlineKeyboardButton(cancel_b, callback_data="task_cancel")])
-    kb = InlineKeyboardMarkup(_kb_rows)
+    _kb_rows.append([InlineKeyboardButton(sub_btn, callback_data=f"ctask_submit_{tid}")])
+    _kb_rows.append([InlineKeyboardButton(cancel_b, callback_data="task_cancel")])
     max_c2  = _rget(task, 'max_completions', 0)
     done_c2 = _rget(task, 'completed_count', 0)
 
@@ -6366,7 +6461,8 @@ async def show_category_task_rules(update, ctx, task):
     ttype_lbl = task_type_label(_rget(task, 'task_type', 'other'))
     _ctcode = _rget(task, 'task_code', '') or ''
     _ctcode_line = f"🔑 *Task Code:* `{_ctcode}`\n" if _ctcode else ""
-    await update.effective_message.reply_text(
+    await _task_reply_ui(
+        update.callback_query, uid,
         f"{ticon} *{_md_esc(task['name'])}*\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
         f"{_ctcode_line}"
@@ -6379,7 +6475,7 @@ async def show_category_task_rules(update, ctx, task):
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
         f"{proof_text}\n\n"
         f"💡 {confirm_txt}",
-        parse_mode="Markdown", reply_markup=kb
+        _kb_rows, parse_mode="Markdown", lang=lang
     )
     # ── Task Media (example image only — video via button) ─────────
     _ct_ex_img = _rget(task, 'example_image_id', '') or ''
@@ -6393,6 +6489,8 @@ async def start_category_task_collect(update, ctx, task_id):
     """Start collecting proof for a category task"""
     q      = update.callback_query
     uid    = q.from_user.id
+    if await _task_cool_blocked(q, uid):
+        return
     task, fields, lang = await asyncio.gather(
         asyncio.to_thread(get_category_task, task_id),
         asyncio.to_thread(get_category_task_fields, task_id),
@@ -6424,6 +6522,7 @@ async def start_category_task_collect(update, ctx, task_id):
     ctx.user_data["task_fields"]    = [dict(f) for f in fields]
     ctx.user_data["field_idx"]      = 0
     ctx.user_data["collected"]      = []
+    _sess_begin(uid, "cat", task_id, ud=ctx.user_data)   # ১৫ মিনিটের কাউন্টডাউন
 
     if not fields:
         lang = await asyncio.to_thread(get_lang, uid)
@@ -6625,9 +6724,11 @@ async def _finalize_category_task_submission(update, ctx, uid, via_callback=Fals
     for k in ("state","task_price","task_name","categ_task_id","task_fields","field_idx","collected"):
         ctx.user_data.pop(k, None)
     if update.message and not via_callback:
-        await update.message.reply_text(T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+        _ok_msg = await update.message.reply_text(T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
     else:
-        await ctx.bot.send_message(uid, T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+        _ok_msg = await ctx.bot.send_message(uid, T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+    # ── জমা হয়ে গেছে → প্রশ্ন/উত্তর/ছবি ডিলিট, শুধু এই রিসিপ্ট থাকবে ──
+    await _sess_purge(uid, _sess_bot(_ok_msg) or ctx.bot, keep=_ok_msg)
     try:
         if update.message and not via_callback:
             await show_tasks(update, ctx)
@@ -6791,12 +6892,12 @@ async def show_tg_task(update, ctx, task):
             f"3️⃣ Bot will verify — you'll get paid instantly!"
         )
 
-    kb = InlineKeyboardMarkup([
+    _rows = [
         [InlineKeyboardButton("📢 Join Channel/Group", url=tg_link)],
         [InlineKeyboardButton("✅ Check — I Joined" if lang=='en' else "✅ Check — আমি জয়েন করেছি", callback_data=f"tgt_check_{tid}")],
         [InlineKeyboardButton("❌ Cancel" if lang=='en' else "❌ বাতিল", callback_data="task_cancel")],
-    ])
-    await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    ]
+    await _task_reply_ui(q, uid, msg, _rows, parse_mode="Markdown", lang=lang)
 
 
 async def handle_tg_task_check(update, ctx, tid):
@@ -7139,6 +7240,8 @@ async def show_task_rules(update, ctx, task):
 async def start_task_collect(update, ctx, task_id):
     q      = update.callback_query
     uid    = q.from_user.id
+    if await _task_cool_blocked(q, uid):
+        return
     task, lang = await asyncio.gather(
         asyncio.to_thread(get_task, task_id),
         asyncio.to_thread(get_lang, uid),
@@ -7182,6 +7285,7 @@ async def start_task_collect(update, ctx, task_id):
     ctx.user_data["task_fields"]   = [dict(f) for f in fields]
     ctx.user_data["field_idx"]     = 0
     ctx.user_data["collected"]     = []
+    _sess_begin(uid, "task", task_id, ud=ctx.user_data)   # ১৫ মিনিটের কাউন্টডাউন
 
     if not fields:
         # No custom fields — ask generic info
@@ -7216,9 +7320,10 @@ async def _ask_next_field(update, ctx, uid, via_callback=False):
         kb = ReplyKeyboardMarkup([[T(uid,'cancel_btn')]], resize_keyboard=True)
 
     if via_callback:
-        await update.callback_query.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+        _q_m = await update.callback_query.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
     else:
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+        _q_m = await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    _sess_track(uid, _q_m)
 
     # ── Sample photo: photo field হলে example image দেখাও ──────────
     # প্রথমে field-এর নিজস্ব example_image_id চেক করো, না থাকলে task-level টা দেখো
@@ -7243,15 +7348,17 @@ async def _ask_next_field(update, ctx, uid, via_callback=False):
             _samp_cap = "📷 নমুনা ছবি — এইরকম ছবি দিন" if lang == 'bn' else "📷 Sample — Submit a photo like this"
             try:
                 if via_callback:
-                    await update.callback_query.message.reply_photo(_samp_img, caption=_samp_cap)
+                    _samp_m = await update.callback_query.message.reply_photo(_samp_img, caption=_samp_cap)
                 else:
-                    await update.message.reply_photo(_samp_img, caption=_samp_cap)
+                    _samp_m = await update.message.reply_photo(_samp_img, caption=_samp_cap)
+                _sess_track(uid, _samp_m)
             except Exception:
                 pass
 
 async def handle_task_collect_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid    = update.effective_user.id
     txt    = update.message.text.strip()
+    _sess_track(uid, update.message)   # ইউজার যা পাঠাল — শেষে ডিলিট হবে
     fields = ctx.user_data.get("task_fields", [])
     idx    = ctx.user_data.get("field_idx", 0)
     total  = len(fields)
@@ -7395,6 +7502,7 @@ async def handle_task_collect_photo(update: Update, ctx: ContextTypes.DEFAULT_TY
             parse_mode="Markdown")
         return
 
+    _sess_track(uid, update.message)   # proof ছবি — শেষে ডিলিট হবে
     file_id        = update.message.photo[-1].file_id
     file_unique_id = update.message.photo[-1].file_unique_id
     # ── ছবির সাথে caption (লেখা) থাকলে সেটাও সংরক্ষণ করো ────────────
@@ -7559,9 +7667,11 @@ async def _finalize_task_submission(update, ctx, uid, via_callback=False):
         ctx.user_data.pop(k, None)
     send_fn = update.message.reply_text if (update.message and not via_callback) else None
     if send_fn:
-        await send_fn(T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+        _ok_msg = await send_fn(T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
     else:
-        await ctx.bot.send_message(uid, T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+        _ok_msg = await ctx.bot.send_message(uid, T(uid, 'submit_ok'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
+    # ── জমা হয়ে গেছে → প্রশ্ন/উত্তর/ছবি ডিলিট, শুধু এই রিসিপ্ট থাকবে ──
+    await _sess_purge(uid, _sess_bot(_ok_msg) or ctx.bot, keep=_ok_msg)
     # ── Submit এর পর টাস্ক লিস্ট আবার দেখাও ────────────────────────────
     try:
         if update.message and not via_callback:
@@ -10277,6 +10387,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
 
     # ── Task cancel ──────────────────────────────────────────────
     if d == "task_cancel":
+        _TASK_REPLY_KB.pop(uid, None)
         ctx.user_data.pop("state", None)
         ctx.user_data.pop("task_id", None)
         ctx.user_data.pop("task_name", None)
@@ -13513,6 +13624,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _trk = _TASK_REPLY_KB.get(uid)
     if _trk:
         _trk_cb = _trk.get(txt.strip())
+        if _trk_cb and _trk_cb.startswith("video:"):
+            # 📽 Video instruction / Join লিংক — ReplyKeyboard-এ URL বসে না
+            _vurl = _trk_cb[6:]
+            try:
+                await update.message.reply_text(
+                    "📽 *Video / Link*\n" + _vurl,
+                    parse_mode="Markdown", disable_web_page_preview=True)
+            except Exception as _ve:
+                log.debug(f"[TASK-KB] লিংক পাঠানো ব্যর্থ: {_ve}")
+            return
         if _trk_cb:
             _trk_q = _TaskKbQuery(_trk_cb, user, update.message)
             _trk_u = _TaskKbUpdate(_trk_q, user, update.message)
@@ -20309,6 +20430,66 @@ async def _task_ui(q, text, kb=None, parse_mode=None):
         log.warning(f"[TASK-UI] পাঠানো যায়নি: {e}")
 
 
+def _reply_kb_build(uid, rows):
+    """inline keyboard rows → নিচের Reply Keyboard rows + রাউটিং ম্যাপ।
+
+    ⚠️ ReplyKeyboard-এ URL বসানো যায় না, তাই url বাটনগুলোর জন্য
+    "video:<url>" স্পেশাল ভ্যালু রাখি — চাপলে বট লিংকটা মেসেজে পাঠায়।
+    """
+    kb, mp = [], {}
+    for row in rows or []:
+        r = []
+        for b in row:
+            lbl = (getattr(b, "text", "") or "").strip()
+            if not lbl:
+                continue
+            cb = getattr(b, "callback_data", None)
+            if not cb:
+                _url = (getattr(b, "url", None) or "").strip()
+                if not _url:
+                    continue
+                cb = "video:" + _url
+            lbl = lbl[:60]
+            base, n = lbl, 2
+            while lbl in mp and mp[lbl] != cb:
+                lbl = f"{base[:55]} ({n})"
+                n += 1
+            mp[lbl] = cb
+            r.append(lbl)
+        if r:
+            kb.append(r)
+    if mp:
+        _TASK_REPLY_KB[uid] = mp
+    return kb
+
+
+def _rk_markup(uid, rows):
+    """এক লাইনে Reply keyboard markup।"""
+    kb = _reply_kb_build(uid, rows)
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=False) if kb else None
+
+
+async def _task_reply_ui(q, uid, text, rows, parse_mode=None, lang=None):
+    """টাস্কের Details = সাধারণ মেসেজ, বাটনগুলো = নিচের Reply Keyboard।
+
+    চ্যাটের ভেতরে আটকানো (inline) বাটন আর পাঠানো হয় না — আগের মেসেজের
+    inline বাটনগুলোও সরিয়ে দেওয়া হয় যাতে ডাবল ক্লিক না লাগে।
+    """
+    try:
+        await q.edit_message_reply_markup(None)
+    except Exception:
+        pass
+    _mk = _rk_markup(uid, rows)
+    try:
+        await q.message.reply_text(text, parse_mode=parse_mode, reply_markup=_mk)
+    except Exception as e:
+        log.warning(f"[TASK-RKB] Markdown ব্যর্থ, plain-এ আবার: {e}")
+        try:
+            await q.message.reply_text(text, reply_markup=_mk)
+        except Exception as e2:
+            log.warning(f"[TASK-RKB] পাঠানো যায়নি: {e2}")
+
+
 def _task_video_row(task, lang):
     """📽 Video instruction বাটন — টাস্কে লিংক সেট থাকলে।"""
     url = (task.get("video_url") or "").strip()
@@ -20363,11 +20544,11 @@ async def fb_show_list(q, uid, lang=None):
         rows.append([InlineKeyboardButton("  •  ".join(bits), callback_data=f"fbtn:{tid}")])
     rows.append([InlineKeyboardButton(
         "✖️ বাতিল" if lang != "en" else "✖️ Cancel", callback_data="task_cancel")])
-    await _task_ui(
-        q,
+    await _task_reply_ui(
+        q, uid,
         ("📘 *Facebook Tasks*\n\nএকটি টাস্ক বেছে নিন:" if lang != "en"
          else "📘 *Facebook Tasks*\n\nChoose a task:"),
-        _fb_kb(rows), parse_mode="Markdown")
+        rows, parse_mode="Markdown", lang=lang)
 
 
 async def fb_task_rules(q, uid, tid):
@@ -20397,15 +20578,17 @@ async def fb_task_rules(q, uid, tid):
     _vid = _task_video_row(task, lang)
     if _vid:
         rows.append(_vid)
-    rows.append([InlineKeyboardButton("◀️ Back", callback_data="fbt_list"),
-                 InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
+    rows.append([InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
                                       callback_data="task_cancel")])
-    await _task_ui(q, "\n".join(parts), _fb_kb(rows))
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data="fbt_list")])
+    await _task_reply_ui(q, uid, "\n".join(parts), rows, lang=lang)
 
 
 async def fb_task_start(q, uid, tid):
     """Start → লগইন দাও, তারপর UID (প্রথম ফিল্ড) চাও।"""
     lang = await asyncio.to_thread(get_lang, uid)
+    if await _task_cool_blocked(q, uid):
+        return
     task = await asyncio.to_thread(_fb_task, tid)
     if not task:
         await q.answer("❌ Task পাওয়া যায়নি")
@@ -20424,12 +20607,14 @@ async def fb_task_start(q, uid, tid):
     fields = await asyncio.to_thread(_fb_fields, task)
     _FB_STATE[uid] = {"task_id": int(tid), "step": 0, "answers": {}, "login": login,
                       "ts": _time.time()}
+    _sess_begin(uid, "fb", tid)     # ১৫ মিনিটের কাউন্টডাউন শুরু
     cred = (f"First name: {login['first']}\nLast name: {login['last']}\n"
             f"Password: {login['password']}")
     ask = _fb_ask_text(fields, 0, lang)
-    await q.message.reply_text(
+    _cred_m = await q.message.reply_text(
         f"📘 *{task.get('name') or 'Facebook Task'}*\n\n{cred}\n\n{ask}",
-        parse_mode="Markdown", reply_markup=_fb_cancel_kb(lang))
+        parse_mode="Markdown", reply_markup=_fb_cancel_kb(lang, uid))
+    _sess_track(uid, _cred_m)       # বাতিল/টাইমআউটে ডিলিট হবে
 
 
 async def fb_on_text(update, ctx):
@@ -20439,6 +20624,11 @@ async def fb_on_text(update, ctx):
     if not st:
         return
     txt = (update.message.text or "").strip()
+    # নিচের Reply Keyboard-এর বাটন (Cancel/Submit/নতুন কোড) → উত্তর নয়,
+    # on_message হ্যান্ডেল করবে
+    if txt in _TASK_REPLY_KB.get(uid, {}) or txt in ("❌ বাতিল", "❌ Cancel", "❌ বাতিল করুন"):
+        return
+    _sess_track(uid, update.message)   # ইউজার যা পাঠাল — শেষে ডিলিট হবে
     task = await asyncio.to_thread(_fb_task, st["task_id"])
     if not task:
         _FB_STATE.pop(uid, None)
@@ -20458,7 +20648,7 @@ async def fb_on_text(update, ctx):
     if not _ok:
         await update.message.reply_text(_err_bn if lang != "en" else _err_en,
                                         parse_mode="Markdown",
-                                        reply_markup=_fb_cancel_kb(lang))
+                                        reply_markup=_fb_cancel_kb(lang, uid))
         return
     if (f.get("type") or _fb_guess_type(f.get("key"))) == "uid" \
             and await asyncio.to_thread(_fb_uid_exists, st["task_id"], txt):
@@ -20470,38 +20660,45 @@ async def fb_on_text(update, ctx):
     st["ts"] = _time.time()
     # ── 2FA: key ঠিক থাকলে বট কোড দেবে ──
     if _extra:
-        await update.message.reply_text(
+        _2fa_m = await update.message.reply_text(
             (f"🔑 আপনার 2FA কোড: `{_extra}`\n⏱ ৩০ সেকেন্ড পর বদলে যাবে — এখনই Facebook-এ দিন।"
              if lang != "en" else
              f"🔑 Your 2FA code: `{_extra}`\n⏱ It changes every 30 seconds — enter it now."),
             parse_mode="Markdown",
-            reply_markup=_fb_kb([[InlineKeyboardButton(
-                "🔁 নতুন কোড" if lang != "en" else "🔁 New code",
-                callback_data=f"fbc:{st['task_id']}")]]))
+            reply_markup=_rk_markup(uid, [
+                [InlineKeyboardButton("🔁 নতুন কোড" if lang != "en" else "🔁 New code",
+                                      callback_data=f"fbc:{st['task_id']}")],
+                [InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
+                                      callback_data="fbt_cancel")]]))
+        _sess_track(uid, _2fa_m)
     st["step"] += 1
     st["ts"] = _time.time()
     if st["step"] < len(fields):
-        await update.message.reply_text(_fb_ask_text(fields, st["step"], lang),
-                                        reply_markup=_fb_cancel_kb(lang))
+        _q_m = await update.message.reply_text(_fb_ask_text(fields, st["step"], lang),
+                                               reply_markup=_fb_cancel_kb(lang, uid))
+        _sess_track(uid, _q_m)
         return
     # সব উত্তর পাওয়া গেছে → সারসংক্ষেপ + "জমা দিন" বাটন (সেভ হবে তখনই)
-    await update.message.reply_text(_fb_summary(task, st, lang),
-                                    reply_markup=_fb_confirm_kb(task, lang))
+    _sum_m = await update.message.reply_text(_fb_summary(task, st, lang),
+                                             reply_markup=_fb_confirm_kb(task, lang, uid))
+    _sess_track(uid, _sum_m)
 
 
-def _fb_cancel_kb(lang):
-    return _fb_kb([[InlineKeyboardButton(
-        "❌ বাতিল" if lang != "en" else "❌ Cancel", callback_data="fbt_cancel")]])
+def _fb_cancel_kb(lang, uid=0):
+    _rows = [[InlineKeyboardButton(
+        "❌ বাতিল" if lang != "en" else "❌ Cancel", callback_data="fbt_cancel")]]
+    return _rk_markup(uid, _rows) if uid else _fb_kb(_rows)
 
 
-def _fb_confirm_kb(task, lang):
+def _fb_confirm_kb(task, lang, uid=0):
     tid = int((task or {}).get("id") or 0)
-    return _fb_kb([
+    _rows = [
         [InlineKeyboardButton("✅ জমা দিন" if lang != "en" else "✅ Submit",
                               callback_data=f"fbd:{tid}")],
         [InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
                               callback_data="fbt_cancel")],
-    ])
+    ]
+    return _rk_markup(uid, _rows) if uid else _fb_kb(_rows)
 
 
 def _fb_summary(task, st, lang):
@@ -20539,13 +20736,13 @@ async def fb_submit_now(q, uid):
         _FB_STATE.pop(uid, None)
         await q.message.reply_text(
             "⚠️ এই UID আগেই জমা হয়েছে — অ্যাকাউন্ট সেভ হয়নি।" if lang != "en"
-            else "⚠️ Duplicate UID — not saved.", reply_markup=_fb_cancel_kb(lang))
+            else "⚠️ Duplicate UID — not saved.", reply_markup=_fb_cancel_kb(lang, uid))
         return
     if err:
         await q.message.reply_text(
             "❌ সেভ করা যায়নি, আবার চেষ্টা করুন।" if lang != "en"
             else "❌ Could not save, please try again.",
-            reply_markup=_fb_confirm_kb(task, lang))
+            reply_markup=_fb_confirm_kb(task, lang, uid))
         return
     _FB_STATE.pop(uid, None)
     price = float(task.get("price") or 0)
@@ -20554,14 +20751,17 @@ async def fb_submit_now(q, uid):
     _uid_key = next((f["key"] for f in fields if (f.get("type") or "") == "uid"), "uid")
     _uid_txt = str((st.get("answers") or {}).get(_uid_key, "") or "")
     rows = [[InlineKeyboardButton("◀️ Tasks", callback_data="fbt_list")]]
-    await q.message.reply_text(
+    _ok_msg = await q.message.reply_text(
         ("✅ *সফলভাবে জমা হয়েছে!*\n\n"
          f"📘 Task: {task.get('name')}\n🔑 UID: {_uid_txt}{extra_bn}\n\n"
          "অ্যাডমিন যাচাই করে দেখবেন।") if lang != "en" else
         ("✅ *Submitted successfully!*\n\n"
          f"📘 Task: {task.get('name')}\n🔑 UID: {_uid_txt}{extra_en}\n\n"
          "Admin will review it."),
-        parse_mode="Markdown", reply_markup=_fb_kb(rows))
+        parse_mode="Markdown", reply_markup=_rk_markup(uid, rows))
+    # ── জমা হয়ে গেছে → বটের দেওয়া লগইন ও ইউজারের পাঠানো তথ্য ডিলিট,
+    #    শুধু এই রিসিপ্টটা থাকবে ──
+    await _sess_purge(uid, _sess_bot(_ok_msg), keep=_ok_msg)
 
 
 async def fb_send_2fa(q, uid, tid):
@@ -20585,19 +20785,65 @@ async def fb_send_2fa(q, uid, tid):
     except Exception:
         await q.answer("❌ Key থেকে কোড হলো না" if lang != "en" else "❌ Bad 2FA key")
         return
-    await q.message.reply_text(
+    _n2fa_m = await q.message.reply_text(
         (f"🔑 নতুন 2FA কোড: `{code}`\n⏱ ৩০ সেকেন্ড পর বদলে যাবে।" if lang != "en"
          else f"🔑 New 2FA code: `{code}`\n⏱ It changes every 30 seconds."),
         parse_mode="Markdown",
-        reply_markup=_fb_kb([[InlineKeyboardButton(
-            "🔁 নতুন কোড" if lang != "en" else "🔁 New code",
-            callback_data=f"fbc:{tid}")]]))
+        reply_markup=_rk_markup(uid, [
+            [InlineKeyboardButton("🔁 নতুন কোড" if lang != "en" else "🔁 New code",
+                                  callback_data=f"fbc:{tid}")],
+            [InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
+                                  callback_data="fbt_cancel")]]))
+    _sess_track(uid, _n2fa_m)
 
 
 async def fb_cancel(q, uid):
     _FB_STATE.pop(uid, None)
+    _TASK_REPLY_KB.pop(int(uid), None)
+    try:
+        await _sess_purge(uid, _sess_bot(getattr(q, "message", None)))
+    except Exception:
+        pass
     lang = await asyncio.to_thread(get_lang, uid)
     await q.answer("✅ বাতিল হয়েছে" if lang != "en" else "✅ Cancelled")
+
+
+# ── ১৫ মিনিটে জমা না দিলে অটো-বাতিল + পাঠানো তথ্য ডিলিট ──
+async def job_task_timeout(ctx):
+    """প্রতি ৩০ সেকেন্ডে চেক — deadline পার হলে বাতিল, মেসেজ ডিলিট, ইউজারকে জানাও।"""
+    now = _time.time()
+    for _uid, _s in list(_TASK_SESS.items()):
+        try:
+            if now < float(_s.get("deadline") or 0):
+                continue
+            _uid = int(_uid)
+            _FB_STATE.pop(_uid, None)
+            _IG_STATE.pop(_uid, None)
+            _TASK_REPLY_KB.pop(_uid, None)
+            _ud = _s.get("ud")
+            if _ud is not None:
+                try:
+                    _ud.clear()
+                except Exception:
+                    pass
+            lang = await asyncio.to_thread(get_lang, _uid)
+            await _sess_purge(_uid, ctx.bot)
+            try:
+                await ctx.bot.send_message(
+                    _uid,
+                    ("⏱ *১৫ মিনিট পার — টাস্কটি অটো বাতিল হয়েছে।*\n\n"
+                     "আপনার পাঠানো তথ্য আর বটের দেওয়া লগইন ডিলিট করে দেওয়া হয়েছে।\n"
+                     "আবার শুরু করতে পারবেন।") if lang != 'en' else
+                    ("⏱ *15 minutes passed — the task was auto-cancelled.*\n\n"
+                     "Your submitted info and the bot-sent login were deleted.\n"
+                     "You can start again."),
+                    parse_mode="Markdown",
+                    reply_markup=await asyncio.to_thread(main_kb, _uid))
+            except Exception:
+                pass
+            log.info(f"[TASK-TIMEOUT] uid={_uid} kind={_s.get('kind')} — অটো বাতিল")
+        except Exception as _e:
+            log.warning(f"[TASK-TIMEOUT] uid={_uid}: {_e}")
 
 
 # ─────────────────────── অটো কাজ (jobs) ───────────────────────
@@ -21395,7 +21641,7 @@ def _ig_cred_card(task, login, fields, lang, step=0):
     return (f"📸 *{task.get('name') or 'Instagram Task'}*\n\n{cred}{hint}\n\n{ask}").strip()
 
 
-def _ig_card_kb(tid, lang, done=False):
+def _ig_card_kb(tid, lang, done=False, uid=0):
     """কার্ডের নিচের বাটন — ১ বার Username বদলানো (+.question না থাকলে 'শেষ' বাটন) + বাতিল।"""
     rows = [[InlineKeyboardButton(
         "🔄 Username পরিবর্তন (১ বার)" if lang != "en" else "🔄 Change username (1 time)",
@@ -21405,7 +21651,7 @@ def _ig_card_kb(tid, lang, done=False):
             "✅ অ্যাকাউন্ট খোলা শেষ" if lang != "en" else "✅ Account created",
             callback_data=f"igd:{int(tid)}")])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="igt_cancel")])
-    return _ig_kb(rows)
+    return _rk_markup(uid, rows) if uid else _ig_kb(rows)
 
 
 def _ig_kb(rows):
@@ -21454,11 +21700,11 @@ async def ig_show_list(q, uid, lang=None):
         rows.append([InlineKeyboardButton("  •  ".join(bits), callback_data=f"igtn:{tid}")])
     rows.append([InlineKeyboardButton(
         "✖️ বাতিল" if lang != "en" else "✖️ Cancel", callback_data="task_cancel")])
-    await _task_ui(
-        q,
+    await _task_reply_ui(
+        q, uid,
         ("📸 *Instagram Tasks*\n\nএকটি টাস্ক বেছে নিন:" if lang != "en"
          else "📸 *Instagram Tasks*\n\nChoose a task:"),
-        _ig_kb(rows), parse_mode="Markdown")
+        rows, parse_mode="Markdown", lang=lang)
 
 
 async def ig_task_rules(q, uid, tid):
@@ -21488,15 +21734,17 @@ async def ig_task_rules(q, uid, tid):
     _vid = _task_video_row(task, lang)
     if _vid:
         rows.append(_vid)
-    rows.append([InlineKeyboardButton("◀️ Back", callback_data="igt_list"),
-                 InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
+    rows.append([InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
                                       callback_data="task_cancel")])
-    await _task_ui(q, "\n".join(parts), _ig_kb(rows))
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data="igt_list")])
+    await _task_reply_ui(q, uid, "\n".join(parts), rows, lang=lang)
 
 
 async def ig_task_start(q, uid, tid):
     """Start → বট Username+Password দেয় (ছবির মতো), দেওয়ার আগে চেক করে অ্যাকাউন্ট আছে কি না।"""
     lang = await asyncio.to_thread(get_lang, uid)
+    if await _task_cool_blocked(q, uid):
+        return
     task = await asyncio.to_thread(_ig_task, tid)
     if not task:
         await q.answer("❌ Task পাওয়া যায়নি")
@@ -21522,9 +21770,11 @@ async def ig_task_start(q, uid, tid):
     fields = await asyncio.to_thread(_ig_fields, task)
     _IG_STATE[uid] = {"task_id": int(tid), "step": 0, "answers": {}, "login": login,
                       "retry": 0, "ts": _time.time()}
-    await q.message.reply_text(_ig_cred_card(task, login, fields, lang),
-                               parse_mode="Markdown",
-                               reply_markup=_ig_card_kb(int(tid), lang, done=not fields))
+    _sess_begin(uid, "ig", tid)     # ১৫ মিনিটের কাউন্টডাউন শুরু
+    _cred_m = await q.message.reply_text(_ig_cred_card(task, login, fields, lang),
+                                         parse_mode="Markdown",
+                                         reply_markup=_ig_card_kb(int(tid), lang, done=not fields, uid=uid))
+    _sess_track(uid, _cred_m)
 
 
 async def _ig_finish(reply, uid, task, st, lang):
@@ -21537,7 +21787,8 @@ async def _ig_finish(reply, uid, task, st, lang):
              "আবার Start চাপলে নতুন Username পাবেন।" if lang != "en" else
              "⚠️ Duplicate username — not saved.\nStart again to get a new username."),
             parse_mode="Markdown",
-            reply_markup=_ig_kb([[InlineKeyboardButton("▶️ Start", callback_data="igt_list")]]))
+            reply_markup=_rk_markup(uid, [[InlineKeyboardButton(
+                "▶️ Start", callback_data="igt_list")]]))
         return
     if err:
         await reply("❌ সেভ করা যায়নি, আবার চেষ্টা করুন।" if lang != "en"
@@ -21547,7 +21798,7 @@ async def _ig_finish(reply, uid, task, st, lang):
     _p_bn = f"\n⏳ Approve হলে +${price} যোগ হবে" if price > 0 else ""
     _p_en = f"\n⏳ +${price} will be added after approval" if price > 0 else ""
     name = (sub.get("ig_username") if sub else "") or (st.get("login") or {}).get("username") or ""
-    await reply(
+    _ok_msg = await reply(
         ("✅ *অ্যাকাউন্ট খোলা শেষ — জমা হয়েছে!*\n\n"
          f"📸 Task: {task.get('name')}\n👤 Username: `{name}`{_p_bn}\n\n"
          "অ্যাডমিন যাচাই করে দেখবেন।") if lang != "en" else
@@ -21555,7 +21806,11 @@ async def _ig_finish(reply, uid, task, st, lang):
          f"📸 Task: {task.get('name')}\n👤 Username: `{name}`{_p_en}\n\n"
          "Admin will review it."),
         parse_mode="Markdown",
-        reply_markup=_ig_kb([[InlineKeyboardButton("◀️ Tasks", callback_data="igt_list")]]))
+        reply_markup=_rk_markup(uid, [[InlineKeyboardButton(
+            "◀️ Tasks", callback_data="igt_list")]]))
+    # ── জমা হয়ে গেছে → বটের দেওয়া Username/Password ও ইউজারের তথ্য ডিলিট,
+    #    শুধু এই রিসিপ্টটা থাকবে ──
+    await _sess_purge(uid, _sess_bot(_ok_msg), keep=_ok_msg)
 
 
 async def ig_done(q, uid):
@@ -21585,6 +21840,10 @@ async def ig_on_text(update, ctx):
     if not st:
         return
     txt = (update.message.text or "").strip()
+    # নিচের Reply Keyboard-এর বাটন → উত্তর নয়, on_message হ্যান্ডেল করবে
+    if txt in _TASK_REPLY_KB.get(uid, {}) or txt in ("❌ বাতিল", "❌ Cancel", "❌ বাতিল করুন"):
+        return
+    _sess_track(uid, update.message)   # ইউজার যা পাঠাল — শেষে ডিলিট হবে
     task = await asyncio.to_thread(_ig_task, st["task_id"])
     if not task:
         _IG_STATE.pop(uid, None)
@@ -21604,41 +21863,47 @@ async def ig_on_text(update, ctx):
     if not _ok:
         await update.message.reply_text(_err_bn if lang != "en" else _err_en,
                                         parse_mode="Markdown",
-                                        reply_markup=_ig_cancel_kb(lang))
+                                        reply_markup=_ig_cancel_kb(lang, uid))
         return
     st["answers"][f["key"]] = txt
     st["ts"] = _time.time()
     # ── 2FA: key ঠিক থাকলে বট কোড দেবে ──
     if _extra:
-        await update.message.reply_text(
+        _2fa_m = await update.message.reply_text(
             (f"🔑 আপনার 2FA কোড: `{_extra}`\n⏱ ৩০ সেকেন্ড পর বদলে যাবে — এখনই Instagram-এ দিন।"
              if lang != "en" else
              f"🔑 Your 2FA code: `{_extra}`\n⏱ It changes every 30 seconds — enter it now."),
             parse_mode="Markdown",
-            reply_markup=_ig_kb([[InlineKeyboardButton(
-                "🔁 নতুন কোড" if lang != "en" else "🔁 New code",
-                callback_data=f"igc:{st['task_id']}")]]))
+            reply_markup=_rk_markup(uid, [
+                [InlineKeyboardButton("🔁 নতুন কোড" if lang != "en" else "🔁 New code",
+                                      callback_data=f"igc:{st['task_id']}")],
+                [InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
+                                      callback_data="igt_cancel")]]))
+        _sess_track(uid, _2fa_m)
     st["step"] += 1
     st["ts"] = _time.time()
     if st["step"] < len(fields):
-        await update.message.reply_text(_ig_ask_text(fields, st["step"], lang),
-                                        reply_markup=_ig_cancel_kb(lang))
+        _q_m = await update.message.reply_text(_ig_ask_text(fields, st["step"], lang),
+                                               reply_markup=_ig_cancel_kb(lang, uid))
+        _sess_track(uid, _q_m)
         return
     # সব উত্তর পাওয়া গেছে → সারসংক্ষেপ + "অ্যাকাউন্ট খোলা শেষ / জমা দিন" বাটন
-    await update.message.reply_text(
+    _sum_m = await update.message.reply_text(
         _ig_summary(task, st, lang),
-        reply_markup=_ig_kb([
+        reply_markup=_rk_markup(uid, [
             [InlineKeyboardButton("✅ অ্যাকাউন্ট খোলা শেষ — জমা দিন" if lang != "en"
                                   else "✅ Account created — submit",
                                   callback_data=f"igd:{st['task_id']}")],
             [InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
                                   callback_data="igt_cancel")],
         ]))
+    _sess_track(uid, _sum_m)
 
 
-def _ig_cancel_kb(lang):
-    return _ig_kb([[InlineKeyboardButton(
-        "❌ বাতিল" if lang != "en" else "❌ Cancel", callback_data="igt_cancel")]])
+def _ig_cancel_kb(lang, uid=0):
+    _rows = [[InlineKeyboardButton(
+        "❌ বাতিল" if lang != "en" else "❌ Cancel", callback_data="igt_cancel")]]
+    return _rk_markup(uid, _rows) if uid else _ig_kb(_rows)
 
 
 def _ig_summary(task, st, lang):
@@ -21675,13 +21940,16 @@ async def ig_send_2fa(q, uid, tid):
     except Exception:
         await q.answer("❌ Key থেকে কোড হলো না" if lang != "en" else "❌ Bad 2FA key")
         return
-    await q.message.reply_text(
+    _n2fa_m = await q.message.reply_text(
         (f"🔑 নতুন 2FA কোড: `{code}`\n⏱ ৩০ সেকেন্ড পর বদলে যাবে।" if lang != "en"
          else f"🔑 New 2FA code: `{code}`\n⏱ It changes every 30 seconds."),
         parse_mode="Markdown",
-        reply_markup=_ig_kb([[InlineKeyboardButton(
-            "🔁 নতুন কোড" if lang != "en" else "🔁 New code",
-            callback_data=f"igc:{tid}")]]))
+        reply_markup=_rk_markup(uid, [
+            [InlineKeyboardButton("🔁 নতুন কোড" if lang != "en" else "🔁 New code",
+                                  callback_data=f"igc:{tid}")],
+            [InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
+                                  callback_data="igt_cancel")]]))
+    _sess_track(uid, _n2fa_m)
 
 
 async def ig_retry(q, uid):
@@ -21710,14 +21978,20 @@ async def ig_retry(q, uid):
     st.setdefault("login", {})["username"] = new
     st["ts"] = _time.time()
     fields = await asyncio.to_thread(_ig_fields, task)
-    await q.message.reply_text(
+    _rt_m = await q.message.reply_text(
         _ig_cred_card(task, st["login"], fields, lang, step=st.get("step") or 0),
         parse_mode="Markdown",
-        reply_markup=_ig_card_kb(int(task["id"]), lang, done=not fields))
+        reply_markup=_ig_card_kb(int(task["id"]), lang, done=not fields, uid=uid))
+    _sess_track(uid, _rt_m)
 
 
 async def ig_cancel(q, uid):
     _IG_STATE.pop(uid, None)
+    _TASK_REPLY_KB.pop(int(uid), None)
+    try:
+        await _sess_purge(uid, _sess_bot(getattr(q, "message", None)))
+    except Exception:
+        pass
     lang = await asyncio.to_thread(get_lang, uid)
     await q.answer("✅ বাতিল হয়েছে" if lang != "en" else "✅ Cancelled")
 
@@ -22129,6 +22403,13 @@ def main():
                 first=20,
                 name="db_keepalive"
             )
+            # ১৫ মিনিটে টাস্ক জমা না দিলে অটো-বাতিল
+            application.job_queue.run_repeating(
+                job_task_timeout,
+                interval=30,
+                first=20,
+                name="task_timeout"
+            )
             application.job_queue.run_daily(
                 job_post_leaderboard,
                 time=dt_time(hour=0, minute=0, tzinfo=BD_TZ),
@@ -22215,6 +22496,7 @@ def main():
                 asyncio.create_task(_run_periodically(job_fb_ig_review,       60, first_sec=25)),
                 asyncio.create_task(_run_periodically(job_web_sync,             5, first_sec=8)),
                 asyncio.create_task(_run_periodically(job_db_keepalive,       60, first_sec=20)),
+                asyncio.create_task(_run_periodically(job_task_timeout,       30, first_sec=20)),
                 asyncio.create_task(_run_daily_at(job_bio_task_check,   0, 5, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_post_leaderboard, 0, 0, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_winback,        14, 0, BD_TZ)),
