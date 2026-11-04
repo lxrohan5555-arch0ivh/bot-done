@@ -25,6 +25,232 @@ wadm = Blueprint("wadm", __name__)
 SESSION_HOURS = 12
 COOKIE = "teb_admin"
 
+# ── পুরোনো/বাজে ডেটা ডিলিট — টাকা, ইউজার, রেফারেল কিছুই ছোঁবে না ────────────
+# (টেবিল, টাইম-কলাম, কত দিনের পুরোনো)
+JUNK_TABLES = (
+    ("pending_notifications", "send_at", 3, ""),
+    ("tg_task_pre_members", "seen_at", 7, ""),
+    ("vrf_signals", "created_at", 3, "processed = 1"),
+    ("security_alerts", "created_at", 30, ""),
+    ("admin_actions", "created_at", 90, ""),
+)
+
+# ⚠️ এই টেবিলগুলো কখনো, কোনোকিছুতেই ডিলিট হয় না (মালিকের নির্দেশ)
+PROTECTED_TABLES = ("devices", "user_ips", "ip_history", "ip_geo_cache")
+
+
+def _junk_cut(days):
+    """(epoch cut, 'YYYY-MM-DD HH:MM' cut) — দুই ফরম্যাটের টাইমকলামের জন্য।"""
+    from datetime import datetime, timedelta, timezone
+    days = max(1, int(days))
+    cut_dt = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+    return str(int(time.time()) - days * 86400), cut_dt
+
+
+def _junk_where(col):
+    """কলামটা epoch সংখ্যা হোক বা 'YYYY-MM-DD HH:MM' — দুটোই ধরে পুরোনো বের করে।"""
+    return ("((" + col + " ~ '^[0-9]+$') AND " + col + " < %s) OR "
+            "((" + col + " ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}') AND " + col + " < %s)")
+
+
+def junk_preview():
+    """কোন টেবিলে কত row ডিলিট হবে — ডিলিটের আগেই প্যানেলে দেখানোর জন্য।"""
+    out = {}
+    for row in JUNK_TABLES:
+        tbl, col, days = row[0], row[1], row[2]
+        extra = row[3] if len(row) > 3 else ""
+        ep, dt = _junk_cut(days)
+        where = _junk_where(col) + ((" AND " + extra) if extra else "")
+        try:
+            r = one("SELECT COUNT(*) AS n FROM " + tbl + " WHERE " + where, (ep, dt))
+            out[tbl] = int((r or {}).get("n") or 0)
+        except Exception:
+            out[tbl] = 0
+    return out
+
+
+def cleanup_junk():
+    """পুরোনো বেকার রেকর্ড ডিলিট — devices/IP/টাকা/রেফারেল কিছুই ছোঁবে না।
+
+    রিটার্ন: {table: কত row মুছল}।
+    """
+    out = {}
+    for row in JUNK_TABLES:
+        tbl, col, days = row[0], row[1], row[2]
+        extra = row[3] if len(row) > 3 else ""
+        ep, dt = _junk_cut(days)
+        where = _junk_where(col) + ((" AND " + extra) if extra else "")
+        try:
+            n = _x("DELETE FROM " + tbl + " WHERE " + where, (ep, dt))
+            out[tbl] = int(n or 0)
+        except Exception as e:
+            print("[cleanup_junk] " + tbl + ": " + str(e)[:120])
+            out[tbl] = 0
+    return out
+
+
+# ── ডেটাবেস সাইজ + সত্যিকারের space reclaim (VACUUM) ────────────────────────
+def human_size(n):
+    """বাইট → "12.4 MB" / "1.8 GB" ইত্যাদি।"""
+    try:
+        n = float(n)
+    except Exception:
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+    return "—"
+
+
+def db_size_bytes():
+    """ডেটাবেসের মোট সাইজ (bytes)। Postgres আর CockroachDB দুটোই চেষ্টা করে।"""
+    for sql in ("SELECT pg_database_size(current_database()) AS n",
+                "SELECT sum(range_size) AS n FROM crdb_internal.ranges_no_leases",
+                "SELECT sum(range_size) AS n FROM crdb_internal.ranges"):
+        try:
+            r = one(sql)
+            if r and r.get("n") is not None:
+                return int(r["n"])
+        except Exception:
+            continue
+    return None
+
+
+def db_table_names():
+    """public schema-র সব টেবিলের নাম।"""
+    try:
+        rows = many("SELECT tablename FROM pg_tables WHERE schemaname='public' "
+                    "ORDER BY tablename")
+        return [str(r["tablename"]) for r in rows if r.get("tablename")]
+    except Exception:
+        return []
+
+
+def db_reclaim(tables=None, full=False):
+    """DELETE-এর পর সত্যিই ডিস্ক থেকে জায়গা ফেরত আনে।
+
+    Postgres-এ `DELETE` শুধু row-কে dead মার্ক করে — ফাইলের সাইজ কমে না,
+    `VACUUM` না চালালে হোস্টিং প্যানেলে (Render/Neon) সাইজ একই দেখায়।
+      • VACUUM (ANALYZE)            → dead space reuse-এর জন্য ছাড়ে (দ্রুত, lock নেই)
+      • VACUUM (FULL, ANALYZE)      → ফাইল সত্যিই ছোট হয় (ধীর, টেবিল lock হয়)
+    CockroachDB-তে VACUUM নেই (GC নিজেই করে) — ওখানে চুপচাপ skip হয়।
+    """
+    import re as _re
+    safe = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    out = {"ok": [], "skip": [], "err": [], "full": bool(full), "supported": False}
+    tbls = list(tables) if tables else db_table_names()
+    if not tbls:
+        return out
+    pool = _get_pool()
+    for t in tbls:
+        if not safe.match(str(t)):
+            out["skip"].append(str(t))
+            continue
+        conn = None
+        try:
+            conn = pool.getconn()
+            conn.autocommit = True          # VACUUM transaction-এর ভেতরে চলে না
+            cur = conn.cursor()
+            cur.execute(('VACUUM (FULL, ANALYZE) "%s"' if full
+                         else 'VACUUM (ANALYZE) "%s"') % t)
+            cur.close()
+            out["ok"].append(str(t))
+            out["supported"] = True
+        except Exception as e:
+            msg = str(e).lower()
+            if "syntax" in msg or "not supported" in msg or "unsupported" in msg:
+                out["skip"].append(str(t))
+            else:
+                out["err"].append(str(t))
+            print("[db_reclaim] " + str(t) + ": " + str(e)[:120])
+        finally:
+            if conn is not None:
+                try:
+                    conn.autocommit = False
+                except Exception:
+                    pass
+                try:
+                    pool.putconn(conn)
+                except Exception:
+                    pass
+    return out
+
+
+# ── Excel (.xlsx) এক্সপোর্ট — CSV-র separator/encoding সমস্যা এড়াতে ──────────
+def xlsx_bytes(header, rows, sheet="Sheet1"):
+    """সাধারণ .xlsx বানায় (stdlib দিয়েই, নতুন dependency নেই)।
+
+    CSV-তে কমা/ইনকোডিং ভুল পড়ে সব এক কলামে যাওয়ার সমস্যা থাকে; .xlsx-এ
+    প্রতিটা ভ্যালু আলাদা সেলে বাঁধা থাকে — Excel/Google Sheets/WPS সবখানে ঠিক খোলে।
+    """
+    import io as _io
+    import re as _re
+    import zipfile as _zf
+    from xml.sax.saxutils import escape as _esc
+
+    def _letters(n):
+        out = ""
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            out = chr(65 + r) + out
+        return out
+
+    def _cell(ref, v):
+        if isinstance(v, bool):
+            v = "TRUE" if v else "FALSE"
+        if isinstance(v, (int, float)):
+            return '<c r="%s"><v>%s</v></c>' % (ref, v)
+        txt = "" if v is None else str(v)
+        txt = _re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", txt)[:32767]
+        if not txt:
+            return ""
+        return ('<c r="%s" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+                % (ref, _esc(txt)))
+
+    all_rows = [list(header or [])] + [list(r) for r in (rows or [])]
+    body = []
+    for ri, r in enumerate(all_rows, 1):
+        cells = "".join(_cell("%s%d" % (_letters(ci), ri), v) for ci, v in enumerate(r, 1))
+        body.append('<row r="%d">%s</row>' % (ri, cells))
+
+    name = _re.sub(r"[\[\]:*?/\\]", " ", str(sheet or "Sheet1")).strip()[:31] or "Sheet1"
+    name = _esc(name, {'"': "&quot;"})
+
+    sheet_xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                 '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                 '<sheetData>' + "".join(body) + '</sheetData></worksheet>')
+    wb_xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+              'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+              '<sheets><sheet name="' + name + '" sheetId="1" r:id="rId1"/></sheets></workbook>')
+    ct_xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+              '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+              '<Default Extension="xml" ContentType="application/xml"/>'
+              '<Override PartName="/xl/workbook.xml" ContentType="application/'
+              'vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+              '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/'
+              'vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
+    rels_xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/'
+                '2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+    wbrels_xml = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                  '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                  '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/'
+                  '2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>')
+
+    buf = _io.BytesIO()
+    with _zf.ZipFile(buf, "w", _zf.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", ct_xml)
+        z.writestr("_rels/.rels", rels_xml)
+        z.writestr("xl/workbook.xml", wb_xml)
+        z.writestr("xl/_rels/workbook.xml.rels", wbrels_xml)
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return buf.getvalue()
+
+
 # ───────────────────────────── CSS ─────────────────────────────
 CSS = """
 *{box-sizing:border-box}
@@ -433,8 +659,17 @@ _CHROME_KEY_TTL = 60.0
 
 
 def alerts_changed():
-    """অ্যালার্ট স্টেটাস বদলালে কাউন্ট ক্যাশে পরিষ্কার করো।"""
+    """অ্যালার্ট স্টেটাস বদলালে কাউন্ট ক্যাশে পরিষ্কার করো।
+
+    ⚠️ আগে শুধু সাইডবারের কাউন্ট ক্যাশে পরিষ্কার হতো; KPI সংখ্যাগুলো
+    (_AGG_CACHE) পুরোনোই থেকে যেত — তাই Review/Ignore চাপলে "কিছুই হয়নি"
+    মনে হতো। এখন দুটোই পরিষ্কার হয়।
+    """
     _CHROME.pop("alerts", None)
+    try:
+        agg_clear()
+    except Exception:
+        pass
 
 
 # ── bot ↔ web ব্রিজ: প্যানেল থেকে বদলালে সাথে সাথে বটে প্রয়োগ ──

@@ -4760,11 +4760,12 @@ def mask_addr_short(addr):
 def main_kb(uid=None):
     lang = get_lang(uid) if uid else 'bn'
     b = get_all_btns(lang)
+    # লেআউট: Balance | Tasks / Withdraw | Profile / Support (ফুল-width) / Refer | Language
     return ReplyKeyboardMarkup([
-        [b['tasks'],         b['profile']],
-        [b['balance'],       b['refer']],
-        [b['support'],       b['withdraw']],
-        [b['language']],
+        [b['balance'],       b['tasks']],
+        [b['withdraw'],      b['profile']],
+        [b['support']],
+        [b['refer'],         b['language']],
     ], resize_keyboard=True)
 
 def lang_kb(uid=None, current_lang=None):
@@ -5932,6 +5933,40 @@ async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str
         log.warning(f"[TASK_DONE_NOTIFY] {_e}")
 
 
+# ── Task Menu → Reply Keyboard (নিচের কিবোর্ড) — uid → {বাটনের লেখা: callback data} ──
+_TASK_REPLY_KB = {}
+
+
+class _TaskKbQuery:
+    """Reply-keyboard বাটন চাপলে callback handler-গুলোকে একইভাবে চালানোর shim।"""
+    __slots__ = ("data", "from_user", "message", "id")
+
+    def __init__(self, data, user, message):
+        self.data = data
+        self.from_user = user
+        self.message = message
+        self.id = "0"
+
+    async def answer(self, *a, **k):
+        return None
+
+    async def edit_message_text(self, *a, **k):
+        raise RuntimeError("edit not possible (reply-keyboard)")
+
+    async def edit_message_reply_markup(self, *a, **k):
+        raise RuntimeError("edit not possible (reply-keyboard)")
+
+
+class _TaskKbUpdate:
+    __slots__ = ("callback_query", "effective_user", "effective_message", "effective_chat")
+
+    def __init__(self, q, user, message):
+        self.callback_query = q
+        self.effective_user = user
+        self.effective_message = message
+        self.effective_chat = getattr(message, "chat", None)
+
+
 async def show_tasks(update, ctx):
     uid          = update.effective_user.id
     if not await _vrf_gate_msg(ctx.bot, uid):
@@ -6093,11 +6128,32 @@ async def show_tasks(update, ctx):
             parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
         return
 
-    btns.append([InlineKeyboardButton(T(uid,'cancel_inline'), callback_data="task_cancel")])
+    # ── সব বাটন (regular/category/bio/TG/FB/IG) এখন নিচের Reply Keyboard-এ ──
+    _kb_rows, _kb_map = [], {}
+    for _row in btns:
+        _r = []
+        for _b in _row:
+            _lbl = (_b.text or "").strip()
+            if not _lbl or not _b.callback_data:
+                continue
+            _lbl = _lbl[:60]
+            if _lbl in _kb_map:   # একই নামের দুই টাস্ক হলে আলাদা করে দাও
+                _n = 2
+                while f"{_lbl[:55]} ({_n})" in _kb_map:
+                    _n += 1
+                _lbl = f"{_lbl[:55]} ({_n})"
+            _kb_map[_lbl] = _b.callback_data
+            _r.append(_lbl)
+        if _r:
+            _kb_rows.append(_r)
+    _home_lbl = "🏠 মেনু" if lang != 'en' else "🏠 Menu"
+    _kb_map[_home_lbl] = "task_cancel"
+    _kb_rows.append([_home_lbl])
+    _TASK_REPLY_KB[uid] = _kb_map
     await update.message.reply_text(
         f"{T(uid,'tasks_title')}\n\n{T(uid,'tasks_choose')}",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(btns)
+        reply_markup=ReplyKeyboardMarkup(_kb_rows, resize_keyboard=True, one_time_keyboard=False)
     )
 
 
@@ -9587,6 +9643,74 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await asyncio.to_thread(is_admin, uid):
         return  # non-admin কে কোনো reply নেই — command সম্পূর্ণ invisible
     await send_admin_panel(update.message, uid)
+
+
+def _set_vrf_bypass(uid, on=True):
+    """একজন ইউজারকে verify ছাড়া চালু/বন্ধ — শুধু মালিকের কমান্ড থেকে ডাকা হয়।"""
+    uid = int(uid)
+    stamp = datetime.now(BD_TZ).strftime("%Y-%m-%d %H:%M") if on else ""
+    try:
+        with _c() as c:
+            c.execute("UPDATE users SET vrf_pass=%s, verified=%s, verified_at=%s "
+                      "WHERE user_id=%s", (1 if on else 0, 1 if on else 0, stamp, uid))
+    except Exception as e:
+        log.warning(f"[NOVERIFY] uid={uid} ব্যর্থ: {e}")
+        return False
+    for _d in (_VRF_SILENT_MEMO, _user_cache, _lang_cache):
+        try:
+            _d.pop(uid, None)
+        except Exception:
+            pass
+    return True
+
+
+async def cmd_noverify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """মালিক-কমান্ড: /noverify <user_id> — verify ছাড়া চালু, `off` দিলে আবার বন্ধ।
+
+    ⚠️ শুধু ADMIN_ID চালাতে পারে; বাকি সবার জন্য কমান্ডটা সম্পূর্ণ নীরব,
+    তাই কেউ ভুলেও এর অস্তিত্ব টের পাবে না।
+    """
+    u = update.effective_user
+    if not u:
+        return
+    try:
+        if int(u.id) != int(ADMIN_ID):
+            return
+    except Exception:
+        return
+    args = [a for a in (ctx.args or []) if (a or "").strip()]
+    if not args or not args[0].strip().isdigit():
+        await update.message.reply_text(
+            "🔓 *verify ছাড়া চালু / বন্ধ*\n\n"
+            "`/noverify <user_id>` — ওই ইউজার verify ছাড়াই সব ব্যবহার করতে পারবে\n"
+            "`/noverify <user_id> off` — আবার স্বাভাবিক verify\n\n"
+            "শুধু আপনি এই কমান্ড চালাতে পারেন — আর কেউ টেরও পাবে না।",
+            parse_mode="Markdown")
+        return
+    tgt = int(args[0])
+    off = len(args) > 1 and args[1].strip().lower() in ("off", "0", "no", "false")
+    row = await asyncio.to_thread(get_user, tgt)
+    if not row:
+        await update.message.reply_text("❌ ইউজার `" + str(tgt) + "` পাওয়া যায়নি।",
+                                        parse_mode="Markdown")
+        return
+    ok = await asyncio.to_thread(_set_vrf_bypass, tgt, not off)
+    if not ok:
+        await update.message.reply_text("❌ করা গেল না — লগ দেখুন।")
+        return
+    if off:
+        txt = ("🔒 *verify আবার চালু*\n\nইউজার `" + str(tgt)
+               + "` এখন আবার verify করবে।")
+        utxt = "🔒 আপনার অ্যাকাউন্টে আবার verify চালু হয়েছে — /start চেপে verify করুন।"
+    else:
+        txt = ("🔓 *verify ছাড়া চালু*\n\nইউজার `" + str(tgt)
+               + "` এখন verify ছাড়াই সব কিছু ব্যবহার করতে পারবে।")
+        utxt = "✅ আপনার অ্যাকাউন্ট verify ছাড়াই চালু হয়েছে — এখনই সব ব্যবহার করতে পারবেন।"
+    await update.message.reply_text(txt, parse_mode="Markdown")
+    try:
+        await ctx.bot.send_message(tgt, utxt)
+    except Exception as e:
+        log.debug(f"[NOVERIFY] ইউজারকে জানানো যায়নি uid={tgt}: {e}")
 
 
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -13383,6 +13507,27 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as _ve:
                 log.debug(f"[VRF] silent gate প্রম্পট ব্যর্থ uid={uid}: {_ve}")
         return
+
+    # ── Task Menu (Reply Keyboard) থেকে টাস্ক বাছাই ──────────────
+    # নিচের কিবোর্ডের বাটনে চাপলে আগের callback handler গুলোই চলে — ফ্লো অপরিবর্তিত
+    _trk = _TASK_REPLY_KB.get(uid)
+    if _trk:
+        _trk_cb = _trk.get(txt.strip())
+        if _trk_cb:
+            _trk_q = _TaskKbQuery(_trk_cb, user, update.message)
+            _trk_u = _TaskKbUpdate(_trk_q, user, update.message)
+            try:
+                if _trk_cb.startswith(("fbt_", "fbtn:", "fbr:", "fbs:",
+                                       "fbd:", "fbc:", "fbx:")):
+                    await fb_callback(_trk_u, ctx)
+                elif _trk_cb.startswith(("igt_", "igtn:", "igtr:", "igts:",
+                                         "igc:", "igu:", "igd:", "igx:")):
+                    await ig_callback(_trk_u, ctx)
+                else:
+                    await on_callback(_trk_u, ctx)
+            except Exception as _trk_e:
+                log.warning(f"[TASK-KB] {txt!r} ({_trk_cb}) ব্যর্থ: {_trk_e}")
+            return
 
     # Cancel always works first
     cancel_btns = {"❌ বাতিল করুন", "❌ Cancel"}
@@ -19557,13 +19702,30 @@ def _fb_2fa_key(txt):
 
 
 def _fb_totp(secret, digits=6, period=30):
-    """RFC 6238 — Facebook Authenticator-এর মতো ৬ ডিজিটের কোড।"""
+    """RFC 6238 — Facebook Authenticator-এর মতো ৬ ডিজিটের কোড।
+
+    key-টা মানুষ হাতে লেখে বলে নানা রকম হয় (স্পেস, ড্যাশ, ছোট হাতের, ভুলে
+    0/1/8/9)। যতটা সম্ভব ঠিক করে নিয়েও ডিকোড না হলে ValueError — কলে
+    ধরা পড়ে ইউজারকে স্পষ্ট মেসেজ দেখানো হয় (আগে চুপচাপ কিছুই আসত না)।
+    """
     import base64, hmac, hashlib, struct
     sec = _fb_2fa_key(secret)
-    # কিছু key-তে ভুল করে 0/1/8/9 লেখা থাকে — Base32-এর অনুরূপ অক্ষরে বদলে নাও
-    sec = sec.translate(str.maketrans({"0": "O", "1": "I", "8": "B", "9": "G"}))
-    sec += "=" * (-len(sec) % 8)
-    key = base64.b32decode(sec, casefold=True)
+    sec = sec.translate(str.maketrans({"0": "O", "1": "I", "8": "B"}))
+    sec = re.sub(r"[^A-Z2-7]", "", sec)          # Base32-এ যা নেই বাদ
+    if len(sec) < 8:
+        raise ValueError("too short")
+    key = None
+    for cut in (0, 1, 2, 3, 4, 5, 6):
+        cand = sec[:len(sec) - cut] if cut else sec
+        if not cand:
+            break
+        try:
+            key = base64.b32decode(cand + "=" * (-len(cand) % 8))
+            break
+        except Exception:
+            continue
+    if key is None:
+        raise ValueError("bad key")
     counter = int(_time.time()) // period
     digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
     off = digest[-1] & 0x0F
@@ -19644,8 +19806,17 @@ def _fb_validate(field, txt):
                     None)
         try:
             return True, "", "", _fb_totp(key)
-        except Exception:
-            return True, "", "", None
+        except Exception as _te:
+            log.debug(f"[FB-2FA] key decode ব্যর্থ: {_te}")
+            return (False,
+                    "⚠️ এই key থেকে কোড বানানো গেল না — key-টা ঠিকভাবে কপি হয়নি।\n"
+                    "Facebook → Settings → Security → Two-factor authentication → "
+                    "Authentication app → *Setup key* থেকে শুধু ইংরেজি অক্ষর/সংখ্যা দিয়ে "
+                    "আবার দিন (যেমন `EOH5 WAFU GQG3 ABUK`)।",
+                    "⚠️ Could not build a code from that key — the key was copied wrong.\n"
+                    "Copy the setup key again from Facebook → Settings → Security → "
+                    "Two-factor authentication → Authentication app.",
+                    None)
     elif typ == "email":
         if "@" not in v or "." not in v.split("@")[-1]:
             return (False, "⚠️ সঠিক ইমেইল দিন।", "⚠️ Please send a valid email.", None)
@@ -20731,8 +20902,17 @@ def _ig_validate(field, txt):
                     None)
         try:
             return True, "", "", _fb_totp(key)
-        except Exception:
-            return True, "", "", None
+        except Exception as _te:
+            log.debug(f"[FB-2FA] key decode ব্যর্থ: {_te}")
+            return (False,
+                    "⚠️ এই key থেকে কোড বানানো গেল না — key-টা ঠিকভাবে কপি হয়নি।\n"
+                    "Facebook → Settings → Security → Two-factor authentication → "
+                    "Authentication app → *Setup key* থেকে শুধু ইংরেজি অক্ষর/সংখ্যা দিয়ে "
+                    "আবার দিন (যেমন `EOH5 WAFU GQG3 ABUK`)।",
+                    "⚠️ Could not build a code from that key — the key was copied wrong.\n"
+                    "Copy the setup key again from Facebook → Settings → Security → "
+                    "Two-factor authentication → Authentication app.",
+                    None)
     elif typ == "email":
         if "@" not in v or "." not in v.split("@")[-1]:
             return (False, "⚠️ সঠিক ইমেইল দিন।", "⚠️ Please send a valid email.", None)
@@ -22096,6 +22276,7 @@ def main():
     app.add_handler(CommandHandler("btest",       _gate(cmd_btest)))
     app.add_handler(CommandHandler("resetall",    _gate(cmd_resetall)))
     app.add_handler(CommandHandler("restart",     _gate(cmd_restart)))
+    app.add_handler(CommandHandler("noverify",    _gate(cmd_noverify)))
     app.add_handler(CommandHandler("cleanup",     _gate(cmd_cleanup)))
     app.add_handler(CommandHandler("sheettest",   _gate(cmd_sheettest)))
     app.add_handler(CommandHandler("vrfdiag",     _gate(cmd_vrfdiag)))

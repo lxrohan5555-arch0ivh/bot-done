@@ -11,6 +11,8 @@ from webadmin import (
     one, many, scal, sfloat, _x, log_admin, client_ip, spark, bars, donut,
     admin_key, unread_alerts, alerts_changed, many_cached,
     _fire_settings_changed, _fire_user_changed,
+    human_size, db_size_bytes, db_reclaim, cleanup_junk, JUNK_TABLES,
+    junk_preview, PROTECTED_TABLES,
 )
 
 
@@ -864,6 +866,145 @@ def _archive_selected(k, ids):
        "updated_at = EXCLUDED.updated_at", (k, now()) + tuple(ids))
 
 
+def _old_logs_where(k, tsc):
+    """পুরোনো টাস্ক-লগ বাছার শর্ত — pending কখনোই না।"""
+    if k == "tg":
+        return tsc + " > '' AND " + tsc + " < %s"
+    return ("COALESCE(status,'pending') IN ('approved','rejected') AND "
+            + tsc + " > '' AND " + tsc + " < %s")
+
+
+def _old_logs_preview(days=90):
+    """কত দিনের বেশি পুরোনো কতগুলো লগ ডিলিট হবে — ডিলিটের আগে দেখানোর জন্য।"""
+    from datetime import datetime, timedelta, timezone
+    cut = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+           ).strftime("%Y-%m-%d %H:%M")
+    out = {}
+    for k, (tbl, tsc) in _LOG_TABLES.items():
+        try:
+            r = one("SELECT COUNT(*) AS n FROM " + tbl + " WHERE " + _old_logs_where(k, tsc), (cut,))
+            out[k] = int((r or {}).get("n") or 0)
+        except Exception:
+            out[k] = 0
+    return out
+
+
+def _purge_old_logs(days=90):
+    """কত দিনের বেশি পুরোনো approved/rejected টাস্ক লগ ডিলিট (pending কখনো নয়)।
+
+    ডিলিটের আগে কাউন্ট `task_archive_counts`-এ archive হয় — লিডারবোর্ড/রেফার/
+    প্রোমোর হিসাব কমবে না, শুধু ডেটাবেস ছোট হবে।
+    """
+    from datetime import datetime, timedelta, timezone
+    days = max(1, min(3650, int(days)))
+    cut = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+    out = {}
+    for k, (tbl, tsc) in _LOG_TABLES.items():
+        day = "LEFT(COALESCE(" + tsc + ",''),10)"
+        ok, rj = _LOG_ARCH[k]
+        where = _old_logs_where(k, tsc)
+        try:
+            _x("INSERT INTO task_archive_counts "
+               "(user_id,day,kind,n_approved,n_rejected,updated_at) "
+               "SELECT user_id, " + day + ", %s, SUM(" + ok + "), SUM(" + rj + "), %s "
+               "FROM " + tbl + " WHERE " + where + " AND COALESCE(user_id,0) <> 0 "
+               "GROUP BY user_id, " + day +
+               " HAVING SUM(" + ok + ") + SUM(" + rj + ") > 0 "
+               "ON CONFLICT (user_id,day,kind) DO UPDATE SET "
+               "n_approved = task_archive_counts.n_approved + EXCLUDED.n_approved, "
+               "n_rejected = task_archive_counts.n_rejected + EXCLUDED.n_rejected, "
+               "updated_at = EXCLUDED.updated_at", (k, now(), cut))
+        except Exception as e:
+            print("[purge-old] archive " + k + ": " + str(e)[:120])
+        try:
+            out[k] = int(_x("DELETE FROM " + tbl + " WHERE " + where, (cut,)) or 0)
+        except Exception as e:
+            print("[purge-old] delete " + k + ": " + str(e)[:120])
+            out[k] = 0
+    return out
+
+
+_PREV = {"t": 0.0, "html": "", "days": 0}
+
+
+def _purge_preview_html(days=90, force=False):
+    """প্যানেলে দেখায়: কোন বেকার ডেটা কত row আছে (devices/IP কখনো নয়)।"""
+    _now = time.time()
+    if (not force) and _PREV["html"] and _PREV["days"] == days \
+            and (_now - _PREV["t"]) < 300:
+        return _PREV["html"]      # COUNT(*) ভারী — ৫ মিনিট ক্যাশ
+    junk = {}
+    try:
+        junk = junk_preview()
+    except Exception:
+        pass
+    old = {}
+    try:
+        old = _old_logs_preview(days)
+    except Exception:
+        pass
+    jl = {"pending_notifications": "🔔 পুরোনো pending notification (৩ দিন+)",
+          "tg_task_pre_members": "👥 Telegram pre-member (৭ দিন+)",
+          "vrf_signals": "🔑 প্রসেস হওয়া verify signal (৩ দিন+)",
+          "security_alerts": "🛡 পুরোনো security alert (৩০ দিন+)"}
+    jl["admin_actions"] = "🧾 পুরোনো admin action (৯০ দিন+)"
+    ll = {"gmail": "📧 Gmail", "fb": "📘 Facebook",
+          "ig": "📸 Instagram", "tg": "✈️ Telegram"}
+    rows = []
+    for r in JUNK_TABLES:
+        rows.append((jl.get(r[0], r[0]), junk.get(r[0], 0)))
+    for k, _tok in _LOG_TABLES.items():
+        rows.append((ll.get(k, k) + " পুরোনো লগ (" + str(days) + " দিন+)", old.get(k, 0)))
+    total = sum([n for _l, n in rows])
+    h = ["<div style='margin-top:12px;background:#0b1220;border:1px solid #1e293b;"
+         "border-radius:12px;padding:10px 12px'>"
+         "<p style='font-size:12px;margin:0 0 6px'><b>এখনই যা ডিলিট হবে</b> — মোট <b>"
+         + num(total) + "</b> row</p>"
+         "<table style='font-size:12px'><tbody>"]
+    for l, n in rows:
+        h.append("<tr><td style='padding:4px 6px'>" + l + "</td>"
+                 "<td style='padding:4px 6px;text-align:right;font-variant-numeric:tabular-nums'>"
+                 + (num(n) if n else "—") + "</td></tr>")
+    h.append("</tbody></table><p class='mut' style='font-size:11px;margin:6px 0 0'>"
+             "📱 <b>ডিভাইস ও IP রেকর্ড</b> (" + ", ".join(PROTECTED_TABLES) + ") "
+             "কখনো ডিলিট হয় না — একদমই অক্ষত থাকবে। মেইল/ব্যালান্স/উইথড্র/রেফারেলও অক্ষত।</p>")
+    h.append(_archive_line())
+    h.append("<p style='margin:6px 0 0'><a class='mut' style='font-size:11px' "
+             "href='?junk=1'>🔄 সংখ্যা রিফ্রেশ</a></p>")
+    h.append("</div>")
+    html = "".join(h)
+    _PREV.update({"t": _now, "html": html, "days": days})
+    return html
+
+
+def _archive_line(full=False):
+    """ডিলিট হওয়া লগের স্থায়ী হিসাব — কে, কবে, কত approved/rejected।"""
+    try:
+        rows = many("SELECT kind, COUNT(DISTINCT user_id) AS u, COUNT(*) AS n, "
+                    "COALESCE(SUM(n_approved),0) AS ap, COALESCE(SUM(n_rejected),0) AS rj, "
+                    "MIN(day) AS d1, MAX(day) AS d2 FROM task_archive_counts GROUP BY kind")
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    ll = {"gmail": "📧 Gmail", "fb": "📘 Facebook",
+          "ig": "📸 Instagram", "tg": "✈️ Telegram"}
+    h = ["<div style='margin-top:10px;border-top:1px solid #1e293b;padding-top:8px'>"
+         "<p style='font-size:11.5px;margin:0 0 4px'><b>🗂 ডিলিট হওয়া লগের স্থায়ী হিসাব</b> "
+         "(লগ মুছে গেলেও কে কবে কত জমা দিয়েছে এখানে থাকবে):</p>"
+         "<table style='font-size:11.5px'><tbody>"]
+    for r in rows:
+        k = str(r.get("kind") or "")
+        h.append("<tr><td style='padding:3px 6px'>" + ll.get(k, k) + "</td>"
+                 "<td style='padding:3px 6px;text-align:right'>" + num(r.get("u")) + " জন</td>"
+                 "<td style='padding:3px 6px;text-align:right'>✅ " + num(r.get("ap")) + "</td>"
+                 "<td style='padding:3px 6px;text-align:right'>❌ " + num(r.get("rj")) + "</td>"
+                 "<td style='padding:3px 6px;text-align:right'>" + esc(str(r.get("d1") or ""))
+                 + " → " + esc(str(r.get("d2") or "")) + "</td></tr>")
+    h.append("</tbody></table></div>")
+    return "".join(h)
+
+
 def _tg_notify(text):
     """অ্যাডমিনদের টেলিগ্রাম DM — সরাসরি Bot API (নতুন dependency নেই)।"""
     import json as _json
@@ -987,8 +1128,157 @@ def task_logs():
         + "<div style='margin-top:10px'>"
           "<button class='err' type='submit'>🗑 Delete selected</button></div>"
           "</form></div>"
+        + _reclaim_card()
     )
     return page("Task Logs", body, "tasklogs")
+
+
+def _reclaim_card():
+    """ডেটাবেস সাইজ + space reclaim বাটন (DELETE করলেও সাইজ কমে না — VACUUM লাগে)।"""
+    _sz = db_size_bytes()
+    _size_txt = human_size(_sz) if _sz is not None else "—"
+    return (
+        "<div class='card' style='margin-top:14px'><h3>" + icon("settings") + " ডেটাবেস সাইজ</h3>"
+        "<p style='font-size:20px;font-weight:700;margin:6px 0'>🗄 " + _size_txt + "</p>"
+        "<p class='mut' style='font-size:11.5px'>ডিলিট করলে Postgres-এ জায়গা সাথে সাথে ছাড়ে না — "
+        "row টা শুধু 'dead' হয়, ফাইলের সাইজ আগের মতোই থাকে। নিচের বাটন <b>VACUUM</b> চালিয়ে "
+        "ওই খালি জায়গা সত্যিই ফেরত আনে।<br>"
+        "• <b>Space ফেরত আনুন</b> — দ্রুত, কোনো lock নেই (dead space reuse হয়)<br>"
+        "• <b>Full VACUUM</b> — ফাইল সত্যিই ছোট হয়, তবে টেবিল কয়েক সেকেন্ড lock থাকে<br>"
+        "<b>CockroachDB</b>-তে VACUUM নেই — ওখানে GC নিজেই ~২৫ ঘণ্টায় জায়গা ছাড়ে, "
+        "প্যানেলের সাইজও তখনই কমে।</p>"
+        "<div class='row' style='gap:8px;flex-wrap:wrap'>"
+        "<form method='post' action='/admin/task-logs/reclaim' style='display:inline'>"
+        "<input type='hidden' name='full' value='0'>"
+        "<button class='btn' type='submit'>🧹 Space ফেরত আনুন</button></form>"
+        "<form method='post' action='/admin/task-logs/reclaim' style='display:inline'>"
+        "<input type='hidden' name='full' value='1'>"
+        "<button class='btn gray' type='submit'>🔥 Full VACUUM (ধীর)</button></form>"
+        "</div>"
+    ) + _purge_preview_html(force=bool(request.args.get("junk"))) + (
+        "<form method='post' action='/admin/task-logs/purge-junk' style='margin-top:12px'"
+        " onsubmit=\"return confirm('পুরোনো ডেটা ডিলিট + Full VACUUM চালাব? টাকা/ব্যালান্স/রেফারেল মুছবে না।')\">"
+        "<div style='display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap'>"
+        "<label style='font-size:12px'>কত দিনের বেশি পুরোনো ডেটা মুছবে:</label>"
+        "<input name='days' type='number' min='1' max='3650' value='90' "
+        "style='width:90px;padding:6px 8px;border-radius:8px;border:1px solid #334155"
+        ";background:#0f172a;color:#e2e8f0'>"
+        "<span class='mut' style='font-size:11px'>দিন (pending কখনো মুছবে না)</span></div>"
+        "<button class='err' type='submit' style='width:100%'>"
+        "🧨 পুরোনো ডেটা ডিলিট + জায়গা ফেরত (এক চাপে)</button></form>"
+        "<p class='mut' style='font-size:11px;margin-top:6px'>উপরের বেকার ডেটা + দিনের বেশি "
+        "পুরোনো <b>approved/rejected টাস্ক লগ</b> ডিলিট করে তারপর Full VACUUM চালায় — "
+        "সাইটের স্টোরেজ সাইজ সত্যিই কমে। <b>ডিভাইস/IP/ব্যালান্স/উইথড্র কিছুই মুছবে না।</b> "
+        "শুরু হলে ট্যাব বন্ধ করলেও কাজ চলবে, শেষে অ্যাডমিনকে Telegram-এ জানাবে।</p>"
+        "</div>"
+    )
+
+
+def _purge_junk_job(days=90):
+    """পুরোনো ডেটা ডিলিট + Full VACUUM — ব্যাকগ্রাউন্ড থ্রেডে (request timeout এড়াতে)।"""
+    import threading
+
+    def _run():
+        before = db_size_bytes()
+        counts = {}
+        try:
+            counts = cleanup_junk()
+        except Exception as e:
+            print("[purge-junk] cleanup: " + str(e)[:200])
+        old_logs = {}
+        try:
+            old_logs = _purge_old_logs(days)
+        except Exception as e:
+            print("[purge-junk] old logs: " + str(e)[:200])
+        tbls = [r[0] for r in JUNK_TABLES] + list(_LOG_TABLES.values())
+        tbls = [t[0] if isinstance(t, (tuple, list)) else t for t in tbls]
+        try:
+            _v = db_reclaim(tables=tbls, full=True)
+            vac_ok = len([x for x in _v.get("ok", [])])
+            vac_skip = len([x for x in _v.get("skip", [])])
+            vac_err = len([x for x in _v.get("err", [])])
+        except Exception as e:
+            vac_ok = vac_skip = vac_err = 0
+            print("[purge-junk] vacuum: " + str(e)[:200])
+        after = db_size_bytes()
+        total = sum(counts.values()) + sum(old_logs.values())
+        lines = ["🧨 পুরোনো ডেটা ডিলিট সম্পন্ন (" + str(days) + " দিনের বেশি পুরোনো)", ""]
+        for _r in JUNK_TABLES:
+            lines.append("• " + _r[0] + ": " + str(counts.get(_r[0], 0)) + " row")
+        for k, (tbl, _tsc) in _LOG_TABLES.items():
+            lines.append("• " + tbl + ": " + str(old_logs.get(k, 0)) + " row")
+        lines += ["", "মোট: " + str(total) + " row ডিলিট",
+                  "VACUUM হয়েছে " + str(vac_ok) + "টা টেবিলে"
+                  + (" (skip " + str(vac_skip) + ")" if vac_skip else "")
+                  + (" (err " + str(vac_err) + ")" if vac_err else "")]
+        if before is not None:
+            lines.append("আগে: " + human_size(before))
+        if after is not None:
+            lines.append("এখন: " + human_size(after))
+        if before is not None and after is not None:
+            lines.append("কমেছে: " + human_size(max(0, int(before) - int(after))))
+        if vac_skip and not vac_ok:
+            lines.append("ℹ️ CockroachDB-তে VACUUM নেই — GC নিজেই ~২৫ ঘণ্টায় জায়গা ছাড়বে।")
+        try:
+            _tg_notify("\n".join(lines))
+        except Exception:
+            pass
+        print("[purge-junk] " + " | ".join(lines[-3:]))
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    return th
+
+
+@wadm.route("/admin/task-logs/purge-junk", methods=["POST"])
+def task_logs_purge_junk():
+    """এক চাপে: পুরোনো বাজে ডেটা ডিলিট → Full VACUUM → স্টোরেজ সাইজ কমে।"""
+    g = guard()
+    if g:
+        return g
+    try:
+        _d = int(str(request.form.get("days") or "90").strip())
+    except Exception:
+        _d = 90
+    _d = max(1, min(3650, _d))
+    try:
+        _purge_junk_job(_d)
+    except Exception as e:
+        return redirect("/admin/task-logs?e=শুরু+করতে+পারেনি+" + str(e)[:60])
+    log_admin("purge_junk", 0, "started")
+    return redirect("/admin/task-logs?ok=পুরোনো+ডেটা+ডিলিট+শুরু+হয়েছে+(" + str(_d)
+                    + "+দিন)+—+শেষে+Telegram-এ+জানাবে")
+
+
+@wadm.route("/admin/task-logs/reclaim", methods=["POST"])
+def task_logs_reclaim():
+    """DELETE-এর পর সত্যিকারের জায়গা ফেরত — VACUUM চালাও, আগে/পরে সাইজ দেখাও।"""
+    g = guard()
+    if g:
+        return g
+    full = str(request.form.get("full") or "0").strip() in ("1", "true", "on", "yes")
+    before = db_size_bytes()
+    res = db_reclaim(full=full)
+    after = db_size_bytes()
+    log_admin("db_reclaim", 0, "full=%s ok=%d err=%d" % (full, len(res.get("ok", [])),
+                                                         len(res.get("err", []))))
+    if not res.get("ok"):
+        if not res.get("err"):
+            return redirect("/admin/task-logs?e=VACUUM+এই+ডেটাবেসে+চলে+না+(CockroachDB+GC+নিজেই+করে)")
+        return redirect("/admin/task-logs?e=VACUUM+ব্যর্থ+—+লগ+দেখুন")
+    msg = "VACUUM+সম্পন্ন+" + str(len(res["ok"])) + "+টেবিল"
+    if before is not None and after is not None:
+        _saved = int(before) - int(after)
+        msg += "+|+আগে+" + human_size(before).replace(" ", "+") + "+এখন+" + human_size(after).replace(" ", "+")
+        msg += "+|+কমেছে+" + human_size(max(0, _saved)).replace(" ", "+")
+    try:
+        _tg_notify("🧹 Space reclaim (" + ("FULL" if full else "VACUUM") + ")\n"
+                   "• টেবিল: " + str(len(res.get("ok", []))) + "\n"
+                   "• আগে: " + (human_size(before) if before is not None else "—") + "\n"
+                   "• এখন: " + (human_size(after) if after is not None else "—"))
+    except Exception:
+        pass
+    return redirect("/admin/task-logs?ok=" + msg)
 
 
 @wadm.route("/admin/task-logs/delete", methods=["POST"])
@@ -1017,6 +1307,14 @@ def task_logs_delete():
         except Exception as _e:
             print("[task-logs] delete " + k + ": " + str(_e))
     total = sum(deleted.values())
+    # ── ডিলিটের পরই VACUUM — নাহলে row মরে গেলেও ফাইলের জায়গা ছাড়ে না ──
+    _vac = {"ok": [], "skip": [], "err": []}
+    try:
+        _vac_tbls = [_LOG_TBLS[k] for k in groups if k in _LOG_TBLS]
+        if _vac_tbls:
+            _vac = db_reclaim(tables=_vac_tbls)
+    except Exception as _ve:
+        print("[task-logs] vacuum: " + str(_ve))
     try:
         from webadmin import agg_clear
         agg_clear()
@@ -1027,6 +1325,10 @@ def task_logs_delete():
         txt = "🗑 Task Logs ডিলিট\n\n" + "\n".join(
             "• " + _LOG_LABEL.get(k, k) + ": " + str(v) + "টা" for k, v in deleted.items())
         txt += "\n\n✅ মোট " + str(total) + "টা রেকর্ড ডিলিট হয়েছে (প্যানেলও আপডেট হয়েছে)।"
+        if _vac.get("ok"):
+            txt += chr(10) + "🧹 VACUUM হয়েছে " + str(len(_vac["ok"])) + "টা টেবিলে — জায়গা ফেরত পাওয়া শুরু হয়েছে।"
+        elif _vac.get("skip") and not _vac.get("err"):
+            txt += chr(10) + "ℹ️ এই ডেটাবেসে VACUUM চলে না (CockroachDB) — GC নিজেই জায়গা ছাড়বে।"
         try:
             _tg_notify(txt)
         except Exception:

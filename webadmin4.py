@@ -12,6 +12,7 @@ from webadmin import (
     wadm, page, guard, table, badge, esc, icon, num, money, one, many, scal, _x,
     log_admin, pager, st_badge, review_card, review_tokens, review_apply,
     review_counts, review_kpi, _fire_settings_changed, _fire_review_changed,
+    xlsx_bytes,
 )
 
 _DDL = (
@@ -452,6 +453,7 @@ def igtasks():
             badge("Sheet ✓", "ok") if (t.get("sheet_url") or "").strip() else "—",
             f"<a class='btn gray sm' href='/admin/igtask/{tid}'>Edit</a> "
             f"<a class='btn gray sm' href='/admin/igtask/{tid}/subs'>Submissions</a> "
+            f"<a class='btn gray sm' href='/admin/igtask/{tid}/export.xlsx'>Excel</a> "
             f"<a class='btn gray sm' href='/admin/igtask/{tid}/export.csv'>CSV</a>",
         ])
     body = (
@@ -511,7 +513,8 @@ def igtask_edit(tid):
     links = (
         f"<div class='card'><div class='row'><a class='btn gray' href='/admin/igtask/{tid}/subs'>"
         "📋 জমা তথ্য দেখুন</a>"
-        f"<a class='btn gray' href='/admin/igtask/{tid}/export.csv'>⬇️ CSV Download</a>"
+        f"<a class='btn gray' href='/admin/igtask/{tid}/export.xlsx'>⬇️ Excel Download</a>"
+        f"<a class='btn gray' href='/admin/igtask/{tid}/export.csv'>CSV</a>"
         "<form method='post' action='/admin/do/igtask/%d/toggle' style='display:inline'>"
         "<button class='btn gray'>%s</button></form></div></div>"
         % (tid, "⏸ বন্ধ করুন" if int(t.get("is_active") or 0) else "▶️ চালু করুন")
@@ -584,7 +587,8 @@ def igtask_subs(tid):
         + review_card(tid, "ig")
         + f"<div class='card'><div class='row' style='justify-content:space-between'>"
         f"<h3>{esc(t['name'])} — জমা তথ্য</h3>"
-        f"<a class='btn gray sm' href='/admin/igtask/{tid}/export.csv'>⬇️ CSV</a></div>"
+        f"<a class='btn gray sm' href='/admin/igtask/{tid}/export.xlsx'>⬇️ Excel</a>"
+        f"<a class='btn gray sm' href='/admin/igtask/{tid}/export.csv'>CSV</a></div>"
         + table(["Date", "User", "Acc#", "Instagram Username", "Login Username",
                  "Login Pass", "IG Password", "Status", "Sheet", ""], trs,
                 "এখনো কোনো জমা নেই")
@@ -633,16 +637,8 @@ def igsub_delete(sid):
     return redirect("/admin/igtasks")
 
 
-@wadm.route("/admin/igtask/<int:tid>/export.csv", methods=["GET"])
-def igtask_export(tid):
-    g = guard()
-    if g:
-        return g
-    _init()
-    t = one("SELECT * FROM ig_tasks WHERE id=%s", (tid,))
-    if not t:
-        return page("Not found", "<div class='card'>Task নেই</div>", "igtasks", status=404)
-    import csv, io
+def _ig_export_table(t):
+    """CSV আর Excel — দুটোর জন্যই একই ডেটা, কলাম-ক্রম অনুযায়ী।"""
     try:
         cols = json.loads(t.get("sheet_columns") or "[]")
     except Exception:
@@ -656,11 +652,12 @@ def igtask_export(tid):
               "login_username": "Login Username", "login_password": "Login Password"}
     subs = many(
         "SELECT s.*, COALESCE(u.username,'') AS username FROM ig_submissions s "
-        "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s ORDER BY s.id ASC", (tid,))
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow([labels.get(c, c[2:].replace("_", " ").title() if c.startswith("f:")
-                else c) for c in cols])
+        "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s ORDER BY s.id ASC",
+        (int(t["id"]),))
+
+    header = [labels.get(c, c[2:].replace("_", " ").title() if c.startswith("f:") else c)
+              for c in cols]
+    rows = []
     for i, s in enumerate(subs, 1):
         try:
             data = json.loads(s.get("data") or "{}")
@@ -684,11 +681,53 @@ def igtask_export(tid):
                 out.append(data.get("coki", "") or data.get("cookies", ""))
             else:
                 out.append(s.get(c, "") if s.get(c) is not None else "")
-        w.writerow(out)
-    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(t.get("name") or tid))[:40]
+        rows.append(out)
+    return header, rows
+
+
+def _ig_file_base(t, tid):
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_"
+                   for ch in str(t.get("name") or tid))[:40]
+
+
+@wadm.route("/admin/igtask/<int:tid>/export.xlsx", methods=["GET"])
+def igtask_export_xlsx(tid):
+    g = guard()
+    if g:
+        return g
+    _init()
+    t = one("SELECT * FROM ig_tasks WHERE id=%s", (tid,))
+    if not t:
+        return page("Not found", "<div class='card'>Task নেই</div>", "igtasks", status=404)
+    header, rows = _ig_export_table(t)
+    data = xlsx_bytes(header, rows, str(t.get("name") or ("IG Task %s" % tid)))
+    return Response(
+        data,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition":
+                 f"attachment; filename=ig_{_ig_file_base(t, tid)}.xlsx"})
+
+
+@wadm.route("/admin/igtask/<int:tid>/export.csv", methods=["GET"])
+def igtask_export(tid):
+    g = guard()
+    if g:
+        return g
+    _init()
+    t = one("SELECT * FROM ig_tasks WHERE id=%s", (tid,))
+    if not t:
+        return page("Not found", "<div class='card'>Task নেই</div>", "igtasks", status=404)
+    import csv, io
+    header, rows = _ig_export_table(t)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(header)
+    for r in rows:
+        w.writerow(r)
     data = ("\ufeff" + buf.getvalue()).encode("utf-8")
-    return Response(data, mimetype="text/csv",
-                    headers={"Content-Disposition": f"attachment; filename=ig_{safe}.csv"})
+    return Response(data, mimetype="text/csv; charset=utf-8",
+                    headers={"Content-Disposition":
+                             f"attachment; filename=ig_{_ig_file_base(t, tid)}.csv"})
 
 
 # ── মেনুতে দেখাও (CONTENT সেকশন, Facebook Tasks-এর ঠিক পরে) ──
