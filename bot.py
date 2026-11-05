@@ -3805,9 +3805,84 @@ def _invalidate_req_ch_cache():
     global _req_ch_cache, _req_ch_cache_ts
     _req_ch_cache = None
     _req_ch_cache_ts = 0.0
+    # চ্যানেল লিস্ট বদলালে ইউজারদের "সব চ্যানেলে আছি" ক্যাশও ফেলে দাও —
+    # নাহলে নতুন চ্যানেল যোগ করলেও ৩০ মিনিট কেউ জয়েন প্রম্পট দেখে না।
+    try:
+        _ch_cache.clear()
+    except Exception:
+        pass
+
+
+_req_ch_deduped = False
+
+
+def _norm_ch_id(v):
+    """@name / t.me/name / https://t.me/name / -100123 — সব এক ফরম্যাটে।"""
+    x = (v or "").strip()
+    for _p in ("https://", "http://"):
+        if x.lower().startswith(_p):
+            x = x[len(_p):]
+    if x.lower().startswith("t.me/"):
+        x = x[5:]
+    elif x.lower().startswith("telegram.me/"):
+        x = x[12:]
+    x = x.strip().strip("/").split("?")[0].strip()
+    if x and not x.startswith("@") and not x.lstrip("-").isdigit():
+        x = "@" + x
+    return x
+
+
+def _req_ch_dedupe():
+    """একবারের মাইগ্রেশন — পুরোনো ভুল ফরম্যাট ঠিক + ডুপ্লিকেট এক + unique index।
+
+    পুরোনো DB-তে ch_id-তে UNIQUE ছিল না, তাই একই চ্যানেল (@news, t.me/news,
+    https://t.me/news) বারবার যোগ হলে আলাদা আলাদা row হতো — একটা ডিলিট
+    করলে বাকিগুলো তালিকায় থেকে যেত।
+    """
+    global _req_ch_deduped
+    if _req_ch_deduped:
+        return
+    _req_ch_deduped = True
+    # ১) প্রতিটা row-এর ch_id নরমালাইজ (বা খালি হলে মুছে ফেলো)
+    try:
+        with _c() as c:
+            rows = c.execute("SELECT id, ch_id FROM required_channels ORDER BY id").fetchall()
+        todo = []
+        for r in rows or []:
+            _rid = int(r["id"])
+            _old = str(r.get("ch_id") or "")
+            _new = _norm_ch_id(_old)
+            if _new != _old:
+                todo.append((_rid, _new))
+        if todo:
+            with _c() as c:
+                for _rid, _new in todo:
+                    if not _new:
+                        c.execute("DELETE FROM required_channels WHERE id=%s", (_rid,))
+                    else:
+                        c.execute("UPDATE required_channels SET ch_id=%s WHERE id=%s",
+                                  (_new, _rid))
+    except Exception as e:
+        log.warning(f"[CH-DEDUPE] ch_id ঠিক করা যায়নি: {e}")
+    # ২) এখন একই ch_id একাধিক থাকলে সবচেয়ে পুরোনোটা রাখো
+    try:
+        with _c() as c:
+            c.execute("DELETE FROM required_channels WHERE id NOT IN "
+                      "(SELECT MIN(id) FROM required_channels GROUP BY lower(trim(ch_id)))")
+    except Exception as e:
+        log.warning(f"[CH-DEDUPE] পুরোনো ডুপ্লিকেট মোছা যায়নি: {e}")
+    # ৩) ভবিষ্যতে ডুপ্লিকেট হবে না
+    try:
+        with _c() as c:
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_req_channel_chid "
+                      "ON required_channels (ch_id)")
+    except Exception as e:
+        log.debug(f"[CH-DEDUPE] unique index: {e}")
+
 
 def get_req_channels():
     global _req_ch_cache, _req_ch_cache_ts
+    _req_ch_dedupe()
     now_ts = _time.monotonic()
     if _req_ch_cache is not None and (now_ts - _req_ch_cache_ts) < _REQ_CH_CACHE_TTL:
         return _req_ch_cache
@@ -3818,13 +3893,36 @@ def get_req_channels():
     return result
 
 def add_req_channel(ch_id, ch_link, ch_name):
+    """একই চ্যানেল আবার যোগ করলে ডুপ্লিকেট নয় — পুরোনোটা আপডেট হয়।"""
+    cid = _norm_ch_id(ch_id)
+    if not cid:
+        return
+    link = (ch_link or "").strip() or f"https://t.me/{cid.lstrip('@')}"
+    if link and not link.lower().startswith(("http://", "https://")):
+        link = "https://" + link.lstrip("/")
+    name = (ch_name or "").strip() or cid
     with _c() as c:
-        c.execute("INSERT INTO required_channels (ch_id, ch_link, ch_name) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
-                  (ch_id, ch_link, ch_name))
+        r = c.execute("SELECT id FROM required_channels WHERE lower(ch_id)=lower(%s) "
+                      "ORDER BY id LIMIT 1", (cid,)).fetchone()
+        if r:
+            c.execute("UPDATE required_channels SET ch_id=%s, ch_link=%s, ch_name=%s "
+                      "WHERE lower(ch_id)=lower(%s)", (cid, link, name, cid))
+        else:
+            c.execute("INSERT INTO required_channels (ch_id, ch_link, ch_name) "
+                      "VALUES (%s,%s,%s)", (cid, link, name))
     _invalidate_req_ch_cache()
 
 def remove_req_channel(rid):
+    """একটা row নয় — একই ch_id-র সব row মুছে দাও (পুরোনো ডুপ্লিকেটও)।"""
     with _c() as c:
+        r = c.execute("SELECT ch_id FROM required_channels WHERE id=%s", (rid,)).fetchone()
+        raw = (r or {}).get("ch_id") if isinstance(r, dict) else None
+        raw = str(raw or "").strip()
+        cid = _norm_ch_id(raw)
+        for _k in {raw, cid, raw.lstrip("@").lower(), cid.lower()}:
+            if _k:
+                c.execute("DELETE FROM required_channels "
+                          "WHERE lower(trim(ch_id))=lower(%s)", (_k,))
         c.execute("DELETE FROM required_channels WHERE id=%s", (rid,))
     _invalidate_req_ch_cache()
 
@@ -6240,17 +6338,35 @@ async def _task_kb_dispatch(txt, user, message, ctx):
     _lbl = (txt or "").strip()
     _cb = _trk.get(_lbl)
     if _lbl in _TASK_CANCEL_LABELS:
-        # ⚠️ ম্যাপ কোন কারণে মুছে গেলেও / ভুল ফ্লোয়ের ম্যাপ থাকলেও বাতিল কাজ করবে
+        # ── বাতিল = ১০০% কাজ করবে ─────────────────────────────────
+        # আগে এটা on_callback-এ যেত, যেখানে rate-limit + verify গেটে আটকে
+        # চুপচাপ কিছুই হতো না। এখন সরাসরি এখানেই সব পরিষ্কার করে দিই।
+        _uid_i = int(user.id)
         try:
-            _k = str((_TASK_SESS.get(int(user.id)) or {}).get("kind") or "").lower()
+            _FB_STATE.pop(_uid_i, None)
+            _IG_STATE.pop(_uid_i, None)
         except Exception:
-            _k = ""
-        if int(user.id) in _FB_STATE or _k == "fb":
-            _cb = "fbt_cancel"
-        elif int(user.id) in _IG_STATE or _k == "ig":
-            _cb = "igt_cancel"
-        else:
-            _cb = "task_cancel"
+            pass
+        try:
+            _TASK_SESS.pop(_uid_i, None)
+        except Exception:
+            pass
+        _TASK_REPLY_KB.pop(_uid_i, None)
+        try:
+            ctx.user_data.pop("state", None)
+        except Exception:
+            pass
+        try:
+            _cl = await asyncio.to_thread(get_lang, _uid_i)
+        except Exception:
+            _cl = "bn"
+        _cnote = ("✅ বাতিল হয়েছে। নিচের মেনু থেকে আবার শুরু করুন।" if _cl != "en"
+                  else "✅ Cancelled. Start again from the menu below.")
+        try:
+            await message.reply_text(_cnote, reply_markup=await asyncio.to_thread(main_kb, _uid_i))
+        except Exception as _ce:
+            log.debug(f"[TASK-KB] বাতিল রিপ্লাই ব্যর্থ: {_ce}")
+        return True
     if not _cb:
         return False
     if _cb.startswith("video:"):
@@ -6298,8 +6414,21 @@ async def _kb_global_router(update, ctx):
 
 async def show_tasks(update, ctx):
     uid          = update.effective_user.id
-    if not await _vrf_gate_msg(ctx.bot, uid):
-        return
+    _t_start     = _time.monotonic()
+    # ── ১৫s ক্যাশ: ইউজার বারবার Task চাপে — DB-তে আবার যাওয়ার দরকার নেই ──
+    _vhit = _TASKS_VIEW_CACHE.get(uid)
+    if _vhit and (_t_start - _vhit[0]) < 15:
+        try:
+            _TASK_REPLY_KB[uid] = dict(_vhit[3])
+            await update.message.reply_text(
+                _vhit[1], parse_mode="Markdown",
+                reply_markup=ReplyKeyboardMarkup(_vhit[2], resize_keyboard=True,
+                                                 one_time_keyboard=False))
+            return
+        except Exception:
+            _TASKS_VIEW_CACHE.pop(uid, None)
+    # verify গেট + ডাটা একসাথে (আগে পরপর ছিল → ২ গুণ সময় লাগত)
+    _gate_fut = asyncio.ensure_future(_vrf_gate_msg(ctx.bot, uid))
     # send_chat_action background — main path block করে না
     _act = asyncio.create_task(ctx.bot.send_chat_action(chat_id=uid, action="typing"))
     _background_tasks.add(_act); _act.add_done_callback(_bg_task_done)
@@ -6311,6 +6440,8 @@ async def show_tasks(update, ctx):
         asyncio.to_thread(get_categories),
         asyncio.to_thread(get_bio_task),
     )
+    if not await _gate_fut:
+        return
     bio_active   = bio_task and bio_task['is_active']
 
     if not tasks and not tg_tasks and not categories and not bio_active:
@@ -6419,11 +6550,11 @@ async def show_tasks(update, ctx):
         btns.append([InlineKeyboardButton(tgt_label, callback_data="tgt_list")])
 
     # Facebook Tasks — active থাকলে একটাই গ্রুপ বাটন
-    _fb_tasks = await asyncio.to_thread(_fb_active_tasks)
+    _fb_tasks = await asyncio.to_thread(_fb_active_tasks_c)
     if _fb_tasks:
         _fb_left = 0
         _fb_map = await asyncio.to_thread(
-            _fb_counts_map, [int(_x["id"]) for _x in _fb_tasks], uid)
+            _fb_counts_map_c, [int(_x["id"]) for _x in _fb_tasks], uid)
         for _ft in _fb_tasks:
             _tot, _mine = _fb_map.get(int(_ft["id"]), (0, 0))
             _mx = int(_ft.get("max_accounts") or 0)
@@ -6435,11 +6566,11 @@ async def show_tasks(update, ctx):
         btns.append([InlineKeyboardButton(_fb_label, callback_data="fbt_list")])
 
     # Instagram Tasks — active থাকলে একটাই গ্রুপ বাটন
-    _ig_tasks = await asyncio.to_thread(_ig_active_tasks)
+    _ig_tasks = await asyncio.to_thread(_ig_active_tasks_c)
     if _ig_tasks:
         _ig_left = 0
         _ig_map = await asyncio.to_thread(
-            _ig_counts_map, [int(_x["id"]) for _x in _ig_tasks], uid)
+            _ig_counts_map_c, [int(_x["id"]) for _x in _ig_tasks], uid)
         for _it in _ig_tasks:
             _tot, _mine = _ig_map.get(int(_it["id"]), (0, 0))
             _mx = int(_it.get("max_accounts") or 0)
@@ -6479,11 +6610,18 @@ async def show_tasks(update, ctx):
     _kb_map[_home_lbl] = "task_cancel"
     _kb_rows.append([_home_lbl])
     _TASK_REPLY_KB[uid] = _kb_map
+    _vtxt = f"{T(uid,'tasks_title')}\n\n{T(uid,'tasks_choose')}"
+    if len(_TASKS_VIEW_CACHE) > 3000:
+        _TASKS_VIEW_CACHE.clear()
+    _TASKS_VIEW_CACHE[uid] = (_time.monotonic(), _vtxt, _kb_rows, dict(_kb_map))
     await update.message.reply_text(
-        f"{T(uid,'tasks_title')}\n\n{T(uid,'tasks_choose')}",
+        _vtxt,
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardMarkup(_kb_rows, resize_keyboard=True, one_time_keyboard=False)
     )
+    _el = _time.monotonic() - _t_start
+    if _el > 3:
+        log.warning(f"[SLOW-TASKS] uid={uid} {_el:.1f}s")
 
 
 async def show_tg_tasks_list(update, ctx):
@@ -13277,22 +13415,35 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             parse_mode="Markdown"); return
 
     # ── Channel Management ────────────────────────────────────────
-    if d == "adm_ch_list":
+    async def _ch_list_ui():
+        """(text, buttons) — একই ch_id একবারই দেখাবে, ডুপ্লিকেট হলেও।"""
         channels = await asyncio.to_thread(get_req_channels)
-        if not channels:
-            text = "📢 *Required Channels*\n\n❌ কোনো channel নেই।"
-            btns = []
-        else:
-            text = "📢 *Required Channels তালিকা:*\n\n"
-            btns = []
-            for ch in channels:
-                text += f"• {_md_esc(str(ch['ch_name'] or ''))} — `{ch['ch_id']}`\n"
-                btns.append([InlineKeyboardButton(
-                    f"🗑 Remove: {ch['ch_name']}", callback_data=f"adm_ch_del_{ch['id']}"
-                )])
-        btns.append([InlineKeyboardButton("➕ নতুন Channel যোগ করুন", callback_data="adm_ch_add")])
-        if len(text) > 4000: text = text[:4000] + "\n\n_(তালিকা কেটে দেওয়া হয়েছে)_"
-        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns)); return
+        seen, uniq = set(), []
+        for _ch in channels or []:
+            _k = str(_ch.get("ch_id") or "").strip().lower()
+            if not _k or _k in seen:
+                continue
+            seen.add(_k)
+            uniq.append(_ch)
+        _add_btn = [InlineKeyboardButton("➕ নতুন Channel যোগ করুন", callback_data="adm_ch_add")]
+        if not uniq:
+            return "📢 *Required Channels*\n\n❌ কোনো channel নেই।", [_add_btn]
+        text = "📢 *Required Channels তালিকা:*\n\n"
+        btn_rows = []
+        for _ch in uniq:
+            text += f"• {_md_esc(str(_ch.get('ch_name') or ''))} — `{_ch.get('ch_id')}`\n"
+            btn_rows.append([InlineKeyboardButton(
+                f"🗑 Remove: {str(_ch.get('ch_name') or '')[:28]}",
+                callback_data=f"adm_ch_del_{_ch['id']}")])
+        btn_rows.append([_add_btn])
+        if len(text) > 4000:
+            text = text[:4000] + "\n\n_(তালিকা কেটে দেওয়া হয়েছে)_"
+        return text, btn_rows
+
+    if d == "adm_ch_list":
+        _t, _rows = await _ch_list_ui()
+        await q.message.reply_text(_t, parse_mode="Markdown",
+                                   reply_markup=InlineKeyboardMarkup(_rows)); return
 
     if d == "adm_ch_add":
         ctx.user_data["state"] = "adm_ch_add_id"
@@ -13301,9 +13452,20 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
             parse_mode="Markdown"); return
 
     if d.startswith("adm_ch_del_"):
-        rid = int(d.split("_")[3])
+        try:
+            rid = int(d.split("_")[3])
+        except (IndexError, ValueError):
+            await q.message.reply_text("❌ ভুল বাটন।"); return
         await asyncio.to_thread(remove_req_channel, rid)
-        await q.message.reply_text("✅ *Channel সরানো হয়েছে।*", parse_mode="Markdown"); return
+        _t, _rows = await _ch_list_ui()      # সাথে সাথে রিফ্রেশ — পুরোনো বাটন বাতিল
+        _msg = "✅ *Channel সরানো হয়েছে।*\n\n" + _t
+        try:
+            await q.edit_message_text(_msg, parse_mode="Markdown",
+                                      reply_markup=InlineKeyboardMarkup(_rows))
+        except Exception:
+            await q.message.reply_text(_msg, parse_mode="Markdown",
+                                       reply_markup=InlineKeyboardMarkup(_rows))
+        return
 
     # ── Category Task Management ─────────────────────────────────
     if d == "adm_cat_add":
@@ -20785,6 +20947,9 @@ async def _task_ui(q, text, kb=None, parse_mode=None):
         log.warning(f"[TASK-UI] পাঠানো যায়নি: {e}")
 
 
+_TASKS_VIEW_CACHE = {}      # uid → (ts, text, kb_rows, label→cb map)
+
+
 def _reply_kb_build(uid, rows):
     """inline keyboard rows → নিচের Reply Keyboard rows + রাউটিং ম্যাপ।
 
@@ -20846,9 +21011,20 @@ async def _task_reply_ui(q, uid, text, rows, parse_mode=None, lang=None):
             log.warning(f"[TASK-RKB] পাঠানো যায়নি: {e2}")
 
 
-def _task_video_row(task, lang):
-    """📽 Video instruction বাটন — টাস্কে লিংক সেট থাকলে।"""
+def _task_video_row(task, lang, kind="fb"):
+    """📽 Video instruction বাটন — টাস্কে লিংক/আপলোড করা ভিডিও থাকলে।
+
+    `video_url` দুই রকম হতে পারে:
+      • https://...  → সরাসরি লিংক বাটন (YouTube/Drive/MP4 যেকোনো লিংক)
+      • tg:<file_id> → বট নিজেই ভিডিওটা পাঠাবে (ওয়েব থেকে আপলোড করা)
+    """
     url = (task.get("video_url") or "").strip()
+    if url.startswith("tg:"):
+        _tid = int(task.get("id") or 0)
+        _cb = f"igvid:{_tid}" if str(kind) == "ig" else f"fbvid:{_tid}"
+        _lbl = "📽 Video দেখুন" if lang != "en" else "📽 Watch Video"
+        if _tid:
+            return [InlineKeyboardButton(_lbl, callback_data=_cb)]
     if url and not url.lower().startswith(("http://", "https://")):
         # "youtu.be/xxxx" ধাঁচে (স্কিম ছাড়া) দিলেও কাজ করবে
         if "." in url and " " not in url:
@@ -20935,7 +21111,7 @@ async def fb_task_rules(q, uid, tid):
     rows = []
     if ok:
         rows.append([InlineKeyboardButton("▶️ Start", callback_data=f"fbs:{tid}")])
-    _vid = _task_video_row(task, lang)
+    _vid = _task_video_row(task, lang, "fb")
     if _vid:
         rows.append(_vid)
     rows.append([InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
@@ -21636,7 +21812,7 @@ def _kick_review():
 
 
 # ─────────────────────── অ্যাডমিন (বট) কুইক ভিউ ───────────────────────
-async def adm_fb_list(q, uid):
+async def adm_fb_list(q, uid, ctx=None):
     tasks = await asyncio.to_thread(_fb_active_tasks)
     if not tasks:
         await q.message.reply_text("📘 কোনো Facebook Task নেই — ওয়েব প্যানেলে যোগ করুন।")
@@ -21649,9 +21825,76 @@ async def adm_fb_list(q, uid):
         lines.append(f"• *{t.get('name')}* — {total}/{mx or '∞'}"
                      + ("  🔑 auto" if int(t.get("password_auto") or 0) else "")
                      + (f"  🕒 {t.get('password_change_time')}" if int(t.get("password_auto") or 0) else ""))
-        rows.append([InlineKeyboardButton(f"⬇️ {str(t.get('name'))[:26]} (CSV)", callback_data=f"fbx:{t['id']}")])
+        _nm = str(t.get('name') or '')[:20]
+        rows.append([
+            InlineKeyboardButton(f"⬇️ {_nm} (CSV)", callback_data=f"fbx:{t['id']}"),
+            InlineKeyboardButton("📢 নোটিফাই", callback_data=f"fbnt:{t['id']}"),
+        ])
     rows.append([InlineKeyboardButton("🔄 রিফ্রেশ", callback_data="adm_fb")])
-    await q.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=_fb_kb(rows))
+    await q.message.reply_text(
+        "\n".join(lines)
+        + "\n\n📢 = ওই টাস্কের জন্য চ্যানেল + বট ইউজারদের নোটিফিকেশন পাঠাবে।",
+        parse_mode="Markdown", reply_markup=_fb_kb(rows))
+
+
+async def adm_fb_notify(ctx, q, uid, tid):
+    """একটা FB টাস্কের জন্য চ্যানেল + বট ইউজারদের 'নতুন টাস্ক' নোটিফিকেশন।"""
+    task = await asyncio.to_thread(_fb_task, tid)
+    if not task:
+        await q.message.reply_text("❌ টাস্ক পাওয়া যায়নি।")
+        return
+    try:
+        if not await asyncio.to_thread(task_notify_on):
+            await q.message.reply_text(
+                "⚠️ Task Notification সেটিং বন্ধ আছে।\n"
+                "ওয়েব প্যানেল → Settings → 🔔 Task Notification চালু করুন, "
+                "তারপর আবার চাপুন।")
+            return
+    except Exception:
+        pass
+    total, _mine = await asyncio.to_thread(_fb_counts, tid, None)
+    mx = int(task.get("max_accounts") or 0)
+    slot = f"{max(0, mx - total)}/{mx}" if mx else "Unlimited"
+    try:
+        _bun = await _get_bot_username(ctx.bot)
+    except Exception:
+        _bun = ""
+    link = f"https://t.me/{_bun}" if _bun else NEWS_CH_LINK
+    await _broadcast_task_notify(
+        ctx, q.message, uid,
+        task.get("name") or "", float(task.get("price") or 0), link,
+        slot_txt=slot, njo_line="📘 *Facebook Task*",
+        task_type="fb")
+
+
+async def adm_ig_notify(ctx, q, uid, tid):
+    """একটা IG টাস্কের জন্য চ্যানেল + বট ইউজারদের 'নতুন টাস্ক' নোটিফিকেশন।"""
+    task = await asyncio.to_thread(_ig_task, tid)
+    if not task:
+        await q.message.reply_text("❌ টাস্ক পাওয়া যায়নি।")
+        return
+    try:
+        if not await asyncio.to_thread(task_notify_on):
+            await q.message.reply_text(
+                "⚠️ Task Notification সেটিং বন্ধ আছে।\n"
+                "ওয়েব প্যানেল → Settings → 🔔 Task Notification চালু করুন, "
+                "তারপর আবার চাপুন।")
+            return
+    except Exception:
+        pass
+    total, _mine = await asyncio.to_thread(_ig_counts, tid, None)
+    mx = int(task.get("max_accounts") or 0)
+    slot = f"{max(0, mx - total)}/{mx}" if mx else "Unlimited"
+    try:
+        _bun = await _get_bot_username(ctx.bot)
+    except Exception:
+        _bun = ""
+    link = f"https://t.me/{_bun}" if _bun else NEWS_CH_LINK
+    await _broadcast_task_notify(
+        ctx, q.message, uid,
+        task.get("name") or "", float(task.get("price") or 0), link,
+        slot_txt=slot, njo_line="📸 *Instagram Task*",
+        task_type="ig")
 
 
 async def adm_fb_export(q, uid, tid):
@@ -21700,7 +21943,22 @@ async def fb_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif data == 'adm_fb':
             if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
                 return
-            await adm_fb_list(q, uid)
+            await adm_fb_list(q, uid, ctx)
+        elif data.startswith('fbvid:'):
+            _vt = await asyncio.to_thread(_fb_task, int(data.split(':', 1)[1]))
+            _vf = ((_vt or {}).get('video_url') or '').strip()
+            if _vf.startswith('tg:'):
+                try:
+                    await q.message.reply_video(_vf[3:], caption='📽 Video')
+                except Exception as _e:
+                    log.warning(f'[FB-VIDEO] {_e}')
+                    await q.message.reply_text('❌ ভিডিও পাঠানো যায়নি।')
+            else:
+                await q.message.reply_text('❌ ভিডিও পাওয়া যায়নি।')
+        elif data.startswith('fbnt:'):
+            if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
+                return
+            await adm_fb_notify(ctx, q, uid, int(data.split(':', 1)[1]))
         elif data.startswith('fbx:'):
             if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
                 return
@@ -22487,7 +22745,7 @@ async def ig_task_rules(q, uid, tid):
     rows = []
     if ok:
         rows.append([InlineKeyboardButton("▶️ Start", callback_data=f"igts:{tid}")])
-    _vid = _task_video_row(task, lang)
+    _vid = _task_video_row(task, lang, "ig")
     if _vid:
         rows.append(_vid)
     rows.append([InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
@@ -22907,7 +23165,7 @@ async def job_ig_export(ctx):
 
 
 # ─────────────────────── অ্যাডমিন (বট) কুইক ভিউ ───────────────────────
-async def adm_ig_list(q, uid):
+async def adm_ig_list(q, uid, ctx=None):
     tasks = await asyncio.to_thread(_ig_active_tasks)
     if not tasks:
         await q.message.reply_text("📸 কোনো Instagram Task নেই — ওয়েব প্যানেলে যোগ করুন।")
@@ -22919,10 +23177,16 @@ async def adm_ig_list(q, uid):
         mx = int(t.get("max_accounts") or 0)
         lines.append(f"• *{t.get('name')}* — {total}/{mx or '∞'}"
                      + ("  🔑 auto" if int(t.get("password_auto") or 0) else ""))
-        rows.append([InlineKeyboardButton(f"⬇️ {str(t.get('name'))[:26]} (CSV)",
-                                          callback_data=f"igx:{t['id']}")])
+        _nm = str(t.get('name') or '')[:20]
+        rows.append([
+            InlineKeyboardButton(f"⬇️ {_nm} (CSV)", callback_data=f"igx:{t['id']}"),
+            InlineKeyboardButton("📢 নোটিফাই", callback_data=f"ignt:{t['id']}"),
+        ])
     rows.append([InlineKeyboardButton("🔄 রিফ্রেশ", callback_data="adm_ig")])
-    await q.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=_ig_kb(rows))
+    await q.message.reply_text(
+        "\n".join(lines)
+        + "\n\n📢 = ওই টাস্কের জন্য চ্যানেল + বট ইউজারদের নোটিফিকেশন পাঠাবে।",
+        parse_mode="Markdown", reply_markup=_ig_kb(rows))
 
 
 async def adm_ig_export(q, uid, tid):
@@ -22974,7 +23238,22 @@ async def ig_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif data == 'adm_ig':
             if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
                 return
-            await adm_ig_list(q, uid)
+            await adm_ig_list(q, uid, ctx)
+        elif data.startswith('igvid:'):
+            _vt = await asyncio.to_thread(_ig_task, int(data.split(':', 1)[1]))
+            _vf = ((_vt or {}).get('video_url') or '').strip()
+            if _vf.startswith('tg:'):
+                try:
+                    await q.message.reply_video(_vf[3:], caption='📽 Video')
+                except Exception as _e:
+                    log.warning(f'[IG-VIDEO] {_e}')
+                    await q.message.reply_text('❌ ভিডিও পাঠানো যায়নি।')
+            else:
+                await q.message.reply_text('❌ ভিডিও পাওয়া যায়নি।')
+        elif data.startswith('ignt:'):
+            if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
+                return
+            await adm_ig_notify(ctx, q, uid, int(data.split(':', 1)[1]))
         elif data.startswith('igx:'):
             if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
                 return
@@ -23422,8 +23701,8 @@ def main():
     app.add_handler(CallbackQueryHandler(sec_callback, pattern=r"^sec_(unban|ignore)_\d+$"))
     app.add_handler(CallbackQueryHandler(moneyreq_callback, pattern=r"^mreq:(ok|no):\d+$"))
     app.add_handler(CallbackQueryHandler(on_resetall_cb, pattern=r"^resetall_(yes|no)$"))
-    app.add_handler(CallbackQueryHandler(fb_callback, pattern=r"^(fbt_list|fbtn:\d+|fbr:\d+|fbs:\d+|fbd:\d+|fbc:\d+|fbt_cancel|adm_fb|fbx:\d+)$"))
-    app.add_handler(CallbackQueryHandler(ig_callback, pattern=r"^(igt_list|igtn:\d+|igtr:\d+|igts:\d+|igc:\d+|igt_cancel|igu:\d+|igd:\d+|adm_ig|igx:\d+)$"))
+    app.add_handler(CallbackQueryHandler(fb_callback, pattern=r"^(fbt_list|fbtn:\d+|fbr:\d+|fbs:\d+|fbd:\d+|fbc:\d+|fbt_cancel|adm_fb|fbx:\d+|fbnt:\d+|fbvid:\d+)$"))
+    app.add_handler(CallbackQueryHandler(ig_callback, pattern=r"^(igt_list|igtn:\d+|igtr:\d+|igts:\d+|igc:\d+|igt_cancel|igu:\d+|igd:\d+|adm_ig|igx:\d+|ignt:\d+|igvid:\d+)$"))
     app.add_handler(CallbackQueryHandler(on_callback))
     # ~filters.VIA_BOT → inline-bot দিয়ে পাঠানো message ignore করো
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_photo, "ph")))

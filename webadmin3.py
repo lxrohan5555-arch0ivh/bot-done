@@ -14,6 +14,7 @@ from webadmin import (
     log_admin, pager, st_badge, review_card, review_tokens, review_apply,
     review_counts, review_kpi, _fire_settings_changed, _fire_review_changed,
     xlsx_bytes, queue_task_notify, export_table, queue_user_msg, queue_broadcast,
+    vid_value,
 )
 
 _DDL = (
@@ -257,10 +258,15 @@ def _form(task=None):
     esc(t.get('rules_bn') or '')}</textarea></div>
 <div class='form'><label>Rules (English) — খালি রাখলে বাংলাটাই দেখাবে</label>
   <textarea name='rules_en' rows='4'>{esc(t.get('rules_en') or '')}</textarea></div>
-<div class='form'><label>📽 Video instruction — লিংক (YouTube/Drive)</label>
-  <input name='video_url' value='{v('video_url')}' placeholder='https://youtu.be/...'>
-  <p class='mut' style='font-size:11px'>ইউজার Rules স্ক্রিনে “📽 Video instruction” বাটন দেখবে, চাপলে এই লিংক খুলবে।
-    খালি রাখলে বাটনটাই দেখাবে না।</p></div>
+<div class='form'><label>📽 Video instruction — লিংক (যেকোনো লিংক)</label>
+  <input name='video_url' value='{v('video_url') if not str(t.get('video_url') or '').startswith('tg:') else ''}'
+         placeholder='https://youtu.be/... / https://drive.google.com/... / যেকোনো MP4 লিংক'>
+  <p class='mut' style='font-size:11px'>ইউজার Rules স্ক্রিনে “📽 Video দেখুন” বাটন দেখবে — চাপলে এই লিংক খুলবে।</p></div>
+<div class='form'><label>🎬 অথবা ভিডিও ফাইল আপলোড (সর্বোচ্চ ~৪৮MB)</label>
+  <input type='file' name='video_file' accept='video/*'>
+  <p class='mut' style='font-size:11px'>আপলোড করলে বটই ভিডিওটা ইউজারকে পাঠাবে (Telegram file_id হিসেবে সেভ হয়)।
+    {('<b>এখন সেট করা আছে:</b> ✅ আপলোড করা ভিডিও' if str(t.get('video_url') or '').startswith('tg:') else '')}
+    লিংক আর ফাইল — দুটোই দিলে ফাইলটাই আগে নেওয়া হবে।</p></div>
 
 <h3 style='margin-top:16px'>👤 নাম</h3>
 <div class='grid g2'>
@@ -440,8 +446,10 @@ def _cols_from_orders(form):
 
 
 def _vid_url(v):
-    """📽 Video লিংক — স্কিম ছাড়া দিলেও https:// বসিয়ে ঠিক করা হয়।"""
+    """📽 Video — লিংক (যেকোনো) অথবা আপলোড করা ভিডিওর `tg:<file_id>`।"""
     u = (v or "").strip()
+    if u.startswith("tg:") and len(u) > 5:
+        return u
     if u and not u.lower().startswith(("http://", "https://")):
         if "." in u and " " not in u:
             u = "https://" + u.lstrip("/")
@@ -454,7 +462,7 @@ def _save(tid=None):
         "name": (f.get("name") or "").strip(),
         "rules_bn": (f.get("rules_bn") or "").strip(),
         "rules_en": (f.get("rules_en") or "").strip(),
-        "video_url": _vid_url(f.get("video_url")),
+        "video_url": _vid_url(vid_value(f.get("video_url"))),
         "price": float(f.get("price") or 0),
         "first_name_mode": _mode(f.get("first_name_mode")),
         "first_name": (f.get("first_name") or "").strip(),

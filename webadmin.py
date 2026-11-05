@@ -2109,7 +2109,6 @@ def user_row(uid):
         "FROM users WHERE user_id=%s", (uid,))
 
 
-@wadm.route("/admin/user/<int:uid>", methods=["GET"])
 def _pending_html(uid):
     """এই ইউজারের অপেক্ষমাণ টাকা/পয়েন্ট রিকোয়েস্ট — বটে না পেলে ওয়েব থেকেই ✅ করা যায়।"""
     rows = money_req_pending(uid, 6)
@@ -2135,6 +2134,7 @@ def _pending_html(uid):
     return "".join(out)
 
 
+@wadm.route("/admin/user/<int:uid>", methods=["GET"])
 def user_detail(uid):
     g = guard()
     if g:
@@ -2404,6 +2404,63 @@ def act_review(uid):
     return back(uid)
 
 
+# ─────────────────── 🎬 ভিডিও আপলোড (web → Telegram file_id) ───────────────────
+def _tg_send_video(up, max_mb=48):
+    """ওয়েব থেকে ভিডিও ফাইল নিয়ে Telegram-এ পাঠায় → file_id ফেরত দেয়।
+
+    file_id পরে `video_url`-এ `tg:<id>` হিসেবে থাকে, বট নিজেই ভিডিওটা
+    ইউজারকে পাঠায়। Render-এ BOT_TOKEN আর ADMIN_ID env লাগবে।
+    """
+    import json as _json
+    import os as _os
+    import urllib.request as _ur
+    import uuid as _uuid
+    tok = (_os.environ.get("BOT_TOKEN") or "").strip()
+    chat = ((_os.environ.get("ADMIN_ID") or _os.environ.get("ADMIN_CHAT_ID") or "").strip())
+    if not tok or not chat:
+        return ""
+    try:
+        raw = up.read()
+        if not raw or len(raw) > max_mb * 1024 * 1024:
+            return ""
+        fname = (getattr(up, "filename", "") or "video.mp4").replace('"', "")
+        boundary = _uuid.uuid4().hex
+        def _field(name, val):
+            return (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n"
+                    f"{val}\r\n").encode()
+        body = _field("chat_id", chat) + _field("supports_streaming", "true")
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"video\"; "
+                 f"filename=\"{fname}\"\r\nContent-Type: video/mp4\r\n\r\n").encode()
+        body += raw + b"\r\n" + f"--{boundary}--\r\n".encode()
+        req = _ur.Request(
+            f"https://api.telegram.org/bot{tok}/sendVideo", data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        with _ur.urlopen(req, timeout=180) as resp:
+            j = _json.loads(resp.read().decode("utf-8", "ignore"))
+        if not j.get("ok"):
+            return ""
+        res = j.get("result") or {}
+        return ((res.get("video") or {}).get("file_id")
+                or (res.get("document") or {}).get("file_id") or "")
+    except Exception as e:
+        print(f"[VIDEO-UPLOAD] ব্যর্থ: {e}")
+        return ""
+
+
+def vid_value(link_val, file_field="video_file"):
+    """ফর্মের লিংক + আপলোড দুটোই সামলায় → video_url এর ফাইনাল মান।"""
+    up = None
+    try:
+        up = request.files.get(file_field)
+    except Exception:
+        up = None
+    if up is not None and getattr(up, "filename", ""):
+        fid = _tg_send_video(up)
+        if fid:
+            return "tg:" + fid
+    return link_val or ""
+
+
 # ─────────────────── 🗄️ Data & Storage (বাকার ডাটা মুছুন) ───────────────────
 _TABLE_LABELS = {
     "users": "👥 ইউজার", "fb_tasks": "📘 FB টাস্ক", "fb_submissions": "📘 FB জমা",
@@ -2436,6 +2493,36 @@ def _table_rows():
             continue
     out.sort(key=lambda x: -x[1])
     return out
+
+
+# কোন ক্যাটাগরির জন্য কোন টেবিল+কলাম লাগবে (না থাকলে স্কিপ)
+_JUNK_NEEDS = {
+    "queue":   ("task_notify_queue", "processed"),
+    "notif":   ("pending_notifications", "send_at"),
+    "alerts":  ("security_alerts", "status"),
+    "devices": ("devices", "last_seen"),
+    "ips":     ("user_ips", "last_seen"),
+    "iph":     ("ip_history", "seen_at"),
+    "actions": ("admin_actions", "created_at"),
+    "mreq":    ("money_requests", "status"),
+    "premem":  ("tg_task_pre_members", "seen_at"),
+}
+
+
+def _col_ok(tbl, col):
+    """টেবিল+কলাম দুটোই আছে কি না (একবার ক্যাশ হয়ে যায়)।"""
+    key = ("col", tbl, col)
+    hit, val = _agg_get(key)
+    if hit:
+        return val
+    ok = False
+    try:
+        ok = bool(one("SELECT 1 AS x FROM information_schema.columns "
+                      "WHERE table_name=%s AND column_name=%s LIMIT 1", (tbl, col)))
+    except Exception:
+        ok = False
+    _agg_put(key, ok)
+    return ok
 
 
 # ⚠️ ফাইলের নিজের নীতি: এই টেবিলগুলো "সব মুছুন"-এ ডিফল্টে বাদ
@@ -2487,22 +2574,32 @@ def _junk_counts():
     for d in _junk_defs():
         key, label, cnt_sql = d[0], d[1], d[2]
         args = d[4] if len(d) > 4 else ()
+        _need = _JUNK_NEEDS.get(key)
+        if _need and not _col_ok(*_need):
+            out.append({"key": key, "label": label, "n": -2, "err": "টেবিল/কলাম নেই"})
+            continue
         n = 0
+        err = ""
         try:
             r = one(cnt_sql, args)
             n = int((r or {}).get("n") or 0)
-        except Exception:
-            n = -1                     # টেবিল নেই
-        out.append({"key": key, "label": label, "n": n})
+        except Exception as e:
+            n = -1                     # query ব্যর্থ
+            err = str(e)[:120]
+        out.append({"key": key, "label": label, "n": n, "err": err})
     return out
 
 
 def _junk_delete(kinds):
-    """নির্বাচিত বাকার ডাটা ডিলিট করে — {key: কত রো} ফেরত দেয়।"""
+    """নির্বাচিত বাকার ডাটা ডিলিট করে — {key: কত রো}; ব্যর্থ হলে {key: -1}।"""
     done = {}
     for d in _junk_defs():
         key = d[0]
         if key not in kinds:
+            continue
+        _need = _JUNK_NEEDS.get(key)
+        if _need and not _col_ok(*_need):
+            done[key] = -2             # স্কিপ — টেবিল/কলাম নেই
             continue
         del_sql = d[3]
         args = d[4] if len(d) > 4 else ()
@@ -2510,7 +2607,7 @@ def _junk_delete(kinds):
             done[key] = int(_x(del_sql, args) or 0)
         except Exception as e:
             print(f"[cleanup] {key} ব্যর্থ: {e}")
-            done[key] = 0
+            done[key] = -1             # ব্যর্থ — পেজে কারণ দেখাবে
     return done
 
 
@@ -2528,9 +2625,15 @@ def storage_page():
             ("<b style='color:#f59e0b'>বেশি</b>" if n >= 20000 else "")] for t, n in rows]
     jtrs = []
     for j in junk:
+        if j["n"] == -2:
+            jtrs.append([f"<code>{esc(j['key'])}</code>", esc(j["label"]),
+                         "<span class='mut'>স্কিপ</span>",
+                         "<span class='mut' style='font-size:11px'>টেবিল/কলাম নেই</span>"])
+            continue
         if j["n"] < 0:
             jtrs.append([f"<code>{esc(j['key'])}</code>", esc(j["label"]),
-                         "<span class='mut'>টেবিল নেই</span>", ""])
+                         "<span class='mut'>?</span>",
+                         f"<span class='mut' style='font-size:11px'>{esc(j.get('err') or 'query ব্যর্থ')}</span>"])
             continue
         jtrs.append([
             f"<input type='checkbox' name='k' value='{esc(j['key'])}'>",
@@ -2586,9 +2689,16 @@ def storage_cleanup():
     if not kinds:
         return redirect("/admin/storage?ok=" + _q_("কিছু নির্বাচন করা হয়নি"))
     done = _junk_delete(kinds)
-    total = sum(done.values())
+    total = sum(v for v in done.values() if v > 0)
+    _bad = [k for k, v in done.items() if v == -1]
+    _skip = [k for k, v in done.items() if v == -2]
     log_admin("junk_cleanup", 0, ",".join(f"{k}={v}" for k, v in done.items())[:280])
-    return redirect("/admin/storage?ok=" + _q_(f"{total} রো ডিলিট হয়েছে"))
+    _msg = f"{total} রো ডিলিট হয়েছে"
+    if _bad:
+        _msg += f" | ❌ ব্যর্থ: {', '.join(_bad)}"
+    if _skip:
+        _msg += f" | ⏭ বাদ: {', '.join(_skip)}"
+    return redirect("/admin/storage?ok=" + _q_(_msg))
 
 
 # ─────────────────── 📜 টাস্ক ইতিহাস (ডিলিট হলেও থাকে) ───────────────────
