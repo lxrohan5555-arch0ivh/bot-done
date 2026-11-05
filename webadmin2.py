@@ -12,7 +12,7 @@ from webadmin import (
     admin_key, unread_alerts, alerts_changed, many_cached,
     _fire_settings_changed, _fire_user_changed,
     human_size, db_size_bytes, db_reclaim, cleanup_junk, JUNK_TABLES,
-    junk_preview, PROTECTED_TABLES,
+    junk_preview, PROTECTED_TABLES, queue_broadcast,
 )
 
 
@@ -725,10 +725,62 @@ def settings():
         f"value='{esc(vals.get('task_notify_daily_max') or 0)}'>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>সীমা শেষ হলে ওই দিন আর পাঠানো হবে না — "
         "টাস্ক/টাকা কিছুই আটকাবে না, শুধু নোটিফিকেশন।</p></div>"
-        "<button type='submit' style='margin-top:10px'>Save Notification</button></form></div>"
+        "<button type='submit' style='margin-top:10px'>Save Notification</button></form>"
+        "<div style='margin-top:14px;border-top:1px solid var(--line);padding-top:12px'>"
+        "<a class='btn' href='/admin/notify'>📢 ইউজারদের নোটিফিকেশন পাঠান</a>"
+        "<p class='mut' style='font-size:11px;margin:8px 0 0'>এখান থেকে নিজের লেখা নোটিশ "
+        "সব verified ইউজারকে বটে পাঠাতে পারবেন (নতুন টাস্ক, দাম বাড়ানো, ছুটির নোটিশ — যেকোনো কিছু)।<br>"
+        "ℹ️ উপরের সেটিং শুধু <b>অ্যাডমিন/চ্যানেল</b>-এর নোটিফিকেশন নিয়ন্ত্রণ করে। "
+        "<b>Task approve হলে ইউজার নিজেই মেসেজ পায় — এর জন্য কোনো সেটিং লাগে না।</b></p>"
+        "</div></div>"
         "</div>"
     )
     return page("Settings", body, "settings", toast=_toast())
+
+
+@wadm.route("/admin/notify", methods=["GET"])
+def notify_page():
+    """নিজের লেখা নোটিফিকেশন সব verified ইউজারকে পাঠানোর পেজ।"""
+    g = guard()
+    if g:
+        return g
+    try:
+        total = int(scal("SELECT COUNT(*) FROM users WHERE COALESCE(vrf_pass,0)=1 "
+                         "AND COALESCE(is_banned,0)=0") or 0)
+    except Exception:
+        total = 0
+    body = (
+        "<div class='card'><h3>" + icon("bell") + " 📢 ইউজারদের নোটিফিকেশন</h3>"
+        f"<p class='mut' style='font-size:12px'>এখন <b>{num(total)}</b> জন verified ইউজারকে "
+        "পাঠানো হবে (ব্যান হওয়া ইউজার বাদ)। বট ৬০ সেকেন্ডের মধ্যে পাঠানো শুরু করবে।</p>"
+        "<form method='post' action='/admin/do/notify'>"
+        "<div class='form'><label>মেসেজ (বাংলা/ইংরেজি — যা লিখবেন হুবহু যাবে)</label>"
+        "<textarea name='msg' rows='7' required maxlength='3000' "
+        "placeholder='🔔 নতুন টাস্ক যোগ হয়েছে!&#10;💰 রিওয়ার্ড বেড়েছে — এখনই দেখুন।'></textarea></div>"
+        "<div class='form'><label>কতজনকে</label><select name='target'>"
+        "<option value='all'>সব verified ইউজার</option>"
+        "</select></div>"
+        "<button type='submit' style='margin-top:10px'>📢 পাঠান</button>"
+        "<a class='btn gray' href='/admin/settings' style='margin-left:8px'>Cancel</a></form></div>"
+    )
+    return page("Notification", body, "settings", toast=_toast())
+
+
+@wadm.route("/admin/do/notify", methods=["POST"])
+def notify_send():
+    g = guard()
+    if g:
+        return g
+    msg = (request.form.get("msg") or "").strip()
+    if not msg:
+        return redirect("/admin/notify?ok=⚠️ মেসেজ খালি")
+    if len(msg) > 3000:
+        msg = msg[:3000]
+    ok = queue_broadcast(msg)
+    log_admin("notify_broadcast", 0, f"{len(msg)} chars")
+    if not ok:
+        return redirect("/admin/notify?ok=⚠️ কিউতে রাখা যায়নি, আবার চেষ্টা করুন")
+    return redirect("/admin/notify?ok=✅ পাঠানো শুরু হবে (বট ৬০s-এর মধ্যে)")
 
 
 @wadm.route("/admin/do/settings", methods=["POST"])

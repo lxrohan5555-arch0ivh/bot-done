@@ -36,7 +36,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes
+    MessageHandler, filters, ContextTypes, ApplicationHandlerStop
 )
 from telegram.constants import ChatMemberStatus
 from telegram.error import TelegramError, RetryAfter as TgRetryAfter, BadRequest as TgBadRequest
@@ -1430,11 +1430,19 @@ def init_security_db():
                     id         BIGSERIAL PRIMARY KEY,
                     kind       TEXT DEFAULT '',
                     task_id    BIGINT DEFAULT 0,
+                    user_id    BIGINT DEFAULT 0,
+                    msg        TEXT DEFAULT '',
                     created_at TEXT DEFAULT '',
                     processed  INTEGER DEFAULT 0
                 )
                 """
             )
+            for _ddl in ("ALTER TABLE task_notify_queue ADD COLUMN IF NOT EXISTS user_id BIGINT DEFAULT 0",
+                         "ALTER TABLE task_notify_queue ADD COLUMN IF NOT EXISTS msg TEXT DEFAULT ''"):
+                try:
+                    c.execute(_ddl)
+                except Exception:
+                    pass
             c.execute(
                 """
                 CREATE TABLE IF NOT EXISTS security_alerts (
@@ -5492,6 +5500,64 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(T(uid, 'cancelled'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
 
 # ──────────────────────────── MENU HANDLERS ────────────────────────────
+# ─────────── 📜 স্থায়ী টাস্ক হিস্ট্রি (জমা ডিলিট হলেও থাকে) ───────────
+def _history_ensure():
+    """কে, কখন, কোন টাস্ক করেছে, কত পেয়েছে — এই টেবিল কখনো মোছে না।"""
+    try:
+        with _c() as c:
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS task_done_history ("
+                "id BIGSERIAL PRIMARY KEY, user_id BIGINT DEFAULT 0, kind TEXT DEFAULT '', "
+                "task_id BIGINT DEFAULT 0, sub_id BIGINT DEFAULT 0, task_name TEXT DEFAULT '', "
+                "amount DOUBLE PRECISION DEFAULT 0, done_at TEXT DEFAULT '', "
+                "created_at TEXT DEFAULT '', UNIQUE (kind, sub_id))")
+        return True
+    except Exception as e:
+        log.debug(f"[HISTORY] DDL ব্যর্থ: {e}")
+        return False
+
+
+def _history_sync():
+    """approved জমাগুলো হিস্ট্রিতে কপি — একই জমা দুবার ঢুকবে না (UNIQUE kind+sub_id)।"""
+    if not _history_ensure():
+        return 0
+    now_s = _time.strftime("%Y-%m-%d %H:%M:%S")
+    total = 0
+    for kind, tbl, ttbl in (("fb", "fb_submissions", "fb_tasks"),
+                            ("ig", "ig_submissions", "ig_tasks")):
+        _when = "COALESCE(NULLIF(s.reviewed_at,''), s.created_at, '')"
+        for _try in range(2):
+            try:
+                with _c() as c:
+                    r = c.execute(
+                        "INSERT INTO task_done_history (user_id, kind, task_id, sub_id, "
+                        "task_name, amount, done_at, created_at) "
+                        "SELECT s.user_id, %s, s.task_id, s.id, COALESCE(t.name,''), "
+                        "COALESCE(t.price,0), " + _when + ", %s "
+                        "FROM " + tbl + " s LEFT JOIN " + ttbl + " t ON t.id=s.task_id "
+                        "WHERE s.status='approved' "
+                        "ON CONFLICT (kind, sub_id) DO NOTHING",
+                        (kind, now_s))
+                total += int(getattr(r, "rowcount", 0) or 0)
+                break
+            except Exception as e:
+                if _try == 0:            # reviewed_at কলাম না থাকলে সেটা বাদ দিয়ে আবার
+                    _when = "COALESCE(s.created_at, '')"
+                    continue
+                log.debug(f"[HISTORY] {kind} sync ব্যর্থ: {e}")
+    return total
+
+
+async def job_history_sync(ctx):
+    """৩০ মিনিটে একবার — নতুন approved জমাগুলো স্থায়ী হিস্ট্রিতে যোগ হয়।"""
+    try:
+        n = await asyncio.to_thread(_history_sync)
+        if n:
+            log.info(f"[HISTORY] {n} টি নতুন টাস্ক-রেকর্ড স্থায়ী হিস্ট্রিতে যোগ হয়েছে")
+    except Exception as e:
+        log.warning(f"[HISTORY] job ব্যর্থ: {e}")
+
+
 def _profile_stats(uid):
     """👤 Profile-এর কাউন্টার + টাকার হিসাব — ২টি query-তেই সব।
 
@@ -5537,6 +5603,7 @@ def _profile_stats(uid):
     except Exception as e:
         log.warning(f"[profile_stats] uid={uid} — {e}")
         return _z
+    _live_fi = 0
     try:
         for r in subs or []:
             _st  = str(r["status"] or "")
@@ -5544,6 +5611,8 @@ def _profile_stats(uid):
             _amt = float(r["amt"] or 0)
             if _st == "approved":
                 _z["completed"] += _n
+                if str(r["src"]) in ("f", "i"):
+                    _live_fi += _n
             elif _st == "pending":
                 _z["pending"] += _n
                 _z["hold"]    += _amt
@@ -5561,6 +5630,16 @@ def _profile_stats(uid):
                 _z["completed"] += int(r["n"] or 0)
     except Exception as e:
         log.warning(f"[profile_stats] parse uid={uid} — {e}")
+    # ── জমা তথ্য (submission) ডিলিট হলেও Completed কমবে না ──
+    try:
+        with _c() as c:
+            _hr = c.execute("SELECT COUNT(*) AS n FROM task_done_history WHERE user_id=%s",
+                            (uid,)).fetchone()
+        _hn = int((_hr or {}).get("n") or 0)
+        if _hn >= _live_fi:                 # হিস্ট্রি পুরোটা ঢেকে দিলে সেটাই আসল
+            _z["completed"] = _z["completed"] - _live_fi + _hn
+    except Exception:
+        pass
     _z["earned"]    = round(_z["earned"], 2)
     _z["withdrawn"] = round(_z["withdrawn"], 2)
     _z["hold"]      = round(_z["hold"], 2)
@@ -5996,7 +6075,13 @@ async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str
                 sent = True
             except Exception as _e:
                 log.warning(f"[TASK_DONE_NOTIFY] চ্যানেলে পাঠাতে ব্যর্থ: {_e}")
-        if mode in ("dm", "both"):
+        _is_adm_user = False
+        try:
+            _is_adm_user = bool(await asyncio.to_thread(is_admin, user_id))
+        except Exception:
+            _is_adm_user = False
+        if mode in ("dm", "both") and not _is_adm_user:
+            # অ্যাডমিন নিজে টাস্ক করলে তাকে আবার DM নোটিফিকেশন যাবে না
             try:
                 await notify_full_admins(bot, msg)
                 sent = True
@@ -6010,6 +6095,9 @@ async def _notify_task_done_ch(bot, user_id: int, task_name: str, task_code: str
 
 # ── Task Menu → Reply Keyboard (নিচের কিবোর্ড) — uid → {বাটনের লেখা: callback data} ──
 _TASK_REPLY_KB = {}
+# Reply Keyboard-এর ক্যানসেল লেবেল — ম্যাপ মুছে গেলেও এগুলো সবসময় কাজ করবে
+_TASK_CANCEL_LABELS = {"❌ বাতিল", "❌ Cancel", "✖️ বাতিল", "✖️ Cancel",
+                       "❌ বাতিল করুন", "❌ Cancel task"}
 
 # ── টাস্ক সেশন: ১৫ মিনিটে জমা না দিলে অটো-বাতিল + পাঠানো তথ্য ডিলিট ──
 _TASK_SESS      = {}            # uid → {kind, task_id, start, deadline, msgs, keep, ud}
@@ -6149,7 +6237,20 @@ async def _task_kb_dispatch(txt, user, message, ctx):
         _trk = _TASK_REPLY_KB.get(user.id) or {}
     except Exception:
         return False
-    _cb = _trk.get((txt or "").strip())
+    _lbl = (txt or "").strip()
+    _cb = _trk.get(_lbl)
+    if _lbl in _TASK_CANCEL_LABELS:
+        # ⚠️ ম্যাপ কোন কারণে মুছে গেলেও / ভুল ফ্লোয়ের ম্যাপ থাকলেও বাতিল কাজ করবে
+        try:
+            _k = str((_TASK_SESS.get(int(user.id)) or {}).get("kind") or "").lower()
+        except Exception:
+            _k = ""
+        if int(user.id) in _FB_STATE or _k == "fb":
+            _cb = "fbt_cancel"
+        elif int(user.id) in _IG_STATE or _k == "ig":
+            _cb = "igt_cancel"
+        else:
+            _cb = "task_cancel"
     if not _cb:
         return False
     if _cb.startswith("video:"):
@@ -6173,6 +6274,26 @@ async def _task_kb_dispatch(txt, user, message, ctx):
     except Exception as _e:
         log.warning(f"[TASK-KB] {txt!r} ({_cb}) ব্যর্থ: {_e}")
     return True
+
+
+async def _kb_global_router(update, ctx):
+    """সব প্রাইভেট টেক্সটের আগে চলবে (group=-1) — Reply Keyboard-এর বাটন
+    যেখানেই চাপুক (2FA key, ফর্ম স্টেট, অ্যাডমিন ইনপুট …) সবসময় রাউট হবে।
+
+    ⚠️ আগে এই বাটনগুলো শুধু fb_on_text / ig_on_text / collect_text-এ রাউট হতো,
+    তাই অন্য ধাপে চাপলে টেক্সট হিসেবে গিয়ে কিছুই হতো না (বাতিল কাজ করত না)।
+    """
+    try:
+        _m = update.effective_message
+        _u = update.effective_user
+        if not _m or not _u or not (_m.text or "").strip():
+            return
+        if await _task_kb_dispatch(_m.text, _u, _m, ctx):
+            raise ApplicationHandlerStop      # নিচের হ্যান্ডলার আর চলবে না
+    except ApplicationHandlerStop:
+        raise
+    except Exception as _e:
+        log.debug(f"[TASK-KB-G] {_e}")
 
 
 async def show_tasks(update, ctx):
@@ -19838,7 +19959,11 @@ async def _fb_ig_review_once(ctx):
             try:
                 await ctx.bot.send_message(uid, part, parse_mode="Markdown")
             except Exception as e:
-                log.warning(f"[REVIEW] notify ব্যর্থ uid={uid} {status}: {e}")
+                # Markdown ভাঙলে plain-এ আবার — নোটিফিকেশন যেন আটকে না যায়
+                try:
+                    await ctx.bot.send_message(uid, part.replace("*", "").replace("`", ""))
+                except Exception as e2:
+                    log.warning(f"[REVIEW] notify ব্যর্থ uid={uid} {status}: {e2}")
         # অ্যাডমিনের Task Notification সেটিং (channel / dm / both / off) — প্যানেল থেকেই নিয়ন্ত্রণ।
         # আগে আলাদা `fb_ig_admin_notify` (ডিফল্ট off, প্যানেলে কোনো অপশনই নেই) গেট ছিল,
         # তাই প্যানেলে নোটিফিকেশন চালু করলেও FB/IG-এর মেসেজ যেত না।
@@ -20190,6 +20315,11 @@ def _fb_active_tasks_c():
     return _memo_task(("fb_active",), _fb_active_tasks, 20) or []
 
 
+def _fb_active_tasks_j():
+    """jobs-এর জন্য ৯০ সেকেন্ড ক্যাশ — প্রতি মিনিটে পুরো fb_tasks স্ক্যান বন্ধ (RU বাঁচে)।"""
+    return _memo_task(("fb_active_job",), _fb_active_tasks, 90) or []
+
+
 def _fb_counts_map_c(tids, uid=None):
     tids = tuple(int(t) for t in (tids or []))
     return _memo_task(("fbcm", tids, uid), lambda: _fb_counts_map(list(tids), uid), 6) or {}
@@ -20231,6 +20361,18 @@ def _fb_counts(tid, uid=None):
         return total, mine
     except Exception:
         return 0, 0
+
+
+def _fb_counts_c(tid, uid=None):
+    """(মোট, আমার) — ৬s ক্যাশ; একই টাস্কে বারবার চাপলে DB-তে যায় না।"""
+    return _memo_task(("fbc", int(tid), int(uid or 0)),
+                      lambda: _fb_counts(tid, uid), 6) or (0, 0)
+
+
+def _ig_counts_c(tid, uid=None):
+    """IG — একই ৬s ক্যাশ।"""
+    return _memo_task(("igc", int(tid), int(uid or 0)),
+                      lambda: _ig_counts(tid, uid), 6) or (0, 0)
 
 
 def _fb_counts_map(tids, uid=None):
@@ -20357,7 +20499,7 @@ def _fb_can_start(task, uid):
     """(ok, কারণ) — max accounts / per-user limit / active"""
     if not task or not task.get("is_active"):
         return False, "off"
-    total, mine = _fb_counts(int(task["id"]), uid)
+    total, mine = _fb_counts_c(int(task["id"]), uid)
     mx = int(task.get("max_accounts") or 0)
     if mx > 0 and total >= mx:
         return False, "full"
@@ -20401,6 +20543,36 @@ def _fb_columns(task):
                     "login_last"]
 
 
+def _data_any(data, *names):
+    """data dict থেকে নাম ধরে মান (case/space উপেক্ষা) — ফিল্ডের key ভিন্ন হলেও ধরা পড়ে।"""
+    if not isinstance(data, dict) or not data:
+        return ""
+    low = {}
+    for k, v in data.items():
+        low[str(k).strip().lower()] = v
+    for n in names:
+        nk = str(n or "").strip().lower()
+        if not nk:
+            continue
+        v = data.get(n, low.get(nk))
+        if v is None:
+            v = low.get(nk)
+        if str(v if v is not None else "").strip():
+            return v
+    return ""
+
+
+def _data_fuzzy(data, *words):
+    """key-র ভেতরে শব্দ থাকলেই ধরে নাও (pass/pwd, cookie, 2fa/totp)।"""
+    if not isinstance(data, dict):
+        return ""
+    for k, v in data.items():
+        kk = str(k).lower()
+        if any(w in kk for w in words) and str(v if v is not None else "").strip():
+            return v
+    return ""
+
+
 def _fb_col_label(tok):
     tok = str(tok).strip()
     if tok.startswith("f:"):
@@ -20415,7 +20587,11 @@ def _fb_col_value(tok, sub, idx=0, task=None):
         return data.get(tok[2:], "")
     tok = _FB_COL_ALIAS.get(tok.lower(), tok)
     if tok in ("2fa", "cookies"):        # যে ফিল্ডে এই টাইপ, তার উত্তর
-        return data.get(_fb_data_key(task, tok), "") or data.get(tok, "")
+        if tok == "2fa":
+            return (_data_any(data, _fb_data_key(task, "2fa"), "2fa", "totp", "2step")
+                    or _data_fuzzy(data, "2fa", "totp", "2step", "auth"))
+        return (_data_any(data, _fb_data_key(task, "cookies"), "cookies", "coki", "ck")
+                or _data_fuzzy(data, "cookie", "coki"))
     if tok == "sl":
         return idx
     if tok == "date":
@@ -20431,15 +20607,29 @@ def _fb_col_value(tok, sub, idx=0, task=None):
     if tok == "status":
         return sub.get("status", "")
     if tok == "uid":                     # ডেটাবেসে fb_uid নামে থাকে
-        return sub.get("fb_uid", "") or data.get("uid", "")
+        return (sub.get("fb_uid", "")
+                or _data_any(data, _fb_data_key(task, "uid"), "uid", "fb_uid", "profile", "id")
+                or _data_fuzzy(data, "uid", "profile"))
     if tok == "password":                 # অ্যাডমিনের সেট করা পাসওয়ার্ড
-        return (sub.get("fb_password", "") or sub.get("login_password", "")
-                or data.get("password", ""))
+        _v = sub.get("fb_password", "") or ""
+        if str(_v).strip():
+            return _v
+        _v = (_data_any(data, _fb_data_key(task, "password"), "password", "pass", "pwd")
+              or _data_fuzzy(data, "pass", "pwd"))
+        if str(_v or "").strip():
+            return _v
+        return sub.get("login_password", "")
     if tok in ("login_first", "first"):
         return sub.get("login_first", "")
     if tok in ("login_last", "last"):
         return sub.get("login_last", "")
-    return data.get(tok, "") or sub.get(tok, "")
+    _v = _data_any(data, tok, tok.lower())
+    if str(_v or "").strip():
+        return _v
+    _v = _data_fuzzy(data, tok.lower())
+    if str(_v or "").strip():
+        return _v
+    return sub.get(tok, "") or ""
 
 
 def _fb_subs(tid, limit=5000, only_unsynced=False):
@@ -20659,6 +20849,10 @@ async def _task_reply_ui(q, uid, text, rows, parse_mode=None, lang=None):
 def _task_video_row(task, lang):
     """📽 Video instruction বাটন — টাস্কে লিংক সেট থাকলে।"""
     url = (task.get("video_url") or "").strip()
+    if url and not url.lower().startswith(("http://", "https://")):
+        # "youtu.be/xxxx" ধাঁচে (স্কিম ছাড়া) দিলেও কাজ করবে
+        if "." in url and " " not in url:
+            url = "https://" + url.lstrip("/")
     if not url.lower().startswith(("http://", "https://")):
         return None
     return [InlineKeyboardButton("📽 Video instruction", url=url)]
@@ -20719,8 +20913,8 @@ async def fb_show_list(q, uid, lang=None):
 
 async def fb_task_rules(q, uid, tid):
     """টাস্কে চাপ → সোজা Rules + Start + Video (মাঝের নাম-ধাপটা বাদ)।"""
-    lang = await asyncio.to_thread(get_lang, uid)
-    task = await asyncio.to_thread(_fb_task, tid)
+    lang, task = await asyncio.gather(
+        asyncio.to_thread(get_lang, uid), asyncio.to_thread(_fb_task, tid))
     if not task:
         await q.answer("❌ Task পাওয়া যায়নি")
         return
@@ -20755,10 +20949,10 @@ async def fb_task_start(q, uid, tid):
         await q.answer()          # স্পিনার সাথে সাথে বন্ধ (শিমে no-op)
     except Exception:
         pass
-    lang = await asyncio.to_thread(get_lang, uid)
+    lang, task = await asyncio.gather(
+        asyncio.to_thread(get_lang, uid), asyncio.to_thread(_fb_task, tid))
     if await _task_cool_blocked(q, uid):
         return
-    task = await asyncio.to_thread(_fb_task, tid)
     if not task:
         await q.answer("❌ Task পাওয়া যায়নি")
         return
@@ -20771,7 +20965,7 @@ async def fb_task_start(q, uid, tid):
         }.get(why, "❌ এখন কাজ করা যাবে না।" if lang != "en" else "❌ Not available now.")
         await q.answer(msg, show_alert=True)
         return
-    _done = (await asyncio.to_thread(_fb_counts, int(task["id"])))[0]
+    _done = (await asyncio.to_thread(_fb_counts_c, int(task["id"]), uid))[0]
     login = await asyncio.to_thread(_fb_login, task, _done)
     fields = await asyncio.to_thread(_fb_fields, task)
     _FB_STATE[uid] = {"task_id": int(tid), "step": 0, "answers": {}, "login": login,
@@ -20857,9 +21051,24 @@ async def fb_on_text(update, ctx):
     _sess_track(uid, _sum_m)
 
 
+def _task_vid_row_for(uid, keymap):
+    """চলমান টাস্কের 📽 Video row (লিংক থাকলে) — ফর্মের ধাপেও দেখাবে।"""
+    try:
+        st = keymap.get(int(uid)) or {}
+        t = _fb_task(st.get("task_id") or 0) or {}
+    except Exception:
+        return None
+    return _task_video_row(t, "bn")
+
+
 def _fb_cancel_kb(lang, uid=0):
-    _rows = [[InlineKeyboardButton(
-        "❌ বাতিল" if lang != "en" else "❌ Cancel", callback_data="fbt_cancel")]]
+    _rows = []
+    if uid:
+        _v = _task_vid_row_for(uid, _FB_STATE)
+        if _v:
+            _rows.append(_v)
+    _rows.append([InlineKeyboardButton(
+        "❌ বাতিল" if lang != "en" else "❌ Cancel", callback_data="fbt_cancel")])
     return _rk_markup(uid, _rows) if uid else _fb_kb(_rows)
 
 
@@ -21034,11 +21243,213 @@ def _notify_targets(limit=5000):
         return []
 
 
+# ────────────── ওয়েব থেকে টাকা/পয়েন্ট বদল — অ্যাডমিনের ✅/❌ অনুমোদন ──────────────
+_MR_FIELD_BN = {"balance": "টাকা", "points": "পয়েন্ট"}
+_MR_OP_BN = {"add": "যোগ", "sub": "বাদ", "set": "সেট"}
+
+
+def _money_req_row(rid):
+    try:
+        with _c() as c:
+            r = c.execute("SELECT * FROM money_requests WHERE id=%s", (int(rid),)).fetchone()
+        return dict(r) if r else None
+    except Exception:
+        return None
+
+
+def _money_req_text(r):
+    """অ্যাডমিনের কাছে দেখানোর মেসেজ (plain text — Markdown ভাঙার ভয় নেই)।"""
+    uid = int(r.get("user_id") or 0)
+    u = {}
+    try:
+        with _c() as c:
+            u = c.execute("SELECT full_name, username, COALESCE(balance,0) AS balance, "
+                          "COALESCE(points,0) AS points FROM users WHERE user_id=%s",
+                          (uid,)).fetchone() or {}
+    except Exception:
+        u = {}
+    fld = r.get("field") if r.get("field") in ("balance", "points") else "balance"
+    op = r.get("op") if r.get("op") in ("add", "sub", "set") else "add"
+    try:
+        amt = float(r.get("amount") or 0)
+    except Exception:
+        amt = 0.0
+    bal = float(u.get("balance") or 0)
+    pts = int(u.get("points") or 0)
+    nb, np_ = bal, pts
+    if op == "add":
+        nb, np_ = (bal + amt, pts) if fld == "balance" else (bal, pts + int(round(amt)))
+    elif op == "sub":
+        nb, np_ = (max(0.0, bal - amt), pts) if fld == "balance" else (bal, max(0, pts - int(round(amt))))
+    else:
+        nb, np_ = (max(0.0, amt), pts) if fld == "balance" else (bal, max(0, int(round(amt))))
+    who = str(u.get("full_name") or "User")
+    un = str(u.get("username") or "").strip()
+    return (
+        "💸 টাকা/পয়েন্ট পরিবর্তনের অনুমোদন\n\n"
+        f"👤 {who}" + (f" (@{un})" if un else "") + f"\n🆔 {uid}\n"
+        f"➡️ {_MR_FIELD_BN.get(fld, fld)} {_MR_OP_BN.get(op, op)}: {amt:g}\n"
+        + (f"📝 নোট: {str(r.get('note') or '').strip()[:200]}\n" if str(r.get('note') or '').strip() else "")
+        + f"🕒 {str(r.get('created_at') or '')[:19]}\n\n"
+        f"💳 এখন: {bal:g} ৳ · {pts} point\n"
+        f"✅ করলে হবে: {nb:g} ৳ · {np_} point\n\n"
+        "✅ চাপলেই ইউজারের ব্যালেন্সে যোগ হবে আর তাকে বটে মেসেজ যাবে।"
+    )
+
+
+def _money_req_apply(rid, ok, by=0):
+    """অনুমোদন/বাতিল — (row, status, user_msg)।"""
+    r = _money_req_row(rid)
+    if not r:
+        return None, "notfound", ""
+    if str(r.get("status") or "") != "pending":
+        return r, "done", ""
+    uid = int(r.get("user_id") or 0)
+    fld = r.get("field") if r.get("field") in ("balance", "points") else "balance"
+    op = r.get("op") if r.get("op") in ("add", "sub", "set") else "add"
+    try:
+        amt = float(r.get("amount") or 0)
+    except Exception:
+        amt = 0.0
+    if fld == "points":
+        amt = int(round(amt))
+    now_s = _time.strftime("%Y-%m-%d %H:%M:%S")
+    if ok:
+        try:
+            with _c() as c:
+                if op == "add":
+                    c.execute(f"UPDATE users SET {fld}=COALESCE({fld},0)+%s WHERE user_id=%s",
+                              (amt, uid))
+                elif op == "sub":
+                    c.execute(f"UPDATE users SET {fld}=GREATEST(0,COALESCE({fld},0)-%s) "
+                              f"WHERE user_id=%s", (amt, uid))
+                else:
+                    c.execute(f"UPDATE users SET {fld}=%s WHERE user_id=%s", (max(0, amt), uid))
+        except Exception as e:
+            log.warning(f"[MONEYREQ] প্রয়োগ ব্যর্থ #{rid}: {e}")
+            return r, "fail", ""
+    try:
+        with _c() as c:
+            c.execute("UPDATE money_requests SET status=%s, decided_at=%s, decided_by=%s "
+                      "WHERE id=%s AND status='pending'",
+                      ("approved" if ok else "rejected", now_s, f"tg:{by}", int(rid)))
+    except Exception as e:
+        log.warning(f"[MONEYREQ] স্টেটাস ব্যর্থ #{rid}: {e}")
+    try:
+        _invalidate_user_cache(uid)
+    except Exception:
+        pass
+    # ওয়েবের ক্যাশেও সিঙ্ক সিগন্যাল
+    try:
+        with _c() as c:
+            c.execute("INSERT INTO bot_meta (key,value) VALUES ('user_ver',%s) "
+                      "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                      (f"{uid}:{int(_time.time() * 1000)}",))
+    except Exception:
+        pass
+    # ইউজারের জন্য মেসেজ
+    _bal = {}
+    try:
+        with _c() as c:
+            _bal = c.execute("SELECT COALESCE(balance,0) AS b, COALESCE(points,0) AS p "
+                             "FROM users WHERE user_id=%s", (uid,)).fetchone() or {}
+    except Exception:
+        _bal = {}
+    _sym = "৳" if fld == "balance" else "পয়েন্ট"
+    _tail = f"💳 এখন: {float(_bal.get('b') or 0):g} ৳ · {int(_bal.get('p') or 0)} point"
+    if ok:
+        if op == "add":
+            msg = f"✅ আপনার {_sym} {amt:g} যোগ হয়েছে।\n{_tail}"
+        elif op == "sub":
+            msg = f"➖ আপনার {_sym} {amt:g} কমানো হয়েছে।\n{_tail}"
+        else:
+            msg = f"🔄 আপনার {_sym} অ্যাডমিন সেট করেছেন: {amt:g}\n{_tail}"
+        if str(r.get("note") or "").strip():
+            msg += f"\n📝 {str(r.get('note')).strip()[:120]}"
+    else:
+        msg = f"❌ আপনার {_sym} {amt:g} পরিবর্তনের অনুরোধ বাতিল হয়েছে।\n{_tail}"
+    return r, ("approved" if ok else "rejected"), msg
+
+
+async def _send_money_req(bot, rid):
+    """অ্যাডমিনকে অনুমোদনের মেসেজ + ✅/❌ বাটন।"""
+    r = await asyncio.to_thread(_money_req_row, rid)
+    if not r or str(r.get("status") or "") != "pending":
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ অনুমোদন", callback_data=f"mreq:ok:{int(rid)}"),
+        InlineKeyboardButton("❌ বাতিল", callback_data=f"mreq:no:{int(rid)}"),
+    ]])
+    try:
+        await bot.send_message(ADMIN_ID, await asyncio.to_thread(_money_req_text, r),
+                               reply_markup=kb)
+    except Exception as e:
+        log.warning(f"[MONEYREQ] অ্যাডমিনকে পাঠানো ব্যর্থ #{rid}: {e}")
+
+
+async def moneyreq_callback(update, ctx):
+    """ওয়েব থেকে টাকা/পয়েন্ট বদলের ✅/❌ — শুধু অ্যাডমিন।"""
+    q = update.callback_query
+    u = update.effective_user
+    if not q or not u:
+        return
+    if int(u.id) != int(ADMIN_ID):
+        try:
+            await q.answer("⛔ শুধু অ্যাডমিন অনুমোদন করতে পারবেন", show_alert=True)
+        except Exception:
+            pass
+        return
+    parts = (q.data or "").split(":")
+    if len(parts) != 3:
+        return
+    try:
+        rid = int(parts[2])
+    except Exception:
+        return
+    ok = parts[1] == "ok"
+    try:
+        await q.answer("✅ অনুমোদন হচ্ছে…" if ok else "❌ বাতিল হচ্ছে…")
+    except Exception:
+        pass
+    r, st, umsg = await asyncio.to_thread(_money_req_apply, rid, ok, int(u.id))
+    if not r:
+        try:
+            await q.edit_message_text("⚠️ রিকোয়েস্ট পাওয়া যায়নি (মুছে ফেলা হয়েছে?)")
+        except Exception:
+            pass
+        return
+    if st == "done":
+        try:
+            await q.edit_message_text((q.message.text or "") + "\n\n⚠️ আগেই সিদ্ধান্ত হয়ে গেছে")
+        except Exception:
+            pass
+        return
+    if st == "fail":
+        try:
+            await q.answer("DB লেখা যায়নি — আবার চেষ্টা করুন", show_alert=True)
+        except Exception:
+            pass
+        return
+    head = "✅ অনুমোদিত" if ok else "❌ বাতিল"
+    try:
+        await q.edit_message_text((q.message.text or "") + f"\n\n{head} — {int(u.id)}",
+                                  parse_mode=None)
+    except Exception:
+        pass
+    if umsg:
+        try:
+            await ctx.bot.send_message(int(r.get("user_id") or 0), umsg)
+        except Exception as e:
+            log.warning(f"[MONEYREQ] ইউজারকে জানানো ব্যর্থ: {e}")
+
+
 def _notify_queue_take(limit=3):
+    """queue থেকে কাজ নাও — kind: fb/ig (টাস্ক), broadcast (সবাইকে), dm (একজনকে)।"""
     out = []
     try:
         with _c() as c:
-            rs = c.execute("SELECT id, kind, task_id FROM task_notify_queue "
+            rs = c.execute("SELECT id, kind, task_id, COALESCE(user_id,0) AS user_id, "
+                           "COALESCE(msg,'') AS msg FROM task_notify_queue "
                            "WHERE COALESCE(processed,0)=0 ORDER BY id LIMIT %s",
                            (limit,)).fetchall()
     except Exception:
@@ -21049,22 +21460,57 @@ def _notify_queue_take(limit=3):
                 c.execute("UPDATE task_notify_queue SET processed=1 WHERE id=%s", (r["id"],))
         except Exception:
             pass
-        out.append(((r["kind"] or "").strip().lower(), int(r["task_id"] or 0)))
+        out.append({"kind": (r["kind"] or "").strip().lower(),
+                    "task_id": int(r["task_id"] or 0),
+                    "user_id": int(r["user_id"] or 0),
+                    "msg": str(r["msg"] or "")})
     return out
 
 
+async def _notify_text_broadcast(bot, text):
+    """ওয়েব প্যানেল থেকে লেখা মেসেজ সব verified ইউজারকে (টাস্ক ছাড়া, সাধারণ নোটিশ)।"""
+    text = (text or "").strip()
+    if not text:
+        return
+    try:
+        targets = await asyncio.to_thread(_notify_targets)
+    except Exception as e:
+        log.warning(f"[BROADCAST] ইউজার লিস্ট ব্যর্থ: {e}")
+        return
+    sent = 0
+    for uid, _lang in targets:
+        try:
+            await bot.send_message(int(uid), text)
+            sent += 1
+        except Exception:
+            pass
+        if sent and sent % 25 == 0:
+            await asyncio.sleep(1.0)
+        else:
+            await asyncio.sleep(0.05)
+    log.info(f"[BROADCAST] {sent}/{len(targets)} জনকে পাঠানো হয়েছে")
+
+
 async def job_task_notify_queue(ctx):
-    """ওয়েব প্যানেলে 📢 টিক দিয়ে সেভ করা Task-এর নোটিফিকেশন পাঠায় (৬০s পর পর)।"""
+    """ওয়েব প্যানেলের নোটিফিকেশন — 📢 টাস্ক আপডেট, সাধারণ ব্রডকাস্ট, এক ইউজারের DM (৬০s পর পর)।"""
     try:
         rows = await asyncio.to_thread(_notify_queue_take)
     except Exception as e:
         log.debug(f"[TASK-NOTIFY] queue ব্যর্থ: {e}")
         return
-    for kind, tid in rows:
+    for it in rows:
         try:
-            await _task_broadcast(ctx.bot, kind, tid)
+            if it["kind"] in ("fb", "ig"):
+                await _task_broadcast(ctx.bot, it["kind"], it["task_id"])
+            elif it["kind"] == "broadcast":
+                await _notify_text_broadcast(ctx.bot, it["msg"])
+            elif it["kind"] == "dm" and it["user_id"]:
+                if it["msg"]:
+                    await ctx.bot.send_message(it["user_id"], it["msg"])
+            elif it["kind"] == "adminreq" and it["task_id"]:
+                await _send_money_req(ctx.bot, it["task_id"])
         except Exception as e:
-            log.warning(f"[TASK-NOTIFY] {kind}:{tid} ব্যর্থ: {e}")
+            log.warning(f"[TASK-NOTIFY] {it} ব্যর্থ: {e}")
         await asyncio.sleep(1)
 
 
@@ -21119,7 +21565,7 @@ async def job_fb_password_rotate(ctx):
         now_bd = datetime.now(BD_TZ)
         hhmm = now_bd.strftime("%H:%M")
         today = now_bd.strftime("%Y-%m-%d")
-        tasks = await asyncio.to_thread(_fb_active_tasks)
+        tasks = await asyncio.to_thread(_fb_active_tasks_j)
         for t in tasks:
             if not int(t.get("password_auto") or 0):
                 continue
@@ -21159,7 +21605,7 @@ async def job_fb_export(ctx):
         now_bd = datetime.now(BD_TZ)
         hhmm = now_bd.strftime("%H:%M")
         today = now_bd.strftime("%Y-%m-%d")
-        for t in await asyncio.to_thread(_fb_active_tasks):
+        for t in await asyncio.to_thread(_fb_active_tasks_j):
             if (t.get("export_time") or "").strip() != hhmm:
                 continue
             if str(t.get("last_export_at") or "").startswith(today):
@@ -21511,6 +21957,11 @@ def _ig_active_tasks():
         return []
 
 
+def _ig_active_tasks_j():
+    """jobs-এর জন্য ৯০ সেকেন্ড ক্যাশ — প্রতি মিনিটে পুরো ig_tasks স্ক্যান বন্ধ।"""
+    return _memo_task(("ig_active_job",), _ig_active_tasks, 90) or []
+
+
 def _ig_active_tasks_c():
     """active টাস্ক লিস্ট ২০s ক্যাশ।"""
     return _memo_task(("ig_active",), _ig_active_tasks, 20) or []
@@ -21731,7 +22182,7 @@ def _ig_can_start(task, uid):
     """(ok, কারণ) — max accounts / per-user limit / active"""
     if not task or not task.get("is_active"):
         return False, "off"
-    total, mine = _ig_counts(int(task["id"]), uid)
+    total, mine = _ig_counts_c(int(task["id"]), uid)
     mx = int(task.get("max_accounts") or 0)
     if mx > 0 and total >= mx:
         return False, "full"
@@ -21765,7 +22216,11 @@ def _ig_col_value(tok, sub, idx=0, task=None):
         return data.get(tok[2:], "")
     tok = _IG_COL_ALIAS.get(tok.lower(), tok)
     if tok in ("2fa", "cookies"):        # যে ফিল্ডে এই টাইপ, তার উত্তর
-        return data.get(_ig_data_key(task, tok), "") or data.get(tok, "")
+        if tok == "2fa":
+            return (_data_any(data, _ig_data_key(task, "2fa"), "2fa", "totp", "2step")
+                    or _data_fuzzy(data, "2fa", "totp", "2step", "auth"))
+        return (_data_any(data, _ig_data_key(task, "cookies"), "cookies", "coki", "ck")
+                or _data_fuzzy(data, "cookie", "coki"))
     if tok == "sl":
         return idx
     if tok == "date":
@@ -21784,13 +22239,24 @@ def _ig_col_value(tok, sub, idx=0, task=None):
         return (sub.get("ig_username", "") or data.get("username", "")
                 or data.get(_ig_data_key(task, "iguser"), ""))
     if tok == "password":                 # অ্যাডমিনের সেট করা পাসওয়ার্ড
-        return (sub.get("ig_password", "") or sub.get("login_password", "")
-                or data.get("password", ""))
+        _v = sub.get("ig_password", "") or ""
+        if str(_v).strip():
+            return _v
+        _v = _data_any(data, "password", "pass", "pwd") or _data_fuzzy(data, "pass", "pwd")
+        if str(_v or "").strip():
+            return _v
+        return sub.get("login_password", "")
     if tok == "login_username":
         return sub.get("login_username", "")
     if tok == "login_password":
         return sub.get("login_password", "")
-    return data.get(tok, "") or sub.get(tok, "")
+    _v = _data_any(data, tok, tok.lower())
+    if str(_v or "").strip():
+        return _v
+    _v = _data_fuzzy(data, tok.lower())
+    if str(_v or "").strip():
+        return _v
+    return sub.get(tok, "") or ""
 
 
 def _ig_subs(tid, limit=5000, only_unsynced=False):
@@ -21999,8 +22465,8 @@ async def ig_show_list(q, uid, lang=None):
 
 async def ig_task_rules(q, uid, tid):
     """টাস্কে চাপ → সোজা Rules + Start + Video (মাঝের নাম-ধাপটা বাদ)।"""
-    lang = await asyncio.to_thread(get_lang, uid)
-    task = await asyncio.to_thread(_ig_task, tid)
+    lang, task = await asyncio.gather(
+        asyncio.to_thread(get_lang, uid), asyncio.to_thread(_ig_task, tid))
     if not task:
         await q.answer("❌ Task পাওয়া যায়নি")
         return
@@ -22035,10 +22501,10 @@ async def ig_task_start(q, uid, tid):
         await q.answer()          # স্পিনার সাথে সাথে বন্ধ (শিমে no-op)
     except Exception:
         pass
-    lang = await asyncio.to_thread(get_lang, uid)
+    lang, task = await asyncio.gather(
+        asyncio.to_thread(get_lang, uid), asyncio.to_thread(_ig_task, tid))
     if await _task_cool_blocked(q, uid):
         return
-    task = await asyncio.to_thread(_ig_task, tid)
     if not task:
         await q.answer("❌ Task পাওয়া যায়নি")
         return
@@ -22051,7 +22517,7 @@ async def ig_task_start(q, uid, tid):
         }.get(why, "❌ এখন কাজ করা যাবে না।" if lang != "en" else "❌ Not available now.")
         await q.answer(msg, show_alert=True)
         return
-    _done = (await asyncio.to_thread(_ig_counts, int(task["id"])))[0]
+    _done = (await asyncio.to_thread(_ig_counts_c, int(task["id"]), uid))[0]
     name = await asyncio.to_thread(_ig_alloc_name, task, _done, (), False)
     if not name:
         await q.answer(
@@ -22100,7 +22566,7 @@ async def _ig_bg_verify(uid, tid, name, card_msg, chk_msg, lang):
         if (not task or st.get("task_id") != int(tid)
                 or (st.get("login") or {}).get("username") != name):
             return                       # ইউজার এর মধ্যে বদল/ক্যান্সেল করেছে
-        _done = (await asyncio.to_thread(_ig_counts, int(task["id"])))[0]
+        _done = (await asyncio.to_thread(_ig_counts_c, int(task["id"]), uid))[0]
         new = await asyncio.to_thread(_ig_alloc_name, task, _done, (name,), False)
         if not new:
             return
@@ -22255,8 +22721,18 @@ async def ig_on_text(update, ctx):
 
 
 def _ig_cancel_kb(lang, uid=0):
-    _rows = [[InlineKeyboardButton(
-        "❌ বাতিল" if lang != "en" else "❌ Cancel", callback_data="igt_cancel")]]
+    _rows = []
+    if uid:
+        try:
+            _st = _IG_STATE.get(int(uid)) or {}
+            _t = _ig_task(_st.get("task_id") or 0) or {}
+            _v = _task_video_row(_t, lang)
+            if _v:
+                _rows.append(_v)
+        except Exception:
+            pass
+    _rows.append([InlineKeyboardButton(
+        "❌ বাতিল" if lang != "en" else "❌ Cancel", callback_data="igt_cancel")])
     return _rk_markup(uid, _rows) if uid else _ig_kb(_rows)
 
 
@@ -22322,7 +22798,7 @@ async def ig_retry(q, uid):
         await q.answer("❌ Task পাওয়া যায়নি")
         return
     old = (st.get("login") or {}).get("username") or ""
-    _done = (await asyncio.to_thread(_ig_counts, int(task["id"])))[0]
+    _done = (await asyncio.to_thread(_ig_counts_c, int(task["id"]), uid))[0]
     new = await asyncio.to_thread(_ig_alloc_name, task, _done + 1, (old,), False)
     if not new:
         await q.answer("❌ এখন নতুন ফ্রি Username নেই — অ্যাডমিনকে জানান।" if lang != "en"
@@ -22372,7 +22848,7 @@ async def job_ig_password_rotate(ctx):
         now_bd = datetime.now(BD_TZ)
         hhmm = now_bd.strftime("%H:%M")
         today = now_bd.strftime("%Y-%m-%d")
-        for t in await asyncio.to_thread(_ig_active_tasks):
+        for t in await asyncio.to_thread(_ig_active_tasks_j):
             if not int(t.get("password_auto") or 0):
                 continue
             if (t.get("password_change_time") or "").strip() != hhmm:
@@ -22411,7 +22887,7 @@ async def job_ig_export(ctx):
         now_bd = datetime.now(BD_TZ)
         hhmm = now_bd.strftime("%H:%M")
         today = now_bd.strftime("%Y-%m-%d")
-        for t in await asyncio.to_thread(_ig_active_tasks):
+        for t in await asyncio.to_thread(_ig_active_tasks_j):
             if (t.get("export_time") or "").strip() != hhmm:
                 continue
             if str(t.get("last_export_at") or "").startswith(today):
@@ -22703,7 +23179,7 @@ def main():
         if application.job_queue is not None:
             application.job_queue.run_repeating(
                 job_dirty_backup,
-                interval=120,   # 120s — _run_periodically(60s) already handles frequent checks
+                interval=300,   # ১২০s → ৩০০s — ব্যাকআপ ডাটা ছাড়া কাজ নেই
                 first=300,
                 name="dirty_backup"
             )
@@ -22728,6 +23204,8 @@ def main():
             application.job_queue.run_repeating(
                 job_task_notify_queue, interval=60, first=30, name="task_notify_queue")
             application.job_queue.run_repeating(
+                job_history_sync, interval=1800, first=120, name="history_sync")
+            application.job_queue.run_repeating(
                 job_clean_stuck_states,
                 interval=1800,
                 first=1800,
@@ -22751,19 +23229,19 @@ def main():
             )
             application.job_queue.run_repeating(
                 job_bio_realtime_monitor,
-                interval=60,
+                interval=180,
                 first=30,
                 name="bio_realtime_monitor"
             )
             application.job_queue.run_repeating(
                 job_web_sync,
-                interval=5,
+                interval=20,        # ৫s → ২০s — ফাঁকা সময়ে RU খরচ ৪ গুণ কম
                 first=8,
                 name="web_sync"
             )
             application.job_queue.run_repeating(
                 job_db_keepalive,
-                interval=60,
+                interval=300,       # ৬০s → ৩০০s — পুল নিজেই stale connection সামলায়
                 first=20,
                 name="db_keepalive"
             )
@@ -22846,21 +23324,22 @@ def main():
                     await asyncio.sleep(86400)
 
             _async_jobs = [
-                asyncio.create_task(_run_periodically(job_dirty_backup,      60,  first_sec=60)),
+                asyncio.create_task(_run_periodically(job_dirty_backup,     180,  first_sec=60)),
                 asyncio.create_task(_run_periodically(job_health_check,    3600,  first_sec=300)),
                 asyncio.create_task(_run_periodically(job_clean_stuck_states, 1800, first_sec=1800)),
                 asyncio.create_task(_run_periodically(job_scheduled_report,
                     BACKUP_INTERVAL_HOURS * 3600, first_sec=BACKUP_INTERVAL_HOURS * 3600)),
                 asyncio.create_task(_run_periodically(job_lb_adm_update,    600,  first_sec=600)),
-                asyncio.create_task(_run_periodically(job_bio_realtime_monitor, 60, first_sec=30)),
+                asyncio.create_task(_run_periodically(job_bio_realtime_monitor, 180, first_sec=30)),
                 asyncio.create_task(_run_periodically(job_ig_sheet_sync,     300, first_sec=150)),
                 asyncio.create_task(_run_periodically(job_ig_password_rotate, 60, first_sec=50)),
                 asyncio.create_task(_run_periodically(job_ig_export,          60, first_sec=80)),
                 # instant hook আছেই — এই ৬০s শুধু ব্যাকআপ (DB চাপ কম)
                 asyncio.create_task(_run_periodically(job_fb_ig_review,       60, first_sec=25)),
-                asyncio.create_task(_run_periodically(job_web_sync,             5, first_sec=8)),
-                asyncio.create_task(_run_periodically(job_db_keepalive,       60, first_sec=20)),
+                asyncio.create_task(_run_periodically(job_web_sync,            20, first_sec=8)),
+                asyncio.create_task(_run_periodically(job_db_keepalive,      300, first_sec=20)),
                 asyncio.create_task(_run_periodically(job_task_timeout,       30, first_sec=20)),
+                asyncio.create_task(_run_periodically(job_history_sync,     1800, first_sec=120)),
                 asyncio.create_task(_run_daily_at(job_bio_task_check,   0, 5, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_post_leaderboard, 0, 0, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_winback,        14, 0, BD_TZ)),
@@ -22941,6 +23420,7 @@ def main():
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
     app.add_handler(CallbackQueryHandler(cleanup_callback, pattern=r"^cleanup_(junk|logs7|logs30|close)$"))
     app.add_handler(CallbackQueryHandler(sec_callback, pattern=r"^sec_(unban|ignore)_\d+$"))
+    app.add_handler(CallbackQueryHandler(moneyreq_callback, pattern=r"^mreq:(ok|no):\d+$"))
     app.add_handler(CallbackQueryHandler(on_resetall_cb, pattern=r"^resetall_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(fb_callback, pattern=r"^(fbt_list|fbtn:\d+|fbr:\d+|fbs:\d+|fbd:\d+|fbc:\d+|fbt_cancel|adm_fb|fbx:\d+)$"))
     app.add_handler(CallbackQueryHandler(ig_callback, pattern=r"^(igt_list|igtn:\d+|igtr:\d+|igts:\d+|igc:\d+|igt_cancel|igu:\d+|igd:\d+|adm_ig|igx:\d+)$"))
@@ -22955,6 +23435,9 @@ def main():
     # FB Task ইনপুট — শুধু যাদের ফ্লো চলছে, বাকিরা সাধারণ on_message
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT & filters.ChatType.PRIVATE & _FB_STATE_F, fb_on_text))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT & filters.ChatType.PRIVATE & _IG_STATE_F, ig_on_text))
+    # Reply Keyboard বাটন — সব টেক্সটের আগে (group=-1), যাতে যেকোনো ধাপে কাজ করে
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT
+                                  & filters.ChatType.PRIVATE, _kb_global_router), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.VIA_BOT, on_message))
     app.add_error_handler(_smart_error_handler)
     log.info("✅ Task Earn Bot started!")

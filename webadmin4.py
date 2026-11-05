@@ -6,13 +6,15 @@ Instagram Username আর আলাদা টেবিল (ig_tasks / ig_submiss
 """
 import json
 
+from urllib.parse import quote as _q
+
 from flask import request, redirect, Response
 
 from webadmin import (
     wadm, page, guard, table, badge, esc, icon, num, money, one, many, scal, _x,
     log_admin, pager, st_badge, review_card, review_tokens, review_apply,
     review_counts, review_kpi, _fire_settings_changed, _fire_review_changed,
-    xlsx_bytes, queue_task_notify,
+    xlsx_bytes, queue_task_notify, export_table, queue_user_msg, queue_broadcast,
 )
 
 _DDL = (
@@ -393,13 +395,22 @@ def _cols_from_orders(form):
     return out[:40]
 
 
+def _vid_url(v):
+    """📽 Video লিংক — স্কিম ছাড়া দিলেও https:// বসিয়ে ঠিক করা হয়।"""
+    u = (v or "").strip()
+    if u and not u.lower().startswith(("http://", "https://")):
+        if "." in u and " " not in u:
+            u = "https://" + u.lstrip("/")
+    return u if u.lower().startswith(("http://", "https://")) else ""
+
+
 def _save(tid=None):
     f = request.form
     data = {
         "name": (f.get("name") or "").strip(),
         "rules_bn": (f.get("rules_bn") or "").strip(),
         "rules_en": (f.get("rules_en") or "").strip(),
-        "video_url": (f.get("video_url") or "").strip(),
+        "video_url": _vid_url(f.get("video_url")),
         "price": float(f.get("price") or 0),
         "username_mode": _mode(f.get("username_mode")),
         "username": _clean_user(f.get("username")),
@@ -461,7 +472,8 @@ def igtasks():
             f"<a class='btn gray sm' href='/admin/igtask/{tid}'>Edit</a> "
             f"<a class='btn gray sm' href='/admin/igtask/{tid}/subs'>Submissions</a> "
             f"<a class='btn gray sm' href='/admin/igtask/{tid}/export.xlsx'>Excel</a> "
-            f"<a class='btn gray sm' href='/admin/igtask/{tid}/export.csv'>CSV</a>",
+            f"<a class='btn gray sm' href='/admin/igtask/{tid}/export.csv'>CSV</a> "
+            f"<a class='btn gray sm' href='/admin/igtask/{tid}/notify'>📢</a>",
         ])
     body = (
         "<div class='card'><div class='row' style='justify-content:space-between'>"
@@ -526,6 +538,7 @@ def igtask_edit(tid):
         "📋 জমা তথ্য দেখুন</a>"
         f"<a class='btn gray' href='/admin/igtask/{tid}/export.xlsx'>⬇️ Excel Download</a>"
         f"<a class='btn gray' href='/admin/igtask/{tid}/export.csv'>CSV</a>"
+        f"<a class='btn gray' href='/admin/igtask/{tid}/notify'>📢 নোটিফাই</a>"
         "<form method='post' action='/admin/do/igtask/%d/toggle' style='display:inline'>"
         "<button class='btn gray'>%s</button></form></div></div>"
         % (tid, "⏸ বন্ধ করুন" if int(t.get("is_active") or 0) else "▶️ চালু করুন")
@@ -558,6 +571,53 @@ def igtask_delete(tid):
     log_admin("igtask_delete", tid, "instagram task deleted")
     _fire_settings_changed(["ig_task"])
     return redirect("/admin/igtasks?ok=মুছে ফেলা হয়েছে")
+
+
+@wadm.route("/admin/igtask/<int:tid>/notify", methods=["GET", "POST"])
+def igtask_notify(tid):
+    """এই টাস্কের নোটিফিকেশন — নিজের লেখা মেসেজ সব verified ইউজারকে (বট পাঠাবে)।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    t = one("SELECT * FROM ig_tasks WHERE id=%s", (tid,))
+    if not t:
+        return page("Not found", "<div class='card'>Task নেই</div>", "igtasks", status=404)
+    if request.method == "POST":
+        txt = (request.form.get("text") or "").strip()
+        if not txt:
+            return page(f"Notify · IG #{tid}",
+                        _ig_notify_form(t, tid, ""), "igtasks", err="মেসেজ লেখুন")
+        queue_broadcast(txt)
+        log_admin("ig_task_notify", tid, txt[:120])
+        return redirect(f"/admin/igtasks?ok=" + _q("📢 নোটিফিকেশন পাঠানো হয়েছে"))
+    return page(f"Notify · IG #{tid}", _ig_notify_form(t, tid, None), "igtasks",
+                toast=request.args.get("ok"))
+
+
+def _ig_notify_form(t, tid, default_text=None):
+    if default_text is None:
+        total = scal("SELECT COUNT(*) FROM ig_submissions WHERE task_id=%s", (tid,))
+        mx = int(t.get("max_accounts") or 0)
+        left = (max(0, mx - total) if mx else "∞")
+        default_text = (
+            "🔥 নতুন টাস্ক এসেছে!\n\n"
+            f"📸 {t.get('name') or 'Instagram Task'}\n"
+            f"💰 রিওয়ার্ড: {float(t.get('price') or 0):g}$\n"
+            f"👥 স্লট বাকি: {left}\n\n"
+            "📌 বটে 📸 Instagram Tasks চাপুন → রুলস পড়ে শুরু করুন।"
+        )
+    return (
+        "<div class='card'><h3>" + icon("bell") + " 📢 নোটিফিকেশন পাঠান</h3>"
+        f"<p class='mut' style='font-size:12px'>এই মেসেজটি সব verified ইউজারের কাছে "
+        f"বটে যাবে (Task: <b>{esc(t.get('name') or '')}</b>)। লেখা বদলাতে পারেন।</p>"
+        "<form method='post'>"
+        f"<textarea name='text' rows='8' class='f1' style='width:100%'>"
+        f"{esc(default_text)}</textarea>"
+        "<div class='row' style='margin-top:10px'>"
+        "<button class='ok' type='submit'>📢 সবাইকে পাঠান</button>"
+        f"<a class='btn gray' href='/admin/igtask/{tid}'>বাতিল</a></div></form></div>"
+    )
 
 
 @wadm.route("/admin/igtask/<int:tid>/subs", methods=["GET"])
@@ -649,51 +709,22 @@ def igsub_delete(sid):
 
 
 def _ig_export_table(t):
-    """CSV আর Excel — দুটোর জন্যই একই ডেটা, কলাম-ক্রম অনুযায়ী।"""
+    """CSV আর Excel — দুটোর জন্যই একই ডেটা, কলাম-ক্রম অনুযায়ী।
+
+    মান বের করা webadmin.export_table-এ — টাস্কের ফিল্ডের আসল key আর
+    টোকেন (uid/username/2fa/coki) দুটোই ধরে, তাই কোনো কলাম ফাঁকা থাকে না।
+    """
     try:
         cols = json.loads(t.get("sheet_columns") or "[]")
     except Exception:
         cols = []
     cols = [str(c) for c in cols if str(c).strip()] or [
-        "sl", "date", "username", "pass", "2fa", "user_id", "tg_username"]
-    labels = {"sl": "SL", "date": "Date", "user_id": "Telegram ID",
-              "username": "Username", "pass": "pass", "password": "pass", "2fa": "2fa",
-              "coki": "coki", "tg_username": "TG Username", "task": "Task",
-              "account_no": "Account No", "status": "Status",
-              "login_username": "Login Username", "login_password": "Login Password"}
+        "sl", "date", "username", "password", "2fa", "user_id", "tg_username"]
     subs = many(
         "SELECT s.*, COALESCE(u.username,'') AS username FROM ig_submissions s "
         "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s ORDER BY s.id ASC",
         (int(t["id"]),))
-
-    header = [labels.get(c, c[2:].replace("_", " ").title() if c.startswith("f:") else c)
-              for c in cols]
-    rows = []
-    for i, s in enumerate(subs, 1):
-        try:
-            data = json.loads(s.get("data") or "{}")
-        except Exception:
-            data = {}
-        out = []
-        for c in cols:
-            if c.startswith("f:"):
-                out.append(data.get(c[2:], ""))
-            elif c == "sl":
-                out.append(i)
-            elif c == "task":
-                out.append(t.get("name", ""))
-            elif c == "username":
-                out.append(s.get("ig_username", "") or data.get("username", ""))
-            elif c in ("pass", "password"):
-                out.append(s.get("ig_password", "") or s.get("login_password", ""))
-            elif c == "2fa":
-                out.append(data.get("2fa", "") or data.get("totp", ""))
-            elif c == "coki":
-                out.append(data.get("coki", "") or data.get("cookies", ""))
-            else:
-                out.append(s.get(c, "") if s.get(c) is not None else "")
-        rows.append(out)
-    return header, rows
+    return export_table(cols, subs, t, "ig")
 
 
 def _ig_file_base(t, tid):

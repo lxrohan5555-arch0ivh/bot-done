@@ -14,6 +14,7 @@ import base64
 import hashlib
 import hmac
 import html
+import json
 import os
 import time
 import threading
@@ -175,6 +176,268 @@ def db_reclaim(tables=None, full=False):
                 except Exception:
                     pass
     return out
+
+
+
+# ═══════════════ Excel / CSV — ঘরের মান বের করার এক জায়গা ═══════════════
+# আগে টোকেন (uid/pass/coki) আর ফিল্ডের আসল key মিলত না → Excel-এ শুধু UID
+# বসত, বাকি কলাম ফাঁকা থাকত। এখন টোকেন → alias → ফিল্ড-টাইপ → ফাজি ম্যাচ।
+_EXPORT_ALIAS = {
+    "pass": "password", "pw": "password", "pwd": "password", "fb_pass": "password",
+    "ig_pass": "password", "ck": "cookies", "coki": "cookies", "cookie": "cookies",
+    "totp": "2fa", "2step": "2fa", "auth2": "2fa",
+    "first": "login_first", "fname": "login_first", "firstname": "login_first",
+    "last": "login_last", "lname": "login_last", "lastname": "login_last",
+    "id": "uid", "profile": "uid", "fb_uid": "uid", "fb_id": "uid",
+    "acc_no": "account_no", "tg_id": "user_id", "telegram_id": "user_id",
+    "created_at": "date", "uname": "username",
+}
+
+_EXPORT_LABELS = {
+    "sl": "SL", "date": "Date", "user_id": "Telegram ID", "username": "Username",
+    "tg_username": "TG Username", "task": "Task", "account_no": "Account No",
+    "login_first": "First Name", "login_last": "Last Name",
+    "login_password": "Login Password", "uid": "UID", "password": "Password",
+    "2fa": "2FA", "cookies": "Cookies", "status": "Status",
+}
+
+
+def _xtask_fields(task):
+    try:
+        arr = json.loads((task or {}).get("fields") or "[]")
+        return [f for f in arr if isinstance(f, dict)]
+    except Exception:
+        return []
+
+
+def _xfield_type(f):
+    t = str((f or {}).get("type") or "").strip().lower()
+    if t:
+        return t
+    k = str((f or {}).get("key") or "").lower()
+    if "cookie" in k or k == "ck":
+        return "cookies"
+    if "2fa" in k or "totp" in k or "2step" in k:
+        return "2fa"
+    if "pass" in k or "pwd" in k:
+        return "password"
+    if k in ("uid", "fb_uid", "profile"):
+        return "uid"
+    if "mail" in k:
+        return "email"
+    return "text"
+
+
+def _xtype_keys(task, typ):
+    """এই টাইপের ফিল্ডগুলোর আসল key (একাধিক হলে সব) — আগে একটা হলেই হতো না।"""
+    return [str(f.get("key") or "") for f in _xtask_fields(task)
+            if _xfield_type(f) == typ and str(f.get("key") or "").strip()]
+
+
+def _xdget(data, *names):
+    """data dict থেকে নাম ধরে মান — case/space উপেক্ষা করে।"""
+    if not isinstance(data, dict) or not data:
+        return ""
+    low = {}
+    for k, v in data.items():
+        low[str(k).strip().lower()] = v
+    for n in names:
+        if not str(n or "").strip():
+            continue
+        nk = str(n).strip().lower()
+        v = data.get(n, low.get(nk))
+        if v is None:
+            v = low.get(nk)
+        if str(v if v is not None else "").strip():
+            return v
+    return ""
+
+
+def _xfuzzy(data, words):
+    """নাম না মিললেও key-র ভেতরে শব্দ থাকলে ধরে নাও (password/pass/pwd ইত্যাদি)।"""
+    if not isinstance(data, dict):
+        return ""
+    for k, v in data.items():
+        kk = str(k).lower()
+        if any(w in kk for w in words) and str(v if v is not None else "").strip():
+            return v
+    return ""
+
+
+def export_cell(tok, sub, data, task=None, idx=1, kind="fb"):
+    """একটা ঘরের মান — টোকেন, ফিল্ড-টাইপ, ফাজি ম্যাচ, DB কলাম সব ক্রমে চেষ্টা।"""
+    sub = sub or {}
+    data = data if isinstance(data, dict) else {}
+    tok = str(tok or "").strip()
+    if not tok:
+        return ""
+    low = tok.lower()
+    if low.startswith("f:"):                 # f:<field_key> — সরাসরি ফিল্ড
+        key = tok[2:]
+        v = _xdget(data, key)
+        if str(v or "").strip():
+            return v
+        v = sub.get(key, "")
+        if str(v or "").strip():
+            return v
+        return _xfuzzy(data, [key.lower()])
+    low = _EXPORT_ALIAS.get(low, low)
+    if low == "sl":
+        return idx
+    if low == "date":
+        return sub.get("created_at", "")
+    if low == "user_id":
+        return sub.get("user_id", "")
+    if low == "task":
+        return (task or {}).get("name", "")
+    if low == "account_no":
+        return sub.get("account_no", "")
+    if low == "status":
+        return sub.get("status", "")
+    if low == "tg_username":
+        return sub.get("username", "")
+    if low == "username":
+        if kind == "ig":                      # IG-তে username = জমা দেওয়া ইউজারনেম
+            v = sub.get("ig_username", "") or _xdget(data, *_xtype_keys(task, "uid"), "username")
+            if str(v or "").strip():
+                return v
+        v = sub.get("username", "")
+        if str(v or "").strip():
+            return v
+        return _xfuzzy(data, ["username", "uname"])
+    if low == "uid":
+        if kind == "ig":
+            v = sub.get("ig_username", "")
+            if str(v or "").strip():
+                return v
+        v = sub.get("fb_uid", "")
+        if str(v or "").strip():
+            return v
+        v = _xdget(data, *_xtype_keys(task, "uid"), "uid", "fb_uid", "profile", "id")
+        if str(v or "").strip():
+            return v
+        return _xfuzzy(data, ["uid", "profile", "_id"])
+    if low == "password":
+        v = sub.get("fb_password") or sub.get("ig_password") or ""
+        if str(v or "").strip():
+            return v
+        v = _xdget(data, *_xtype_keys(task, "password"), "password", "pass", "pwd")
+        if str(v or "").strip():
+            return v
+        v = _xfuzzy(data, ["pass", "pwd"])
+        if str(v or "").strip():
+            return v
+        return sub.get("login_password", "")
+    if low == "2fa":
+        v = _xdget(data, *_xtype_keys(task, "2fa"), "2fa", "totp", "2step")
+        if str(v or "").strip():
+            return v
+        return _xfuzzy(data, ["2fa", "totp", "2step", "auth"])
+    if low == "cookies":
+        v = _xdget(data, *_xtype_keys(task, "cookies"), "cookies", "coki", "ck")
+        if str(v or "").strip():
+            return v
+        return _xfuzzy(data, ["cookie", "coki"])
+    if low in ("login_first", "login_last"):
+        w = "first" if low.endswith("first") else "last"
+        v = sub.get(low, "")
+        if str(v or "").strip():
+            return v
+        v = _xdget(data, low, w)
+        if str(v or "").strip():
+            return v
+        return _xfuzzy(data, [w])
+    # শেষ চেষ্টা: DB কলাম → data → ফাজি
+    v = sub.get(tok, sub.get(low, ""))
+    if v is not None and str(v).strip():
+        return v
+    v = _xdget(data, tok, low)
+    if str(v or "").strip():
+        return v
+    return _xfuzzy(data, [low])
+
+
+def export_label(tok, task=None):
+    """কলামের হেডার — চেনা টোকেন হলে সুন্দর নাম, নাহলে ফিল্ডের লেবেল।"""
+    tok = str(tok or "").strip()
+    if tok.lower().startswith("f:"):
+        key = tok[2:]
+        for f in _xtask_fields(task):
+            if str(f.get("key") or "") == key:
+                return str(f.get("label_en") or f.get("label_bn")
+                           or key.replace("_", " ").title())
+        return key.replace("_", " ").title()
+    low = _EXPORT_ALIAS.get(tok.lower(), tok.lower())
+    if low in _EXPORT_LABELS:
+        return _EXPORT_LABELS[low]
+    for f in _xtask_fields(task):
+        if str(f.get("key") or "").lower() == low:
+            return str(f.get("label_en") or f.get("label_bn") or tok)
+    return tok.replace("_", " ").title()
+
+
+def _col_covers(key, cols, task=None):
+    """এই data key কি কোনো কলামে ইতিমধ্যে যাচ্ছে?"""
+    kl = str(key or "").strip().lower()
+    if not kl:
+        return True
+    # এই key টাস্কের কোন ফিল্ড — তার টাইপ (cookies/2fa/password/uid)
+    _ktype = ""
+    for f in _xtask_fields(task):
+        if str(f.get("key") or "").strip().lower() == kl:
+            _ktype = _xfield_type(f)
+            break
+    for c in cols or []:
+        cl = str(c).strip().lower()
+        if cl.startswith("f:") and cl[2:] == kl:
+            return True
+        if _ktype and _EXPORT_ALIAS.get(cl, cl) == _ktype:
+            return True
+        cl = _EXPORT_ALIAS.get(cl, cl)
+        if cl == kl:
+            return True
+        if cl == "uid" and kl in ("uid", "fb_uid", "ig_username", "profile", "id"):
+            return True
+        if cl == "username" and kl in ("username", "ig_username", "tg_username", "uname"):
+            return True
+        if cl == "password" and ("pass" in kl or "pwd" in kl):
+            return True
+        if cl == "2fa" and ("2fa" in kl or "totp" in kl or "2step" in kl):
+            return True
+        if cl == "cookies" and ("cookie" in kl or "coki" in kl or kl == "ck"):
+            return True
+        if cl == "login_first" and "first" in kl:
+            return True
+        if cl == "login_last" and "last" in kl:
+            return True
+    return False
+
+
+def export_table(cols, subs, task=None, kind="fb"):
+    """(header, rows) — কলাম অনুযায়ী সাজানো, আর কলামে না-ঢোকা ডেটাও শেষে যোগ হয়।"""
+    cols = [str(c) for c in (cols or []) if str(c).strip()]
+    datas = []
+    for s in subs or []:
+        try:
+            d = json.loads(s.get("data") or "{}")
+        except Exception:
+            d = {}
+        datas.append(d if isinstance(d, dict) else {})
+    extra = []
+    for d in datas:
+        for k in d.keys():
+            if k in extra:
+                continue
+            if not _col_covers(k, cols, task):
+                extra.append(k)
+    header = [export_label(c, task) for c in cols] + [export_label("f:" + str(k), task) for k in extra]
+    rows = []
+    for i, s in enumerate(subs or [], 1):
+        d = datas[i - 1]
+        row = [export_cell(c, s, d, task, i, kind) for c in cols]
+        row += [d.get(k, "") for k in extra]
+        rows.append(row)
+    return header, rows
 
 
 # ── Excel (.xlsx) এক্সপোর্ট — CSV-র separator/encoding সমস্যা এড়াতে ──────────
@@ -1046,12 +1309,14 @@ MENU = [
     ("CONTENT", []),
     ("tasks", "/admin/tasks", "Task Management", "task", ""),
     ("taskstats", "/admin/task-stats", "Task Statistics", "trend", ""),
+    ("history", "/admin/history", "Task History", "task", ""),
     ("earnings", "/admin/earnings", "Earnings", "money", ""),
     ("withdrawals", "/admin/withdrawals", "Withdrawals", "wallet", ""),
     ("referrals", "/admin/referrals", "Referrals", "refer", ""),
     ("blocked", "/admin/blocked", "Blocked Users", "ban", ""),
     ("SYSTEM", []),
     ("logs", "/admin/logs", "Admin Activity Logs", "logs", ""),
+    ("storage", "/admin/storage", "Data & Storage", "logs", ""),
     ("settings", "/admin/settings", "Settings", "settings", ""),
 ]
 
@@ -1317,6 +1582,43 @@ def badge(text, kind="mut"):
     return f"<span class='badge b-{kind}'>{esc(text)}</span>"
 
 
+def _notify_queue_init():
+    """ওয়েব → বট নোটিফিকেশন কিউ (পুরোনো টেবিলেও নতুন কলাম যোগ হয়)।"""
+    try:
+        _x("CREATE TABLE IF NOT EXISTS task_notify_queue (id BIGSERIAL PRIMARY KEY, "
+           "kind TEXT DEFAULT '', task_id BIGINT DEFAULT 0, user_id BIGINT DEFAULT 0, "
+           "msg TEXT DEFAULT '', created_at TEXT DEFAULT '', processed INTEGER DEFAULT 0)")
+    except Exception:
+        pass
+    for col in ("user_id BIGINT DEFAULT 0", "msg TEXT DEFAULT ''"):
+        try:
+            _x("ALTER TABLE task_notify_queue ADD COLUMN IF NOT EXISTS " + col)
+        except Exception:
+            pass
+
+
+def _queue_push(kind, task_id=0, user_id=0, msg=""):
+    _notify_queue_init()
+    try:
+        _x("INSERT INTO task_notify_queue (kind, task_id, user_id, msg, created_at, processed) "
+           "VALUES (%s,%s,%s,%s,%s,0)",
+           (str(kind), int(task_id or 0), int(user_id or 0), str(msg or ""),
+            time.strftime("%Y-%m-%d %H:%M:%S")))
+        return True
+    except Exception:
+        return False
+
+
+def queue_broadcast(text):
+    """প্যানেল থেকে লেখা নোটিশ সব verified ইউজারকে (বট পাঠাবে)।"""
+    return _queue_push("broadcast", msg=text)
+
+
+def queue_user_msg(user_id, text):
+    """একজন ইউজারকে বটে মেসেজ (যেমন অ্যাডমিন ব্যালেন্স যোগ করলে)।"""
+    return _queue_push("dm", user_id=user_id, msg=text)
+
+
 def queue_task_notify(kind, task_id):
     """বটকে বলি — এই টাস্কের আপডেট সব verified ইউজারকে জানাও (queue টেবিলে row)।"""
     try:
@@ -1332,6 +1634,129 @@ def queue_task_notify(kind, task_id):
         return True
     except Exception:
         return False
+
+
+# ─────────────────── টাকা/পয়েন্ট পরিবর্তনের অনুমোদন ───────────────────
+_MONEY_FIELD_BN = {"balance": "টাকা", "points": "পয়েন্ট"}
+_MONEY_OP_BN = {"add": "যোগ", "sub": "বাদ", "set": "সেট"}
+
+
+_MONEY_REQ_READY = False
+
+
+def _money_req_init():
+    """ওয়েব থেকে টাকা/পয়েন্ট বদলের অনুমোদন-রিকোয়েস্ট টেবিল (প্রসেসে একবারই)।"""
+    global _MONEY_REQ_READY
+    if _MONEY_REQ_READY:
+        return
+    try:
+        _x("CREATE TABLE IF NOT EXISTS money_requests (id BIGSERIAL PRIMARY KEY, "
+           "user_id BIGINT DEFAULT 0, field TEXT DEFAULT 'balance', op TEXT DEFAULT 'add', "
+           "amount DOUBLE PRECISION DEFAULT 0, note TEXT DEFAULT '', status TEXT DEFAULT 'pending', "
+           "admin TEXT DEFAULT '', created_at TEXT DEFAULT '', decided_at TEXT DEFAULT '', "
+           "decided_by TEXT DEFAULT '')")
+        _MONEY_REQ_READY = True     # সফল হলেই ফ্ল্যাগ — DB ডাউন থাকলে পরের বার আবার চেষ্টা
+    except Exception:
+        pass
+
+
+def money_req_new(uid, field, op, amt, note="", admin=""):
+    """রিকোয়েস্ট সেভ করে অ্যাডমিনকে বটে অনুমোদনের মেসেজ পাঠানোর কিউ-তে দেয়।"""
+    _money_req_init()
+    rid = 0
+    try:
+        r = one("INSERT INTO money_requests (user_id, field, op, amount, note, status, admin, "
+                "created_at) VALUES (%s,%s,%s,%s,%s,'pending',%s,%s) RETURNING id",
+                (int(uid), str(field), str(op), float(amt or 0), str(note or "")[:200],
+                 str(admin or ""), time.strftime("%Y-%m-%d %H:%M:%S")))
+        rid = int((r or {}).get("id") or 0)
+    except Exception as e:
+        print(f"[moneyreq] সেভ ব্যর্থ: {e}")
+        return 0
+    if rid:
+        _queue_push("adminreq", task_id=rid)     # বট অ্যাডমিনকে ✅/❌ বাটনসহ পাঠাবে
+    return rid
+
+
+def money_req_pending(uid=0, limit=10):
+    _money_req_init()
+    try:
+        q = ("SELECT id, user_id, field, op, amount, note, status, created_at "
+             "FROM money_requests WHERE status='pending'")
+        args = ()
+        if uid:
+            q += " AND user_id=%s"
+            args = (int(uid),)
+        q += " ORDER BY id DESC LIMIT %s"
+        return many(q, args + (int(limit),))
+    except Exception:
+        return []
+
+
+def money_req_apply(rid, ok, by=""):
+    """অনুমোদন/বাতিল — সত্যি হলে ব্যালেন্স বদলায় ও ইউজারকে বটে জানায়।"""
+    _money_req_init()
+    r = one("SELECT * FROM money_requests WHERE id=%s", (int(rid),))
+    if not r:
+        return None, "notfound"
+    if str(r.get("status") or "") != "pending":
+        return r, "done"
+    uid = int(r.get("user_id") or 0)
+    field = r.get("field") if r.get("field") in ("balance", "points") else "balance"
+    op = r.get("op") if r.get("op") in ("add", "sub", "set") else "add"
+    try:
+        amt = float(r.get("amount") or 0)
+    except Exception:
+        amt = 0.0
+    if field == "points":
+        amt = int(round(amt))
+    now_s = time.strftime("%Y-%m-%d %H:%M:%S")
+    if ok:
+        if op == "add":
+            _x(f"UPDATE users SET {field}=COALESCE({field},0)+%s WHERE user_id=%s", (amt, uid))
+        elif op == "sub":
+            _x(f"UPDATE users SET {field}=GREATEST(0,COALESCE({field},0)-%s) "
+               f"WHERE user_id=%s", (amt, uid))
+        else:
+            _x(f"UPDATE users SET {field}=%s WHERE user_id=%s", (max(0, amt), uid))
+        _fire_user_changed(uid)
+    else:
+        _fire_user_changed(uid)
+    try:
+        _x("UPDATE money_requests SET status=%s, decided_at=%s, decided_by=%s WHERE id=%s",
+           ("approved" if ok else "rejected", now_s, str(by or "")[:60], int(rid)))
+    except Exception:
+        pass
+    log_admin(("money_approved" if ok else "money_rejected"), uid,
+              f"#{rid} {field}_{op} {amt} {r.get('note') or ''}")
+    # ইউজারকে বটে জানাও (অনুমোদন হলে নতুন ব্যালেন্সসহ)
+    try:
+        _bal = one("SELECT COALESCE(balance,0) AS b, COALESCE(points,0) AS p FROM users "
+                   "WHERE user_id=%s", (uid,)) or {}
+        _sym = "৳" if field == "balance" else "পয়েন্ট"
+        if ok:
+            if op == "add":
+                _msg = (f"✅ আপনার {_sym} {amt:g} যোগ হয়েছে।\n"
+                        f"💳 এখন: {float(_bal.get('b') or 0):g} ৳ · "
+                        f"{int(_bal.get('p') or 0)} point")
+            elif op == "sub":
+                _msg = (f"➖ আপনার {_sym} {amt:g} কমানো হয়েছে।\n"
+                        f"💳 এখন: {float(_bal.get('b') or 0):g} ৳ · "
+                        f"{int(_bal.get('p') or 0)} point")
+            else:
+                _msg = (f"🔄 আপনার {_sym} অ্যাডমিন সেট করেছেন: {amt:g}\n"
+                        f"💳 এখন: {float(_bal.get('b') or 0):g} ৳ · "
+                        f"{int(_bal.get('p') or 0)} point")
+            if str(r.get("note") or "").strip():
+                _msg += f"\n📝 {str(r.get('note')).strip()[:120]}"
+        else:
+            _msg = (f"❌ আপনার {_sym} {amt:g} পরিবর্তনের অনুরোধ বাতিল হয়েছে।\n"
+                    f"💳 এখন: {float(_bal.get('b') or 0):g} ৳ · "
+                    f"{int(_bal.get('p') or 0)} point")
+        queue_user_msg(uid, _msg)
+    except Exception:
+        pass
+    return r, "ok"
 
 
 def _rget(row, key, default=None):
@@ -1685,6 +2110,31 @@ def user_row(uid):
 
 
 @wadm.route("/admin/user/<int:uid>", methods=["GET"])
+def _pending_html(uid):
+    """এই ইউজারের অপেক্ষমাণ টাকা/পয়েন্ট রিকোয়েস্ট — বটে না পেলে ওয়েব থেকেই ✅ করা যায়।"""
+    rows = money_req_pending(uid, 6)
+    if not rows:
+        return ""
+    out = ["<div style='margin-top:10px'><b style='font-size:12.5px'>⏳ অপেক্ষমাণ অনুমোদন</b>"]
+    for r in rows:
+        _f = _MONEY_FIELD_BN.get(r.get("field"), r.get("field"))
+        _o = _MONEY_OP_BN.get(r.get("op"), r.get("op"))
+        _a = float(r.get("amount") or 0)
+        out.append(
+            "<div class='row' style='margin-top:6px;gap:8px;align-items:center'>"
+            f"<span class='mono mut'>#{int(r.get('id') or 0)}</span>"
+            f"<span>{esc(str(_f))} {esc(str(_o))} <b>{num(_a)}</b></span>"
+            f"<span class='mut' style='font-size:11px'>{esc(str(r.get('created_at') or '')[:16])}</span>"
+            f"<form method='post' action='/admin/do/moneyreq/{int(r.get('id') or 0)}/ok' "
+            "style='display:inline'><button class='ok sm' type='submit'>✅ অনুমোদন</button></form>"
+            f"<form method='post' action='/admin/do/moneyreq/{int(r.get('id') or 0)}/no' "
+            "style='display:inline'><button class='gray sm' type='submit'>❌ বাতিল</button></form>"
+            "</div>"
+        )
+    out.append("</div>")
+    return "".join(out)
+
+
 def user_detail(uid):
     g = guard()
     if g:
@@ -1755,7 +2205,10 @@ def user_detail(uid):
         "<input name='note' class='f1' placeholder='Note (optional)'>"
         "<button type='submit'>Apply</button></form>"
         "<p class='mut' style='font-size:11.5px;margin:8px 0 0'>"
-        "সব পরিবর্তন <b>admin_actions</b> লগে সেভ হয়; কখনো ব্যালেন্স নেগেটিভ হবে না।</p></div>"
+        "সব পরিবর্তন <b>admin_actions</b> লগে সেভ হয়; কখনো ব্যালেন্স নেগেটিভ হবে না। "
+        "<b>এখন Apply চাপলে টাকা সাথে সাথে যোগ হয় না</b> — বটে আপনার কাছে ✅/❌ বাটনসহ "
+        "অনুমোদনের মেসেজ যায়, আপনি ✅ চাপলেই ইউজারের ব্যালেন্সে যোগ হবে।</p>"
+        + _pending_html(uid) + "</div>"
     )
     action_card = (
         "<div class='card'><h3>" + icon("shield") + " অ্যাকশন</h3>"
@@ -1845,6 +2298,20 @@ def back(uid=None, to="/admin/users", msg=""):
     return redirect(url)
 
 
+@wadm.route("/admin/do/moneyreq/<int:rid>/<act>", methods=["POST"])
+def act_moneyreq(rid, act):
+    """ওয়েব থেকেই অনুমোদন (বটে মেসেজ না পেলে/বন্ধ থাকলে)।"""
+    g = guard()
+    if g:
+        return g
+    r, st = money_req_apply(rid, act == "ok", admin_user())
+    if not r:
+        return back(None, to="/admin/users", msg="রিকোয়েস্ট পাওয়া যায়নি")
+    return back(int(r.get("user_id") or 0),
+                msg=("অনুমোদিত হয়েছে ✅ টাকা/পয়েন্ট যোগ হয়েছে" if act == "ok"
+                     else "বাতিল করা হয়েছে ❌"))
+
+
 @wadm.route("/admin/do/money/<int:uid>", methods=["POST"])
 def act_money(uid):
     g = guard()
@@ -1860,15 +2327,17 @@ def act_money(uid):
         amt = 0.0
     if field == "points":
         amt = int(round(amt))
-    if op == "add":
-        _x(f"UPDATE users SET {field}=COALESCE({field},0)+%s WHERE user_id=%s", (amt, uid))
-    elif op == "sub":
-        _x(f"UPDATE users SET {field}=GREATEST(0,COALESCE({field},0)-%s) WHERE user_id=%s", (amt, uid))
-    else:
-        _x(f"UPDATE users SET {field}=%s WHERE user_id=%s", (max(0, amt), uid))
-    log_admin(f"{field}_{op}", uid, f"{amt} {request.form.get('note') or ''}")
-    _fire_user_changed(uid)      # বটের ক্যাশে সাথে সাথে নতুন ব্যালেন্স
-    return back(uid)
+    if amt <= 0:
+        return back(uid, msg="পরিমাণ ০-এর বেশি হতে হবে")
+    # ── সরাসরি প্রয়োগ নয় — অ্যাডমিনের অনুমোদনের জন্য রিকোয়েস্ট ──
+    rid = money_req_new(uid, field, op, amt, request.form.get("note") or "", admin_user())
+    if not rid:
+        return back(uid, msg="রিকোয়েস্ট সেভ করা যায়নি")
+    log_admin(f"money_request_{field}_{op}", uid,
+              f"#{rid} {amt} {request.form.get('note') or ''}")
+    _fbn = _MONEY_FIELD_BN.get(field, field)
+    _obn = _MONEY_OP_BN.get(op, op)
+    return back(uid, msg=f"{_fbn} {_obn} {amt:g} — অনুমোদনের জন্য পাঠানো হয়েছে (#{rid})")
 
 
 @wadm.route("/admin/do/ban/<int:uid>", methods=["POST"])
@@ -1903,8 +2372,9 @@ def act_restart(uid):
         return g
     try:
         try:
+            # vrf_force=1 → এরপর verify-এ ডিভাইস/IP লিমিট আটকাবে না (রিস্টার্টের নিয়ম)
             _x("UPDATE users SET vrf_pass=0, verified=0, verified_at='', "
-               "vrf_notice_build='' WHERE user_id=%s", (uid,))
+               "vrf_notice_build='', vrf_force=1 WHERE user_id=%s", (uid,))
         except Exception as e:
             if "does not exist" not in str(e).lower():
                 raise
@@ -1932,3 +2402,238 @@ def act_review(uid):
     log_admin("review", uid)
     _fire_user_changed(uid)
     return back(uid)
+
+
+# ─────────────────── 🗄️ Data & Storage (বাকার ডাটা মুছুন) ───────────────────
+_TABLE_LABELS = {
+    "users": "👥 ইউজার", "fb_tasks": "📘 FB টাস্ক", "fb_submissions": "📘 FB জমা",
+    "ig_tasks": "📸 IG টাস্ক", "ig_submissions": "📸 IG জমা", "gmails": "📧 Gmail জমা",
+    "tg_tasks": "✈️ TG টাস্ক", "tg_task_completions": "✈️ TG সম্পন্ন",
+    "bio_task_completions": "📝 Bio সম্পন্ন", "withdrawals": "💸 উইথড্র",
+    "commissions": "🎁 কমিশন", "referrals": "🔗 রেফারেল", "devices": "📱 ডিভাইস",
+    "user_ips": "🌐 IP তালিকা", "ip_history": "🧭 IP হিস্ট্রি",
+    "verifications": "✅ ভেরিফিকেশন", "security_alerts": "🛡️ অ্যালার্ট",
+    "task_notify_queue": "📨 নোটিফাই কিউ", "pending_notifications": "🔔 পেন্ডিং নোটিফিকেশন",
+    "admin_actions": "📋 অ্যাডমিন লগ", "money_requests": "💸 টাকা রিকোয়েস্ট",
+    "task_done_history": "📜 টাস্ক হিস্ট্রি", "settings": "⚙️ সেটিংস",
+    "bot_meta": "🔧 bot_meta", "user_activity": "📈 অ্যাক্টিভিটি",
+}
+
+
+def _table_rows():
+    """(নাম, রো) — CockroachDB-তে estimated_row_count, না পেলে COUNT(*)।"""
+    rows = many("SELECT table_name AS t, estimated_row_count AS n FROM crdb_internal.tables "
+                "WHERE database_name = current_database() AND schema_name = 'public' "
+                "ORDER BY n DESC")
+    if rows:
+        return [(str(r.get("t")), int(r.get("n") or 0)) for r in rows]
+    out = []
+    for t in _TABLE_LABELS:
+        try:
+            r = one(f"SELECT COUNT(*) AS n FROM {t}")
+            out.append((t, int((r or {}).get("n") or 0)))
+        except Exception:
+            continue
+    out.sort(key=lambda x: -x[1])
+    return out
+
+
+# ⚠️ ফাইলের নিজের নীতি: এই টেবিলগুলো "সব মুছুন"-এ ডিফল্টে বাদ
+# (লাগলে আলাদা টিক দিয়ে মোছা যাবে — সেটা ইউজারের ইচ্ছা)
+_JUNK_PROTECTED = ("devices", "ips", "iph")
+
+
+def _junk_defs():
+    """বাকার (মুছলে কোনো হিসাব/টাকা নষ্ট হয় না) ডাটার তালিকা।"""
+    _now = time.time()
+    d3 = time.strftime("%Y-%m-%d %H:%M", time.localtime(_now - 3 * 86400))
+    d7 = time.strftime("%Y-%m-%d %H:%M", time.localtime(_now - 7 * 86400))
+    d60 = time.strftime("%Y-%m-%d %H:%M", time.localtime(_now - 60 * 86400))
+    e90 = str(int(_now - 90 * 86400))
+    e120 = str(int(_now - 120 * 86400))
+    return [
+        ("queue", "📨 পাঠানো হয়ে যাওয়া নোটিফিকেশন কিউ (processed)",
+         "SELECT COUNT(*) AS n FROM task_notify_queue WHERE processed=1",
+         "DELETE FROM task_notify_queue WHERE processed=1"),
+        ("notif", "🔔 পুরোনো পেন্ডিং নোটিফিকেশন (৩ দিন+)",
+         "SELECT COUNT(*) AS n FROM pending_notifications WHERE send_at < %s",
+         "DELETE FROM pending_notifications WHERE send_at < %s", (d3,)),
+        ("alerts", "🛡️ সমাধান/ইগনোর হওয়া সিকিউরিটি অ্যালার্ট",
+         "SELECT COUNT(*) AS n FROM security_alerts WHERE status IN ('resolved','ignored')",
+         "DELETE FROM security_alerts WHERE status IN ('resolved','ignored')"),
+        ("devices", "📱 ১২০ দিন দেখা হয়নি এমন ডিভাইস",
+         "SELECT COUNT(*) AS n FROM devices WHERE last_seen ~ '^[0-9]+$' AND last_seen < %s",
+         "DELETE FROM devices WHERE last_seen ~ '^[0-9]+$' AND last_seen < %s", (e120,)),
+        ("ips", "🌐 ৯০ দিন পুরোনো IP তালিকা (user_ips)",
+         "SELECT COUNT(*) AS n FROM user_ips WHERE last_seen ~ '^[0-9]+$' AND last_seen < %s",
+         "DELETE FROM user_ips WHERE last_seen ~ '^[0-9]+$' AND last_seen < %s", (e90,)),
+        ("iph", "🧭 ৯০ দিন পুরোনো IP হিস্ট্রি (ip_history)",
+         "SELECT COUNT(*) AS n FROM ip_history WHERE seen_at ~ '^[0-9]+$' AND seen_at < %s",
+         "DELETE FROM ip_history WHERE seen_at ~ '^[0-9]+$' AND seen_at < %s", (e90,)),
+        ("actions", "📋 ৬০ দিন পুরোনো অ্যাডমিন লগ",
+         "SELECT COUNT(*) AS n FROM admin_actions WHERE created_at < %s",
+         "DELETE FROM admin_actions WHERE created_at < %s", (d60,)),
+        ("mreq", "💸 ৬০ দিন পুরোনো হয়ে যাওয়া টাকা-রিকোয়েস্ট",
+         "SELECT COUNT(*) AS n FROM money_requests WHERE status <> 'pending' AND created_at < %s",
+         "DELETE FROM money_requests WHERE status <> 'pending' AND created_at < %s", (d60,)),
+        ("premem", "👥 ৭ দিন পুরোনো TG pre-members",
+         "SELECT COUNT(*) AS n FROM tg_task_pre_members WHERE seen_at < %s",
+         "DELETE FROM tg_task_pre_members WHERE seen_at < %s", (d7,)),
+    ]
+
+
+def _junk_counts():
+    out = []
+    for d in _junk_defs():
+        key, label, cnt_sql = d[0], d[1], d[2]
+        args = d[4] if len(d) > 4 else ()
+        n = 0
+        try:
+            r = one(cnt_sql, args)
+            n = int((r or {}).get("n") or 0)
+        except Exception:
+            n = -1                     # টেবিল নেই
+        out.append({"key": key, "label": label, "n": n})
+    return out
+
+
+def _junk_delete(kinds):
+    """নির্বাচিত বাকার ডাটা ডিলিট করে — {key: কত রো} ফেরত দেয়।"""
+    done = {}
+    for d in _junk_defs():
+        key = d[0]
+        if key not in kinds:
+            continue
+        del_sql = d[3]
+        args = d[4] if len(d) > 4 else ()
+        try:
+            done[key] = int(_x(del_sql, args) or 0)
+        except Exception as e:
+            print(f"[cleanup] {key} ব্যর্থ: {e}")
+            done[key] = 0
+    return done
+
+
+@wadm.route("/admin/storage", methods=["GET"])
+def storage_page():
+    g = guard()
+    if g:
+        return g
+    rows = _table_rows()
+    junk = _junk_counts()
+    total_rows = sum(n for _, n in rows)
+    junk_rows = sum(j["n"] for j in junk if j["n"] > 0)
+    trs = [[f"<span class='mono'>{esc(t)}</span>",
+            esc(_TABLE_LABELS.get(t, t)), num(n),
+            ("<b style='color:#f59e0b'>বেশি</b>" if n >= 20000 else "")] for t, n in rows]
+    jtrs = []
+    for j in junk:
+        if j["n"] < 0:
+            jtrs.append([f"<code>{esc(j['key'])}</code>", esc(j["label"]),
+                         "<span class='mut'>টেবিল নেই</span>", ""])
+            continue
+        jtrs.append([
+            f"<input type='checkbox' name='k' value='{esc(j['key'])}'>",
+            esc(j["label"]), num(j["n"]),
+            f"<span class='mono mut'>~{num(int(j['n'] * 0.6))} KB</span>",
+        ])
+    body = (
+        "<div class='grid g-kpi'>"
+        f"<div class='card kpi'><div class='t'>মোট রো (সব টেবিল)</div>"
+        f"<div class='v'>{num(total_rows)}</div></div>"
+        f"<div class='card kpi'><div class='t'>বাকার ডাটা (মুছতে পারেন)</div>"
+        f"<div class='v'>{num(junk_rows)}</div></div>"
+        f"<div class='card kpi'><div class='t'>সবচেয়ে বড় টেবিল</div>"
+        f"<div class='v' style='font-size:15px'>{esc(rows[0][0]) if rows else '-'}</div></div>"
+        "</div>"
+        "<div class='card'><h3>" + icon("logs") + " 🧹 বাকার ডাটা ডিলিট (সরাসরি সাইট থেকে)</h3>"
+        "<form method='post' action='/admin/do/cleanup'>"
+        "<p class='mut' style='font-size:12px;margin:0 0 8px'>নিচের যেগুলো টিক দেবেন সেগুলোই "
+        "সাথে সাথে ডিলিট হবে। <b>টাকা, ব্যালেন্স, উইথড্র, কমিশন, রেফারেল, টাস্ক হিস্ট্রি — "
+        "কোনোদিন মুছবে না।</b> IP/ডিভাইস হিস্ট্রি ডিফল্টে সুরক্ষিত — দরকার হলে আলাদা টিক দিন।</p>"
+        + table(["", "কী ডিলিট হবে", "রো সংখ্যা", "আকার (আন্দাজ)"], jtrs, "বাকার ডাটা নেই")
+        + "<div class='row' style='margin-top:12px'>"
+        "<button class='red' type='submit' "
+        "data-confirm='নির্বাচিত বাকার ডাটা স্থায়ীভাবে ডিলিট হবে। চালিয়ে যাবেন?'>"
+        "🗑 নির্বাচিত ডিলিট করুন</button>"
+        "<button class='gray' type='submit' name='all' value='1' "
+        "data-confirm='সব বাকার ডাটা ডিলিট হবে (IP ও ডিভাইস হিস্ট্রি বাদে)। চালিয়ে যাবেন?'>"
+        "🧹 সব বাকার ডাটা মুছুন</button>"
+        "</div></form>"
+        "<p class='mut' style='font-size:11.5px;margin:10px 0 0'>"
+        "ℹ️ CockroachDB-তে ডিলিট করা ডাটা সাথে সাথে ডিস্ক থেকে কমে না — ব্যাকগ্রাউন্ড GC "
+        "প্রায় ২৫ ঘণ্টায় একবার চলে, তারপর Storage used কমতে দেখা যায় (কখনো ১-২ দিন)। "
+        "ডিলিটের সাথে সাথেই কিন্তু RU/query খরচ কমে যায়।</p></div>"
+        "<div class='card'><h3>" + icon("chart") + " কোন টেবিলে কী আছে</h3>"
+        + table(["টেবিল", "কী", "রো", ""], trs, "টেবিল পাওয়া যায়নি")
+        + "<p class='mut' style='font-size:11.5px;margin-top:10px'>"
+        "৪০০ ইউজারে ৪৮০MB হওয়ার সাধারণ কারণ: IP তালিকা/হিস্ট্রি, ডিভাইস, অ্যালার্ট, "
+        "নোটিফাই কিউ আর অ্যাডমিন লগ জমে থাকা — উপরের ডিলিট বাটনে এসব কমে যাবে।</p></div>"
+    )
+    return page("Data & Storage", body, "storage", toast=request.args.get("ok"))
+
+
+@wadm.route("/admin/do/cleanup", methods=["POST"])
+def storage_cleanup():
+    g = guard()
+    if g:
+        return g
+    if (request.form.get("all") or "") == "1":
+        # IP/ডিভাইস হিস্ট্রি ডিফল্টে বাদ — আলাদা টিক দিলেই মুছবে
+        kinds = [d[0] for d in _junk_defs() if d[0] not in _JUNK_PROTECTED]
+    else:
+        kinds = request.form.getlist("k")
+    if not kinds:
+        return redirect("/admin/storage?ok=" + _q_("কিছু নির্বাচন করা হয়নি"))
+    done = _junk_delete(kinds)
+    total = sum(done.values())
+    log_admin("junk_cleanup", 0, ",".join(f"{k}={v}" for k, v in done.items())[:280])
+    return redirect("/admin/storage?ok=" + _q_(f"{total} রো ডিলিট হয়েছে"))
+
+
+# ─────────────────── 📜 টাস্ক ইতিহাস (ডিলিট হলেও থাকে) ───────────────────
+@wadm.route("/admin/history", methods=["GET"])
+def task_history_page():
+    g = guard()
+    if g:
+        return g
+    q = (request.args.get("q") or "").strip()
+    kind = (request.args.get("kind") or "").strip().lower()
+    where, args = [], []
+    if q:
+        if q.isdigit():
+            where.append("user_id=%s")
+            args.append(int(q))
+        else:
+            where.append("(task_name ILIKE %s OR kind ILIKE %s)")
+            args += [f"%{q}%", f"%{q}%"]
+    if kind in ("fb", "ig", "tg", "bio", "g"):
+        where.append("kind=%s")
+        args.append(kind)
+    w = (" WHERE " + " AND ".join(where)) if where else ""
+    rows = many("SELECT * FROM task_done_history" + w + " ORDER BY id DESC LIMIT 300", tuple(args))
+    trs = [[f"<a class='mono' href='/admin/user/{int(r.get('user_id') or 0)}'>"
+            f"{int(r.get('user_id') or 0)}</a>",
+            esc(str(r.get("kind") or "")), esc(str(r.get("task_name") or "-")),
+            money(r.get("amount") or 0), esc(str(r.get("done_at") or "")[:19])] for r in rows]
+    body = (
+        "<div class='card'><h3>" + icon("task") + " 📜 টাস্ক ইতিহাস (স্থায়ী)</h3>"
+        "<p class='mut' style='font-size:12px;margin:0 0 8px'>কে, কখন, কোন টাস্ক করেছে আর কত "
+        "পেয়েছে — এই রেকর্ড <b>কখনো মুছবে না</b>, জমা তথ্য (submission) ডিলিট করলেও থাকে।</p>"
+        "<form class='row' method='get'>"
+        f"<input name='q' class='f1' value='{esc(q)}' placeholder='User ID বা টাস্কের নাম'>"
+        "<select name='kind' style='max-width:150px'>"
+        f"<option value=''>সব</option>"
+        + "".join(f"<option value='{k}' {'selected' if kind == k else ''}>{v}</option>"
+                  for k, v in (("fb", "Facebook"), ("ig", "Instagram"), ("tg", "Telegram"),
+                               ("bio", "Bio"), ("g", "Gmail")))
+        + "</select><button type='submit'>খুঁজুন</button></form>"
+        + table(["ইউজার", "ধরন", "টাস্ক", "টাকা", "কখন"], trs, "এখনো কোনো রেকর্ড নেই")
+        + "</div>"
+    )
+    return page("Task History", body, "history", toast=request.args.get("ok"))
+
+
+def _q_(txt):
+    from urllib.parse import quote
+    return quote(str(txt or ""))

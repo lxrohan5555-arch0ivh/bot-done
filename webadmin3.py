@@ -5,13 +5,15 @@
 """
 import json
 
+from urllib.parse import quote as _q
+
 from flask import request, redirect, Response
 
 from webadmin import (
     wadm, page, guard, table, badge, esc, icon, num, money, one, many, scal, _x,
     log_admin, pager, st_badge, review_card, review_tokens, review_apply,
     review_counts, review_kpi, _fire_settings_changed, _fire_review_changed,
-    xlsx_bytes, queue_task_notify,
+    xlsx_bytes, queue_task_notify, export_table, queue_user_msg, queue_broadcast,
 )
 
 _DDL = (
@@ -437,13 +439,22 @@ def _cols_from_orders(form):
     return out[:40]
 
 
+def _vid_url(v):
+    """📽 Video লিংক — স্কিম ছাড়া দিলেও https:// বসিয়ে ঠিক করা হয়।"""
+    u = (v or "").strip()
+    if u and not u.lower().startswith(("http://", "https://")):
+        if "." in u and " " not in u:
+            u = "https://" + u.lstrip("/")
+    return u if u.lower().startswith(("http://", "https://")) else ""
+
+
 def _save(tid=None):
     f = request.form
     data = {
         "name": (f.get("name") or "").strip(),
         "rules_bn": (f.get("rules_bn") or "").strip(),
         "rules_en": (f.get("rules_en") or "").strip(),
-        "video_url": (f.get("video_url") or "").strip(),
+        "video_url": _vid_url(f.get("video_url")),
         "price": float(f.get("price") or 0),
         "first_name_mode": _mode(f.get("first_name_mode")),
         "first_name": (f.get("first_name") or "").strip(),
@@ -509,7 +520,8 @@ def fbtasks():
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}'>Edit</a> "
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs'>Submissions</a> "
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/export.xlsx'>Excel</a> "
-            f"<a class='btn gray sm' href='/admin/fbtask/{tid}/export.csv'>CSV</a>",
+            f"<a class='btn gray sm' href='/admin/fbtask/{tid}/export.csv'>CSV</a> "
+            f"<a class='btn gray sm' href='/admin/fbtask/{tid}/notify'>📢</a>",
         ])
     body = (
         "<div class='card'><div class='row' style='justify-content:space-between'>"
@@ -574,6 +586,7 @@ def fbtask_edit(tid):
         "📋 জমা তথ্য দেখুন</a>"
         f"<a class='btn gray' href='/admin/fbtask/{tid}/export.xlsx'>⬇️ ডাউনলোড (Excel)</a>"
         f"<a class='btn gray' href='/admin/fbtask/{tid}/export.csv'>CSV</a>"
+        f"<a class='btn gray' href='/admin/fbtask/{tid}/notify'>📢 নোটিফাই</a>"
         "<form method='post' action='/admin/do/fbtask/%d/toggle' style='display:inline'>"
         "<button class='btn gray'>%s</button></form></div></div>"
         % (tid, "⏸ বন্ধ করুন" if int(t.get("is_active") or 0) else "▶️ চালু করুন")
@@ -605,6 +618,56 @@ def fbtask_delete(tid):
     log_admin("fbtask_delete", tid, "facebook task deleted")
     _fire_settings_changed(["fb_task"])
     return redirect("/admin/fbtasks?ok=মুছে ফেলা হয়েছে")
+
+
+@wadm.route("/admin/fbtask/<int:tid>/notify", methods=["GET", "POST"])
+def fbtask_notify(tid):
+    """এই টাস্কের নোটিফিকেশন — নিজের লেখা মেসেজ সব verified ইউজারকে (বট পাঠাবে)।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    t = one("SELECT * FROM fb_tasks WHERE id=%s", (tid,))
+    if not t:
+        return page("Not found", "<div class='card'>Task নেই</div>", "fbtasks", status=404)
+    total = scal("SELECT COUNT(*) FROM fb_submissions WHERE task_id=%s", (tid,))
+    mx = int(t.get("max_accounts") or 0)
+    left = (max(0, mx - total) if mx else "∞")
+    if request.method == "POST":
+        txt = (request.form.get("text") or "").strip()
+        if not txt:
+            return page(f"Notify · FB #{tid}",
+                        _notify_form(t, tid, ""), "fbtasks", err="মেসেজ লেখুন")
+        queue_broadcast(txt)
+        log_admin("fb_task_notify", tid, txt[:120])
+        return redirect(f"/admin/fbtasks?ok=" + _q("📢 নোটিফিকেশন পাঠানো হয়েছে"))
+    return page(f"Notify · FB #{tid}", _notify_form(t, tid, None), "fbtasks",
+                toast=request.args.get("ok"))
+
+
+def _notify_form(t, tid, default_text=None):
+    if default_text is None:
+        total = scal("SELECT COUNT(*) FROM fb_submissions WHERE task_id=%s", (tid,))
+        mx = int(t.get("max_accounts") or 0)
+        left = (max(0, mx - total) if mx else "∞")
+        default_text = (
+            "🔥 নতুন টাস্ক এসেছে!\n\n"
+            f"📘 {t.get('name') or 'Facebook Task'}\n"
+            f"💰 রিওয়ার্ড: {float(t.get('price') or 0):g}$\n"
+            f"👥 স্লট বাকি: {left}\n\n"
+            "📌 বটে 📘 Facebook Tasks চাপুন → রুলস পড়ে শুরু করুন।"
+        )
+    return (
+        "<div class='card'><h3>" + icon("bell") + " 📢 নোটিফিকেশন পাঠান</h3>"
+        f"<p class='mut' style='font-size:12px'>এই মেসেজটি সব verified ইউজারের কাছে "
+        f"বটে যাবে (Task: <b>{esc(t.get('name') or '')}</b>)। লেখা বদলাতে পারেন।</p>"
+        "<form method='post'>"
+        f"<textarea name='text' rows='8' class='f1' style='width:100%'>"
+        f"{esc(default_text)}</textarea>"
+        "<div class='row' style='margin-top:10px'>"
+        "<button class='ok' type='submit'>📢 সবাইকে পাঠান</button>"
+        f"<a class='btn gray' href='/admin/fbtask/{tid}'>বাতিল</a></div></form></div>"
+    )
 
 
 @wadm.route("/admin/fbtask/<int:tid>/subs", methods=["GET"])
@@ -703,61 +766,21 @@ def fbsub_delete(sid):
 
 
 def _fb_export_table(t):
-    """CSV আর Excel — দুটোর জন্যই একই ডেটা, কলাম-ক্রম অনুযায়ী।"""
+    """CSV আর Excel — দুটোর জন্যই একই ডেটা, কলাম-ক্রম অনুযায়ী।
+
+    মান বের করা এখন webadmin.export_table-এ (টোকেন/ফিল্ড-টাইপ/ফাজি ম্যাচ) —
+    আগে শুধু UID বসত, বাকি কলাম ফাঁকা থাকত।
+    """
     try:
         _raw = json.loads(t.get("sheet_columns") or "[]")
     except Exception:
         _raw = []
     cols = _fb_norm_cols(t, _raw)          # username বাদ, 2fa/coki যোগ
-    labels = {"sl": "SL", "date": "Date", "user_id": "Telegram ID",
-              "tg_username": "Username", "task": "Task", "account_no": "Account No",
-              "login_first": "First Name", "login_last": "Last Name",
-              "login_password": "Login Password", "uid": "Facebook UID",
-              "pass": "Password", "password": "Facebook Password",
-              "2fa": "2FA", "coki": "Cookies", "cookies": "Cookies", "status": "Status"}
     subs = many(
         "SELECT s.*, COALESCE(u.username,'') AS username FROM fb_submissions s "
         "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s ORDER BY s.id ASC",
         (int(t["id"]),))
-
-    def _val(c, i, s, data):
-        if c.startswith("f:"):
-            return data.get(c[2:], "")
-        cl = c.lower()
-        if cl == "sl":
-            return i
-        if cl == "task":
-            return t.get("name", "")
-        if cl in ("uid", "fb_uid"):
-            return s.get("fb_uid", "") or data.get("uid", "")
-        if cl in ("pass", "password", "pw", "fb_pass"):
-            return s.get("fb_password", "") or s.get("login_password", "")
-        if cl in ("2fa", "totp"):
-            return data.get(_fld_key(t, "2fa"), "") or data.get("2fa", "")
-        if cl in ("coki", "cookies", "cookie"):
-            return data.get(_fld_key(t, "cookies"), "") or data.get("cookies", "")
-        if cl in ("date", "created_at"):
-            return s.get("created_at", "")
-        if cl in ("first", "login_first", "fname"):
-            return s.get("login_first", "")
-        if cl in ("last", "login_last", "lname"):
-            return s.get("login_last", "")
-        if cl in ("username", "tg_username"):
-            return s.get("username", "")
-        if cl == "user_id":
-            return s.get("user_id", "")
-        return s.get(c, "") or data.get(c, "")
-
-    header = [labels.get(c, c[2:].replace("_", " ").title() if c.startswith("f:") else c)
-              for c in cols]
-    rows = []
-    for i, s in enumerate(subs, 1):
-        try:
-            data = json.loads(s.get("data") or "{}")
-        except Exception:
-            data = {}
-        rows.append([_val(c, i, s, data) for c in cols])
-    return header, rows
+    return export_table(cols, subs, t, "fb")
 
 
 def _fb_file_base(t, tid):

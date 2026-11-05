@@ -235,14 +235,24 @@ def _ip_flags(ip: str):
         return None
     try:
         url = ("http://ip-api.com/json/" + urllib.parse.quote(ip)
-               + "?fields=status,proxy,hosting,mobile")
+               + "?fields=status,proxy,hosting,mobile,isp,org,as")
         req = urllib.request.Request(url, headers={"User-Agent": "task-earn-bot/1.0"})
         with urllib.request.urlopen(req, timeout=4) as resp:
             d = json.loads(resp.read().decode("utf-8", "ignore"))
         if d.get("status") != "success":
             return None
+        _txt = " ".join(str(d.get(k) or "") for k in ("isp", "org", "as")).lower()
+        # ip-api-র mobile ফ্ল্যাগ অনেক ক্যারিয়ারে false আসে — ISP নাম দেখেও ধরো
+        _mobile_word = any(w in _txt for w in (
+            "mobile", "cellular", "wireless", "gsm", "3g", "4g", "5g", "lte",
+            "wimax", "grameenphone", "gp-", "robi", "airtel", "banglalink",
+            "teletalk", "jio", "vodafone", "idea cellular", "telenor", "dialog",
+            "bharati", "vi ", "zong", "ufone", "jazz", "tigo", "claro", "movistar",
+            "orange", "mtn", "safaricom", "globe telecom", "smart comm", "telkomsel",
+            "viettel", "vinaphone", "mobifone", "true move", "ais ", "dtac"))
+        _mobile = bool(d.get("mobile")) or _mobile_word
         return {
-            "mobile": 1 if d.get("mobile") else 0,
+            "mobile": 1 if _mobile else 0,
             # proxy/VPN বা datacenter IP = VPN ধরনের ট্রাফিক
             "vpn": 1 if (d.get("proxy") or d.get("hosting")) else 0,
         }
@@ -413,6 +423,11 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = "", ua: str = ""):
                 _f = cur.fetchone()
                 if _f and int(_f.get("f") or 0) == 1:
                     print(f"[verify] vrf_force bypass uid={uid}")
+                    # ⚠️ ফ্ল্যাগটা একবারই — নাহলে এই ইউজার চিরকাল লিমিট বাইপাস করত
+                    try:
+                        cur.execute("UPDATE users SET vrf_force=0 WHERE user_id=%s", (uid,))
+                    except Exception:
+                        pass
                     return None
             except Exception:
                 pass
@@ -462,6 +477,15 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = "", ua: str = ""):
                 r5 = cur.fetchone()
                 if int((r5 or {}).get("n") or 0) >= max(1, dlim):
                     return "device"
+            # IP লিমিট শুধু "নিশ্চিত Wi-Fi" IP-তে — মোবাইল ডেটা (CGNAT) বা ধরন
+            # অজানা IP-তে কাউকে আটকানো হয় না (আগে মোবাইল ইউজারও আটকে যেত)।
+            _kind_ip = ""
+            try:
+                _kind_ip = _ip_type(ip, False)
+            except Exception:
+                _kind_ip = ""
+            if ip and _kind_ip != "wifi":
+                return None
             if ip:
                 cur.execute(
                     "SELECT COUNT(DISTINCT user_id) AS n FROM user_ips "
@@ -626,6 +650,11 @@ def _mark_pass(uid: int):
     try:
         with _db() as cur:
             cur.execute("UPDATE users SET vrf_pass=1 WHERE user_id=%s", (uid,))
+    except Exception:
+        pass
+    try:
+        with _db() as cur:
+            cur.execute("UPDATE users SET vrf_force=0 WHERE user_id=%s", (uid,))
     except Exception:
         pass
 
