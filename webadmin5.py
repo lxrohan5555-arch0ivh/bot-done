@@ -71,6 +71,17 @@ def _init():
             _x(q)
         except Exception:
             pass
+    for m in (   # পুরোনো টেবিলে কলাম না থাকলে যোগ করে
+        "ALTER TABLE shop_stock ADD COLUMN IF NOT EXISTS added_at TEXT DEFAULT ''",
+        "ALTER TABLE shop_stock ADD COLUMN IF NOT EXISTS sold_to BIGINT DEFAULT 0",
+        "ALTER TABLE shop_stock ADD COLUMN IF NOT EXISTS sold_at TEXT DEFAULT ''",
+        "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS deliver_type TEXT DEFAULT 'auto'",
+        "ALTER TABLE shop_orders ADD COLUMN IF NOT EXISTS delivered_at TEXT DEFAULT ''",
+    ):
+        try:
+            _x(m)
+        except Exception:
+            pass
     _inited = True
 
 
@@ -85,11 +96,15 @@ def _cur():
 
 
 def _fmt(v):
+    """ছোট দামও পুরো দেখাবে (0.0001 → `0.0001`, 0 নয়)।"""
     try:
         n = float(v or 0)
     except Exception:
         n = 0.0
-    s = f"{n:.2f}".rstrip("0").rstrip(".")
+    if n == int(n):
+        s = str(int(n))
+    else:
+        s = f"{n:.8f}".rstrip("0").rstrip(".")
     return f"{s or '0'} {_cur()}"
 
 
@@ -101,13 +116,37 @@ def _stock_n(pid):
         return 0
 
 
+def _stock_key(s):
+    import re as _re
+    return _re.sub(r"\s+", " ", str(s or "").strip()).lower().strip('"\'')
+
+
 def _add_stock(pid, text):
+    """স্টক যোগ — ডুপ্লিকেট লাইন বাদ। রিটার্ন ``(added, dup)``।"""
     lines = [ln.strip() for ln in str(text or "").replace("\r", "").split("\n")]
     lines = [ln for ln in lines if ln][:3000]
+    if not lines:
+        return 0, 0
+    added = dup = 0
+    seen = set()
+    for r in (many("SELECT content FROM shop_stock WHERE product_id=%s", (int(pid),)) or []):
+        seen.add(_stock_key(r["content"]))
     for ln in lines:
+        k = _stock_key(ln)
+        if k in seen:
+            dup += 1
+            continue
+        seen.add(k)
         _x("INSERT INTO shop_stock (product_id, content, added_at, sold) VALUES (%s,%s,%s,0)",
            (int(pid), ln[:3900], _now()))
-    return len(lines)
+        added += 1
+    return added, dup
+
+
+def _import_sheet(pid, url):
+    """Google Sheet / CSV / যেকোনো লিংক থেকে স্টক। রিটার্ন ``(added, dup)``।"""
+    import bot as _b          # একই প্রসেসে লোড থাকে — একই নিয়ম, একই ডুপ্লিকেট চেক
+    return _b.shop_import_sheet(int(pid), url)
 
 
 def _cats():
@@ -195,7 +234,9 @@ def shop_home():
     for p in prods:
         c = cat_map.get(int(p["category_id"] or 0))
         stock = int(p["stock"] or 0)
-        typ = "অটো" if (p["deliver_type"] or "auto") != "manual" else "ম্যানুয়াল"
+        _t = str(p["deliver_type"] or "auto").lower()
+        typ = {"auto": "🤖 অটো", "manual": "✍️ ম্যানুয়াল",
+               "hybrid": "⚡ হাইব্রিড"}.get(_t, "🤖 অটো")
         prod_rows.append([
             f"<a href='/admin/shop/{int(p['id'])}'><b>{esc(p['name'] or '')}</b></a>",
             esc(((c or {}).get("emoji") or "") + " " + ((c or {}).get("name") or "—")),
@@ -312,7 +353,8 @@ def _form(p=None):
         f"<input name='price' value='{price}' placeholder='0.78' required></div>"
         "<div class='field'><label>ডেলিভারি ধরন</label>"
         f"<select name='deliver_type'>"
-        f"<option value='auto'{' selected' if typ == 'auto' else ''}>🤖 অটো — txt/লাইন স্টক থেকে বট দেবে</option>"
+        f"<option value='auto'{' selected' if typ == 'auto' else ''}>🤖 অটো — txt/লাইন/Sheet স্টক থেকে বট দেবে</option>"
+        f"<option value='hybrid'{' selected' if typ == 'hybrid' else ''}>⚡ হাইব্রিড — স্টক থাকলে সাথে সাথে, না থাকলে ম্যানুয়াল</option>"
         f"<option value='manual'{' selected' if typ == 'manual' else ''}>✍️ ম্যানুয়াল — আমি নিজে দেব</option>"
         f"</select></div>"
         "<div class='field'><label>বর্ণনা (ঐচ্ছিক)</label>"
@@ -340,7 +382,9 @@ def _save(pid=0):
         cid = int(cid)
     except Exception:
         cid = 0
-    typ = "manual" if (request.form.get("deliver_type") or "auto") == "manual" else "auto"
+    typ = str(request.form.get("deliver_type") or "auto").strip().lower()
+    if typ not in ("auto", "manual", "hybrid"):
+        typ = "auto"
     desc = (request.form.get("description") or "").strip()[:2000]
     active = 1 if request.form.get("is_active") else 0
     if pid:
@@ -445,6 +489,7 @@ def shop_stock(pid):
     msg = None
     if request.method == "POST":
         text = request.form.get("items") or ""
+        sheet = (request.form.get("sheet") or "").strip()
         f = request.files.get("txtfile")
         if f and f.filename:
             try:
@@ -452,11 +497,22 @@ def shop_stock(pid):
                 text = (text or "") + "\n" + raw.decode("utf-8", "ignore")
             except Exception as e:
                 msg = f"ফাইল পড়া যায়নি: {e}"
-        n = _add_stock(pid, text) if text.strip() else 0
-        if n:
-            log_admin("shop_stock_add", pid, f"{n} items")
-            return redirect(f"/admin/shop/{pid}/stock?ok={n} টা স্টক যোগ হয়েছে")
-        msg = msg or "কিছু পাওয়া যায়নি — লাইন লিখুন বা .txt দিন"
+        added = dup = 0
+        if sheet:
+            try:
+                added, dup = _import_sheet(pid, sheet)
+            except Exception as e:
+                msg = (f"লিংক পড়া যায়নি: {e} — Google Sheet হলে "
+                       "Share → Anyone with the link → Viewer করুন")
+        elif text.strip():
+            added, dup = _add_stock(pid, text)
+        if added or dup:
+            log_admin("shop_stock_add", pid, f"{added} items ({dup} dup skipped)")
+            tail = f" · {dup} ডুপ্লিকেট বাদ" if dup else ""
+            if not added:
+                return redirect(f"/admin/shop/{pid}/stock?err=সব লাইনই আগে থেকে আছে — নতুন কিছু যোগ হয়নি")
+            return redirect(f"/admin/shop/{pid}/stock?ok={added} টা স্টক যোগ হয়েছে{tail}")
+        msg = msg or "কিছু পাওয়া যায়নি — লাইন লিখুন, .txt দিন বা Sheet লিংক দিন"
     unsold = many("SELECT * FROM shop_stock WHERE product_id=%s AND COALESCE(sold,0)=0 "
                   "ORDER BY id LIMIT 300", (pid,))
     sold = many("SELECT * FROM shop_stock WHERE product_id=%s AND COALESCE(sold,0)=1 "
@@ -491,9 +547,14 @@ def shop_stock(pid):
           "<textarea name='items' rows='7' placeholder='user1@outlook.com:pass1&#10;user2@outlook.com:pass2'></textarea></div>"
           "<div class='field'><label>অথবা .txt ফাইল</label>"
           "<input type='file' name='txtfile' accept='.txt,text/plain'></div>"
+          "<div class='field'><label>অথবা Google Sheet / CSV লিংক</label>"
+          "<input name='sheet' placeholder='https://docs.google.com/spreadsheets/d/.../edit#gid=0'>"
+          "<div class='mut' style='font-size:12px'>Sheet: Share → Anyone with the link → Viewer। "
+          "প্রতি সারির প্রথম ঘর থেকেই আইটেম নেওয়া হবে।</div></div>"
           "<button class='ok' type='submit'>➕ যোগ করুন</button>"
           "<span class='mut' style='font-size:12px;margin-left:10px'>"
-          "ইউজার কিনলে বট একটা একটা করে দেবে, শেষ হলে \"স্টক নেই\" দেখাবে।</span>"
+          "এক ইউজার একটা পাবে, ওই লাইন আর কারও কাছে যাবে না। "
+          "ডুপ্লিকেট লাইন অটো বাদ যায়।</span>"
           "</form></div>"
         + "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
           "<b>📦 স্টক বাকি (" + num(stock) + ")</b>"

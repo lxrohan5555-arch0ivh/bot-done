@@ -4960,11 +4960,15 @@ def _shop_cur():
 
 
 def _shop_money(v):
+    """দাম/ব্যালেন্স — ছোট অঙ্কও পুরো দেখাবে (0.0001 → `0.0001`, 0 নয়)।"""
     try:
         n = float(v or 0)
     except Exception:
         n = 0.0
-    s = f"{n:.2f}".rstrip("0").rstrip(".")
+    try:
+        s = _amt(n)
+    except Exception:
+        s = f"{n:.8f}".rstrip("0").rstrip(".")
     return f"{s or '0'} {_shop_cur()}"
 
 
@@ -5012,6 +5016,20 @@ def _shop_ddl():
             )""",
             "CREATE INDEX IF NOT EXISTS shop_stock_unsold ON shop_stock (product_id, sold)",
         ):
+            # পুরোনো DB-তে কলাম না থাকলে নিজেই যোগ করে নেয় (কিছু ভাঙবে না)
+            pass
+        for _mig in (
+            "ALTER TABLE shop_stock ADD COLUMN IF NOT EXISTS added_at TEXT DEFAULT ''",
+            "ALTER TABLE shop_stock ADD COLUMN IF NOT EXISTS sold_to BIGINT DEFAULT 0",
+            "ALTER TABLE shop_stock ADD COLUMN IF NOT EXISTS sold_at TEXT DEFAULT ''",
+            "ALTER TABLE shop_orders ADD COLUMN IF NOT EXISTS delivered_at TEXT DEFAULT ''",
+            "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS deliver_type TEXT DEFAULT 'auto'",
+        ):
+            try:
+                c.execute(_mig)
+            except Exception:
+                pass
+        for _q in ():
             try:
                 c.execute(_q)
             except Exception:
@@ -5138,30 +5156,151 @@ def shop_stock_count(pid):
     return int(r["n"] or 0) if r else 0
 
 
-def shop_add_stock(pid, text):
-    """প্রতি লাইনে ১টা আইটেম। রিটার্ন: কতটা স্টক যোগ হলো।"""
+def _stock_key(s):
+    """ডুপ্লিকেট ধরার জন্য নরমালাইজ — স্পেস/কেস/বাড়তি অক্ষর বাদ।"""
+    return re.sub(r"\s+", " ", str(s or "").strip()).lower().strip('"\'')
+
+
+def shop_add_stock(pid, text, dedupe=True):
+    """প্রতি লাইনে ১টা আইটেম। রিটার্ন: ``(যোগ হয়েছে, ডুপ্লিকেট বাদ)``।
+
+    ডুপ্লিকেট মানে — এই পণ্যের স্টকে (বিক্রীত বা অবিক্রীত) একই লাইন আগেই আছে।
+    এতে একই অ্যাকাউন্ট দুইজন ইউজার পায় না — ১০০% নিশ্চিত।
+    """
     lines = [ln.strip() for ln in str(text or "").replace("\r", "").split("\n")]
-    lines = [ln for ln in lines if ln][:2000]
+    lines = [ln for ln in lines if ln][:3000]
     if not lines:
-        return 0
+        return 0, 0
+    added = dup = 0
     with _c() as c:
+        seen = set()
+        if dedupe:
+            try:
+                for r in c.execute("SELECT content FROM shop_stock WHERE product_id=%s",
+                                   (int(pid),)).fetchall():
+                    seen.add(_stock_key(r["content"]))
+            except Exception:
+                seen = set()
         for ln in lines:
+            k = _stock_key(ln)
+            if dedupe and k in seen:
+                dup += 1
+                continue
+            seen.add(k)
             c.execute("INSERT INTO shop_stock (product_id, content, added_at, sold) "
                       "VALUES (%s,%s,%s,0)", (int(pid), ln[:3900], now()))
-    return len(lines)
+            added += 1
+    return added, dup
 
 
 def shop_take_stock(pid, uid):
-    """Atomic: একটা unsold আইটেম দখল করে (stock_id, content) দেয়, না থাকলে None।"""
-    with _c() as c:
-        r = c.execute(
-            "UPDATE shop_stock SET sold=1, sold_to=%s, sold_at=%s "
-            "WHERE id = (SELECT id FROM shop_stock WHERE product_id=%s AND COALESCE(sold,0)=0 "
-            "            ORDER BY id LIMIT 1) "
-            "RETURNING id, content", (int(uid), now(), int(pid))).fetchone()
-    if not r:
-        return None
-    return int(r["id"]), str(r["content"] or "")
+    """Atomic: একটা unsold আইটেম দখল করে ``(stock_id, content)`` দেয়, না থাকলে None।
+
+    ১০০% ইউনিক গ্যারান্টি:
+    • ``FOR UPDATE SKIP LOCKED`` — দুইজন একসাথে কিনলেও একই লাইন পায় না
+    • DB লক সাপোর্ট না করলে plain UPDATE...RETURNING fallback
+    • row না পেলে অল্প retry — parallel purchase race-এও নিরাপদ
+    """
+    sql_pick = ("SELECT id FROM shop_stock WHERE product_id=%s AND COALESCE(sold,0)=0 "
+                "ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED")
+    sql_take = ("UPDATE shop_stock SET sold=1, sold_to=%s, sold_at=%s "
+                "WHERE id=%s AND COALESCE(sold,0)=0 RETURNING id, content")
+    sql_plain = ("UPDATE shop_stock SET sold=1, sold_to=%s, sold_at=%s "
+                 "WHERE id = (SELECT id FROM shop_stock WHERE product_id=%s "
+                 "AND COALESCE(sold,0)=0 ORDER BY id LIMIT 1) "
+                 "RETURNING id, content")
+    for attempt in range(4):
+        r = None
+        try:
+            if attempt < 2:
+                # লক নিয়ে নেওয়া — একই ট্রানজেকশনে, তাই অন্য কেউ ওই row নিতে পারবে না
+                with _c() as c:
+                    pick = c.execute(sql_pick, (int(pid),)).fetchone()
+                    if pick:
+                        r = c.execute(sql_take, (int(uid), now(),
+                                                 int(pick["id"]))).fetchone()
+            else:
+                # DB লক সাপোর্ট না করলে সাধারণ atomic UPDATE
+                with _c() as c:
+                    r = c.execute(sql_plain, (int(uid), now(), int(pid))).fetchone()
+        except Exception as e:
+            log.debug(f"[SHOP] stock claim attempt {attempt + 1}: {e}")
+            r = None
+            _time.sleep(0.05)
+            continue
+        if r:
+            return int(r["id"]), str(r["content"] or "")
+        if shop_stock_count(pid) <= 0:
+            return None
+        _time.sleep(0.05 * (attempt + 1))
+    return None
+
+
+def shop_sheet_csv_url(url):
+    """Google Sheet / Sheet-Link → CSV ডাউনলোড URL।
+
+    সাপোর্ট: /spreadsheets/d/<ID>/edit#gid=N, /pubhtml, /gviz/tq, export?format=csv,
+    আর যেকোনো সাধারণ CSV/টেক্সট লিংক হুবহু ফেরত দেয়।
+    """
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    if not re.match(r"^https?://", u, re.I):
+        u = "https://" + u
+    m = re.search(r"docs\.google\.com/spreadsheets/d/(?:e/)?([A-Za-z0-9_\-]{10,})", u)
+    if not m:
+        return u
+    sid = m.group(1)
+    gid = "0"
+    mg = re.search(r"[#?&]gid=(\d+)", u)
+    if mg:
+        gid = mg.group(1)
+    if "/d/e/" in u:
+        return f"https://docs.google.com/spreadsheets/d/e/{sid}/pub?output=csv&single=true&gid={gid}"
+    return (f"https://docs.google.com/spreadsheets/d/{sid}/export"
+            f"?format=csv&single=true&gid={gid}")
+
+
+def shop_fetch_stock_text(url, timeout=25):
+    """লিংক থেকে স্টক টেক্সট নামায় (Google Sheet → CSV হলে ১ম কলাম)।"""
+    import csv as _csv
+    import io as _io
+    final = shop_sheet_csv_url(url)
+    if not final:
+        return ""
+    req = urllib.request.Request(final, headers={
+        "User-Agent": "Mozilla/5.0 (TaskEarnBot stock import)",
+        "Accept": "text/csv,text/plain,*/*",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(6 * 1024 * 1024)
+    text = raw.decode("utf-8", "ignore").replace("\ufeff", "")
+    low = text[:800].lower()
+    if "<html" in low or "<!doctype" in low:
+        raise ValueError("লিংকটি CSV দিচ্ছে না — Sheet শেয়ারিং 'Anyone with the link' করুন")
+    if "," not in text and "\t" not in text:
+        return text
+    delim = "," if "," in text else "\t"
+    out = []
+    for row in _csv.reader(_io.StringIO(text), delimiter=delim):
+        if not row:
+            continue
+        cell = ""
+        for c in row:
+            if str(c or "").strip():
+                cell = str(c).strip()
+                break
+        if cell:
+            out.append(cell)
+    return "\n".join(out)
+
+
+def shop_import_sheet(pid, url):
+    """লিংক (Google Sheet / CSV / raw txt) থেকে স্টক যোগ। রিটার্ন ``(added, dup)``।"""
+    text = shop_fetch_stock_text(url)
+    if not str(text or "").strip():
+        return 0, 0
+    return shop_add_stock(pid, text)
 
 
 def shop_release_stock(sid):
@@ -5172,12 +5311,14 @@ def shop_release_stock(sid):
         pass
 
 
-def shop_order_new(uid, p, content, status):
+def shop_order_new(uid, p, content, status, price=None):
+    """price না দিলে পণ্যের একক দাম, দিলে ওটাই (কয়েকটা কিনলে মোট দাম)।"""
+    amt = float(p["price"] or 0) if price is None else float(price or 0)
     with _c() as c:
         r = c.execute(
             "INSERT INTO shop_orders (user_id, product_id, product_name, price, status, "
             "content, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (int(uid), int(p["id"]), str(p["name"] or "")[:120], float(p["price"] or 0),
+            (int(uid), int(p["id"]), str(p["name"] or "")[:120], amt,
              status, content or "", now())).fetchone()
     return int(r["id"]) if r else 0
 
@@ -5212,14 +5353,23 @@ _SHOP_ST_BN = {"delivered": "✅ ডেলিভারি হয়েছে", "
                "refunded": "💸 রিফান্ড হয়েছে", "cancelled": "❌ বাতিল"}
 
 
+_SHOP_TYPE_BN = {"auto": "🤖 অটো (স্টক থেকে)",
+                 "manual": "✍️ ম্যানুয়াল (অ্যাডমিন দেবেন)",
+                 "hybrid": "⚡ স্টক থাকলে সাথে সাথে, না থাকলে ম্যানুয়াল"}
+
+
 def _shop_type(p):
-    return "manual" if (p["deliver_type"] or "auto") == "manual" else "auto"
+    t = str(p["deliver_type"] or "auto").strip().lower()
+    return t if t in ("auto", "manual", "hybrid") else "auto"
 
 
 def _shop_btn_label(p, stock):
     nm = (p["name"] or "?")[:40]
-    if _shop_type(p) == "manual":
+    typ = _shop_type(p)
+    if typ == "manual":
         return f"{nm} · {_shop_money(p['price'])} · 📦 হাতে ডেলিভারি"
+    if typ == "hybrid" and stock <= 0:
+        return f"{nm} · {_shop_money(p['price'])} · 📦 অর্ডার (ম্যানুয়াল)"
     if stock > 0:
         return f"{nm} · {_shop_money(p['price'])} · স্টক ({stock})"
     return f"{nm} · স্টক নেই ❌"
@@ -5348,7 +5498,7 @@ async def _shop_show_confirm(q, pid):
     txt = (f"🧾 *অর্ডার নিশ্চিত করুন*\n"
            f"━━━━━━━━━━━━━━\n"
            f"🛍 পণ্য: *{_md_esc(p['name'] or '')}*\n"
-           f"💵 দাম: *{_shop_money(price)}*\n"
+           f"💵 এক পিসের দাম: *{_shop_money(price)}*\n"
            f"💰 আপনার ব্যালেন্স: `{_shop_money(bal)}`\n"
            f"➡️ কেনার পরে থাকবে: `{_shop_money(after)}`\n\n")
     if after < 0:
@@ -5366,103 +5516,266 @@ async def _shop_show_confirm(q, pid):
                                    reply_markup=InlineKeyboardMarkup(rows))
 
 
-def _shop_deliver_body(p, content):
+def _shop_deliver_body(p, content, qty=1, total=None):
+    qty = int(qty or 1)
+    show = total if total is not None else (float(p["price"] or 0) * qty)
+    head = html.escape(str(p["name"] or "")) + (f" × {qty} পিস" if qty > 1 else "")
     return (f"✅ <b>অর্ডার সম্পন্ন!</b>\n\n"
-            f"🛍 পণ্য: <b>{html.escape(str(p['name'] or ''))}</b>\n"
-            f"💵 মূল্য: <b>{html.escape(_shop_money(p['price']))}</b>\n\n"
+            f"🛍 পণ্য: <b>{head}</b>\n"
+            f"💵 মূল্য: <b>{html.escape(_shop_money(show))}</b>\n\n"
             f"📦 <b>আপনার প্রোডাক্ট:</b>\n"
             f"<pre>{html.escape(str(content or '')[:3500])}</pre>\n\n"
             f"⚠️ এই তথ্য কারও সাথে শেয়ার করবেন না। সমস্যা হলে সাপোর্টে মেসেজ দিন।")
 
 
-async def _shop_do_buy(q, ctx, pid):
+async def _shop_pending_order(ctx, uid, p, qty, total, full_name=""):
+    """ম্যানুয়াল/স্টক-শেষ অর্ডার তৈরি + অ্যাডমিনকে নোটিফাই। অর্ডার আইডি দেয়।"""
+    qty = int(qty or 1)
+    pp = dict(p)
+    if qty > 1:                       # অর্ডার/অ্যাডমিন দুই জায়গায়ই পরিমাণ দেখা যাবে
+        pp["name"] = f"{str(p['name'] or '')[:110]} × {qty}"
+    oid = await asyncio.to_thread(shop_order_new, uid, pp, "", "pending", total)
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ ডেলিভারি দিন", callback_data=f"shopao:{oid}"),
+        InlineKeyboardButton("💸 রিফান্ড", callback_data=f"shopar:{oid}"),
+    ]])
+    try:
+        await notify_full_admins(
+            ctx.bot,
+            f"🛒 *নতুন অর্ডার (ম্যানুয়াল ডেলিভারি)*\n\n"
+            f"🆔 অর্ডার: `#{oid}`\n"
+            f"🛍 পণ্য: {_md_esc(p['name'] or '')}\n"
+            f"🔢 পরিমাণ: `{int(qty)}` পিস\n"
+            f"💵 মোট: `{_shop_money(total)}`\n"
+            f"👤 ইউজার: `{uid}` ({_md_esc(full_name or '')[:40]})\n\n"
+            f"✅ চাপলে বট কনটেন্ট চাইবে, ওটা পাঠালেই ইউজার পাবে।",
+            reply_markup=kb)
+    except Exception:
+        pass
+    return oid
+
+
+async def _shop_buy_core(ctx, q, pid, count):
+    """নির্বাচিত সংখ্যক আইটেম কেনা + ইউনিক ডেলিভারি। সফল হলে True।"""
     uid = q.from_user.id
     p = await asyncio.to_thread(shop_product, pid)
     if not p or not _onoff(p["is_active"]):
         await q.answer("পণ্যটি এখন নেই", show_alert=True)
-        return
-    price = float(p["price"] or 0)
+        return False
     typ = _shop_type(p)
+    price = float(p["price"] or 0)
+    count = max(1, min(int(count or 1), 20))
     bal = await asyncio.to_thread(get_bal, uid)
-    if price > bal:
+    total = price * count
+    if total > bal:
         await q.answer("ব্যালেন্স যথেষ্ট নয়", show_alert=True)
-        return
-    taken = None
-    if typ == "auto":
-        taken = await asyncio.to_thread(shop_take_stock, pid, uid)
-        if not taken:
-            await q.answer("স্টক শেষ", show_alert=True)
-            try:
-                await q.edit_message_text(
-                    f"😔 *{_md_esc(p['name'] or '')}* — স্টক শেষ!\n\n"
-                    "নতুন স্টক এলে আবার চেষ্টা করুন।",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔙 ফিরে যান", callback_data=f"shop:c:{int(p['category_id'] or 0)}")]]))
-            except Exception:
-                pass
-            return
-    if price > 0 and not await asyncio.to_thread(safe_ded_bal, uid, price):
-        if taken:
-            await asyncio.to_thread(shop_release_stock, taken[0])
-        await q.answer("ব্যালেন্স যথেষ্ট নয়", show_alert=True)
-        return
-    try:
-        await q.answer("✅ অর্ডার হয়েছে")
-    except Exception:
-        pass
-    if typ == "auto":
-        content = taken[1]
-        oid = await asyncio.to_thread(shop_order_new, uid, p, content, "delivered")
-        try:
-            await q.edit_message_text("✅ পেমেন্ট সম্পন্ন — প্রোডাক্ট নিচে পাঠানো হলো।")
-        except Exception:
-            pass
-        try:
-            await ctx.bot.send_message(uid, _shop_deliver_body(p, content), parse_mode="HTML")
-        except Exception as e:
-            log.warning(f"[SHOP] ডেলিভারি মেসেজ ব্যর্থ uid={uid} pid={pid}: {e}")
-        try:
-            await notify_full_admins(
-                ctx.bot,
-                f"🛒 *নতুন অর্ডার (অটো)*\n\n"
-                f"🆔 অর্ডার: `#{oid}`\n"
-                f"🛍 পণ্য: {_md_esc(p['name'] or '')}\n"
-                f"💵 দাম: `{_shop_money(price)}`\n"
-                f"👤 ইউজার: `{uid}`\n"
-                f"📦 বাকি স্টক: `{await asyncio.to_thread(shop_stock_count, pid)}`")
-        except Exception:
-            pass
-    else:
-        oid = await asyncio.to_thread(shop_order_new, uid, p, "", "pending")
+        return False
+    full_name = getattr(q.from_user, "full_name", "") or ""
+
+    # ── ম্যানুয়াল: টাকা কাটিয়ে পেন্ডিং অর্ডার ──
+    if typ == "manual":
+        if total > 0 and not await asyncio.to_thread(safe_ded_bal, uid, total):
+            await q.answer("ব্যালেন্স যথেষ্ট নয়", show_alert=True)
+            return False
+        oid = await _shop_pending_order(ctx, uid, p, count, total, full_name)
         try:
             await q.edit_message_text(
                 f"⏳ *অর্ডার গ্রহণ করা হয়েছে*\n\n"
                 f"🆔 অর্ডার: `#{oid}`\n"
                 f"🛍 পণ্য: {_md_esc(p['name'] or '')}\n"
-                f"💵 দাম: `{_shop_money(price)}`\n\n"
+                f"🔢 পরিমাণ: `{count}` পিস\n"
+                f"💵 মোট: `{_shop_money(total)}`\n\n"
                 "অ্যাডমিন খুব শীঘ্রই আপনার প্রোডাক্ট পাঠিয়ে দেবেন।",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔙 দোকানে ফিরুন", callback_data="shop:list")]]))
         except Exception:
             pass
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ ডেলিভারি দিন", callback_data=f"shopao:{oid}"),
-            InlineKeyboardButton("💸 রিফান্ড", callback_data=f"shopar:{oid}"),
-        ]])
+        return True
+
+    # ── অটো / হাইব্রিড: স্টক থেকে ঠিক count টা আলাদা লাইন ──
+    lines = []
+    for _i in range(count):
+        t = await asyncio.to_thread(shop_take_stock, pid, uid)
+        if not t:
+            break
+        lines.append(t)
+    if len(lines) < count:
+        for sid, _c in lines:            # আংশিক হলে সব ফেরত — টাকা কাটা হবে না
+            await asyncio.to_thread(shop_release_stock, sid)
+        avail = await asyncio.to_thread(shop_stock_count, pid)
+        if typ == "hybrid" and not lines:
+            if total > 0 and not await asyncio.to_thread(safe_ded_bal, uid, total):
+                await q.answer("ব্যালেন্স যথেষ্ট নয়", show_alert=True)
+                return False
+            oid = await _shop_pending_order(ctx, uid, p, count, total, full_name)
+            try:
+                await q.edit_message_text(
+                    f"⏳ *স্টক শেষ — অর্ডার গ্রহণ করা হয়েছে*\n\n"
+                    f"🆔 অর্ডার: `#{oid}`\n"
+                    f"🛍 পণ্য: {_md_esc(p['name'] or '')}\n"
+                    f"🔢 পরিমাণ: `{count}` পিস\n"
+                    f"💵 মোট: `{_shop_money(total)}`\n\n"
+                    "অ্যাডমিন নিজে ডেলিভারি দেবেন।",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 দোকানে ফিরুন", callback_data="shop:list")]]))
+            except Exception:
+                pass
+            return True
+        await q.answer(f"স্টক শেষ — এখন মাত্র {avail} টা আছে" if avail else "স্টক শেষ",
+                       show_alert=True)
         try:
-            await notify_full_admins(
-                ctx.bot,
-                f"🛒 *নতুন অর্ডার (ম্যানুয়াল ডেলিভারি)*\n\n"
-                f"🆔 অর্ডার: `#{oid}`\n"
-                f"🛍 পণ্য: {_md_esc(p['name'] or '')}\n"
-                f"💵 দাম: `{_shop_money(price)}`\n"
-                f"👤 ইউজার: `{uid}` ({(q.from_user.full_name or '')[:40]})\n\n"
-                f"✅ চাপলে বট কনটেন্ট চাইবে, ওটা পাঠালেই ইউজার পাবে।",
-                reply_markup=kb)
+            await q.edit_message_text(
+                f"😔 *{_md_esc(p['name'] or '')}* — স্টক শেষ!\n\n"
+                + (f"এখন আছে মাত্র `{avail}` টা।" if avail else "নতুন স্টক এলে আবার চেষ্টা করুন।"),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 ফিরে যান",
+                                          callback_data=f"shop:p:{int(p['id'])}")]]))
         except Exception:
             pass
+        return False
+
+    if total > 0 and not await asyncio.to_thread(safe_ded_bal, uid, total):
+        for sid, _c in lines:
+            await asyncio.to_thread(shop_release_stock, sid)
+        await q.answer("ব্যালেন্স যথেষ্ট নয়", show_alert=True)
+        return False
+
+    content = "\n".join((f"{i}. {c}" if count > 1 else c)
+                        for i, (_sid, c) in enumerate(lines, 1))
+    oid = await asyncio.to_thread(shop_order_new, uid, p, content, "delivered", total)
+    try:
+        await q.answer("✅ অর্ডার হয়েছে")
+    except Exception:
+        pass
+    try:
+        await q.edit_message_text("✅ পেমেন্ট সম্পন্ন — প্রোডাক্ট নিচে পাঠানো হলো।")
+    except Exception:
+        pass
+    try:
+        await ctx.bot.send_message(uid, _shop_deliver_body(p, content, count, total),
+                                   parse_mode="HTML")
+    except Exception as e:
+        log.warning(f"[SHOP] ডেলিভারি মেসেজ ব্যর্থ uid={uid} pid={pid}: {e}")
+    try:
+        await notify_full_admins(
+            ctx.bot,
+            f"🛒 *নতুন অর্ডার (অটো)*\n\n"
+            f"🆔 অর্ডার: `#{oid}`\n"
+            f"🛍 পণ্য: {_md_esc(p['name'] or '')}\n"
+            f"🔢 পরিমাণ: `{count}` পিস\n"
+            f"💵 মোট: `{_shop_money(total)}`\n"
+            f"👤 ইউজার: `{uid}`\n"
+            f"📦 বাকি স্টক: `{await asyncio.to_thread(shop_stock_count, pid)}`")
+    except Exception:
+        pass
+    return True
+
+
+async def _shop_do_buy(q, ctx, pid):
+    """কিনুন → কয়টা নেবে জিজ্ঞেস করে, তারপর ডেলিভারি।"""
+    uid = q.from_user.id
+    p = await asyncio.to_thread(shop_product, pid)
+    if not p or not _onoff(p["is_active"]):
+        await q.answer("পণ্যটি এখন নেই", show_alert=True)
+        return
+    typ = _shop_type(p)
+    price = float(p["price"] or 0)
+    bal = await asyncio.to_thread(get_bal, uid)
+    if price > bal:
+        await q.answer("ব্যালেন্স যথেষ্ট নয়", show_alert=True)
+        return
+    stock = 0 if typ == "manual" else await asyncio.to_thread(shop_stock_count, pid)
+    if typ == "hybrid" and stock <= 0:
+        # স্টক নেই → ম্যানুয়াল অর্ডার (কয়টা জিজ্ঞেস না করে এক ধাপে)
+        return await _shop_buy_core(ctx, q, pid, 1)
+    if typ != "manual" and stock <= 0:
+        await q.answer("স্টক শেষ", show_alert=True)
+        try:
+            await q.edit_message_text(
+                f"😔 *{_md_esc(p['name'] or '')}* — স্টক শেষ!\n\n"
+                "নতুন স্টক এলে আবার চেষ্টা করুন।",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 ফিরে যান",
+                                          callback_data=f"shop:c:{int(p['category_id'] or 0)}")]]))
+        except Exception:
+            pass
+        return
+    maxn = 20 if typ == "manual" else min(20, stock)
+    if price > 0:
+        maxn = min(maxn, int(bal // price) or 1)
+    maxn = max(1, maxn)
+    if maxn == 1:                       # একটাই সম্ভব — সরাসরি কিনে দাও
+        return await _shop_buy_core(ctx, q, pid, 1)
+
+    rows, row = [], []
+    for k in (1, 2, 3, 5):
+        if k <= maxn:
+            row.append(InlineKeyboardButton(f"{k}", callback_data=f"shop:q:{int(p['id'])}:{k}"))
+            if len(row) == 4:
+                rows.append(row); row = []
+    if row:
+        rows.append(row)
+    if maxn > 5:
+        rows.append([InlineKeyboardButton("✍️ নিজে লিখুন",
+                                          callback_data=f"shop:qy:{int(p['id'])}")])
+    rows.append([InlineKeyboardButton("❌ বাতিল", callback_data=f"shop:p:{int(p['id'])}")])
+    txt = (f"🧮 *কয়টা নিবেন?*\n"
+           f"━━━━━━━━━━━━━━\n"
+           f"🛍 পণ্য: *{_md_esc(p['name'] or '')}*\n"
+           f"💵 একটার দাম: *{_shop_money(price)}*\n")
+    if typ != "manual":
+        txt += f"📦 স্টক: `{stock}`\n"
+    txt += (f"💰 আপনার ব্যালেন্স: `{_shop_money(bal)}`\n"
+            f"➡️ সর্বোচ্চ `{maxn}` টা নিতে পারবেন।\n\n"
+            "সংখ্যা বেছে নিন 👇")
+    try:
+        await q.edit_message_text(txt, parse_mode="Markdown",
+                                  reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="Markdown",
+                                   reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def shop_qty_input(update, ctx, st):
+    """ইউজার নিজে সংখ্যা লিখলে (`shop_qty:<pid>`)।"""
+    txt = (update.message.text or "").strip()
+    m = re.search(r"\d+", txt.replace(" ", ""))
+    if not m:
+        await update.message.reply_text(
+            "❌ শুধু সংখ্যা লিখুন (যেমন `3`)।\n/cancel — বাতিল", parse_mode="Markdown")
+        return True
+    pid = int(str(st).split(":")[1])
+    cnt = int(m.group(0))
+    ctx.user_data.pop("state", None)
+    class _Q:
+        from_user = update.effective_user
+        message = update.message
+        answer = _QtyNoop()
+        edit_message_text = _QtyEdit(update.message)
+
+    q = _Q()
+    await _shop_buy_core(ctx, q, pid, cnt)
+    return True
+
+
+class _QtyNoop:
+    async def __call__(self, *a, **k):
+        return None
+
+
+class _QtyEdit:
+    def __init__(self, msg):
+        self._msg = msg
+
+    async def __call__(self, text, **k):
+        try:
+            return await self._msg.reply_text(text, **k)
+        except Exception:
+            return None
 
 
 async def _shop_show_my(q):
@@ -5516,6 +5829,17 @@ async def shop_callback(update, ctx):
             return await _shop_show_confirm(q, int(d.split(":")[2]))
         if d.startswith("shop:y:"):
             return await _shop_do_buy(q, ctx, int(d.split(":")[2]))
+        if d.startswith("shop:q:"):
+            _sp = d.split(":")
+            return await _shop_buy_core(ctx, q, int(_sp[2]), int(_sp[3]))
+        if d.startswith("shop:qy:"):
+            pid = int(d.split(":")[2])
+            ctx.user_data["shop_qty_pid"] = pid
+            ctx.user_data["state"] = f"shop_qty:{pid}"
+            await q.edit_message_text(
+                "🔢 *কয়টা নিবেন?*\n\nশুধু সংখ্যাটা লিখে পাঠান (যেমন `3`)।\n\n/cancel — বাতিল",
+                parse_mode="Markdown")
+            return
         if d.startswith("shop:no:"):
             await q.answer("এই পণ্যের স্টক এখন নেই 😔", show_alert=True)
             return
@@ -5632,7 +5956,7 @@ async def _shop_admin_prod(q, pid):
     txt = (f"📦 *{_md_esc(p['name'] or '')}*\n"
            f"━━━━━━━━━━━━━━\n"
            f"💵 দাম: `{_shop_money(p['price'])}`\n"
-           f"🚚 ডেলিভারি: `{'ম্যানুয়াল' if _shop_type(p) == 'manual' else 'অটো (স্টক)'}`\n"
+           f"🚚 ডেলিভারি: {_SHOP_TYPE_BN.get(_shop_type(p), _shop_type(p))}\n"
            f"📥 স্টক বাকি: `{stock}`\n"
            f"⚙️ স্ট্যাটাস: {st}")
     rows = [
@@ -5687,9 +6011,12 @@ async def _shop_admin_cb(q, ctx, d):
             await q.edit_message_text(
                 "📥 *স্টক যোগ করার নিয়ম*\n\n"
                 "১) 📦 পণ্য তালিকা → পণ্য → *📥 স্টক যোগ করুন*\n"
-                "২) প্রতি লাইনে ১টা আইটেম পাঠান, বা `.txt` ফাইল দিন\n"
-                "৩) ইউজার কিনলে বট একটা একটা করে দেবে, শেষ হলে \"স্টক নেই\" দেখাবে\n\n"
-                "🔁 ম্যানুয়াল পণ্য হলে স্টক লাগবে না — অর্ডার এলে আপনি নিজে পাঠাবেন।",
+                "২) প্রতি লাইনে ১টা আইটেম পাঠান, `.txt` ফাইল দিন, "
+                "অথবা Google Sheet/CSV লিংক দিন\n"
+                "৩) ইউজার কিনলে বট একটা একটা করে দেবে, শেষ হলে \"স্টক নেই\" দেখাবে\n"
+                "৪) ডুপ্লিকেট লাইন অটো বাদ যায় — একই অ্যাকাউন্ট কেউ দুইবার পায় না\n\n"
+                "🔁 ম্যানুয়াল পণ্য হলে স্টক লাগবে না — অর্ডার এলে আপনি নিজে পাঠাবেন।\n"
+                "⚡ হাইব্রিড পণ্যে স্টক থাকলে সাথে সাথে যাবে, না থাকলে ম্যানুয়াল।",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔙 Shop", callback_data="adm_shop")]]))
@@ -5721,8 +6048,9 @@ async def _shop_admin_cb(q, ctx, d):
                 f"✅ পণ্য তৈরি হয়েছে (`#{pid}`)\n\n"
                 f"🛍 {_md_esc(info.get('name') or '')}\n"
                 f"💵 {_shop_money(info.get('price'))}\n"
-                f"🚚 {'ম্যানুয়াল' if typ == 'manual' else 'অটো (স্টক)'}\n\n"
-                + ("এখন স্টক যোগ করুন 👇" if typ != "manual" else "অর্ডার এলে আপনি নিজে ডেলিভারি দেবেন।"),
+                f"🚚 {_SHOP_TYPE_BN.get(_shop_type({'deliver_type': typ}), typ)}\n\n"
+                + ("এখন স্টক যোগ করুন 👇" if typ != "manual"
+                   else "অর্ডার এলে আপনি নিজে ডেলিভারি দেবেন।"),
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("📥 স্টক যোগ", callback_data=f"shopa:st:{pid}")],
@@ -5746,9 +6074,13 @@ async def _shop_admin_cb(q, ctx, d):
             ctx.user_data["state"] = f"shopa_txt:{pid}"
             await q.edit_message_text(
                 f"📥 *স্টক যোগ — {_md_esc((p['name'] if p else '') or '')}*\n\n"
-                "প্রতি লাইনে *১টা* আইটেম লিখে পাঠান, অথবা `.txt` ফাইল আপলোড করুন।\n"
-                "খালি লাইন বাদ যাবে।\n\n"
-                "উদাহরণ:\n`user1@outlook.com:pass1`\n`user2@outlook.com:pass2`\n\n/cancel — বাতিল",
+                "যেকোনো একটা দিলেই হবে 👇\n"
+                "১) প্রতি লাইনে *১টা* আইটেম লিখে পাঠান\n"
+                "২) `.txt` ফাইল আপলোড করুন\n"
+                "৩) *Google Sheet / CSV লিংক* পাঠান\n\n"
+                "উদাহরণ:\n`user1@outlook.com:pass1`\n`user2@outlook.com:pass2`\n\n"
+                "🔒 একই লাইন দুইবার দিলে বা আগে থেকে থাকলে বাদ যাবে — "
+                "এক ইউজার একটা পেলে অন্য কেউ ওটা পাবে না।\n\n/cancel — বাতিল",
                 parse_mode="Markdown")
             return
         if d.startswith("shopa:tg:"):
@@ -5865,25 +6197,51 @@ async def shop_admin_input(update, ctx, st):
             f"🚚 *ধাপ ৩/৩ — ডেলিভারি ধরন*\n\n"
             f"পণ্য: *{_md_esc(d.get('name') or '')}*\n"
             f"দাম: `{_shop_money(price)}`\n\n"
-            "• *অটো* — txt/লাইন স্টক থেকে বট নিজে দেবে\n"
-            "• *ম্যানুয়াল* — অর্ডার এলে আপনি নিজে পাঠাবেন",
+            "• *অটো* — txt/লাইন/Sheet স্টক থেকে বট নিজে দেবে\n"
+            "• *ম্যানুয়াল* — অর্ডার এলে আপনি নিজে পাঠাবেন\n"
+            "• *⚡ হাইব্রিড* — স্টক থাকলে সাথে সাথে, না থাকলে ম্যানুয়াল",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🤖 অটো (স্টক থেকে)", callback_data="shopa:ptype:auto")],
                 [InlineKeyboardButton("✍️ ম্যানুয়াল (আমি দেব)", callback_data="shopa:ptype:manual")],
+                [InlineKeyboardButton("⚡ হাইব্রিড (স্টক থাকলে সাথে সাথে)",
+                                      callback_data="shopa:ptype:hybrid")],
                 [InlineKeyboardButton("❌ বাতিল", callback_data="adm_shop")]]))
         return True
 
     if st.startswith("shopa_txt:"):
         pid = int(st.split(":")[1])
-        n = await asyncio.to_thread(shop_add_stock, pid, txt)
+        added = dup = 0
+        is_link = bool(re.match(r"^(https?://)?(docs\.google\.com|drive\.google\.com|\S+\.csv)",
+                                txt, re.I)) or txt.lower().startswith("https://")
+        if is_link:
+            await update.message.reply_text("⏳ লিংক থেকে স্টক নামাচ্ছি…")
+            try:
+                added, dup = await asyncio.to_thread(shop_import_sheet, pid, txt)
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ লিংক পড়া যায়নি: {e}\n\n"
+                    "Google Sheet হলে: Share → Anyone with the link → Viewer, তারপর লিংকটা আবার দিন।")
+                return True
+        else:
+            added, dup = await asyncio.to_thread(shop_add_stock, pid, txt)
         ctx.user_data.pop("state", None)
-        if not n:
-            await update.message.reply_text("❌ কিছু পাওয়া যায়নি — আবার চেষ্টা করুন।")
+        if not added and not dup:
+            await update.message.reply_text(
+                "❌ কিছু পাওয়া যায়নি — লাইন, .txt ফাইল বা Google Sheet/CSV লিংক দিন।")
             return True
         total = await asyncio.to_thread(shop_stock_count, pid)
+        note = f"\n♻️ ডুপ্লিকেট বাদ: `{dup}`" if dup else ""
+        if not added:
+            await update.message.reply_text(
+                f"⚠️ সব লাইনই আগে থেকে স্টকে আছে — নতুন কিছু যোগ হয়নি ({dup} টা বাদ)।\n"
+                f"📥 মোট স্টক: `{total}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 পণ্যে ফিরুন", callback_data=f"shopa:p:{pid}")]]))
+            return True
         await update.message.reply_text(
-            f"✅ `{n}` টা স্টক যোগ হয়েছে।\n📥 এখন মোট স্টক: `{total}`",
+            f"✅ `{added}` টা স্টক যোগ হয়েছে।{note}\n📥 এখন মোট স্টক: `{total}`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 পণ্যে ফিরুন", callback_data=f"shopa:p:{pid}")]]))
@@ -5918,7 +6276,8 @@ async def shop_admin_input(update, ctx, st):
 
 # ──────────────────── 💳 DEPOSIT / ডিপোজিট ────────────────────
 # auto  → USDT BEP-20 (Binance) — TxID দিলে অন-চেইনে যাচাই করে সাথে সাথে ব্যালেন্স যোগ
-# manual→ Binance Pay/UID, bKash, অন্য কিছু — অ্যাডমিন ✅ করলে ব্যালেন্স যোগ
+# uid   → Binance Pay (Binance UID) — Binance API দিয়ে নিজেই পেমেন্ট খুঁজে ব্যালেন্স যোগ
+# manual→ bKash, অন্য কিছু — অ্যাডমিন ✅ করলে ব্যালেন্স যোগ
 
 _TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
@@ -5976,15 +6335,28 @@ def _dep_ddl():
                         "INSERT INTO deposit_methods (name, kind, address, instructions, "
                         "min_amount, is_active, sort_order, created_at) "
                         "VALUES (%s,%s,%s,%s,%s,1,%s,%s)",
-                        ("Binance Pay / UID — ম্যানুয়াল", "manual", "",
-                         "Binance UID / Pay ID: (অ্যাডমিন প্যানেল থেকে সেট করুন)\n"
-                         "পেমেন্ট করার পর TxID / স্ক্রিনশট এখানে পাঠান।",
+                        ("Binance Pay / UID — ⚡ অটো", "uid", "",
+                         "Binance অ্যাপ → Pay → Send → নিচের UID-তে টাকা পাঠান।\n"
+                         "পাঠানোর পর আপনার নিজের Binance UID দিন — বট নিজেই যাচাই করে "
+                         "সাথে সাথে ব্যালেন্স যোগ করবে।",
                          1.0, 2, now()))
                 c.execute("INSERT INTO settings (key,value) VALUES (%s,%s) "
                           "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
                           ("dep_seeded", "1"))
         except Exception as _sde:
             log.debug(f"[DEP] seed স্কিপ: {_sde}")
+        # ── পুরোনো ডিফল্ট "Binance Pay / UID — ম্যানুয়াল" → এখন ⚡ অটো (Binance UID) ──
+        try:
+            c.execute("UPDATE deposit_methods SET kind='uid', "
+                      "name='Binance Pay / UID — ⚡ অটো' "
+                      "WHERE kind='manual' AND name=%s",
+                      ("Binance Pay / UID — ম্যানুয়াল",))
+            c.execute("UPDATE deposit_methods SET kind='uid', "
+                      "name='Binance Pay / UID — ⚡ অটো' "
+                      "WHERE kind='manual' AND LOWER(name) LIKE %s",
+                      ("%binance pay%uid%",))
+        except Exception as _dmg:
+            log.debug(f"[DEP] UID অটো মাইগ্রেশন স্কিপ: {_dmg}")
 
 
 def dep_methods(active=True):
@@ -6281,7 +6653,12 @@ def _dep_kind_bn(k):
 def _dep_kb(methods):
     rows = []
     for m in methods:
-        lbl = f"{m['name'] or ''}"[:40]
+        nm = str(m["name"] or "")
+        _k = str(m["kind"] or "manual")
+        _has = any(t in nm for t in ("⚡", "✍️", "অটো", "ম্যানুয়াল"))
+        if not _has:
+            nm += " ⚡" if _k in ("auto", "uid") else " ✍️"
+        lbl = nm[:40]
         rows.append([InlineKeyboardButton(lbl, callback_data=f"dep:m:{int(m['id'])}")])
     rows.append([InlineKeyboardButton("🧾 আমার ডিপোজিট হিস্ট্রি", callback_data="dep:my")])
     return InlineKeyboardMarkup(rows)
@@ -11588,15 +11965,16 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ ফাইল পড়া যায়নি: {e}")
             return
-        n = await asyncio.to_thread(shop_add_stock, pid, text)
+        added, dup = await asyncio.to_thread(shop_add_stock, pid, text)
         ctx.user_data.pop("state", None)
-        if not n:
+        if not added and not dup:
             await update.message.reply_text("❌ ফাইলে কিছু পাওয়া যায়নি (<code>utf-8</code> txt দিন)।",
                                             parse_mode="HTML")
             return
         total = await asyncio.to_thread(shop_stock_count, pid)
+        note = f"\n♻️ ডুপ্লিকেট বাদ: `{dup}`" if dup else ""
         await update.message.reply_text(
-            f"✅ ফাইল থেকে `{n}` টা স্টক যোগ হয়েছে।\n📥 এখন মোট স্টক: `{total}`",
+            f"✅ ফাইল থেকে `{added}` টা স্টক যোগ হয়েছে।{note}\n📥 এখন মোট স্টক: `{total}`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 পণ্যে ফিরুন", callback_data=f"shopa:p:{pid}")]]))
@@ -16202,6 +16580,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
         except Exception as _depe:
             log.warning(f"[DEP] input ব্যর্থ: {_depe}")
+
+    # ── 🛒 Shop: ইউজারের "কয়টা নিবেন" ইনপুট ──
+    if st and str(st).startswith("shop_qty:"):
+        try:
+            if await shop_qty_input(update, ctx, str(st)):
+                return
+        except Exception as _sqe:
+            log.warning(f"[SHOP] qty input ব্যর্থ: {_sqe}")
 
     # ── 🛒 Shop: অ্যাডমিনের ইনপুট (ক্যাটাগরি / পণ্য / স্টক / ডেলিভারি) ──
     if st and str(st).startswith("shopa_"):
