@@ -77,6 +77,7 @@ def _init():
         "ALTER TABLE shop_stock ADD COLUMN IF NOT EXISTS sold_at TEXT DEFAULT ''",
         "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS deliver_type TEXT DEFAULT 'auto'",
         "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS ref_pct REAL DEFAULT -1",
+        "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS fields TEXT DEFAULT ''",
         "ALTER TABLE shop_orders ADD COLUMN IF NOT EXISTS delivered_at TEXT DEFAULT ''",
     ):
         try:
@@ -361,6 +362,10 @@ def _form(p=None):
         "<div class='field'><label>💸 রেফার কমিশন (%)</label>"
         f"<input name='ref_pct' value='{esc(str(p.get('ref_pct')) if p.get('ref_pct') not in (None, '') else '')}' "
         "placeholder='খালি = ডিফল্ট, 0 = বন্ধ, 10 = ১০%'></div>"
+        "<div class='field'><label>🏷 ফিল্ড-নাম (প্রতি লাইনে একটি) — ইউজার বুঝবে কোনটা কী</label>"
+        f"<textarea name='fields' rows='4' placeholder='Number\nUsername\nPassword'>{esc(str(p.get('fields') or '').replace('|', chr(10)))}</textarea>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>স্টকের প্রতিটি লাইনে যতগুলো অংশ "
+        "(ট্যাব / | / কমা / স্পেস দিয়ে আলাদা), ঠিক ততগুলো নাম দিন। খালি রাখলে কপি করা লাইনই যাবে।</p></div>"
         "<div class='field'><label>বর্ণনা (ঐচ্ছিক)</label>"
         f"<textarea name='description' rows='3' placeholder='যেমন: ১০০% Fresh, Instant Delivery'>{desc}</textarea></div>"
         f"<label class='chk'><input type='checkbox' name='is_active' value='1'"
@@ -397,16 +402,19 @@ def _save(pid=0):
     except Exception:
         ref_pct = -1.0
     ref_pct = -1.0 if ref_pct < 0 else min(90.0, ref_pct)
+    _flds = [x.strip()[:24] for x in str(request.form.get("fields") or "").replace(",", "\n")
+             .replace("|", "\n").replace(";", "\n").splitlines() if x.strip()][:8]
+    fields = "|".join(_flds)
     if pid:
         _x("UPDATE shop_products SET category_id=%s, name=%s, description=%s, price=%s, "
-           "deliver_type=%s, ref_pct=%s, is_active=%s WHERE id=%s",
-           (cid, name, desc, price, typ, ref_pct, active, pid))
+           "deliver_type=%s, ref_pct=%s, fields=%s, is_active=%s WHERE id=%s",
+           (cid, name, desc, price, typ, ref_pct, fields, active, pid))
         return pid
     nxt = (one("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shop_products") or {}).get("n") or 1
     r = one("INSERT INTO shop_products (category_id, name, description, price, deliver_type, "
-            "ref_pct, is_active, sort_order, created_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (cid, name, desc, price, typ, ref_pct, active, int(nxt), _now()))
+            "ref_pct, fields, is_active, sort_order, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (cid, name, desc, price, typ, ref_pct, fields, active, int(nxt), _now()))
     return int((r or {}).get("id") or 0)
 
 

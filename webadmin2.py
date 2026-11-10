@@ -675,8 +675,8 @@ def settings():
             "points_on", "points_block", "reset_on_update", "sec_device_strict",
             "pt_max", "pt_start", "pt_approve", "pt_reject", "pt_dup",
             "task_notify_mode", "task_notify_channel", "task_notify_daily_max",
-            "min_withdraw", "wd_fee", "commission_pct", "bsc_wallet",
-            "support_owner", "support_bot"]
+            "min_withdraw", "wd_fee", "commission_pct", "shop_ref_pct", "bsc_wallet",
+            "support_owner", "support_bot", "task_promo_text", "ch_btn_text", "ch_btn_url"]
     vals = settings_all(keys)
     body = (
         f"<div class='grid g2'>"
@@ -793,9 +793,23 @@ def settings():
         "<div class='form'><label>Withdraw fee ($)</label>"
         f"<input name='wd_fee' type='number' step='0.0001' min='0' "
         f"value='{esc(vals.get('wd_fee') or '0.01')}'></div>"
-        "<div class='form'><label>Refer commission (%)</label>"
+        "<div class='form'><label>Refer commission (%) — টাস্ক</label>"
         f"<input name='commission_pct' type='number' step='0.1' min='0' max='100' "
         f"value='{esc(vals.get('commission_pct') or '10')}'></div>"
+        "<div class='form'><label>🛍 শপ রেফার কমিশন (%) — কিছু কিনলে রেফারার যা পাবে</label>"
+        f"<input name='shop_ref_pct' type='number' step='0.1' min='0' max='100' "
+        f"value='{esc(vals.get('shop_ref_pct') or '')}' placeholder='খালি = উপরের % ব্যবহৃত হবে'>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>পণ্যে আলাদা % সেট থাকলে সেটাই "
+        "আগে প্রযোজ্য (শপ → পণ্য → 💸 রেফার কমিশন)।</p></div>"
+        "<div class='form'><label>📌 Task প্রোমো লেখা (ব্যালেন্স/রেফার পেজে) — {owner} বসবে</label>"
+        f"<textarea name='task_promo_text' rows='3' placeholder='📌 বটে আপনার Task যোগ করতে চান?\n"
+        f"এডমিনকে মেসেজ করুন: {{owner}}'>{esc(vals.get('task_promo_text') or '')}</textarea></div>"
+        "<div class='form'><label>🔗 চ্যানেল বাটন লেখা (কেনা/ডিপোজিট পোস্টের নিচে)</label>"
+        f"<input name='ch_btn_text' value='{esc(vals.get('ch_btn_text') or '')}' "
+        "placeholder='🛒 BUY PROXY / VPN'></div>"
+        "<div class='form'><label>🔗 চ্যানেল বাটন লিংক</label>"
+        f"<input name='ch_btn_url' value='{esc(vals.get('ch_btn_url') or '')}' "
+        "placeholder='খালি = বটের start লিংক (?start=shop) | - = বন্ধ'></div>"
         "<div class='form'><label>USDT BEP-20 ওয়ালেট (ডিপোজিট অ্যাড্রেস)</label>"
         f"<input name='bsc_wallet' value='{esc(vals.get('bsc_wallet') or '')}' "
         "placeholder='0x...'></div>"
@@ -927,7 +941,7 @@ def settings_save():
         settings_set("task_notify_daily_max", v)
         saved.append("task_notify_daily_max")
     # ── Withdraw / পেমেন্ট / Support (বটের অ্যাডমিন প্যানেলেও আছে) ──
-    for k in ("min_withdraw", "wd_fee", "commission_pct"):
+    for k in ("min_withdraw", "wd_fee", "commission_pct", "shop_ref_pct"):
         v = (request.form.get(k) or "").strip().replace(",", ".").replace("$", "")
         try:
             if v != "" and float(v) >= 0:
@@ -935,6 +949,10 @@ def settings_save():
                 saved.append(k)
         except Exception:
             pass
+    for k in ("task_promo_text", "ch_btn_text", "ch_btn_url"):
+        v = (request.form.get(k) or "").strip()[:500]
+        settings_set(k, v)
+        saved.append(k)
     for k in ("bsc_wallet", "support_owner", "support_bot"):
         v = (request.form.get(k) or "").strip()[:120]
         if v:
