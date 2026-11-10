@@ -568,7 +568,8 @@ def _mark_verified(uid: int, ip: str, payload: dict):
                 "UPDATE users SET verified_at=%s, reg_ip=%s, last_ip=%s, "
                 "reg_country=COALESCE(NULLIF(%s,''), reg_country), "
                 "country=CASE WHEN COALESCE(country,'') IN ('','BD') AND %s <> '' THEN %s "
-                "ELSE country END, device_hash=COALESCE(device_hash, %s), "
+                "ELSE country END, device_hash=CASE WHEN COALESCE(device_hash,'')='' "
+                "THEN %s ELSE device_hash END, "
                 "last_ip_mobile=%s, last_ip_vpn=%s, "
                 "last_seen=COALESCE(NULLIF(last_seen,''), %s) WHERE user_id=%s",
                 (now_s, ip, ip, country, country, country, dev_hash,

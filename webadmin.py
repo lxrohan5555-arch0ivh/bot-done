@@ -2481,14 +2481,34 @@ _TABLE_LABELS = {
 }
 
 
+_STORAGE_NOTE = ""
+
+
 def _table_rows():
-    """(নাম, রো) — CockroachDB-তে estimated_row_count, না পেলে COUNT(*)।"""
-    rows = many("SELECT table_name AS t, estimated_row_count AS n FROM crdb_internal.tables "
-                "WHERE database_name = current_database() AND schema_name = 'public' "
-                "ORDER BY n DESC")
-    if rows:
-        return [(str(r.get("t")), int(r.get("n") or 0)) for r in rows]
+    """(নাম, রো) — CockroachDB-তে estimated_row_count, না পেলে COUNT(*)।
+
+    যেকোনো query ব্যর্থ হলেও খালি তালিকা ফেরত দেয় — পেজ কখনো 500 হবে না।
+    """
+    global _STORAGE_NOTE
+    _STORAGE_NOTE = ""
+    try:
+        rows = many("SELECT table_name AS t, estimated_row_count AS n FROM crdb_internal.tables "
+                    "WHERE database_name = current_database() AND schema_name = 'public' "
+                    "ORDER BY n DESC")
+    except Exception as e:
+        print(f"[storage] estimated_row_count ব্যর্থ: {e}")
+        _STORAGE_NOTE = ("টেবিলের সঠিক গণনা আনা যায়নি — COUNT(*) দিয়ে দেখানো হচ্ছে।")
+        rows = []
     out = []
+    if rows:
+        for r in rows:
+            try:
+                out.append((str(r.get("t")), int(r.get("n") or 0)))
+            except Exception:
+                continue
+        if out:
+            out.sort(key=lambda x: -x[1])
+            return out
     for t in _TABLE_LABELS:
         try:
             r = one(f"SELECT COUNT(*) AS n FROM {t}")
@@ -2523,8 +2543,9 @@ def _col_ok(tbl, col):
     try:
         ok = bool(one("SELECT 1 AS x FROM information_schema.columns "
                       "WHERE table_name=%s AND column_name=%s LIMIT 1", (tbl, col)))
-    except Exception:
-        ok = False
+    except Exception as e:
+        print(f"[storage] কলাম চেক ব্যর্থ {tbl}.{col}: {e}")
+        return False          # ব্যর্থতা ক্যাশে রাখি না — পরে আবার চেষ্টা হবে
     _agg_put(key, ok)
     return ok
 
@@ -2620,8 +2641,19 @@ def storage_page():
     g = guard()
     if g:
         return g
-    rows = _table_rows()
-    junk = _junk_counts()
+    _warn = ""
+    try:
+        rows = _table_rows()
+    except Exception as e:
+        print(f"[storage] টেবিল তালিকা ব্যর্থ: {e}")
+        rows, _warn = [], "টেবিলের গণনা আনা যায়নি — নিচের ডিলিট অপশন তবুও কাজ করবে।"
+    try:
+        junk = _junk_counts()
+    except Exception as e:
+        print(f"[storage] বাকার ডাটার গণনা ব্যর্থ: {e}")
+        junk, _warn = [], "বাকার ডাটার হিসাব আনা যায়নি — কিছুক্ষণ পরে আবার চেষ্টা করুন।"
+    if not _warn and _STORAGE_NOTE:
+        _warn = _STORAGE_NOTE
     total_rows = sum(n for _, n in rows)
     junk_rows = sum(j["n"] for j in junk if j["n"] > 0)
     trs = [[f"<span class='mono'>{esc(t)}</span>",
@@ -2644,7 +2676,13 @@ def storage_page():
             esc(j["label"]), num(j["n"]),
             f"<span class='mono mut'>~{num(int(j['n'] * 0.6))} KB</span>",
         ])
+    if _warn:
+        body_warn = ("<div class='card' style='border-color:#f59e0b'>"
+                     f"<p style='margin:0;color:#f59e0b'>⚠️ {esc(_warn)}</p></div>")
+    else:
+        body_warn = ""
     body = (
+        body_warn +
         "<div class='grid g-kpi'>"
         f"<div class='card kpi'><div class='t'>মোট রো (সব টেবিল)</div>"
         f"<div class='v'>{num(total_rows)}</div></div>"
@@ -2692,7 +2730,11 @@ def storage_cleanup():
         kinds = request.form.getlist("k")
     if not kinds:
         return redirect("/admin/storage?ok=" + _q_("কিছু নির্বাচন করা হয়নি"))
-    done = _junk_delete(kinds)
+    try:
+        done = _junk_delete(kinds)
+    except Exception as e:
+        print(f"[storage] cleanup ব্যর্থ: {e}")
+        done = {k: -1 for k in kinds}
     total = sum(v for v in done.values() if v > 0)
     _bad = [k for k, v in done.items() if v == -1]
     _skip = [k for k, v in done.items() if v == -2]

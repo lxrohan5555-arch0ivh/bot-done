@@ -486,34 +486,381 @@ def _i18n_db_put(text, en):
         pass
 
 
-def translate_to_en(text):
-    if not text:
-        return text
-    # Cache hit — network call এড়াও
-    cached = _translation_cache.get(text)
-    if cached is not None:
-        return cached
-    _disk = _i18n_db_get(text)
-    if _disk:
-        _translation_cache[text] = _disk
-        return _disk
+# ── হাতে লেখা ইংরেজি (নেটওয়ার্ক ছোঁবে না) — মূল স্ক্রিনগুলো সাথে সাথে ইংরেজি ──
+# চাবিতে সংখ্যা {{1}}, {{2}}… হিসেবে বসানো — তাই দাম/স্টক বদলালেও একই অনুবাদ।
+_EN_FAST = {
+    # ── শপ ──
+    "🛍 *প্রোডাক্ট ক্যাটাগরি বেছে নিন*": "🛍 *Choose a product category*",
+    "নিচের বাটন থেকে ক্যাটাগরি বেছে নিন, তারপর পণ্য।":
+        "Pick a category from the buttons below, then a product.",
+    "💵 পেমেন্ট আপনার ব্যালেন্স থেকে কেটে নেওয়া হবে।":
+        "💵 Payment is deducted from your balance.",
+    "🛍 *দোকান*": "🛍 *Shop*",
+    "এখনো কোনো পণ্য যোগ করা হয়নি।": "No products have been added yet.",
+    "অ্যাডমিন শীঘ্রই পণ্য যোগ করবেন।": "The admin will add products soon.",
+    "🔴 এই ক্যাটাগরিটি এখন বন্ধ আছে।": "🔴 This category is currently disabled.",
+    "🔙 দোকান": "🔙 Shop",
+    "এই ক্যাটাগরিতে এখন কোনো পণ্য নেই।": "No products in this category yet.",
+    "👇 পণ্য বেছে নিন। বাটনে দাম ও স্টক দেখা যাচ্ছে।":
+        "👇 Choose a product — price and stock are shown on the buttons.",
+    "❌ পণ্যটি এখন পাওয়া যাচ্ছে না।": "❌ This product is not available right now.",
+    "📦 ডেলিভারি: অ্যাডমিন নিজে পাঠাবেন (সাধারণত ৫–৩০ মিনিট)":
+        "📦 Delivery: sent by the admin (usually 5–30 min)",
+    "📦 স্টক: `{{1}}`": "📦 Stock: `{{1}}`",
+    "📦 স্টক: `{{1}}` ❌": "📦 Stock: `{{1}}` ❌",
+    "💵 দাম: *{{1}} $*": "💵 Price: *{{1}} $*",
+    "✅ কিনুন": "✅ Buy",
+    "🔙 ফিরে যান": "🔙 Back",
+    "📦 অন্যান্য": "📦 Others",
+    "📁 ক্যাটাগরি": "📁 Categories",
+    "📦 পণ্য তালিকা": "📦 Products",
+    # ── বাটন / মেনু ──
+    "💳 ডিপোজিট": "💳 Deposit",
+    "🧾 আমার অর্ডার": "🧾 My Orders",
+    "🛍 পণ্য কিনুন": "🛍 Buy Product",
+    "🧾 আমার ডিপোজিট হিস্ট্রি": "🧾 My Deposit History",
+    "🧾 আমার ডিপোজিট": "🧾 My Deposits",
+    "❌ বাতিল": "❌ Cancel",
+    "/cancel — বাতিল": "/cancel — cancel",
+    # ── অর্ডার কনফার্ম / পরিমাণ ──
+    "🧾 *অর্ডার নিশ্চিত করুন*": "🧾 *Confirm your order*",
+    "💵 এক পিসের দাম: *{{1}} $*": "💵 Price per piece: *{{1}} $*",
+    "💰 আপনার ব্যালেন্স: `{{1}} $`": "💰 Your balance: `{{1}} $`",
+    "➡️ কেনার পরে থাকবে: `{{1}} $`": "➡️ Balance after purchase: `{{1}} $`",
+    "❌ *ব্যালেন্স যথেষ্ট নয়।* আগে ডিপোজিট করুন।":
+        "❌ *Not enough balance.* Please deposit first.",
+    "✅ নিশ্চিত হলে নিচের বাটনে চাপুন।": "✅ Tap the button below to confirm.",
+    "✅ নিশ্চিত করে কিনুন": "✅ Confirm & Buy",
+    "🧮 *কয়টা নিবেন?*": "🧮 *How many do you want?*",
+    "💵 একটার দাম: *{{1}} $*": "💵 Price each: *{{1}} $*",
+    "📦 স্টক: `{{1}}`\\n": "📦 Stock: `{{1}}`",
+    "➡️ সর্বোচ্চ `{{1}}` টা নিতে পারবেন।": "➡️ You can take up to `{{1}}`.",
+    "সংখ্যা বেছে নিন 👇": "Choose a quantity 👇",
+    "✍️ নিজে লিখুন": "✍️ Enter manually",
+    "❌ শুধু সংখ্যা লিখুন (যেমন `{{1}}`)।": "❌ Numbers only (e.g. `{{1}}`).",
+    # ── আমার অর্ডার / ডিটেইলস ──
+    "🧾 *আমার অর্ডার*": "🧾 *My Orders*",
+    "এখনো কোনো অর্ডার নেই।": "No orders yet.",
+    "🧾 *আমার অর্ডার* — মোট `{{1}}`টি": "🧾 *My Orders* — total `{{1}}`",
+    "_যে অর্ডারে চাপবেন, তার পূর্ণ ডিটেইলস দেখাবে._":
+        "_Tap an order to see its full details._",
+    "_…সর্বশেষ ২৫টি দেখানো হচ্ছে ({{1}}টির মধ্যে)_":
+        "_…showing the latest 25 (of {{1}})_",
+    "🔙 আমার অর্ডার": "🔙 My Orders",
+    "⏳ _ডেলিভারি এখনো দেওয়া হয়নি — অ্যাডমিন শীঘ্রই পাঠাবেন।_":
+        "⏳ _Delivery pending — the admin will send it soon._",
+    "_এই অর্ডারে কোনো কনটেন্ট নেই।_": "_No content in this order._",
+    "📦 <b>আপনার প্রোডাক্ট:</b>": "📦 <b>Your product:</b>",
+    "💵 মূল্য: <b>{{1}} $</b>": "💵 Amount: <b>{{1}} $</b>",
+    "⚠️ এই তথ্য কারও সাথে শেয়ার করবেন না।": "⚠️ Do not share this with anyone.",
+    "⚠️ এই তথ্য কারও সাথে শেয়ার করবেন না। সমস্যা হলে সাপোর্টে মেসেজ দিন।":
+        "⚠️ Do not share this with anyone. Contact support if there is any problem.",
+    "✅ <b>অর্ডার সম্পন্ন!</b>": "✅ <b>Order complete!</b>",
+    "🛍 পণ্য:": "🛍 Product:",
+    "💵 মূল্য:": "💵 Amount:",
+    "📅 তারিখ:": "📅 Date:",
+    "⚙️ স্ট্যাটাস:": "⚙️ Status:",
+    "📦 <b>ডেলিভারি:</b>": "📦 <b>Delivery:</b>",
+    # ── অর্ডার স্ট্যাটাস ──
+    "✅ ডেলিভারি হয়েছে": "✅ Delivered",
+    "⏳ অপেক্ষমাণ": "⏳ Pending",
+    "💸 রিফান্ড হয়েছে": "💸 Refunded",
+    "⌛ মেয়াদ শেষ": "⌛ Expired",
+    "✅ অনুমোদিত": "✅ Approved",
+    "✅ অনুমোদন": "✅ Approve",
+    # ── ম্যানুয়াল অর্ডার ──
+    "⏳ *অর্ডার গ্রহণ করা হয়েছে*": "⏳ *Order received*",
+    "অ্যাডমিন খুব শীঘ্রই আপনার প্রোডাক্ট পাঠিয়ে দেবেন।":
+        "The admin will send your product very soon.",
+    "🔙 দোকানে ফিরুন": "🔙 Back to shop",
+    "⏳ *স্টক শেষ — অর্ডার গ্রহণ করা হয়েছে*": "⏳ *Out of stock — order received*",
+    "অ্যাডমিন নিজে ডেলিভারি দেবেন।": "The admin will deliver it manually.",
+    "✅ অর্ডার হয়েছে": "✅ Order placed",
+    "✅ পেমেন্ট সম্পন্ন — প্রোডাক্ট নিচে পাঠানো হলো।":
+        "✅ Payment complete — your product is below.",
+    # ── ডিপোজিট ──
+    "💳 *ডিপোজিট*": "💳 *Deposit*",
+    "নিচের যেকোনো একটি মেথড বেছে নিন।": "Choose one of the methods below.",
+    "⚡ *অটো* — পরিমাণ + TxID/Order ID দিলে সাথে সাথে যাচাই হয়ে ব্যালেন্স যোগ হবে।":
+        "⚡ *Auto* — send the amount + TxID/Order ID and your balance is credited "
+        "instantly after verification.",
+    "✍️ *ম্যানুয়াল* — আপনি পেমেন্ট করে TxID/স্ক্রিনশট দিলে অ্যাডমিন ✅ করবেন।":
+        "✍️ *Manual* — pay and send the TxID/screenshot; the admin will approve it.",
+    "এখনো কোনো মেথড সেট করা হয়নি।": "No deposit method is set up yet.",
+    "অ্যাডমিনকে জানান।": "Please inform the admin.",
+    "❌ এই মেথডটি এখন বন্ধ আছে।": "❌ This method is currently disabled.",
+    "⚡ অটো (BEP-20)": "⚡ Auto (BEP-20)",
+    "⚡ অটো (Binance UID)": "⚡ Auto (Binance UID)",
+    "✍️ ম্যানুয়াল": "✍️ Manual",
+    "ম্যানুয়াল": "Manual",
+    "🏷 ধরন:": "🏷 Type:",
+    "📉 সর্বনিম্ন: `{{1}}$`": "📉 Minimum: `{{1}}$`",
+    "📥 *এই Binance Pay আইডিতে পাঠান:*": "📥 *Send to this Binance Pay ID:*",
+    "_Binance Pay ID সেট করা নেই — অ্যাডমিনকে জানান_":
+        "_Binance Pay ID is not set — please inform the admin_",
+    "📱 Binance অ্যাপ → Pay → Send → UID দিন → পরিমাণ লিখে পাঠান।":
+        "📱 Binance app → Pay → Send → enter the UID → type the amount and send.",
+    "পাঠানোর পর *TxID / Order ID* দিলে বট নিজেই যাচাই করে ":
+        "After sending, give the *TxID / Order ID* and the bot verifies it ",
+    "ব্যালেন্স যোগ করবে।": "and credits your balance.",
+    "📤 *এই অ্যাড্রেসে USDT (BEP-20) পাঠান:*":
+        "📤 *Send USDT (BEP-20) to this address:*",
+    "_অ্যাড্রেস সেট করা নেই — অ্যাডমিনকে জানান_":
+        "_Address is not set — please inform the admin_",
+    "⚠️ শুধু *BEP-20 (BSC)* নেটওয়ার্কে পাঠাবেন। অন্য নেটওয়ার্কে পাঠালে টাকা হারাবে।":
+        "⚠️ Send only on the *BEP-20 (BSC)* network. Other networks will lose your funds.",
+    "পাঠানোর পর *TxID* কপি করে নিচের বাটনে চাপুন।":
+        "After sending, copy the *TxID* and tap the button below.",
+    "📋 *নির্দেশনা:*": "📋 *Instructions:*",
+    "_অ্যাডমিন নির্দেশনা দেননি_": "_No instructions from the admin_",
+    "পেমেন্ট করার পর TxID / স্ক্রিনশট দিন।": "After paying, send the TxID / screenshot.",
+    "✅ আমি পাঠিয়েছি": "✅ I have sent it",
+    "✅ পেমেন্ট করেছি": "✅ I have paid",
+    "🔙 ডিপোজিট": "🔙 Deposit",
+    # ── ডিপোজিট হিস্ট্রি / রি-চেক ──
+    "🧾 *আমার ডিপোজিট*": "🧾 *My Deposits*",
+    "এখনো কোনো ডিপোজিট নেই।": "No deposits yet.",
+    "🧾 *আমার ডিপোজিট (সর্বশেষ ৮টি)*": "🧾 *My Deposits (latest 8)*",
+    "🔁 আবার চেক": "🔁 Check again",
+    "📤 অ্যাডমিনকে পাঠান (ছবি লাগবে)": "📤 Send to admin (photo required)",
+    "⏳ *ডিপোজিট যাচাই বাকি*": "⏳ *Deposit pending verification*",
+    "পেমেন্ট এখনো পাওয়া যায়নি": "Payment not found yet",
+    "কারণ:": "Reason:",
+    "১-২ মিনিট পরে *🔁 আবার চেক* চাপুন — পাওয়া গেলে সাথে সাথে ":
+        "Tap *🔁 Check again* in 1–2 minutes — if found, the amount is ",
+    "ব্যালেন্স যোগ হবে। না পেলে অ্যাডমিন নিজে যাচাই করে ✅ করবেন।":
+        "credited at once. If not, the admin will verify it manually.",
+    "💵 *কত ডলার পাঠিয়েছেন?*": "💵 *How much did you send?*",
+    "📥 Binance Pay আইডি: `{{1}}`": "📥 Binance Pay ID: `{{1}}`",
+    "শুধু সংখ্যা লিখুন (যেমন `{{1}}`)": "Type numbers only (e.g. `{{1}}`)",
+    "🔗 *এখন TxID দিন* — অথবা Order ID": "🔗 *Now send the TxID* — or Order ID",
+    "Binance অ্যাপ → Pay → History → ওই পেমেন্টে চাপ দিন → ":
+        "Binance app → Pay → History → tap that payment → ",
+    "*TxID / Order ID* কপি করে পাঠান।": "copy the *TxID / Order ID* and send it.",
+    "_(TxID না পেলে শুধু আপনার Binance UID-ও চলবে)_":
+        "_(If you don't have a TxID, your Binance UID works too)_",
+    "❌ TxID / Order ID ঠিক নয় — আবার পাঠান।": "❌ Invalid TxID / Order ID — send it again.",
+    "🔎 Binance Pay-এ পেমেন্ট খোঁজা হচ্ছে…": "🔎 Searching Binance Pay for your payment…",
+    "🔎 *পেমেন্ট খোঁজা হচ্ছে… ({{1}}/{{2}})*": "🔎 *Searching for payment… ({{1}}/{{2}})*",
+    "Binance-এ পেমেন্ট দেখা যেতে কয়েক সেকেন্ড লাগে — অপেক্ষা করুন।":
+        "Binance can take a few seconds to show the payment — please wait.",
+    "📷 *স্ক্রিনশট বা পেমেন্ট স্লিপের ছবি পাঠান*":
+        "📷 *Send a screenshot or payment slip photo*",
+    "ছবি *দিতেই হবে* — caption-এ কিছু লিখতে হবে না।":
+        "A photo is *required* — no caption needed.",
+    "ছবি পেলেই অ্যাডমিনের কাছে চলে যাবে, তিনি ✅ করলে ব্যালেন্স যোগ হবে।":
+        "The admin gets it right away; your balance is credited after approval.",
+    "একই পেমেন্টে দুইবার টাকা যোগ হবে না। নতুন পেমেন্ট হলে তার TxID দিন, ":
+        "The same payment cannot be credited twice. For a new payment send its TxID, ",
+    "নাহলে *🧾 আমার ডিপোজিট* → 🔁 আবার চেক চাপুন।":
+        "otherwise open *🧾 My Deposits* → 🔁 Check again.",
+    "⚠️ এই TxID / Order ID আগেই ব্যবহার করা হয়েছে।":
+        "⚠️ This TxID / Order ID has already been used.",
+    "✅ *প্রমাণ অ্যাডমিনের কাছে পাঠানো হয়েছে*": "✅ *Proof sent to the admin*",
+    "অ্যাডমিন যাচাই করে ✅ করলেই ব্যালেন্স যোগ হবে।":
+        "Your balance is credited once the admin approves it.",
+    "⏳ *ডিপোজিট রিকোয়েস্ট জমা হয়েছে*": "⏳ *Deposit request submitted*",
+    "❌ পরিমাণ ০ এর বেশি হতে হবে।": "❌ The amount must be greater than 0.",
+    "❌ সর্বনিম্ন `{{1}}$`।": "❌ Minimum is `{{1}}$`.",
+    "❌ শুধু সংখ্যা লিখুন (যেমন {{1}})।": "❌ Numbers only (e.g. {{1}}).",
+    "✅ <b>ডিপোজিট পাওয়া গেছে!</b>": "✅ <b>Deposit found!</b>",
+    "ব্যালেন্স যোগ হয়েছে।": "Balance credited.",
+    "✅ <b>ডিপোজিট সফল!</b>": "✅ <b>Deposit successful!</b>",
+    "💵 পরিমাণ: <b>{{1}}$</b>": "💵 Amount: <b>{{1}}$</b>",
+    "🏷 মেথড:": "🏷 Method:",
+    "💰 নতুন ব্যালেন্স: <b>{{1}}$</b>": "💰 New balance: <b>{{1}}$</b>",
+    "🧾 ডিপোজিট নম্বর: <code>#{{1}}</code>":
+        "🧾 Deposit number: <code>#{{1}}</code>",
+    # ── সাধারণ অ্যালার্ট ──
+    "ডিপোজিট পাওয়া যায়নি": "Deposit not found",
+    "এটি আগেই প্রসেস হয়েছে": "Already processed",
+    "মেথড পাওয়া যায়নি": "Method not found",
+    "সমস্যা হয়েছে": "Something went wrong",
+    "অর্ডারটি পাওয়া যায়নি": "Order not found",
+    "এখনো কোনো ডিপোজিট নেই": "No deposits yet",
+    "কিছু একটা সমস্যা হয়েছে": "Something went wrong",
+}
+
+# অ্যাডমিন-ডেটার সাধারণ বাংলা শব্দ → ইংরেজি। Google না পেলেও এগুলো ইংরেজি হবে।
+_EN_WORDS = [
+    ("মেটা এআই", "Meta AI"), ("ফেসবুক", "Facebook"), ("ইনস্টাগ্রাম", "Instagram"),
+    ("জিমেইল", "Gmail"), ("বাইন্যান্স", "Binance"), ("বিকাশ", "bKash"),
+    ("নগদ", "Nagad"), ("রকেট", "Rocket"), ("টেলিগ্রাম", "Telegram"),
+    ("ভেরিফাইড", "Verified"), ("ভেরিফাই", "Verify"), ("অ্যাকাউন্ট", "Account"),
+    ("পাসওয়ার্ড", "Password"), ("ইউজারনেম", "Username"), ("ইমেইল", "Email"),
+    ("ম্যানুয়াল", "Manual"), ("অটো", "Auto"), ("ডেলিভারি", "Delivery"),
+    ("ডিপোজিট", "Deposit"), ("উইথড্র", "Withdraw"), ("ব্যালেন্স", "Balance"),
+    ("অর্ডার", "Order"), ("পণ্য", "Product"), ("প্রোডাক্ট", "Product"),
+    ("ক্যাটাগরি", "Category"), ("স্টক", "Stock"), ("দাম", "Price"),
+    ("পরিমাণ", "Amount"), ("পেমেন্ট", "Payment"), ("প্রমাণ", "Proof"),
+    ("স্ক্রিনশট", "Screenshot"), ("অ্যাডমিন", "Admin"), ("ইউজার", "User"),
+    ("টাস্ক", "Task"), ("রেফার", "Referral"), ("কমিশন", "Commission"),
+    ("সাপোর্ট", "Support"), ("চ্যানেল", "Channel"), ("স্ট্যাটাস", "Status"),
+    ("অপেক্ষমাণ", "Pending"), ("অনুমোদিত", "Approved"), ("রিফান্ড", "Refund"),
+    ("সর্বনিম্ন", "Minimum"), ("সর্বোচ্চ", "Maximum"), ("তারিখ", "Date"),
+    ("সময়", "Time"), ("মেয়াদ", "Validity"), ("নাম", "Name"), ("লিংক", "Link"),
+    ("বন্ধ", "Off"), ("চালু", "On"), ("সফল", "Successful"), ("ব্যর্থ", "Failed"),
+    ("পিস", "pcs"), ("মোট", "Total"), ("নোট", "Note"), ("ফ্রি", "Free"),
+]
+
+_PACKAGE_WORDS = ("প্যাকেজ", "প্যাক", "বান্ডেল")
+
+
+_BN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+
+
+def _glossary_en(text):
+    """শেষ চেষ্টা: শব্দ-ভিত্তিক অনুবাদ (নেটওয়ার্ক ছাড়াই)।"""
+    out = str(text or "")
+    for bn, en in _EN_WORDS:
+        if bn in out:
+            out = out.replace(bn, en)
+    for _w in _PACKAGE_WORDS:
+        out = out.replace(_w, "Package")
+    return out
+
+
+# লাইনের শুরুতে লেবেল — পরে যা-ই থাকুক (পণ্যের নাম, স্ট্যাটাস, দাম) ইংরেজি হবে
+_EN_PREFIX = [
+    ("🛍 পণ্য: ", "🛍 Product: "),
+    ("🧾 <b>অর্ডার #", "🧾 <b>Order #"),
+    ("⚙️ স্ট্যাটাস: ", "⚙️ Status: "),
+    ("📅 তারিখ: ", "📅 Date: "),
+    ("🏷 ধরন: ", "🏷 Type: "),
+    ("💵 দাম: ", "💵 Price: "),
+    ("💵 মূল্য: ", "💵 Amount: "),
+    ("📦 স্টক: ", "📦 Stock: "),
+    ("📉 সর্বনিম্ন: ", "📉 Minimum: "),
+    ("💰 আপনার ব্যালেন্স: ", "💰 Your balance: "),
+    ("➡️ কেনার পরে থাকবে: ", "➡️ After purchase: "),
+    ("⏳ পেন্ডিং অর্ডার (", "⏳ Pending orders ("),
+    ("🔢 পরিমাণ: ", "🔢 Quantity: "),
+    ("💵 মোট: ", "💵 Total: "),
+    ("🆔 অর্ডার: ", "🆔 Order: "),
+]
+
+# সংখ্যা/তারিখ/আইডি → {{n}} — একই বাক্যের ভিন্ন মানেও ক্যাশ কাজ করবে
+_NUM_MASK_RE = _re.compile(r"\d[\d.,:/\-]*")
+_TR_OFF_TILL = 0.0          # নেটওয়ার্ক ফেল করলে এই সময় পর্যন্ত আর চেষ্টা নয়
+_TR_FAIL_COOLDOWN = 300.0   # ৫ মিনিট
+
+
+def _mask_nums(text):
+    vals = []
+
+    def _sub(m):
+        vals.append(m.group(0))
+        return "{{%d}}" % len(vals)
+
+    return _NUM_MASK_RE.sub(_sub, str(text)), vals
+
+
+def _unmask_nums(text, vals):
+    for i, v in enumerate(vals, 1):
+        text = text.replace("{{%d}}" % i, v)
+    return text
+
+
+def _tr_net(key):
+    """Google Translate — ফেল/টাইমআউটে সার্কিট ব্রেকার, তাই বারবার অপেক্ষা নয়।"""
+    global _TR_OFF_TILL
+    if _time.time() < _TR_OFF_TILL:
+        return key
     try:
         url = ("https://translate.googleapis.com/translate_a/single"
-               "?client=gtx&sl=bn&tl=en&dt=t&q=" + urllib.parse.quote(text))
+               "?client=gtx&sl=bn&tl=en&dt=t&q=" + urllib.parse.quote(key))
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=2) as r:
             data = _json.loads(r.read())
-        result = "".join(seg[0] for seg in data[0] if seg[0]).strip()
+        out = "".join(seg[0] for seg in data[0] if seg[0]).strip()
     except Exception:
+        _TR_OFF_TILL = _time.time() + _TR_FAIL_COOLDOWN
+        return key
+    return out or key
+
+
+def _tr_line(line):
+    """এক লাইন অনুবাদ — অভিধান → মেমরি ক্যাশ → নেটওয়ার্ক।"""
+    src = str(line)
+    if not src.strip() or not _BN_RE.search(src):
+        return src
+    masked, vals = _mask_nums(src)
+    key = masked.strip()
+    hit = _EN_FAST.get(key)
+    if hit:
+        return _unmask_nums(hit, vals)
+    for _bp, _ep in _EN_PREFIX:
+        if key.startswith(_bp):
+            _tail = key[len(_bp):].strip()
+            if _tail:
+                _tv = _EN_FAST.get(_tail)
+                if _tv:
+                    return _unmask_nums(_ep + _tv, vals)
+                if not _BN_RE.search(_tail):
+                    return _unmask_nums(_ep + _tail, vals)
+            break
+    ck = "L|" + key
+    cached = _translation_cache.get(ck)
+    if cached is None:
+        out = _tr_net(key)
+        if out == key:            # অনুবাদ হয়নি — শব্দ-ভিত্তিক ফলব্যাক (ক্যাশে বিষ রাখব না)
+            return _unmask_nums(_glossary_en(key), vals)
+        cached = out
+        if len(_translation_cache) >= _TRANSLATION_CACHE_MAX:
+            for _k in list(_translation_cache.keys())[:len(_translation_cache) // 2]:
+                _translation_cache.pop(_k, None)
+        _translation_cache[ck] = cached
+        _i18n_db_put(ck, cached)
+    return _unmask_nums(cached, vals)
+
+
+def translate_to_en(text):
+    """বাংলা → ইংরেজি। লাইন ধরে ধরে, সংখ্যা মাস্ক করে (ক্যাশ হিট বেশি), পাল্টাপাল্টি অনুবাদ।"""
+    if not text or not isinstance(text, str) or not _BN_RE.search(text):
         return text
-    # Cache store — overflow হলে পুরনো অর্ধেক মুছো
-    if len(_translation_cache) >= _TRANSLATION_CACHE_MAX:
-        keys = list(_translation_cache.keys())
-        for k in keys[:len(keys)//2]:
-            _translation_cache.pop(k, None)
-    _translation_cache[text] = result
-    _i18n_db_put(text, result)
-    return result
+    text = text.translate(_BN_DIGITS)     # বাংলা সংখ্যা → ইংরেজি সংখ্যা
+    if "\n" not in text:
+        return _tr_line(text)
+    parts = text.split("\n")
+    todo, done = [], {}
+    for ln in parts:
+        if ln in done or not ln.strip() or not _BN_RE.search(ln) or ln in todo:
+            continue
+        masked, vals = _mask_nums(ln)
+        hit = _EN_FAST.get(masked.strip())
+        if hit:
+            done[ln] = _unmask_nums(hit, vals)
+            continue
+        cached = _translation_cache.get("L|" + masked.strip())
+        if cached:
+            done[ln] = _unmask_nums(cached, vals)
+            continue
+        _pfx_done = None
+        for _bp, _ep in _EN_PREFIX:
+            if masked.strip().startswith(_bp):
+                _tail = masked.strip()[len(_bp):].strip()
+                if _tail:
+                    _tv = _EN_FAST.get(_tail)
+                    if _tv:
+                        _pfx_done = _ep + _tv
+                    elif not _BN_RE.search(_tail):
+                        _pfx_done = _ep + _tail
+                break
+        if _pfx_done is not None:
+            done[ln] = _unmask_nums(_pfx_done, vals)
+            continue
+        todo.append(ln)
+    if todo:
+        try:
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=min(6, len(todo))) as _ex:
+                for _ln, _res in zip(todo, _ex.map(_tr_line, todo)):
+                    done[_ln] = _res
+        except Exception:
+            for _ln in todo:
+                done[_ln] = _tr_line(_ln)
+    return "\n".join(done.get(ln, ln) for ln in parts)
+
 
 def md_escape(text):
     for ch in ('*', '_', '`', '['):
@@ -548,6 +895,37 @@ def _translate_html_en(text):
             out.append(seg)
     return "".join(out)
 
+def _mk_with_rows(markup, rows):
+    """একই ধরনের নতুন markup, ভেতরের রো বদলানো (PTB-তে immutable)।"""
+    try:
+        return type(markup)(rows)
+    except Exception:
+        pass
+    try:
+        nm = _copymod.copy(markup)
+        object.__setattr__(nm, "keyboard" if hasattr(markup, "keyboard")
+                           else "inline_keyboard", rows)
+        return nm
+    except Exception:
+        return markup
+
+
+def _btn_retitled(btn, new_text):
+    """একই বাটনের কপি, শুধু টেক্সট বদলানো (PTB-তে text immutable)।"""
+    try:
+        nb = _copymod.copy(btn)
+        object.__setattr__(nb, "text", new_text)
+        return nb
+    except Exception:
+        pass
+    try:
+        d = btn.to_dict()
+        d.pop("text", None)
+        return type(btn)(text=new_text, **d)
+    except Exception:
+        return btn
+
+
 def _i18n_markup_en(markup, translator):
     """ReplyMarkup-এর বাংলা বাটন-লেবেল ইংরেজি করো — মূল object ছোঁয় না।"""
     rows = getattr(markup, "keyboard", None) or getattr(markup, "inline_keyboard", None)
@@ -559,21 +937,49 @@ def _i18n_markup_en(markup, translator):
         for btn in row:
             t = getattr(btn, "text", None)
             if isinstance(t, str) and _BN_RE.search(t):
-                nb = _copymod.copy(btn)
-                nb.text = translator(t)
-                new_row.append(nb)
+                new_row.append(_btn_retitled(btn, translator(t)))
                 touched = True
             else:
                 new_row.append(btn)
         new_rows.append(new_row)
     if not touched:
         return markup
-    new_mk = _copymod.copy(markup)
-    if hasattr(markup, "keyboard"):
-        new_mk.keyboard = new_rows
-    else:
-        new_mk.inline_keyboard = new_rows
-    return new_mk
+    return _mk_with_rows(markup, new_rows)
+
+
+async def _i18n_markup_en_async(markup):
+    """বাটন-লেবেলগুলো একসাথে (সমান্তরাল) অনুবাদ — একটা একটা করে অপেক্ষা নয়।"""
+    rows = getattr(markup, "keyboard", None) or getattr(markup, "inline_keyboard", None)
+    if not rows:
+        return markup
+    labels = []
+    for row in rows:
+        for btn in row:
+            t = getattr(btn, "text", None)
+            if isinstance(t, str) and _BN_RE.search(t) and t not in labels:
+                labels.append(t)
+    if not labels:
+        return markup
+    try:
+        results = await asyncio.gather(
+            *(asyncio.to_thread(translate_to_en, lab) for lab in labels))
+    except Exception:
+        return markup
+    mapping = dict(zip(labels, results))
+    new_rows, touched = [], False
+    for row in rows:
+        new_row = []
+        for btn in row:
+            t = getattr(btn, "text", None)
+            if isinstance(t, str) and t in mapping and mapping[t] != t:
+                new_row.append(_btn_retitled(btn, mapping[t]))
+                touched = True
+            else:
+                new_row.append(btn)
+        new_rows.append(new_row)
+    if not touched:
+        return markup
+    return _mk_with_rows(markup, new_rows)
 
 
 async def _i18n_out(text, markup, chat_id):
@@ -602,7 +1008,7 @@ async def _i18n_out(text, markup, chat_id):
             else:
                 text = await asyncio.to_thread(translate_to_en, text)
         if markup is not None:
-            markup = await asyncio.to_thread(_i18n_markup_en, markup, translate_to_en)
+            markup = await _i18n_markup_en_async(markup)
     except Exception:
         pass
     return text, markup
@@ -1784,6 +2190,20 @@ def sec_multi_scan(uid):
     out["device_hash"] = dh
     out["ip"] = ip
     out["country"] = (r["reg_country"] or "") if r["reg_country"] else ""
+    # users.device_hash ফাঁকা হলে verifications থেকে নাও — পুরোনো ইউজারও ধরা পড়বে
+    if not dh:
+        try:
+            with _c() as c:
+                _v = c.execute(
+                    "SELECT device_hash FROM verifications WHERE user_id=%s "
+                    "AND COALESCE(device_hash,'')<>'' "
+                    "ORDER BY COALESCE(verified_at,'') DESC LIMIT 1",
+                    (uid,)).fetchone()
+            if _v and _v["device_hash"]:
+                dh = str(_v["device_hash"])
+                out["device_hash"] = dh
+        except Exception as _e:
+            log.debug(f"[SEC2] verifications device পড়া যায়নি: {_e}")
     if dh:
         try:
             with _c() as c:
@@ -7540,24 +7960,46 @@ def _dep_pay_match(rows, low, dref, want):
 
 
 def dep_binance_pay_find(ref, want=0.0, minutes=45):
-    """Binance Pay-এ পেমেন্ট খোঁজে — ref = Order ID / TxID / নিজের UID।
+    """Binance Pay-এ শুধু Order ID / TxID দিয়ে পেমেন্ট খোঁজে — (amount, txid, err)।
 
-    রিটার্ন: (amount, txid, err) — সফল হলে err = ""।
+    ইউজারের UID বা পরিমাণ দিয়ে অনুমান করা হয় না — ভুল ক্রেডিটের ঝুঁকি শূন্য।
     """
     r = re.sub(r"\s+", "", str(ref or ""))
-    if len(r) < 4:
-        return 0.0, "", "TxID / Order ID ঠিক নয়।"
-    try:
-        want = float(want or 0)
-    except Exception:
-        want = 0.0
+    if len(r) < 6:
+        return 0.0, "", "Order ID ঠিক নয় — পেমেন্টের Order ID দিন।"
     rows, err = _binance_pay_rows(minutes)
     if err:
         return 0.0, "", err
-    hit = _dep_pay_match(rows, r.casefold(), re.sub(r"\D", "", r), want)
-    if not hit:
-        return 0.0, "", ("এই পেমেন্ট এখনো পাওয়া যায়নি — ১-২ মিনিট পরে আবার চেক করুন।")
-    return round(hit[0], 6), hit[1], ""
+    low = r.casefold()
+    seen_other = ""
+    for it in rows or []:
+        if not isinstance(it, dict):
+            continue
+        keys = {str(it.get(k) or "").strip().casefold()
+                for k in ("orderId", "transactionId", "prepayId", "merchantTradeNo")}
+        if low not in keys:
+            continue
+        try:
+            amt = float(it.get("amount") or 0)
+        except Exception:
+            amt = 0.0
+        if amt <= 0:
+            continue
+        tx_id = str(it.get("transactionId") or it.get("orderId") or "").strip()
+        if not tx_id:
+            continue
+        if dep_txid_used(tx_id):
+            return 0.0, "", "এই পেমেন্ট আগেই অন্য ডিপোজিটে যোগ হয়েছে।"
+        _cur = str(it.get("currency") or "").upper()
+        if _cur and _cur not in _DEP_STABLE:
+            seen_other = _cur
+            continue
+        return round(amt, 6), tx_id, ""
+    if seen_other:
+        return 0.0, "", (f"পেমেন্ট পাওয়া গেছে ({seen_other}) কিন্তু USDT/USD-তে নয় — "
+                         "অ্যাডমিন যাচাই করবেন।")
+    return 0.0, "", ("এই Order ID-তে পেমেন্ট পাওয়া যায়নি — Order ID ঠিক আছে কি না "
+                     "দেখুন; নতুন পেমেন্ট হলে ১–২ মিনিট পরে আবার চেক করুন।")
 
 
 def dep_binance_uid_pay(payer_uid, want, minutes=45):
@@ -7572,6 +8014,13 @@ def dep_attach_txid(oid, txid):
     with _c() as c:
         c.execute("UPDATE deposits SET txid=%s WHERE id=%s",
                   ((txid or "").strip()[:120], int(oid)))
+
+
+def dep_set_ref(oid, ref):
+    """পেন্ডিং ডিপোজিটে সঠিক Order ID বসাও (পুরোনো txid বাদ)।"""
+    with _c() as c:
+        c.execute("UPDATE deposits SET note=%s, txid='' WHERE id=%s",
+                  (("Binance: " + str(ref or "").strip())[:120], int(oid)))
 
 
 def dep_set_kind(mid, kind):
@@ -7663,7 +8112,7 @@ async def _dep_method_page(q, mid):
         lines += ["", "📥 *এই Binance Pay আইডিতে পাঠান:*",
                   f"`{pay_id}`" if pay_id else "_Binance Pay ID সেট করা নেই — অ্যাডমিনকে জানান_",
                   "", "📱 Binance অ্যাপ → Pay → Send → UID দিন → পরিমাণ লিখে পাঠান।",
-                  "", "পাঠানোর পর *TxID / Order ID* দিলে বট নিজেই যাচাই করে "
+                  "", "পাঠানোর পর শুধু *Order ID* দিলেই বট নিজেই যাচাই করে "
                   "ব্যালেন্স যোগ করবে।"]
         if ins:
             lines += ["", "📋 " + ins]
@@ -7731,22 +8180,34 @@ async def _dep_recheck(q, ctx, oid):
     if str(o["status"]) != "pending":
         await q.answer("এটি আগেই প্রসেস হয়েছে", show_alert=True)
         return
-    buid = _dep_note_ref(o["note"])
-    if not buid:
-        await q.answer("এটি অটো ডিপোজিট নয় — অ্যাডমিন যাচাই করবেন", show_alert=True)
+    # ref: নোটে লেখা TxID / Order ID / UID → না পেলে ডিপোজিটের txid
+    buid = (_dep_note_ref(o["note"]) or str(o["txid"] or "")).strip()
+    try:
+        amt = float(o["amount"] or 0)
+    except Exception:
+        amt = 0.0
+    if not buid and amt <= 0:
+        await q.answer("এই ডিপোজিটে খোঁজার মতো তথ্য নেই — অ্যাডমিন যাচাই করবেন",
+                       show_alert=True)
         return
-    amt = float(o["amount"] or 0)
     m = await asyncio.to_thread(dep_method, int(o["method_id"] or 0))
     if not m:
         await q.answer("মেথড পাওয়া যায়নি", show_alert=True)
         return
+    _prov = dep_method_provider(m)
     _win = await asyncio.to_thread(dep_uid_window)
-    got, tx, err = await asyncio.to_thread(dep_api_find, dep_method_provider(m), buid, amt, _win)
+    # ধাপে ধাপে বড় উইন্ডো — দেরিতে আসা পেমেন্টও যাতে ধরা পড়ে (কনফিগ → ৩ ঘণ্টা → ২৪ ঘণ্টা)
+    got, tx, err = 0.0, "", ""
+    for _w in sorted({int(_win or 45), 180, 1440}):
+        got, tx, err = await asyncio.to_thread(dep_api_find, _prov, buid, amt, _w)
+        if tx and not err:
+            break
     if not (tx and not err):
         await q.answer(("❌ " + (err or "পেমেন্ট এখনো পাওয়া যায়নি"))[:190], show_alert=True)
         try:
             await q.edit_message_reply_markup(InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔁 আবার চেক", callback_data=f"dep:re:{oid}")],
+                [InlineKeyboardButton("✏️ Order ID বদলান", callback_data=f"dep:fix:{oid}")],
                 [InlineKeyboardButton("📤 অ্যাডমিনকে পাঠান (ছবি লাগবে)",
                                       callback_data=f"dep:pf:{oid}")],
                 [InlineKeyboardButton("🧾 আমার ডিপোজিট", callback_data="dep:my")]]))
@@ -7835,6 +8296,22 @@ async def dep_callback(update, ctx):
             return await _dep_method_page(q, int(d.split(":")[2]))
         if d.startswith("dep:re:"):
             return await _dep_recheck(q, ctx, int(d.split(":")[2]))
+        if d.startswith("dep:fix:"):
+            oid = int(d.split(":")[2])
+            o = await asyncio.to_thread(dep_row, oid)
+            if not o or int(o["user_id"] or 0) != int(uid) or str(o["status"]) != "pending":
+                await q.answer("ডিপোজিট পাওয়া যায়নি বা আগেই প্রসেস হয়েছে",
+                               show_alert=True)
+                return
+            ctx.user_data["state"] = f"dep_fix_ref:{oid}"
+            await q.message.reply_text(
+                "✏️ *সঠিক Order ID দিন*\n\n"
+                f"🧾 ডিপোজিট `#{oid}` · 💵 `{float(o['amount'] or 0):g}$`\n\n"
+                "📱 Binance অ্যাপ → Pay → History → ওই পেমেন্টে চাপ দিন → "
+                "*Order ID* কপি করে এখানে পাঠান।\n"
+                "_(শুধু সংখ্যা, ৮–৩০ ডিজিট)_\n\n/cancel — বাতিল",
+                parse_mode="Markdown")
+            return
         if d.startswith("dep:pf:"):
             oid = int(d.split(":")[2])
             o = await asyncio.to_thread(dep_row, oid)
@@ -7958,6 +8435,73 @@ async def dep_input(update, ctx, st):
                     pass
         return True
 
+    # ── ✏️ ভুল Order ID বদলে আবার যাচাই (পেন্ডিং ডিপোজিট) ──
+    if str(st).startswith("dep_fix_ref:"):
+        try:
+            _oid = int(str(st).split(":")[1])
+        except Exception:
+            ctx.user_data.pop("state", None)
+            return True
+        _o = await asyncio.to_thread(dep_row, _oid)
+        if (not _o or int(_o["user_id"] or 0) != int(uid)
+                or str(_o["status"]) != "pending"):
+            ctx.user_data.pop("state", None)
+            await update.message.reply_text("❌ এই ডিপোজিট এখন আর পেন্ডিং নেই।")
+            return True
+        ref = re.sub(r"[\s\-_]+", "", txt)
+        if not (ref.isdigit() and 8 <= len(ref) <= 30):
+            await update.message.reply_text(
+                "❌ *Order ID শুধু সংখ্যায় হয়* (৮–৩০ ডিজিট)।\n\n"
+                "📱 Binance অ্যাপ → Pay → History → ওই পেমেন্টে চাপ দিন → "
+                "*Order ID* কপি করে পাঠান।\n\n/cancel — বাতিল",
+                parse_mode="Markdown")
+            return True
+        if await asyncio.to_thread(dep_ref_used, ref):
+            await update.message.reply_text(
+                "⚠️ এই Order ID আগেই অন্য ডিপোজিটে ব্যবহার হয়েছে — নতুন Order ID দিন।")
+            return True
+        await asyncio.to_thread(dep_set_ref, _oid, ref)
+        ctx.user_data.pop("state", None)
+        _msg = await update.message.reply_text("🔎 নতুন Order ID দিয়ে যাচাই হচ্ছে…")
+        _m2 = await asyncio.to_thread(dep_method, int(_o["method_id"] or 0))
+        _prov = dep_method_provider(_m2) if _m2 else "binance"
+        try:
+            _amt2 = float(_o["amount"] or 0)
+        except Exception:
+            _amt2 = 0.0
+        _win2 = await asyncio.to_thread(dep_uid_window)
+        _got2, _tx2, _err2 = 0.0, "", ""
+        for _w in sorted({int(_win2 or 45), 180, 1440}):
+            _got2, _tx2, _err2 = await asyncio.to_thread(
+                dep_api_find, _prov, ref, _amt2, _w)
+            if _tx2 and not _err2:
+                break
+        if _tx2 and not _err2:
+            n = await asyncio.to_thread(dep_set, _oid, "approved", 0)
+            if n:
+                await asyncio.to_thread(dep_attach_txid, _oid, _tx2)
+                await _dep_auto_credit(ctx, uid, _m2, float(_got2 or _amt2), _tx2, _oid)
+                try:
+                    await _msg.edit_text(
+                        f"✅ <b>ডিপোজিট পাওয়া গেছে!</b>\n\n"
+                        f"💵 <b>{float(_got2 or _amt2):g}$</b>\n"
+                        f"🧾 <code>#{_oid}</code>\n\nব্যালেন্স যোগ হয়েছে।",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+                return True
+        await _msg.edit_text(
+            f"⏳ *এখনো পাওয়া যায়নি*\n\n🧾 `#{_oid}`\n🔗 `{ref}`\n\n"
+            "Order ID ঠিক থাকলে ১–২ মিনিট পরে *🔁 আবার চেক* চাপুন। "
+            "নাহলে *📤 অ্যাডমিনকে পাঠান* — ছবিসহ পাঠালে অ্যাডমিন নিজে যাচাই করবেন।",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔁 আবার চেক", callback_data=f"dep:re:{_oid}")],
+                [InlineKeyboardButton("✏️ Order ID বদলান", callback_data=f"dep:fix:{_oid}")],
+                [InlineKeyboardButton("📤 অ্যাডমিনকে পাঠান (ছবি লাগবে)",
+                                      callback_data=f"dep:pf:{_oid}")]]))
+        return True
+
     mid = int(ctx.user_data.get("dep_mid") or 0)
     m = await asyncio.to_thread(dep_method, mid) if mid else None
     if not m:
@@ -8015,18 +8559,24 @@ async def dep_input(update, ctx, st):
         ctx.user_data["state"] = "dep_uid_tx"
         await update.message.reply_text(
             f"💵 `{amt:g}$`\n\n"
-            "🔗 *এখন TxID দিন* — অথবা Order ID\n\n"
-            "Binance অ্যাপ → Pay → History → ওই পেমেন্টে চাপ দিন → "
-            "*TxID / Order ID* কপি করে পাঠান।\n"
-            "_(TxID না পেলে শুধু আপনার Binance UID-ও চলবে)_\n\n/cancel — বাতিল",
-            parse_mode="Markdown")
+                    "🔗 *এখন Order ID দিন*\n\n"
+                    "📱 Binance অ্যাপ → Pay → History → ওই পেমেন্টে চাপ দিন → "
+                    "*Order ID* কপি করুন → এখানে পাঠান।\n"
+                    "_(শুধু সংখ্যা, যেমন `1226414262338551810`)_\n\n"
+                    "✅ Order ID মিললেই সাথে সাথে ব্যালেন্স যোগ হবে।\n/cancel — বাতিল",
+                    parse_mode="Markdown")
         return True
 
     if st == "dep_uid_tx":
-        ref = re.sub(r"\s+", "", txt)
-        if len(ref) < 4:
+        ref = re.sub(r"[\s\-_]+", "", txt)
+        if not (ref.isdigit() and 8 <= len(ref) <= 30):
             await update.message.reply_text(
-                "❌ TxID / Order ID ঠিক নয় — আবার পাঠান।\n\n/cancel — বাতিল")
+                "❌ *Order ID ঠিক নয়*\n\n"
+                "Binance Pay-এর Order ID শুধু সংখ্যায় হয় (৮–৩০ ডিজিট)।\n"
+                "যেমন: `1226414262338551810`\n\n"
+                "📱 Binance অ্যাপ → Pay → History → ওই পেমেন্টে চাপ দিন → "
+                "*Order ID* কপি করে পাঠান।\n\n/cancel — বাতিল",
+                parse_mode="Markdown")
             return True
         try:
             amt = float(ctx.user_data.get("dep_uid_amt") or 0)
@@ -8039,14 +8589,18 @@ async def dep_input(update, ctx, st):
                 "একই পেমেন্টে দুইবার টাকা যোগ হবে না। নতুন পেমেন্ট হলে তার TxID দিন, "
                 "নাহলে *🧾 আমার ডিপোজিট* → 🔁 আবার চেক চাপুন।")
             return True
-        wait_msg = await update.message.reply_text("🔎 Binance Pay-এ পেমেন্ট খোঁজা হচ্ছে…")
+        wait_msg = await update.message.reply_text("🔎 Binance Pay-এ Order ID খোঁজা হচ্ছে…")
         _win = await asyncio.to_thread(dep_uid_window)
         _prov = dep_method_provider(m)
         _ready = await asyncio.to_thread(dep_provider_ready, _prov)
         _tries = 3 if _ready else 1
         _got, _tx, _err = 0.0, "", ""
         for _i in range(_tries):
-            _got, _tx, _err = await asyncio.to_thread(dep_api_find, _prov, ref, amt, _win)
+            # ছোট উইন্ডো → ৩ ঘণ্টা → ২৪ ঘণ্টা (দেরিতে আসা পেমেন্টও ধরা পড়বে)
+            for _w in sorted({int(_win or 45), 180, 1440}):
+                _got, _tx, _err = await asyncio.to_thread(dep_api_find, _prov, ref, amt, _w)
+                if _tx and not _err:
+                    break
             if _tx and not _err:
                 break
             if _i < _tries - 1:
@@ -8084,23 +8638,12 @@ async def dep_input(update, ctx, st):
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔁 আবার চেক", callback_data=f"dep:re:{oid}")],
+                [InlineKeyboardButton("✏️ Order ID বদলান", callback_data=f"dep:fix:{oid}")],
                 [InlineKeyboardButton("📤 অ্যাডমিনকে পাঠান (ছবি লাগবে)",
                                       callback_data=f"dep:pf:{oid}")],
                 [InlineKeyboardButton("🧾 আমার ডিপোজিট", callback_data="dep:my")]]))
-        try:
-            await notify_full_admins(
-                ctx.bot,
-                f"💳 *Binance ডিপোজিট (যাচাই বাকি)*\n\n"
-                f"🧾 `#{oid}` · 👤 `{uid}`\n"
-                f"💵 `{amt:g}$` — {_md_esc(m['name'] or '')}\n"
-                f"🔗 `{ref}`\n"
-                f"⚠️ অটো: {_md_esc(str(_err or _why)[:120])}",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ অনুমোদন", callback_data=f"depok:{oid}"),
-                    InlineKeyboardButton("❌ বাতিল", callback_data=f"depno:{oid}"),
-                ]]))
-        except Exception:
-            pass
+        log.info(f"[DEP] অটো যাচাই ব্যর্থ #{oid} uid={uid} — অ্যাডমিনকে "
+                 f"অটো পাঠানো হয়নি (ইউজার চাইলে স্ক্রিনশট পাঠাবে): {_err or _why}")
         return True
 
     if st == "dep_amt":
@@ -11375,11 +11918,35 @@ async def show_refer(update, ctx):
                 f"(~`{_amt}$`)")
     except Exception as _sce:
         log.debug(f"[REFER] শপ কমিশন লিস্ট ব্যর্থ: {_sce}")
-    _shop_comm_blk = ("\n━━━━━━━━━━━━━━━━\n"
-                      f"🛍 *শপে রেফার কমিশন:* `{_shop_glob:g}%`\n"
-                      + "\n".join(_shop_comm_lines)) \
-        if _shop_comm_lines else (
-            f"\n━━━━━━━━━━━━━━━━\n🛍 *শপে রেফার কমিশন:* `{_shop_glob:g}%`")
+    # টাস্কের রেফার নিয়মের মতোই শপ কমিশনের পূর্ণ ব্যাখ্যা
+    if lang == 'en':
+        _shop_comm_blk = (
+            "\n━━━━━━━━━━━━━━━━\n"
+            "🛍 *Shop referral commission*\n\n"
+            "💡 *How it works:*\n"
+            "• Someone joins the bot with your link\n"
+            f"• When they buy from the shop, you get *{_shop_glob:g}%* of the price\n"
+            "• The commission is credited to your balance right away\n"
+            "• If a product has its own rate, that rate applies\n"
+            "• Direct referral only — no chain commission")
+        _shop_off = "\n━━━━━━━━━━━━━━━━\n🛍 *Shop referral commission:* currently off"
+        _shop_hdr = "\n\n📦 *Per-product commission:*\n"
+    else:
+        _shop_comm_blk = (
+            "\n━━━━━━━━━━━━━━━━\n"
+            "🛍 *শপে রেফার কমিশন*\n\n"
+            "💡 *নিয়ম:*\n"
+            "• আপনার লিংক দিয়ে কেউ বটে জয়েন করলে\n"
+            f"• সে শপ থেকে পণ্য কিনলে দামের *{_shop_glob:g}%* আপনি পাবেন\n"
+            "• কেনার সাথে সাথেই কমিশন আপনার ব্যালেন্সে যোগ হয়\n"
+            "• কোনো পণ্যে আলাদা % সেট থাকলে সেটাই প্রযোজ্য\n"
+            "• শুধু সরাসরি রেফার — chain কমিশন নেই")
+        _shop_off = "\n━━━━━━━━━━━━━━━━\n🛍 *শপে রেফার কমিশন:* এখন বন্ধ"
+        _shop_hdr = "\n\n📦 *পণ্যভিত্তিক কমিশন:*\n"
+    if _shop_glob <= 0 and not _shop_comm_lines:
+        _shop_comm_blk = _shop_off
+    elif _shop_comm_lines:
+        _shop_comm_blk += _shop_hdr + "\n".join(_shop_comm_lines)
 
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(T(uid, 'my_referrals_btn'), callback_data=f"my_refs_{uid}")
