@@ -206,6 +206,7 @@ _BNB_ALERT_COOLDOWN = 3600          # seconds (1 ঘন্টা)
 
 # ── Default menu button labels ──────────────────────────────────
 DEFAULT_BTNS = {
+    'shop':     ('🛍 পণ্য কিনুন',   '🛍 Buy Product'),
     'tasks':    ('📋 Tasks',        '📋 Tasks'),
     'profile':  ('👤 My Profile',   '👤 My Profile'),
     'balance':  ('💰 Balance',      '💰 Balance'),
@@ -2950,6 +2951,15 @@ def init_db():
                 log.info(f"[POINTS] 0–100 → 0–50 scale migrate: {len(_ps_rows)} users")
         except Exception as _pe:
             log.warning(f"[POINTS] scale migration ব্যর্থ: {_pe}")
+        # ── 🛒 Shop টেবিল (ক্যাটাগরি / পণ্য / স্টক / অর্ডার) ──
+        try:
+            _shop_ddl()
+        except Exception as _se:
+            log.warning(f"[SHOP] DDL ব্যর্থ: {_se}")
+        try:
+            _dep_ddl()
+        except Exception as _de:
+            log.warning(f"[DEP] DDL ব্যর্থ: {_de}")
         log.info("✅ PostgreSQL schema ready.")
 
 
@@ -4937,16 +4947,2006 @@ def mask_addr_short(addr):
     if len(addr) <= 12: return addr[:4] + "*****" + addr[-4:]
     return addr[:6] + "*****" + addr[-6:]
 
+# ──────────────────────────── 🛒 SHOP / দোকান ────────────────────────────
+# ইউজার ব্যালেন্স দিয়ে কিনবে। auto → txt/লাইন স্টক থেকে অটো ডেলিভারি,
+# manual → অর্ডার pending, অ্যাডমিন নিজে কনটেন্ট পাঠাবে (অথবা রিফান্ড)।
+
+def _shop_cur():
+    try:
+        v = (get_setting("shop_currency") or "").strip()
+    except Exception:
+        v = ""
+    return v or "$"
+
+
+def _shop_money(v):
+    try:
+        n = float(v or 0)
+    except Exception:
+        n = 0.0
+    s = f"{n:.2f}".rstrip("0").rstrip(".")
+    return f"{s or '0'} {_shop_cur()}"
+
+
+def _shop_ddl():
+    with _c() as c:
+        for _q in (
+            """CREATE TABLE IF NOT EXISTS shop_categories (
+                id         BIGSERIAL PRIMARY KEY,
+                name       TEXT DEFAULT '',
+                emoji      TEXT DEFAULT '🛍',
+                sort_order INTEGER DEFAULT 0,
+                is_active  INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT ''
+            )""",
+            """CREATE TABLE IF NOT EXISTS shop_products (
+                id           BIGSERIAL PRIMARY KEY,
+                category_id  BIGINT DEFAULT 0,
+                name         TEXT DEFAULT '',
+                description  TEXT DEFAULT '',
+                price        REAL DEFAULT 0,
+                deliver_type TEXT DEFAULT 'auto',
+                is_active    INTEGER DEFAULT 1,
+                sort_order   INTEGER DEFAULT 0,
+                created_at   TEXT DEFAULT ''
+            )""",
+            """CREATE TABLE IF NOT EXISTS shop_stock (
+                id         BIGSERIAL PRIMARY KEY,
+                product_id BIGINT DEFAULT 0,
+                content    TEXT DEFAULT '',
+                added_at   TEXT DEFAULT '',
+                sold       INTEGER DEFAULT 0,
+                sold_to    BIGINT DEFAULT 0,
+                sold_at    TEXT DEFAULT ''
+            )""",
+            """CREATE TABLE IF NOT EXISTS shop_orders (
+                id           BIGSERIAL PRIMARY KEY,
+                user_id      BIGINT DEFAULT 0,
+                product_id   BIGINT DEFAULT 0,
+                product_name TEXT DEFAULT '',
+                price        REAL DEFAULT 0,
+                status       TEXT DEFAULT 'delivered',
+                content      TEXT DEFAULT '',
+                created_at   TEXT DEFAULT '',
+                delivered_at TEXT DEFAULT ''
+            )""",
+            "CREATE INDEX IF NOT EXISTS shop_stock_unsold ON shop_stock (product_id, sold)",
+        ):
+            try:
+                c.execute(_q)
+            except Exception:
+                pass
+        # ── প্রথমবার চালু হলে ডিফল্ট ক্যাটাগরি (পরে এডিট/ডিলিট করা যাবে) ──
+        try:
+            _seed = c.execute("SELECT value FROM settings WHERE key=%s",
+                              ("shop_seeded",)).fetchone()
+            if not _seed or str(_seed["value"] or "") != "1":
+                _n = c.execute("SELECT COUNT(*) AS n FROM shop_categories").fetchone()
+                if int((_n or {})["n"] or 0) == 0:
+                    _defs = (("📧", "Mail"), ("🌐", "VPN"), ("🔌", "Proxy-IP"),
+                             ("📨", "Other Domain Mail"), ("🔑", "Recovery Added Mail"),
+                             ("🤖", "Meta Ai"))
+                    for _i, (_em, _nm) in enumerate(_defs, start=1):
+                        c.execute(
+                            "INSERT INTO shop_categories (name, emoji, sort_order, is_active, created_at) "
+                            "VALUES (%s,%s,%s,1,%s)", (_nm, _em, _i, now()))
+                c.execute("INSERT INTO settings (key,value) VALUES (%s,%s) "
+                          "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                          ("shop_seeded", "1"))
+                log.info("[SHOP] ডিফল্ট ক্যাটাগরি সিড হয়েছে")
+        except Exception as _sed:
+            log.debug(f"[SHOP] seed স্কিপ: {_sed}")
+
+
+def shop_cats(only_active=True):
+    sql = "SELECT * FROM shop_categories"
+    if only_active:
+        sql += " WHERE COALESCE(is_active,1)=1"
+    sql += " ORDER BY sort_order, id"
+    with _c() as c:
+        return c.execute(sql).fetchall()
+
+
+def shop_cat(cid):
+    with _c() as c:
+        return c.execute("SELECT * FROM shop_categories WHERE id=%s", (cid,)).fetchone()
+
+
+def shop_cat_add(name, emoji="🛍"):
+    with _c() as c:
+        r = c.execute(
+            "INSERT INTO shop_categories (name, emoji, sort_order, is_active, created_at) "
+            "VALUES (%s,%s,%s,1,%s) RETURNING id",
+            ((name or "")[:80], (emoji or "🛍")[:8],
+             int(c.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shop_categories").fetchone()["n"] or 1),
+             now())).fetchone()
+    return int(r["id"]) if r else 0
+
+
+def shop_products(cid=None, only_active=True):
+    sql = ("SELECT p.*, "
+           "(SELECT COUNT(*) FROM shop_stock s WHERE s.product_id=p.id AND COALESCE(s.sold,0)=0) AS stock, "
+           "(SELECT COUNT(*) FROM shop_stock s2 WHERE s2.product_id=p.id AND COALESCE(s2.sold,0)=1) AS sold_n "
+           "FROM shop_products p WHERE 1=1")
+    args = []
+    if only_active:
+        sql += " AND COALESCE(p.is_active,1)=1"
+    if cid is not None:
+        sql += " AND COALESCE(p.category_id,0)=%s"
+        args.append(int(cid))
+    sql += " ORDER BY p.sort_order, p.id"
+    with _c() as c:
+        return c.execute(sql, tuple(args)).fetchall()
+
+
+def shop_product(pid):
+    with _c() as c:
+        return c.execute("SELECT * FROM shop_products WHERE id=%s", (pid,)).fetchone()
+
+
+def shop_product_add(cid, name, price, deliver_type="auto", desc=""):
+    with _c() as c:
+        r = c.execute(
+            "INSERT INTO shop_products (category_id, name, description, price, deliver_type, "
+            "is_active, sort_order, created_at) VALUES (%s,%s,%s,%s,%s,1,%s,%s) RETURNING id",
+            (int(cid or 0), (name or "")[:120], desc or "", float(price or 0),
+             "manual" if deliver_type == "manual" else "auto",
+             int(c.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shop_products").fetchone()["n"] or 1),
+             now())).fetchone()
+    return int(r["id"]) if r else 0
+
+
+def shop_product_del(pid):
+    with _c() as c:
+        c.execute("DELETE FROM shop_stock WHERE product_id=%s AND COALESCE(sold,0)=0", (pid,))
+        c.execute("DELETE FROM shop_products WHERE id=%s", (pid,))
+
+
+def shop_product_toggle(pid):
+    with _c() as c:
+        r = c.execute("SELECT is_active FROM shop_products WHERE id=%s", (pid,)).fetchone()
+        if not r:
+            return 0
+        new = 0 if int(r["is_active"] or 0) else 1
+        c.execute("UPDATE shop_products SET is_active=%s WHERE id=%s", (new, pid))
+    return new
+
+
+def shop_stock_count(pid):
+    with _c() as c:
+        r = c.execute("SELECT COUNT(*) AS n FROM shop_stock WHERE product_id=%s AND COALESCE(sold,0)=0",
+                      (pid,)).fetchone()
+    return int(r["n"] or 0) if r else 0
+
+
+def shop_add_stock(pid, text):
+    """প্রতি লাইনে ১টা আইটেম। রিটার্ন: কতটা স্টক যোগ হলো।"""
+    lines = [ln.strip() for ln in str(text or "").replace("\r", "").split("\n")]
+    lines = [ln for ln in lines if ln][:2000]
+    if not lines:
+        return 0
+    with _c() as c:
+        for ln in lines:
+            c.execute("INSERT INTO shop_stock (product_id, content, added_at, sold) "
+                      "VALUES (%s,%s,%s,0)", (int(pid), ln[:3900], now()))
+    return len(lines)
+
+
+def shop_take_stock(pid, uid):
+    """Atomic: একটা unsold আইটেম দখল করে (stock_id, content) দেয়, না থাকলে None।"""
+    with _c() as c:
+        r = c.execute(
+            "UPDATE shop_stock SET sold=1, sold_to=%s, sold_at=%s "
+            "WHERE id = (SELECT id FROM shop_stock WHERE product_id=%s AND COALESCE(sold,0)=0 "
+            "            ORDER BY id LIMIT 1) "
+            "RETURNING id, content", (int(uid), now(), int(pid))).fetchone()
+    if not r:
+        return None
+    return int(r["id"]), str(r["content"] or "")
+
+
+def shop_release_stock(sid):
+    try:
+        with _c() as c:
+            c.execute("UPDATE shop_stock SET sold=0, sold_to=0, sold_at='' WHERE id=%s", (int(sid),))
+    except Exception:
+        pass
+
+
+def shop_order_new(uid, p, content, status):
+    with _c() as c:
+        r = c.execute(
+            "INSERT INTO shop_orders (user_id, product_id, product_name, price, status, "
+            "content, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (int(uid), int(p["id"]), str(p["name"] or "")[:120], float(p["price"] or 0),
+             status, content or "", now())).fetchone()
+    return int(r["id"]) if r else 0
+
+
+def shop_order(oid):
+    with _c() as c:
+        return c.execute("SELECT * FROM shop_orders WHERE id=%s", (oid,)).fetchone()
+
+
+def shop_order_set(oid, status, content=None):
+    with _c() as c:
+        if content is None:
+            c.execute("UPDATE shop_orders SET status=%s WHERE id=%s", (status, oid))
+        else:
+            c.execute("UPDATE shop_orders SET status=%s, content=%s, delivered_at=%s WHERE id=%s",
+                      (status, content, now(), oid))
+
+
+def shop_orders_of(uid, limit=8):
+    with _c() as c:
+        return c.execute("SELECT * FROM shop_orders WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+                         (int(uid), int(limit))).fetchall()
+
+
+def shop_orders_pending(limit=20):
+    with _c() as c:
+        return c.execute("SELECT * FROM shop_orders WHERE status='pending' ORDER BY id LIMIT %s",
+                         (int(limit),)).fetchall()
+
+
+_SHOP_ST_BN = {"delivered": "✅ ডেলিভারি হয়েছে", "pending": "⏳ অপেক্ষমাণ",
+               "refunded": "💸 রিফান্ড হয়েছে", "cancelled": "❌ বাতিল"}
+
+
+def _shop_type(p):
+    return "manual" if (p["deliver_type"] or "auto") == "manual" else "auto"
+
+
+def _shop_btn_label(p, stock):
+    nm = (p["name"] or "?")[:40]
+    if _shop_type(p) == "manual":
+        return f"{nm} · {_shop_money(p['price'])} · 📦 হাতে ডেলিভারি"
+    if stock > 0:
+        return f"{nm} · {_shop_money(p['price'])} · স্টক ({stock})"
+    return f"{nm} · স্টক নেই ❌"
+
+
+def _shop_cats_kb(cats, other=False):
+    rows, row = [], []
+    for ct in cats:
+        lbl = f"{ct['emoji'] or '🛍'} {ct['name'] or ''}".strip()[:38]
+        row.append(InlineKeyboardButton(lbl, callback_data=f"shop:c:{int(ct['id'])}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if other:
+        rows.append([InlineKeyboardButton("📦 অন্যান্য", callback_data="shop:c:0")])
+    rows.append([InlineKeyboardButton("🧾 আমার অর্ডার", callback_data="shop:my")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _shop_prods_kb(cid, prods):
+    rows = []
+    for p in prods:
+        stock = int(p["stock"] or 0)
+        if _shop_type(p) == "auto" and stock <= 0:
+            rows.append([InlineKeyboardButton(_shop_btn_label(p, stock),
+                                              callback_data=f"shop:no:{int(p['id'])}")])
+        else:
+            rows.append([InlineKeyboardButton(_shop_btn_label(p, stock),
+                                              callback_data=f"shop:p:{int(p['id'])}")])
+    rows.append([InlineKeyboardButton("🔙 ফিরে যান", callback_data="shop:list")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_shop(update, ctx=None):
+    """🛍 পণ্য কিনুন — ক্যাটাগরি লিস্ট।"""
+    cats = await asyncio.to_thread(shop_cats)
+    prods_other = await asyncio.to_thread(shop_products, 0)
+    txt = ("🛍 *প্রোডাক্ট ক্যাটাগরি বেছে নিন*\n\n"
+           "নিচের বাটন থেকে ক্যাটাগরি বেছে নিন, তারপর পণ্য।\n"
+           "💵 পেমেন্ট আপনার ব্যালেন্স থেকে কেটে নেওয়া হবে।")
+    if not cats and not prods_other:
+        txt = ("🛍 *দোকান*\n\nএখনো কোনো পণ্য যোগ করা হয়নি।\n"
+               "অ্যাডমিন শীঘ্রই পণ্য যোগ করবেন।")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="shop:back")]])
+    else:
+        kb = _shop_cats_kb(cats, other=bool(prods_other))
+    msg = update.effective_message
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+        except Exception:
+            msg = update.callback_query.message
+    await msg.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+
+async def _shop_show_cat(q, cid):
+    cat = None
+    if cid:
+        cat = await asyncio.to_thread(shop_cat, cid)
+    prods = await asyncio.to_thread(shop_products, cid)
+    title = ((cat["emoji"] or "🛍") + " " + (cat["name"] or "")) if cat else "📦 অন্যান্য"
+    if not prods:
+        await q.edit_message_text(
+            f"{title}\n\nএই ক্যাটাগরিতে এখন কোনো পণ্য নেই।",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 ফিরে যান", callback_data="shop:list")]]))
+        return
+    txt = (f"*{_md_esc(title)}*\n\n"
+           "👇 পণ্য বেছে নিন। বাটনে দাম ও স্টক দেখা যাচ্ছে।")
+    try:
+        await q.edit_message_text(txt, parse_mode="Markdown",
+                                  reply_markup=_shop_prods_kb(cid, prods))
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="Markdown",
+                                   reply_markup=_shop_prods_kb(cid, prods))
+
+
+async def _shop_show_product(q, pid):
+    p = await asyncio.to_thread(shop_product, pid)
+    if not p or not int(p["is_active"] or 1):
+        await q.edit_message_text("❌ পণ্যটি এখন পাওয়া যাচ্ছে না।")
+        return
+    stock = await asyncio.to_thread(shop_stock_count, pid)
+    typ = _shop_type(p)
+    if typ == "manual":
+        stock_line = "📦 ডেলিভারি: অ্যাডমিন নিজে পাঠাবেন (সাধারণত ৫–৩০ মিনিট)"
+    else:
+        stock_line = f"📦 স্টক: `{stock}`" if stock > 0 else "📦 স্টক: `0` ❌"
+    desc = (p["description"] or "").strip()
+    txt = (f"🛍 *{_md_esc(p['name'] or '')}*\n"
+           f"━━━━━━━━━━━━━━\n"
+           f"💵 দাম: *{_shop_money(p['price'])}*\n"
+           f"{stock_line}\n")
+    if desc:
+        txt += f"\n📝 {desc[:700]}\n"
+    rows = []
+    if typ == "manual" or stock > 0:
+        rows.append([InlineKeyboardButton("✅ কিনুন", callback_data=f"shop:b:{int(p['id'])}")])
+    rows.append([InlineKeyboardButton("🔙 ফিরে যান", callback_data=f"shop:c:{int(p['category_id'] or 0)}")])
+    try:
+        await q.edit_message_text(txt, parse_mode="Markdown",
+                                  reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="Markdown",
+                                   reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _shop_show_confirm(q, pid):
+    uid = q.from_user.id
+    p = await asyncio.to_thread(shop_product, pid)
+    if not p:
+        await q.edit_message_text("❌ পণ্যটি পাওয়া যাচ্ছে না।")
+        return
+    bal = await asyncio.to_thread(get_bal, uid)
+    price = float(p["price"] or 0)
+    after = bal - price
+    txt = (f"🧾 *অর্ডার নিশ্চিত করুন*\n"
+           f"━━━━━━━━━━━━━━\n"
+           f"🛍 পণ্য: *{_md_esc(p['name'] or '')}*\n"
+           f"💵 দাম: *{_shop_money(price)}*\n"
+           f"💰 আপনার ব্যালেন্স: `{_shop_money(bal)}`\n"
+           f"➡️ কেনার পরে থাকবে: `{_shop_money(after)}`\n\n")
+    if after < 0:
+        txt += "❌ *ব্যালেন্স যথেষ্ট নয়।* আগে ডিপোজিট করুন।"
+        rows = [[InlineKeyboardButton("🔙 ফিরে যান", callback_data=f"shop:p:{int(p['id'])}")]]
+    else:
+        txt += "✅ নিশ্চিত হলে নিচের বাটনে চাপুন।"
+        rows = [[InlineKeyboardButton("✅ নিশ্চিত করে কিনুন", callback_data=f"shop:y:{int(p['id'])}")],
+                [InlineKeyboardButton("❌ বাতিল", callback_data=f"shop:p:{int(p['id'])}")]]
+    try:
+        await q.edit_message_text(txt, parse_mode="Markdown",
+                                  reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="Markdown",
+                                   reply_markup=InlineKeyboardMarkup(rows))
+
+
+def _shop_deliver_body(p, content):
+    return (f"✅ <b>অর্ডার সম্পন্ন!</b>\n\n"
+            f"🛍 পণ্য: <b>{html.escape(str(p['name'] or ''))}</b>\n"
+            f"💵 মূল্য: <b>{html.escape(_shop_money(p['price']))}</b>\n\n"
+            f"📦 <b>আপনার প্রোডাক্ট:</b>\n"
+            f"<pre>{html.escape(str(content or '')[:3500])}</pre>\n\n"
+            f"⚠️ এই তথ্য কারও সাথে শেয়ার করবেন না। সমস্যা হলে সাপোর্টে মেসেজ দিন।")
+
+
+async def _shop_do_buy(q, ctx, pid):
+    uid = q.from_user.id
+    p = await asyncio.to_thread(shop_product, pid)
+    if not p or not int(p["is_active"] or 1):
+        await q.answer("পণ্যটি এখন নেই", show_alert=True)
+        return
+    price = float(p["price"] or 0)
+    typ = _shop_type(p)
+    bal = await asyncio.to_thread(get_bal, uid)
+    if price > bal:
+        await q.answer("ব্যালেন্স যথেষ্ট নয়", show_alert=True)
+        return
+    taken = None
+    if typ == "auto":
+        taken = await asyncio.to_thread(shop_take_stock, pid, uid)
+        if not taken:
+            await q.answer("স্টক শেষ", show_alert=True)
+            try:
+                await q.edit_message_text(
+                    f"😔 *{_md_esc(p['name'] or '')}* — স্টক শেষ!\n\n"
+                    "নতুন স্টক এলে আবার চেষ্টা করুন।",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 ফিরে যান", callback_data=f"shop:c:{int(p['category_id'] or 0)}")]]))
+            except Exception:
+                pass
+            return
+    if price > 0 and not await asyncio.to_thread(safe_ded_bal, uid, price):
+        if taken:
+            await asyncio.to_thread(shop_release_stock, taken[0])
+        await q.answer("ব্যালেন্স যথেষ্ট নয়", show_alert=True)
+        return
+    try:
+        await q.answer("✅ অর্ডার হয়েছে")
+    except Exception:
+        pass
+    if typ == "auto":
+        content = taken[1]
+        oid = await asyncio.to_thread(shop_order_new, uid, p, content, "delivered")
+        try:
+            await q.edit_message_text("✅ পেমেন্ট সম্পন্ন — প্রোডাক্ট নিচে পাঠানো হলো।")
+        except Exception:
+            pass
+        try:
+            await ctx.bot.send_message(uid, _shop_deliver_body(p, content), parse_mode="HTML")
+        except Exception as e:
+            log.warning(f"[SHOP] ডেলিভারি মেসেজ ব্যর্থ uid={uid} pid={pid}: {e}")
+        try:
+            await notify_full_admins(
+                ctx.bot,
+                f"🛒 *নতুন অর্ডার (অটো)*\n\n"
+                f"🆔 অর্ডার: `#{oid}`\n"
+                f"🛍 পণ্য: {_md_esc(p['name'] or '')}\n"
+                f"💵 দাম: `{_shop_money(price)}`\n"
+                f"👤 ইউজার: `{uid}`\n"
+                f"📦 বাকি স্টক: `{await asyncio.to_thread(shop_stock_count, pid)}`")
+        except Exception:
+            pass
+    else:
+        oid = await asyncio.to_thread(shop_order_new, uid, p, "", "pending")
+        try:
+            await q.edit_message_text(
+                f"⏳ *অর্ডার গ্রহণ করা হয়েছে*\n\n"
+                f"🆔 অর্ডার: `#{oid}`\n"
+                f"🛍 পণ্য: {_md_esc(p['name'] or '')}\n"
+                f"💵 দাম: `{_shop_money(price)}`\n\n"
+                "অ্যাডমিন খুব শীঘ্রই আপনার প্রোডাক্ট পাঠিয়ে দেবেন।",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 দোকানে ফিরুন", callback_data="shop:list")]]))
+        except Exception:
+            pass
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ ডেলিভারি দিন", callback_data=f"shopao:{oid}"),
+            InlineKeyboardButton("💸 রিফান্ড", callback_data=f"shopar:{oid}"),
+        ]])
+        try:
+            await notify_full_admins(
+                ctx.bot,
+                f"🛒 *নতুন অর্ডার (ম্যানুয়াল ডেলিভারি)*\n\n"
+                f"🆔 অর্ডার: `#{oid}`\n"
+                f"🛍 পণ্য: {_md_esc(p['name'] or '')}\n"
+                f"💵 দাম: `{_shop_money(price)}`\n"
+                f"👤 ইউজার: `{uid}` ({(q.from_user.full_name or '')[:40]})\n\n"
+                f"✅ চাপলে বট কনটেন্ট চাইবে, ওটা পাঠালেই ইউজার পাবে।",
+                reply_markup=kb)
+        except Exception:
+            pass
+
+
+async def _shop_show_my(q):
+    uid = q.from_user.id
+    rows_db = await asyncio.to_thread(shop_orders_of, uid, 8)
+    if not rows_db:
+        txt = "🧾 *আমার অর্ডার*\n\nএখনো কোনো অর্ডার নেই।"
+    else:
+        lines = ["🧾 *আমার অর্ডার (সর্বশেষ ৮টি)*", "━━━━━━━━━━━━━━"]
+        for r in rows_db:
+            st_txt = _SHOP_ST_BN.get(str(r["status"] or ""), str(r["status"] or ""))
+            lines.append(f"`#{int(r['id'])}` {_md_esc(str(r['product_name'] or '')[:38])}\n"
+                         f"   {_shop_money(r['price'])} · {st_txt} · {str(r['created_at'] or '')[:16]}")
+        txt = "\n".join(lines)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="shop:list")]])
+    try:
+        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+
+async def shop_callback(update, ctx):
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    d = q.data or ""
+    uid = q.from_user.id
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    # ── অ্যাডমিন সাইড ──
+    if d == "adm_shop" or d.startswith("shopa:") or d.startswith("shopaon:") \
+            or d.startswith("shopar:") or d.startswith("shopao:"):
+        if not await asyncio.to_thread(is_admin, uid):
+            return
+        return await _shop_admin_cb(q, ctx, d)
+
+    # ── ইউজার সাইড ──
+    if d in ("shop:list", "shop:back"):
+        return await show_shop(update, ctx)
+    if d == "shop:my":
+        return await _shop_show_my(q)
+    try:
+        if d.startswith("shop:c:"):
+            return await _shop_show_cat(q, int(d.split(":")[2]))
+        if d.startswith("shop:p:"):
+            return await _shop_show_product(q, int(d.split(":")[2]))
+        if d.startswith("shop:b:"):
+            return await _shop_show_confirm(q, int(d.split(":")[2]))
+        if d.startswith("shop:y:"):
+            return await _shop_do_buy(q, ctx, int(d.split(":")[2]))
+        if d.startswith("shop:no:"):
+            await q.answer("এই পণ্যের স্টক এখন নেই 😔", show_alert=True)
+            return
+    except Exception as e:
+        log.warning(f"[SHOP] callback {d} ব্যর্থ: {e}")
+        try:
+            await q.answer("কিছু একটা সমস্যা হয়েছে", show_alert=True)
+        except Exception:
+            pass
+
+
+# ── অ্যাডমিন: শপ ম্যানেজ ──
+def _shop_admin_kb(pending_n=0):
+    rows = [
+        [InlineKeyboardButton("📁 ক্যাটাগরি", callback_data="shopa:cats"),
+         InlineKeyboardButton("📦 পণ্য তালিকা", callback_data="shopa:prods")],
+        [InlineKeyboardButton(f"⏳ পেন্ডিং অর্ডার ({pending_n})", callback_data="shopa:pend")],
+        [InlineKeyboardButton("📥 স্টক যোগ (txt)", callback_data="shopa:help_stock")],
+        [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_panel")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def _shop_admin_panel(q):
+    cats = await asyncio.to_thread(shop_cats, False)
+    prods = await asyncio.to_thread(shop_products, None, False)
+    pend = await asyncio.to_thread(shop_orders_pending, 50)
+    total_stock = 0
+    for p in prods:
+        total_stock += int(p["stock"] or 0)
+    txt = ("🛒 *Shop / দোকান ম্যানেজার*\n"
+           "━━━━━━━━━━━━━━\n"
+           f"📁 ক্যাটাগরি: `{len(cats)}`\n"
+           f"📦 পণ্য: `{len(prods)}`\n"
+           f"📥 মোট স্টক (বিক্রির জন্য): `{total_stock}`\n"
+           f"⏳ পেন্ডিং অর্ডার: `{len(pend)}`\n\n"
+           "👉 ক্যাটাগরি তৈরি করুন → পণ্য যোগ করুন → txt/লাইন দিয়ে স্টক দিন।\n"
+           "ইউজার কিনলেই বট নিজে স্টক থেকে ১টা পাঠাবে।")
+    try:
+        await q.edit_message_text(txt, parse_mode="Markdown",
+                                  reply_markup=_shop_admin_kb(len(pend)))
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="Markdown",
+                                   reply_markup=_shop_admin_kb(len(pend)))
+
+
+async def _shop_admin_cats(q):
+    cats = await asyncio.to_thread(shop_cats, False)
+    lines = ["📁 *ক্যাটাগরি তালিকা*", "━━━━━━━━━━━━━━"]
+    rows = []
+    if not cats:
+        lines.append("_কোনো ক্যাটাগরি নেই_")
+    for ct in cats:
+        n = await asyncio.to_thread(shop_products, int(ct["id"]), False)
+        st = "🟢" if int(ct["is_active"] or 1) else "🔴"
+        lines.append(f"{st} {ct['emoji'] or '🛍'} *{_md_esc(ct['name'] or '')}* — `{len(n)}` পণ্য")
+        rows.append([InlineKeyboardButton(f"{st} {ct['emoji'] or '🛍'} {ct['name'] or ''}"[:40],
+                                          callback_data=f"shopa:cat:{int(ct['id'])}")])
+    rows.append([InlineKeyboardButton("➕ নতুন ক্যাটাগরি", callback_data="shopa:newcat")])
+    rows.append([InlineKeyboardButton("🔙 Shop", callback_data="adm_shop")])
+    await q.edit_message_text("\n".join(lines), parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup(rows))
+
+
+def _shop_cats_kb_admin(cats, other=False):
+    rows, row = [], []
+    for ct in cats:
+        lbl = f"{ct['emoji'] or '🛍'} {ct['name'] or ''}".strip()[:38]
+        row.append(InlineKeyboardButton(lbl, callback_data=f"shopa:cat:{int(ct['id'])}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if other:
+        rows.append([InlineKeyboardButton("📦 অন্যান্য", callback_data="shopa:cat:0")])
+    rows.append([InlineKeyboardButton("➕ নতুন ক্যাটাগরি", callback_data="shopa:newcat")])
+    rows.append([InlineKeyboardButton("🔙 Shop", callback_data="adm_shop")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _shop_admin_cat(q, cid):
+    ct = await asyncio.to_thread(shop_cat, cid) if cid else None
+    prods = await asyncio.to_thread(shop_products, cid, False) if cid else \
+        await asyncio.to_thread(shop_products, 0, False)
+    title = (ct["emoji"] + " " + ct["name"]) if ct else "📦 অন্যান্য"
+    lines = [f"{title}", "━━━━━━━━━━━━━━", f"📦 পণ্য: `{len(prods)}`"]
+    rows = []
+    for p in prods:
+        st = "🟢" if int(p["is_active"] or 1) else "🔴"
+        lines.append(f"{st} {_md_esc(p['name'] or '')} — {_shop_money(p['price'])} · স্টক `{int(p['stock'] or 0)}`")
+        rows.append([InlineKeyboardButton(f"{st} {p['name'] or ''}"[:40],
+                                          callback_data=f"shopa:p:{int(p['id'])}")])
+    rows.append([InlineKeyboardButton("➕ নতুন পণ্য", callback_data=f"shopa:newp:{cid}")])
+    rows.append([InlineKeyboardButton("🔙 ক্যাটাগরি", callback_data="shopa:cats")])
+    await q.edit_message_text("\n".join(lines), parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _shop_admin_prod(q, pid):
+    p = await asyncio.to_thread(shop_product, pid)
+    if not p:
+        await q.edit_message_text("❌ পণ্য নেই")
+        return
+    stock = await asyncio.to_thread(shop_stock_count, pid)
+    st = "🟢 চালু" if int(p["is_active"] or 1) else "🔴 বন্ধ"
+    txt = (f"📦 *{_md_esc(p['name'] or '')}*\n"
+           f"━━━━━━━━━━━━━━\n"
+           f"💵 দাম: `{_shop_money(p['price'])}`\n"
+           f"🚚 ডেলিভারি: `{'ম্যানুয়াল' if _shop_type(p) == 'manual' else 'অটো (স্টক)'}`\n"
+           f"📥 স্টক বাকি: `{stock}`\n"
+           f"⚙️ স্ট্যাটাস: {st}")
+    rows = [
+        [InlineKeyboardButton("📥 স্টক যোগ করুন", callback_data=f"shopa:st:{int(p['id'])}"),
+         InlineKeyboardButton("🔁 চালু/বন্ধ", callback_data=f"shopa:tg:{int(p['id'])}")],
+        [InlineKeyboardButton("🗑 পণ্য ডিলিট", callback_data=f"shopa:del:{int(p['id'])}")],
+        [InlineKeyboardButton("🔙 ফিরে যান", callback_data=f"shopa:cat:{int(p['category_id'] or 0)}")],
+    ]
+    await q.edit_message_text(txt, parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _shop_admin_pending(q):
+    rows_db = await asyncio.to_thread(shop_orders_pending, 20)
+    if not rows_db:
+        await q.edit_message_text(
+            "⏳ *পেন্ডিং অর্ডার*\n\nকোনো অপেক্ষমাণ অর্ডার নেই ✅",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Shop", callback_data="adm_shop")]]))
+        return
+    lines = ["⏳ *পেন্ডিং অর্ডার*", "━━━━━━━━━━━━━━"]
+    rows = []
+    for r in rows_db:
+        lines.append(f"`#{int(r['id'])}` {_md_esc(str(r['product_name'] or '')[:34])}\n"
+                     f"   {_shop_money(r['price'])} · uid `{int(r['user_id'])}` · {str(r['created_at'] or '')[:16]}")
+        rows.append([
+            InlineKeyboardButton(f"✅ #{int(r['id'])}", callback_data=f"shopao:{int(r['id'])}"),
+            InlineKeyboardButton(f"💸 #{int(r['id'])}", callback_data=f"shopar:{int(r['id'])}"),
+        ])
+    rows.append([InlineKeyboardButton("🔙 Shop", callback_data="adm_shop")])
+    await q.edit_message_text("\n".join(lines), parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _shop_admin_cb(q, ctx, d):
+    try:
+        if d == "adm_shop":
+            return await _shop_admin_panel(q)
+        if d == "shopa:cats":
+            return await _shop_admin_cats(q)
+        if d == "shopa:prods":
+            cats = await asyncio.to_thread(shop_cats, False)
+            other = await asyncio.to_thread(shop_products, 0, False)
+            await q.edit_message_text("📦 *পণ্য তালিকা*\n\nক্যাটাগরি বেছে নিন:",
+                                      parse_mode="Markdown",
+                                      reply_markup=_shop_cats_kb_admin(cats, bool(other)))
+            return
+        if d == "shopa:pend":
+            return await _shop_admin_pending(q)
+        if d == "shopa:help_stock":
+            await q.edit_message_text(
+                "📥 *স্টক যোগ করার নিয়ম*\n\n"
+                "১) 📦 পণ্য তালিকা → পণ্য → *📥 স্টক যোগ করুন*\n"
+                "২) প্রতি লাইনে ১টা আইটেম পাঠান, বা `.txt` ফাইল দিন\n"
+                "৩) ইউজার কিনলে বট একটা একটা করে দেবে, শেষ হলে \"স্টক নেই\" দেখাবে\n\n"
+                "🔁 ম্যানুয়াল পণ্য হলে স্টক লাগবে না — অর্ডার এলে আপনি নিজে পাঠাবেন।",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Shop", callback_data="adm_shop")]]))
+            return
+        if d == "shopa:newcat":
+            ctx.user_data["state"] = "shopa_newcat"
+            await q.edit_message_text(
+                "📁 *নতুন ক্যাটাগরি*\n\nক্যাটাগরির নাম লিখুন।\n"
+                "শুরুতে ইমোজি দিলেও চলবে (যেমন: `VPN` বা `🌐 VPN`)।\n\n/cancel — বাতিল",
+                parse_mode="Markdown")
+            return
+        if d.startswith("shopa:ptype:"):
+            typ = d.split(":")[2]
+            info = ctx.user_data.get("shop_new") or {}
+            ctx.user_data.pop("state", None)
+            cid = int(info.get("cid") or 0)
+            pid = await asyncio.to_thread(shop_product_add, cid, info.get("name") or "",
+                                          info.get("price") or 0, typ)
+            ctx.user_data.pop("shop_new", None)
+            await q.edit_message_text(
+                f"✅ পণ্য তৈরি হয়েছে (`#{pid}`)\n\n"
+                f"🛍 {_md_esc(info.get('name') or '')}\n"
+                f"💵 {_shop_money(info.get('price'))}\n"
+                f"🚚 {'ম্যানুয়াল' if typ == 'manual' else 'অটো (স্টক)'}\n\n"
+                + ("এখন স্টক যোগ করুন 👇" if typ != "manual" else "অর্ডার এলে আপনি নিজে ডেলিভারি দেবেন।"),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📥 স্টক যোগ", callback_data=f"shopa:st:{pid}")],
+                    [InlineKeyboardButton("🔙 ক্যাটাগরি", callback_data=f"shopa:cat:{cid}")]]))
+            return
+        if d.startswith("shopa:cat:"):
+            return await _shop_admin_cat(q, int(d.split(":")[2]))
+        if d.startswith("shopa:p:"):
+            return await _shop_admin_prod(q, int(d.split(":")[2]))
+        if d.startswith("shopa:newp:"):
+            cid = int(d.split(":")[2])
+            ctx.user_data["shop_new"] = {"cid": cid}
+            ctx.user_data["state"] = "shopa_pname"
+            await q.edit_message_text(
+                "📦 *নতুন পণ্য — ধাপ ১/৩*\n\nপণ্যের নাম লিখুন (যেমন: `Outlook Trusted`)।\n\n/cancel — বাতিল",
+                parse_mode="Markdown")
+            return
+        if d.startswith("shopa:st:"):
+            pid = int(d.split(":")[2])
+            p = await asyncio.to_thread(shop_product, pid)
+            ctx.user_data["state"] = f"shopa_txt:{pid}"
+            await q.edit_message_text(
+                f"📥 *স্টক যোগ — {_md_esc((p['name'] if p else '') or '')}*\n\n"
+                "প্রতি লাইনে *১টা* আইটেম লিখে পাঠান, অথবা `.txt` ফাইল আপলোড করুন।\n"
+                "খালি লাইন বাদ যাবে।\n\n"
+                "উদাহরণ:\n`user1@outlook.com:pass1`\n`user2@outlook.com:pass2`\n\n/cancel — বাতিল",
+                parse_mode="Markdown")
+            return
+        if d.startswith("shopa:tg:"):
+            pid = int(d.split(":")[2])
+            await asyncio.to_thread(shop_product_toggle, pid)
+            return await _shop_admin_prod(q, pid)
+        if d.startswith("shopa:del:"):
+            pid = int(d.split(":")[2])
+            p = await asyncio.to_thread(shop_product, pid)
+            cid = int((p["category_id"] if p else 0) or 0)
+            await asyncio.to_thread(shop_product_del, pid)
+            await q.answer("পণ্য ডিলিট হয়েছে", show_alert=True)
+            return await _shop_admin_cat(q, cid)
+        if d.startswith("shopao:") or d.startswith("shopar:"):
+            oid = int(d.split(":")[1])
+            o = await asyncio.to_thread(shop_order, oid)
+            if not o:
+                await q.answer("অর্ডার নেই", show_alert=True)
+                return
+            if str(o["status"]) != "pending":
+                await q.answer("এই অর্ডার আগেই প্রসেস হয়েছে", show_alert=True)
+                return
+            if d.startswith("shopao:"):
+                ctx.user_data["state"] = f"shopa_cont:{oid}"
+                await q.message.reply_text(
+                    f"✍️ *অর্ডার #{oid} — ডেলিভারি কনটেন্ট*\n\n"
+                    f"🛍 {_md_esc(str(o['product_name'] or ''))}\n"
+                    f"👤 uid `{int(o['user_id'])}`\n\n"
+                    "যে টেক্সট/একাউন্ট ইউজারকে পাঠাতে হবে সেটা লিখে পাঠান।\n"
+                    "ইউজার এটা সরাসরি পাবে।\n\n/cancel — বাতিল",
+                    parse_mode="Markdown")
+                return
+            price = float(o["price"] or 0)
+            await asyncio.to_thread(add_bal, int(o["user_id"]), price)
+            await asyncio.to_thread(shop_order_set, oid, "refunded")
+            try:
+                await ctx.bot.send_message(
+                    int(o["user_id"]),
+                    f"💸 *অর্ডার #{oid} বাতিল — টাকা ফেরত দেওয়া হয়েছে*\n\n"
+                    f"🛍 {_md_esc(str(o['product_name'] or ''))}\n"
+                    f"💰 `{_shop_money(price)}` আপনার ব্যালেন্সে ফেরত গেছে।",
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+            await q.answer("রিফান্ড হয়েছে", show_alert=True)
+            try:
+                await q.edit_message_text(
+                    f"{q.message.text or ''}\n\n💸 *রিফান্ড করা হয়েছে*", parse_mode="Markdown")
+            except Exception:
+                pass
+            return
+    except Exception as e:
+        log.warning(f"[SHOP-ADMIN] {d} ব্যর্থ: {e}")
+        try:
+            await q.answer("সমস্যা হয়েছে", show_alert=True)
+        except Exception:
+            pass
+
+
+async def shop_admin_input(update, ctx, st):
+    """অ্যাডমিনের টেক্সট ইনপুট (স্টেট `shopa_*`)। True = হ্যান্ডল হয়েছে।"""
+    uid = update.effective_user.id
+    if not await asyncio.to_thread(is_admin, uid):
+        return False
+    txt = (update.message.text or "").strip()
+
+    if st == "shopa_newcat":
+        if len(txt) < 2:
+            await update.message.reply_text("❌ নাম খুব ছোট — আবার লিখুন (/cancel বাতিল)।")
+            return True
+        emoji, name = "🛍", txt
+        parts = txt.split(None, 1)
+        if len(parts) == 2 and not parts[0].isalnum() and len(parts[0]) <= 4:
+            emoji, name = parts[0], parts[1]
+        cid = await asyncio.to_thread(shop_cat_add, name, emoji)
+        ctx.user_data.pop("state", None)
+        await update.message.reply_text(
+            f"✅ ক্যাটাগরি তৈরি: {emoji} *{_md_esc(name)}* (`#{cid}`)\n\n"
+            "এখন এতে পণ্য যোগ করুন।",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ পণ্য যোগ", callback_data=f"shopa:newp:{cid}")],
+                [InlineKeyboardButton("🔙 Shop", callback_data="adm_shop")]]))
+        return True
+
+    if st == "shopa_pname":
+        if len(txt) < 2:
+            await update.message.reply_text("❌ নাম খুব ছোট — আবার লিখুন (/cancel বাতিল)।")
+            return True
+        d = ctx.user_data.get("shop_new") or {}
+        d["name"] = txt[:120]
+        ctx.user_data["shop_new"] = d
+        ctx.user_data["state"] = "shopa_pprice"
+        await update.message.reply_text(
+            f"💵 *ধাপ ২/৩ — দাম*\n\n`{_md_esc(txt)}` এর দাম লিখুন "
+            f"(শুধু সংখ্যা, যেমন `0.78`)।\n\n/cancel — বাতিল",
+            parse_mode="Markdown")
+        return True
+
+    if st == "shopa_pprice":
+        try:
+            price = float(txt.replace(",", ".").replace(_shop_cur(), "").strip())
+        except Exception:
+            await update.message.reply_text("❌ শুধু সংখ্যা লিখুন (যেমন 0.78)।")
+            return True
+        if price < 0:
+            await update.message.reply_text("❌ দাম ঋণাত্মক হতে পারে না।")
+            return True
+        d = ctx.user_data.get("shop_new") or {}
+        d["price"] = price
+        ctx.user_data["shop_new"] = d
+        ctx.user_data["state"] = "shopa_ptype"
+        await update.message.reply_text(
+            f"🚚 *ধাপ ৩/৩ — ডেলিভারি ধরন*\n\n"
+            f"পণ্য: *{_md_esc(d.get('name') or '')}*\n"
+            f"দাম: `{_shop_money(price)}`\n\n"
+            "• *অটো* — txt/লাইন স্টক থেকে বট নিজে দেবে\n"
+            "• *ম্যানুয়াল* — অর্ডার এলে আপনি নিজে পাঠাবেন",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🤖 অটো (স্টক থেকে)", callback_data="shopa:ptype:auto")],
+                [InlineKeyboardButton("✍️ ম্যানুয়াল (আমি দেব)", callback_data="shopa:ptype:manual")],
+                [InlineKeyboardButton("❌ বাতিল", callback_data="adm_shop")]]))
+        return True
+
+    if st.startswith("shopa_txt:"):
+        pid = int(st.split(":")[1])
+        n = await asyncio.to_thread(shop_add_stock, pid, txt)
+        ctx.user_data.pop("state", None)
+        if not n:
+            await update.message.reply_text("❌ কিছু পাওয়া যায়নি — আবার চেষ্টা করুন।")
+            return True
+        total = await asyncio.to_thread(shop_stock_count, pid)
+        await update.message.reply_text(
+            f"✅ `{n}` টা স্টক যোগ হয়েছে।\n📥 এখন মোট স্টক: `{total}`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 পণ্যে ফিরুন", callback_data=f"shopa:p:{pid}")]]))
+        return True
+
+    if st.startswith("shopa_cont:"):
+        oid = int(st.split(":")[1])
+        o = await asyncio.to_thread(shop_order, oid)
+        ctx.user_data.pop("state", None)
+        if not o:
+            await update.message.reply_text("❌ অর্ডার পাওয়া যায়নি।")
+            return True
+        if str(o["status"]) != "pending":
+            await update.message.reply_text("⚠️ এই অর্ডার আগেই প্রসেস হয়েছে।")
+            return True
+        p = {"name": o["product_name"], "price": o["price"]}
+        try:
+            await ctx.bot.send_message(int(o["user_id"]), _shop_deliver_body(p, txt), parse_mode="HTML")
+        except Exception as e:
+            await update.message.reply_text(f"❌ ইউজারকে পাঠানো যায়নি: {e}")
+            return True
+        await asyncio.to_thread(shop_order_set, oid, "delivered", txt)
+        await update.message.reply_text(
+            f"✅ অর্ডার `#{oid}` ডেলিভারি সম্পন্ন — ইউজার পেয়েছে।",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Shop", callback_data="adm_shop")]]))
+        return True
+
+    return False
+
+
+# ──────────────────── 💳 DEPOSIT / ডিপোজিট ────────────────────
+# auto  → USDT BEP-20 (Binance) — TxID দিলে অন-চেইনে যাচাই করে সাথে সাথে ব্যালেন্স যোগ
+# manual→ Binance Pay/UID, bKash, অন্য কিছু — অ্যাডমিন ✅ করলে ব্যালেন্স যোগ
+
+_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def _dep_ddl():
+    with _c() as c:
+        for _q in (
+            """CREATE TABLE IF NOT EXISTS deposit_methods (
+                id           BIGSERIAL PRIMARY KEY,
+                name         TEXT DEFAULT '',
+                kind         TEXT DEFAULT 'manual',
+                address      TEXT DEFAULT '',
+                instructions TEXT DEFAULT '',
+                min_amount   REAL DEFAULT 0,
+                is_active    INTEGER DEFAULT 1,
+                sort_order   INTEGER DEFAULT 0,
+                created_at   TEXT DEFAULT ''
+            )""",
+            """CREATE TABLE IF NOT EXISTS deposits (
+                id          BIGSERIAL PRIMARY KEY,
+                user_id     BIGINT DEFAULT 0,
+                method_id   BIGINT DEFAULT 0,
+                method_name TEXT DEFAULT '',
+                kind        TEXT DEFAULT 'manual',
+                amount      REAL DEFAULT 0,
+                status      TEXT DEFAULT 'pending',
+                txid        TEXT DEFAULT '',
+                note        TEXT DEFAULT '',
+                created_at  TEXT DEFAULT '',
+                reviewed_by BIGINT DEFAULT 0,
+                reviewed_at TEXT DEFAULT ''
+            )""",
+            "CREATE INDEX IF NOT EXISTS deposits_user ON deposits (user_id, id)",
+        ):
+            try:
+                c.execute(_q)
+            except Exception:
+                pass
+        try:
+            _sd = c.execute("SELECT value FROM settings WHERE key=%s", ("dep_seeded",)).fetchone()
+            if not _sd or str(_sd["value"] or "") != "1":
+                _n = c.execute("SELECT COUNT(*) AS n FROM deposit_methods").fetchone()
+                if int((_n or {})["n"] or 0) == 0:
+                    try:
+                        _addr = get_bsc_wallet_addr()
+                    except Exception:
+                        _addr = BSC_WALLET_ADDR
+                    c.execute(
+                        "INSERT INTO deposit_methods (name, kind, address, instructions, "
+                        "min_amount, is_active, sort_order, created_at) "
+                        "VALUES (%s,%s,%s,%s,%s,1,%s,%s)",
+                        ("Binance USDT (BEP-20) — অটো", "auto", _addr or "", "",
+                         1.0, 1, now()))
+                    c.execute(
+                        "INSERT INTO deposit_methods (name, kind, address, instructions, "
+                        "min_amount, is_active, sort_order, created_at) "
+                        "VALUES (%s,%s,%s,%s,%s,1,%s,%s)",
+                        ("Binance Pay / UID — ম্যানুয়াল", "manual", "",
+                         "Binance UID / Pay ID: (অ্যাডমিন প্যানেল থেকে সেট করুন)\n"
+                         "পেমেন্ট করার পর TxID / স্ক্রিনশট এখানে পাঠান।",
+                         1.0, 2, now()))
+                c.execute("INSERT INTO settings (key,value) VALUES (%s,%s) "
+                          "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                          ("dep_seeded", "1"))
+        except Exception as _sde:
+            log.debug(f"[DEP] seed স্কিপ: {_sde}")
+
+
+def dep_methods(active=True):
+    sql = "SELECT * FROM deposit_methods"
+    if active:
+        sql += " WHERE COALESCE(is_active,1)=1"
+    sql += " ORDER BY sort_order, id"
+    with _c() as c:
+        return c.execute(sql).fetchall()
+
+
+def dep_method(mid):
+    with _c() as c:
+        return c.execute("SELECT * FROM deposit_methods WHERE id=%s", (mid,)).fetchone()
+
+
+def dep_method_add(name, kind, address="", instructions="", min_amount=1.0):
+    with _c() as c:
+        r = c.execute(
+            "INSERT INTO deposit_methods (name, kind, address, instructions, min_amount, "
+            "is_active, sort_order, created_at) VALUES (%s,%s,%s,%s,%s,1,%s,%s) RETURNING id",
+            ((name or "")[:80],
+             kind if kind in ("auto", "uid", "manual") else "manual", (address or "").strip(),
+             (instructions or "").strip()[:1200], float(min_amount or 0),
+             int(c.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM deposit_methods").fetchone()["n"] or 1),
+             now())).fetchone()
+    return int(r["id"]) if r else 0
+
+
+def dep_method_del(mid):
+    with _c() as c:
+        c.execute("DELETE FROM deposit_methods WHERE id=%s", (mid,))
+
+
+def dep_method_toggle(mid):
+    with _c() as c:
+        r = c.execute("SELECT is_active FROM deposit_methods WHERE id=%s", (mid,)).fetchone()
+        if not r:
+            return 0
+        new = 0 if int(r["is_active"] or 0) else 1
+        c.execute("UPDATE deposit_methods SET is_active=%s WHERE id=%s", (new, mid))
+    return new
+
+
+def dep_txid_used(txid):
+    tx = (txid or "").strip().lower()
+    if not tx:
+        return False
+    with _c() as c:
+        return c.execute("SELECT id FROM deposits WHERE LOWER(COALESCE(txid,''))=%s LIMIT 1",
+                         (tx,)).fetchone() is not None
+
+
+def dep_new(uid, m, amount, txid="", note="", status="pending"):
+    with _c() as c:
+        r = c.execute(
+            "INSERT INTO deposits (user_id, method_id, method_name, kind, amount, status, "
+            "txid, note, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (int(uid), int(m["id"]), str(m["name"] or "")[:80], str(m["kind"] or "manual"),
+             float(amount or 0), status, (txid or "").strip()[:120], (note or "")[:900], now())
+        ).fetchone()
+    return int(r["id"]) if r else 0
+
+
+def dep_row(oid):
+    with _c() as c:
+        return c.execute("SELECT * FROM deposits WHERE id=%s", (oid,)).fetchone()
+
+
+def dep_set(oid, status, by=0):
+    with _c() as c:
+        cur = c.execute(
+            "UPDATE deposits SET status=%s, reviewed_by=%s, reviewed_at=%s "
+            "WHERE id=%s AND status='pending'",
+            (status, int(by or 0), now(), int(oid)))
+        return cur.rowcount
+
+
+def dep_pending(limit=20):
+    with _c() as c:
+        return c.execute("SELECT * FROM deposits WHERE status='pending' ORDER BY id LIMIT %s",
+                         (int(limit),)).fetchall()
+
+
+def dep_of_user(uid, limit=8):
+    with _c() as c:
+        return c.execute("SELECT * FROM deposits WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+                         (int(uid), int(limit))).fetchall()
+
+
+def dep_verify_bep20(txid, to_addr, need_conf=1):
+    """BSC-তে tx যাচাই করে আমাদের অ্যাড্রেসে আসা USDT পরিমাণ ফেরত দেয়।
+
+    রিটার্ন: (amount_float, err_text)। সফল হলে err_text = ""।
+    """
+    tx = (txid or "").strip()
+    if not tx.startswith("0x") or len(tx) != 66:
+        return 0.0, "TxID ঠিক নয় — 0x দিয়ে শুরু হওয়া ৬৬ অক্ষরের hash দিন।"
+    if not _WEB3_OK:
+        return 0.0, "সার্ভারে web3 নেই — অ্যাডমিনকে জানান।"
+    try:
+        w3 = _get_w3()
+        if not w3 or not w3.is_connected():
+            return 0.0, "BSC নেটওয়ার্কে সংযোগ হচ্ছে না — কিছুক্ষণ পরে চেষ্টা করুন।"
+        receipt = w3.eth.get_transaction_receipt(tx)
+    except Exception as e:
+        _m = str(e).lower()
+        if "not found" in _m or "unknown transaction" in _m:
+            return 0.0, "এই TxID এখনো ব্লকচেইনে পাইনি — ১-২ মিনিট পরে আবার পাঠান।"
+        return 0.0, f"TxID চেক করা যায়নি: {str(e)[:120]}"
+    try:
+        if int(getattr(receipt, "status", 0) or 0) != 1:
+            return 0.0, "এই ট্রানজেকশন ব্লকচেইনে ব্যর্থ (failed) হয়েছে।"
+        try:
+            head = w3.eth.block_number
+            conf = int(head) - int(receipt.blockNumber or 0) + 1
+            if conf < int(need_conf or 1):
+                return 0.0, "কনফার্মেশন কম — ১ মিনিট পরে আবার চেষ্টা করুন।"
+        except Exception:
+            pass
+        want_to = "0x" + "0" * 24 + (to_addr or "").lower().replace("0x", "")
+        usdt = USDT_BEP20_CA.lower()
+        total_raw = 0
+        for lg in (receipt.logs or []):
+            try:
+                addr = (lg["address"] if isinstance(lg, dict) else lg.address) or ""
+                topics = (lg["topics"] if isinstance(lg, dict) else lg.topics) or []
+                data = (lg["data"] if isinstance(lg, dict) else lg.data) or "0x"
+            except Exception:
+                continue
+            if str(addr).lower() != usdt:
+                continue
+            if len(topics) < 3:
+                continue
+            t0 = topics[0].hex() if hasattr(topics[0], "hex") else str(topics[0])
+            if not str(t0).lower().startswith(_TRANSFER_TOPIC):
+                continue
+            t2 = topics[2].hex() if hasattr(topics[2], "hex") else str(topics[2])
+            if str(t2).lower() != want_to:
+                continue
+            try:
+                raw = data.hex() if hasattr(data, "hex") else str(data)
+                total_raw += int(raw, 16) if raw and raw != "0x" else 0
+            except Exception:
+                continue
+        if total_raw <= 0:
+            return 0.0, "এই TxID-তে আমাদের অ্যাড্রেসে কোনো USDT পাওয়া যায়নি।"
+        return round(total_raw / (10 ** 18), 6), ""
+    except Exception as e:
+        return 0.0, f"যাচাইয়ে সমস্যা: {str(e)[:120]}"
+
+
+# ── ⚡ Binance UID অটো (Binance Pay API) ────────────────────────────
+import hmac, hashlib  # noqa: E402  (শুধু ডিপোজিট সিগনেচারের জন্য)
+
+_DEP_STABLE = {"USDT", "USDC", "BUSD", "FDUSD", "BNFCR"}
+
+
+def get_binance_creds():
+    """(api_key, api_secret) — DB settings আগে, তারপর env।"""
+    k = s_ = ""
+    try:
+        k = (get_setting("binance_api_key") or "").strip()
+        s_ = (get_setting("binance_api_secret") or "").strip()
+    except Exception:
+        pass
+    k = k or (os.environ.get("BINANCE_API_KEY") or "").strip()
+    s_ = s_ or (os.environ.get("BINANCE_API_SECRET") or "").strip()
+    return k, s_
+
+
+def dep_binance_ready():
+    k, s_ = get_binance_creds()
+    return bool(k and s_)
+
+
+def dep_uid_window(default=45):
+    """কত মিনিট আগের Binance Pay লেনদেন খুঁজবে (৫–১৪৪০)।"""
+    try:
+        v = int(float(get_setting("binance_uid_window") or default))
+    except Exception:
+        v = default
+    return max(5, min(1440, v))
+
+
+def dep_binance_uid_pay(payer_uid, want, minutes=45):
+    """Binance Pay হিস্ট্রি থেকে এই UID-এর পেমেন্ট খোঁজে।
+
+    রিটার্ন: (amount, txid, err) — সফল হলে err = ""।
+    """
+    pu = re.sub(r"\D", "", str(payer_uid or ""))
+    if not (6 <= len(pu) <= 14):
+        return 0.0, "", "Binance UID ঠিক নয় — শুধু ডিজিটের UID দিন (৮–১২ সংখ্যা)।"
+    try:
+        want = float(want or 0)
+    except Exception:
+        want = 0.0
+    key, sec = get_binance_creds()
+    if not (key and sec):
+        return 0.0, "", "Binance API সেট করা নেই — অ্যাডমিন ম্যানুয়াল ✅ করবেন।"
+    base = (os.environ.get("BINANCE_API_BASE") or "https://api.binance.com").rstrip("/")
+    end_ms = int(_time.time() * 1000)
+    try:
+        mins = int(minutes or 45)
+    except Exception:
+        mins = 45
+    params = {"startTime": end_ms - max(5, mins) * 60 * 1000, "endTime": end_ms,
+              "limit": 100, "recvWindow": 10000, "timestamp": end_ms}
+    qs = urllib.parse.urlencode(params)
+    sig = hmac.new(sec.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    _url = f"{base}/sapi/v1/pay/transactions?{qs}&signature={sig}"
+    try:
+        _req = urllib.request.Request(_url, headers={"X-MBX-APIKEY": key})
+        with urllib.request.urlopen(_req, timeout=15) as _resp:
+            _body = _resp.read().decode("utf-8", "ignore")
+        js = _json.loads(_body) if _body.strip() else {}
+    except urllib.error.HTTPError as e:
+        try:
+            js = _json.loads(e.read().decode("utf-8", "ignore"))
+        except Exception:
+            return 0.0, "", f"Binance API HTTP {e.code} — কী/সার্ভার চেক করুন।"
+    except Exception as e:
+        return 0.0, "", f"Binance API-তে সংযোগ হয়নি: {str(e)[:90]}"
+    if not isinstance(js, dict):
+        return 0.0, "", "Binance API থেকে সঠিক উত্তর আসেনি।"
+    code = str(js.get("code") or "").strip()
+    if code and code not in ("000000", "0"):
+        return 0.0, "", f"Binance API: {str(js.get('msg') or js.get('message') or code)[:90]}"
+    rows = js.get("data") if isinstance(js.get("data"), list) else []
+    best = None
+    for it in rows:
+        if not isinstance(it, dict):
+            continue
+        pinfo = it.get("payerInfo") or {}
+        pid = re.sub(r"\D", "", str(pinfo.get("payerId") or pinfo.get("payerUid") or ""))
+        if pid != pu:
+            continue
+        if str(it.get("currency") or "").upper() not in _DEP_STABLE:
+            continue
+        try:
+            amt = float(it.get("amount") or 0)
+        except Exception:
+            continue
+        if amt <= 0 or amt + 0.011 < want:
+            continue
+        tx_id = str(it.get("transactionId") or it.get("orderId") or "").strip()
+        if not tx_id or dep_txid_used(tx_id):
+            continue
+        if best is None or amt < best[0]:
+            best = (amt, tx_id)
+    if not best:
+        return 0.0, "", ("এই UID থেকে এই পরিমাণ পেমেন্ট এখনো পাওয়া যায়নি। "
+                         "পেমেন্ট ঠিক থাকলে ১-২ মিনিট পরে আবার চেক করুন।")
+    return round(best[0], 6), best[1], ""
+
+
+def dep_attach_txid(oid, txid):
+    with _c() as c:
+        c.execute("UPDATE deposits SET txid=%s WHERE id=%s",
+                  ((txid or "").strip()[:120], int(oid)))
+
+
+def dep_set_kind(mid, kind):
+    kind = kind if kind in ("auto", "uid", "manual") else "manual"
+    with _c() as c:
+        c.execute("UPDATE deposit_methods SET kind=%s WHERE id=%s", (kind, int(mid)))
+    return kind
+
+
+def _dep_note_uid(note):
+    m = re.search(r"UID[:\s]*([0-9]{6,14})", str(note or ""))
+    return m.group(1) if m else ""
+
+
+_DEP_ST_BN = {"pending": "⏳ অপেক্ষমাণ", "approved": "✅ অনুমোদিত",
+              "rejected": "❌ বাতিল", "expired": "⌛ মেয়াদ শেষ"}
+
+
+_DEP_KIND_BN = {"auto": "⚡ অটো (BEP-20)", "uid": "⚡ অটো (Binance UID)",
+                "manual": "✍️ ম্যানুয়াল"}
+
+
+def _dep_kind_bn(k):
+    return _DEP_KIND_BN.get(str(k), "✍️ ম্যানুয়াল")
+
+
+def _dep_kb(methods):
+    rows = []
+    for m in methods:
+        lbl = f"{m['name'] or ''}"[:40]
+        rows.append([InlineKeyboardButton(lbl, callback_data=f"dep:m:{int(m['id'])}")])
+    rows.append([InlineKeyboardButton("🧾 আমার ডিপোজিট হিস্ট্রি", callback_data="dep:my")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_deposit(update, ctx=None):
+    """💳 ডিপোজিট — মেথড লিস্ট।"""
+    methods = await asyncio.to_thread(dep_methods)
+    txt = ("💳 *ডিপোজিট*\n"
+           "━━━━━━━━━━━━━━\n"
+           "নিচের যেকোনো একটি মেথড বেছে নিন।\n\n"
+           "⚡ *অটো* — TxID বা Binance UID দিলে সাথে সাথে যাচাই হয়ে ব্যালেন্স যোগ হবে।\n"
+           "✍️ *ম্যানুয়াল* — আপনি পেমেন্ট করে TxID/স্ক্রিনশট দিলে অ্যাডমিন ✅ করবেন।")
+    if not methods:
+        txt = ("💳 *ডিপোজিট*\n\nএখনো কোনো মেথড সেট করা হয়নি।\n"
+               "অ্যাডমিনকে জানান।")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ফিরে যান", callback_data="dep:back")]])
+    else:
+        kb = _dep_kb(methods)
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+        except Exception:
+            msg = update.callback_query.message
+    else:
+        msg = update.effective_message
+    await msg.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+
+async def _dep_method_page(q, mid):
+    m = await asyncio.to_thread(dep_method, mid)
+    if not m or not int(m["is_active"] or 1):
+        await q.edit_message_text("❌ এই মেথডটি এখন বন্ধ আছে।")
+        return
+    kind = str(m["kind"] or "manual")
+    mn = float(m["min_amount"] or 0)
+    lines = [f"💳 *{_md_esc(m['name'] or '')}*", "━━━━━━━━━━━━━━",
+             f"🏷 ধরন: {_dep_kind_bn(kind)}",
+             f"📉 সর্বনিম্ন: `{mn:g}$`"]
+    if kind == "uid":
+        pay_id = (m["address"] or "").strip()
+        ins = (m["instructions"] or "").strip()
+        lines += ["", "📥 *Binance Pay (UID) — এই আইডিতে পাঠান:*",
+                  f"`{pay_id}`" if pay_id else "_Binance Pay ID সেট করা নেই — অ্যাডমিনকে জানান_",
+                  "", "📱 Binance অ্যাপ → Pay → Send → UID দিন → পরিমাণ লিখে পাঠান।",
+                  "", "⚠️ *টাকা পাঠানোর পর* আপনার নিজের Binance UID দিয়ে যাচাই হবে — "
+                  "বট নিজেই পেমেন্ট খুঁজে ব্যালেন্স যোগ করবে।"]
+        if ins:
+            lines += ["", "📋 " + ins]
+    elif kind == "auto":
+        addr = (m["address"] or "").strip()
+        lines += ["", "📤 *এই অ্যাড্রেসে USDT (BEP-20) পাঠান:*",
+                  f"`{addr}`" if addr else "_অ্যাড্রেস সেট করা নেই — অ্যাডমিনকে জানান_",
+                  "", "⚠️ শুধু *BEP-20 (BSC)* নেটওয়ার্কে পাঠাবেন। অন্য নেটওয়ার্কে পাঠালে টাকা হারাবে।",
+                  "", "পাঠানোর পর *TxID* কপি করে নিচের বাটনে চাপুন।"]
+    else:
+        ins = (m["instructions"] or "").strip()
+        lines += ["", "📋 *নির্দেশনা:*", ins if ins else "_অ্যাডমিন নির্দেশনা দেননি_",
+                  "", "পেমেন্ট করার পর TxID / স্ক্রিনশট দিন।"]
+    go_lbl = "✅ আমি পাঠিয়েছি" if kind != "uid" else "✅ পেমেন্ট করেছি"
+    rows = [[InlineKeyboardButton(go_lbl, callback_data=f"dep:go:{int(m['id'])}")]]
+    rows.append([InlineKeyboardButton("🔙 ডিপোজিট", callback_data="dep:list")])
+    try:
+        await q.edit_message_text("\n".join(lines), parse_mode="Markdown",
+                                  reply_markup=InlineKeyboardMarkup(rows),
+                                  disable_web_page_preview=True)
+    except Exception:
+        await q.message.reply_text("\n".join(lines), parse_mode="Markdown",
+                                   reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _dep_show_my(q):
+    uid = q.from_user.id
+    rows_db = await asyncio.to_thread(dep_of_user, uid, 8)
+    if not rows_db:
+        txt = "🧾 *আমার ডিপোজিট*\n\nএখনো কোনো ডিপোজিট নেই।"
+    else:
+        lines = ["🧾 *আমার ডিপোজিট (সর্বশেষ ৮টি)*", "━━━━━━━━━━━━━━"]
+        for r in rows_db:
+            st = _DEP_ST_BN.get(str(r["status"] or ""), str(r["status"] or ""))
+            lines.append(f"`#{int(r['id'])}` {_md_esc(str(r['method_name'] or '')[:30])}\n"
+                         f"   `{float(r['amount'] or 0):g}$` · {st} · {str(r['created_at'] or '')[:16]}")
+        txt = "\n".join(lines)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ডিপোজিট", callback_data="dep:list")]])
+    try:
+        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+
+async def _dep_recheck(q, ctx, oid):
+    """Binance UID ডিপোজিট আবার যাচাই — পাওয়া গেলে সাথে সাথে ক্রেডিট।"""
+    uid = q.from_user.id
+    o = await asyncio.to_thread(dep_row, oid)
+    if not o or int(o["user_id"] or 0) != int(uid):
+        await q.answer("ডিপোজিট পাওয়া যায়নি", show_alert=True)
+        return
+    if str(o["status"]) != "pending":
+        await q.answer("এটি আগেই প্রসেস হয়েছে", show_alert=True)
+        return
+    buid = _dep_note_uid(o["note"])
+    if not buid:
+        await q.answer("এটি UID ডিপোজিট নয় — অ্যাডমিন যাচাই করবেন", show_alert=True)
+        return
+    amt = float(o["amount"] or 0)
+    m = await asyncio.to_thread(dep_method, int(o["method_id"] or 0))
+    if not m:
+        await q.answer("মেথড পাওয়া যায়নি", show_alert=True)
+        return
+    _win = await asyncio.to_thread(dep_uid_window)
+    got, tx, err = await asyncio.to_thread(dep_binance_uid_pay, buid, amt, _win)
+    if not (tx and not err):
+        await q.answer(("❌ " + (err or "পেমেন্ট এখনো পাওয়া যায়নি"))[:190], show_alert=True)
+        return
+    n = await asyncio.to_thread(dep_set, oid, "approved", 0)
+    if not n:
+        await q.answer("এটি আগেই প্রসেস হয়েছে", show_alert=True)
+        return
+    await asyncio.to_thread(dep_attach_txid, oid, tx)
+    await _dep_auto_credit(ctx, uid, m, float(got or amt), tx, oid)
+    try:
+        await q.edit_message_text(
+            f"✅ <b>ডিপোজিট পাওয়া গেছে!</b>\n\n💵 <b>{float(got or amt):g}$</b>\n"
+            f"🧾 <code>#{oid}</code>\n\nব্যালেন্স যোগ হয়েছে।",
+            parse_mode="HTML")
+    except Exception:
+        pass
+
+
+async def _dep_auto_credit(ctx, uid, m, amount, txid, oid):
+    """অটো ডিপোজিট সফল — ব্যালেন্স যোগ + ইউজার ও অ্যাডমিনকে জানাও।"""
+    await asyncio.to_thread(add_bal, uid, amount)
+    try:
+        bal = await asyncio.to_thread(get_bal, uid)
+    except Exception:
+        bal = 0
+    try:
+        await ctx.bot.send_message(
+            uid,
+            (f"✅ <b>ডিপোজিট সফল!</b>\n\n"
+             f"💵 পরিমাণ: <b>{amount:g}$</b>\n"
+             f"🏷 মেথড: {html.escape(str(m['name'] or ''))}\n"
+             f"🔗 TxID: <code>{html.escape(txid)}</code>\n"
+             f"💰 নতুন ব্যালেন্স: <b>{bal:g}$</b>\n\n"
+             f"🧾 ডিপোজিট নম্বর: <code>#{oid}</code>"),
+            parse_mode="HTML")
+    except Exception as e:
+        log.warning(f"[DEP] ইউজারকে জানানো যায়নি uid={uid}: {e}")
+    try:
+        await notify_full_admins(
+            ctx.bot,
+            f"💳 *অটো ডিপোজিট*\n\n"
+            f"🆔 `#{oid}` · 👤 `{uid}`\n"
+            f"💵 `{amount:g}$` — {_md_esc(m['name'] or '')}\n"
+            f"🔗 `{txid}`")
+    except Exception:
+        pass
+
+
+async def dep_callback(update, ctx):
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    d = q.data or ""
+    uid = q.from_user.id
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    # ── অ্যাডমিন: pending অনুমোদন / মেথড ম্যানেজ ──
+    if d.startswith("depok:") or d.startswith("depno:") or d == "adm_dep" or d.startswith("depa:"):
+        if not await asyncio.to_thread(is_admin, uid):
+            return
+        return await _dep_admin_cb(q, ctx, d)
+
+    # ── ইউজার ──
+    try:
+        if d in ("dep:list", "dep:back"):
+            return await show_deposit(update, ctx)
+        if d == "dep:my":
+            return await _dep_show_my(q)
+        if d.startswith("dep:m:"):
+            return await _dep_method_page(q, int(d.split(":")[2]))
+        if d.startswith("dep:re:"):
+            return await _dep_recheck(q, ctx, int(d.split(":")[2]))
+        if d.startswith("dep:go:"):
+            mid = int(d.split(":")[2])
+            m = await asyncio.to_thread(dep_method, mid)
+            if not m:
+                await q.answer("মেথড পাওয়া যায়নি", show_alert=True)
+                return
+            ctx.user_data["dep_mid"] = mid
+            if str(m["kind"]) == "uid":
+                ctx.user_data["state"] = "dep_uid"
+                _pid = (m["address"] or "").strip()
+                await q.message.reply_text(
+                    f"🆔 *আপনার Binance UID দিন*\n\n"
+                    f"{_md_esc(m['name'] or '')}\n"
+                    + (f"📥 পাঠাতে হবে এই আইডিতে: `{_pid}`\n\n" if _pid else "\n")
+                    + "যে Binance অ্যাকাউন্ট থেকে টাকা পাঠিয়েছেন, তার *UID* "
+                      "(Binance অ্যাপ → Profile → UID) লিখে পাঠান।\n\n"
+                      "শুধু ডিজিট (যেমন `123456789`)\n\n/cancel — বাতিল",
+                    parse_mode="Markdown")
+            elif str(m["kind"]) == "auto":
+                ctx.user_data["state"] = "dep_tx"
+                await q.message.reply_text(
+                    f"🔗 *TxID দিন*\n\n"
+                    f"{_md_esc(m['name'] or '')} — পেমেন্ট TxID কপি করে এখানে পাঠান "
+                    f"(0x… দিয়ে শুরু)।\n\n"
+                    "বট অন-চেইনে যাচাই করে সাথে সাথে ব্যালেন্স যোগ করবে।\n\n/cancel — বাতিল",
+                    parse_mode="Markdown")
+            else:
+                ctx.user_data["state"] = "dep_amt"
+                await q.message.reply_text(
+                    f"💵 *কত ডলার পাঠিয়েছেন?*\n\n"
+                    f"{_md_esc(m['name'] or '')}\n"
+                    f"শুধু সংখ্যা লিখুন (যেমন `10`)।\n\n/cancel — বাতিল",
+                    parse_mode="Markdown")
+            return
+    except Exception as e:
+        log.warning(f"[DEP] callback {d} ব্যর্থ: {e}")
+        try:
+            await q.answer("সমস্যা হয়েছে", show_alert=True)
+        except Exception:
+            pass
+
+
+async def dep_input(update, ctx, st):
+    """ডিপোজিট ইনপুট (state: dep_tx / dep_amt / dep_note)। True = হ্যান্ডল হয়েছে।"""
+    uid = update.effective_user.id
+    txt = (update.message.text or "").strip()
+    mid = int(ctx.user_data.get("dep_mid") or 0)
+    m = await asyncio.to_thread(dep_method, mid) if mid else None
+    if not m:
+        ctx.user_data.pop("state", None)
+        await update.message.reply_text("❌ ডিপোজিট মেথড পাওয়া যায়নি — আবার শুরু করুন।")
+        return True
+
+    if st == "dep_tx":
+        if await asyncio.to_thread(dep_txid_used, txt):
+            await update.message.reply_text("⚠️ এই TxID আগেই ব্যবহার করা হয়েছে।")
+            return True
+        wait_msg = await update.message.reply_text("🔎 অন-চেইনে যাচাই করা হচ্ছে…")
+        amount, err = await asyncio.to_thread(dep_verify_bep20, txt, m["address"] or "")
+        if err:
+            await wait_msg.edit_text(f"❌ {err}\n\nআবার চেষ্টা করুন বা /cancel দিন।")
+            return True
+        mn = float(m["min_amount"] or 0)
+        if amount < mn:
+            await wait_msg.edit_text(
+                f"⚠️ পাওয়া গেছে `{amount:g}$` — সর্বনিম্ন `{mn:g}$`।\n"
+                "কম টাকা হলে অ্যাডমিনের সাথে যোগাযোগ করুন।", parse_mode="Markdown")
+            return True
+        oid = await asyncio.to_thread(dep_new, uid, m, amount, txt, "on-chain auto", "approved")
+        await asyncio.to_thread(dep_set, oid, "approved", 0)
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("dep_mid", None)
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+        await _dep_auto_credit(ctx, uid, m, amount, txt, oid)
+        return True
+
+    if st == "dep_uid":
+        buid = re.sub(r"\D", "", txt)
+        if not (6 <= len(buid) <= 14):
+            await update.message.reply_text(
+                "❌ UID ঠিক নয় — শুধু ডিজিট লিখুন (৮–১২ সংখ্যা)।\n"
+                "Binance অ্যাপ → Profile → UID\n\n/cancel — বাতিল")
+            return True
+        ctx.user_data["dep_buid"] = buid
+        ctx.user_data["state"] = "dep_uid_amt"
+        await update.message.reply_text(
+            f"🆔 UID: `{buid}`\n\n💵 *কত ডলার পাঠিয়েছেন?*\n"
+            f"শুধু সংখ্যা লিখুন (যেমন `10`)।\n\n/cancel — বাতিল",
+            parse_mode="Markdown")
+        return True
+
+    if st == "dep_uid_amt":
+        try:
+            amt = float(txt.replace(",", ".").replace("$", "").strip())
+        except Exception:
+            await update.message.reply_text("❌ শুধু সংখ্যা লিখুন (যেমন 10)।")
+            return True
+        mn = float(m["min_amount"] or 0)
+        if amt <= 0:
+            await update.message.reply_text("❌ পরিমাণ ০ এর বেশি হতে হবে।")
+            return True
+        if amt < mn:
+            await update.message.reply_text(f"❌ সর্বনিম্ন `{mn:g}$`।", parse_mode="Markdown")
+            return True
+        buid = str(ctx.user_data.get("dep_buid") or "")
+        wait_msg = await update.message.reply_text("🔎 Binance Pay-এ পেমেন্ট খোঁজা হচ্ছে…")
+        _win = await asyncio.to_thread(dep_uid_window)
+        _got, _tx, _err = await asyncio.to_thread(dep_binance_uid_pay, buid, amt, _win)
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("dep_mid", None)
+        ctx.user_data.pop("dep_buid", None)
+        if _tx and not _err:
+            oid = await asyncio.to_thread(
+                dep_new, uid, m, _got, _tx, f"Binance UID: {buid}", "approved")
+            try:
+                await wait_msg.delete()
+            except Exception:
+                pass
+            await _dep_auto_credit(ctx, uid, m, _got, _tx, oid)
+            return True
+        oid = await asyncio.to_thread(
+            dep_new, uid, m, amt, "", f"Binance UID: {buid}", "pending")
+        _why = ("Binance API সেট করা নেই" if not await asyncio.to_thread(dep_binance_ready)
+                else "পেমেন্ট এখনো পাওয়া যায়নি")
+        await wait_msg.edit_text(
+            f"⏳ *ডিপোজিট যাচাই বাকি*\n\n"
+            f"🆔 `#{oid}`\n💵 `{amt:g}$`\n🆔 UID: `{buid}`\n\n"
+            f"কারণ: {_why}\n\n"
+            "পেমেন্ট ঠিক থাকলে ১-২ মিনিট পরে *🔁 আবার চেক* চাপুন — "
+            "পাওয়া গেলে সাথে সাথে ব্যালেন্স যোগ হবে।\n"
+            "না পেলে অ্যাডমিন নিজে যাচাই করে ✅ করবেন।",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔁 আবার চেক", callback_data=f"dep:re:{oid}")],
+                [InlineKeyboardButton("🧾 আমার ডিপোজিট", callback_data="dep:my")]]))
+        try:
+            await notify_full_admins(
+                ctx.bot,
+                f"💳 *Binance UID ডিপোজিট (যাচাই বাকি)*\n\n"
+                f"🆔 `#{oid}` · 👤 `{uid}`\n"
+                f"💵 `{amt:g}$` — {_md_esc(m['name'] or '')}\n"
+                f"🆔 UID: `{buid}`",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ অনুমোদন", callback_data=f"depok:{oid}"),
+                    InlineKeyboardButton("❌ বাতিল", callback_data=f"depno:{oid}"),
+                ]]))
+        except Exception:
+            pass
+        return True
+
+    if st == "dep_amt":
+        try:
+            amt = float(txt.replace(",", ".").replace("$", "").strip())
+        except Exception:
+            await update.message.reply_text("❌ শুধু সংখ্যা লিখুন (যেমন 10)।")
+            return True
+        mn = float(m["min_amount"] or 0)
+        if amt <= 0:
+            await update.message.reply_text("❌ পরিমাণ ০ এর বেশি হতে হবে।")
+            return True
+        if amt < mn:
+            await update.message.reply_text(f"❌ সর্বনিম্ন `{mn:g}$`।", parse_mode="Markdown")
+            return True
+        ctx.user_data["dep_amt"] = amt
+        ctx.user_data["state"] = "dep_note"
+        await update.message.reply_text(
+            f"🧾 *{amt:g}$* — এখন প্রমাণ দিন\n\n"
+            "TxID / Binance UID / স্ক্রিনশটের লেখা পাঠান।\n"
+            "(ছবি দিলে caption-এ পরিমাণ লিখুন)\n\n/cancel — বাতিল",
+            parse_mode="Markdown")
+        return True
+
+    if st == "dep_note":
+        amt = float(ctx.user_data.get("dep_amt") or 0)
+        note = txt or (update.message.caption or "")
+        if not note and update.message.photo:
+            note = "স্ক্রিনশট পাঠানো হয়েছে"
+        if not note:
+            await update.message.reply_text("❌ TxID বা প্রমাণ লিখে পাঠান।")
+            return True
+        oid = await asyncio.to_thread(dep_new, uid, m, amt, note, note, "pending")
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("dep_mid", None)
+        ctx.user_data.pop("dep_amt", None)
+        await update.message.reply_text(
+            f"⏳ *ডিপোজিট রিকোয়েস্ট জমা হয়েছে*\n\n"
+            f"🆔 `#{oid}`\n"
+            f"💵 `{amt:g}$`\n"
+            f"🏷 {_md_esc(m['name'] or '')}\n\n"
+            "অ্যাডমিন যাচাই করে ✅ করলেই ব্যালেন্স যোগ হবে — সাধারণত ৫–৩০ মিনিট।",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧾 আমার ডিপোজিট", callback_data="dep:my")],
+                [InlineKeyboardButton("🔙 ডিপোজিট", callback_data="dep:list")]]))
+        try:
+            await notify_full_admins(
+                ctx.bot,
+                f"💳 *নতুন ম্যানুয়াল ডিপোজিট*\n\n"
+                f"🆔 `#{oid}` · 👤 `{uid}`\n"
+                f"💵 `{amt:g}$` — {_md_esc(m['name'] or '')}\n"
+                f"📝 {_md_esc(note[:300])}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ অনুমোদন", callback_data=f"depok:{oid}"),
+                    InlineKeyboardButton("❌ বাতিল", callback_data=f"depno:{oid}"),
+                ]]))
+        except Exception:
+            pass
+        return True
+
+    return False
+
+
+# ── অ্যাডমিন: ডিপোজিট ম্যানেজার ──
+def _dep_admin_kb(pend_n=0):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⏳ পেন্ডিং ডিপোজিট ({pend_n})", callback_data="depa:pend")],
+        [InlineKeyboardButton("📋 মেথড তালিকা", callback_data="depa:methods"),
+         InlineKeyboardButton("➕ নতুন মেথড", callback_data="depa:new")],
+        [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_panel")],
+    ])
+
+
+async def _dep_admin_panel(q):
+    methods = await asyncio.to_thread(dep_methods, False)
+    pend = await asyncio.to_thread(dep_pending, 50)
+    auto_n = sum(1 for m in methods if str(m["kind"]) in ("auto", "uid"))
+    _bready = await asyncio.to_thread(dep_binance_ready)
+    txt = ("💳 *ডিপোজিট ম্যানেজার*\n"
+           "━━━━━━━━━━━━━━\n"
+           f"📋 মেথড: `{len(methods)}` (⚡ অটো `{auto_n}`)\n"
+           f"⏳ পেন্ডিং: `{len(pend)}`\n\n"
+           f"🔌 Binance API: {'✅ সেট আছে' if _bready else '❌ সেট নেই (UID অটো কাজ করবে না)'}\n\n"
+           "⚡ অটো = BEP-20 TxID / Binance UID যাচাই।\n"
+           "✍️ ম্যানুয়াল = আপনি ✅ করবেন।")
+    try:
+        await q.edit_message_text(txt, parse_mode="Markdown",
+                                  reply_markup=_dep_admin_kb(len(pend)))
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="Markdown",
+                                   reply_markup=_dep_admin_kb(len(pend)))
+
+
+async def _dep_admin_methods(q):
+    methods = await asyncio.to_thread(dep_methods, False)
+    lines = ["📋 *ডিপোজিট মেথড*", "━━━━━━━━━━━━━━"]
+    rows = []
+    for m in methods:
+        st = "🟢" if int(m["is_active"] or 1) else "🔴"
+        lines.append(f"{st} {_md_esc(m['name'] or '')} — {_dep_kind_bn(m['kind'])} "
+                     f"· min `{float(m['min_amount'] or 0):g}$`")
+        rows.append([InlineKeyboardButton(f"{st} {m['name'] or ''}"[:42],
+                                          callback_data=f"depa:m:{int(m['id'])}")])
+    rows.append([InlineKeyboardButton("➕ নতুন মেথড", callback_data="depa:new")])
+    rows.append([InlineKeyboardButton("🔙 ডিপোজিট", callback_data="adm_dep")])
+    await q.edit_message_text("\n".join(lines) if methods else
+                              "📋 *ডিপোজিট মেথড*\n\nকোনো মেথড নেই।",
+                              parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _dep_admin_method(q, mid):
+    m = await asyncio.to_thread(dep_method, mid)
+    if not m:
+        await q.edit_message_text("❌ মেথড নেই")
+        return
+    kind = str(m["kind"] or "manual")
+    txt = (f"📋 *{_md_esc(m['name'] or '')}*\n"
+           f"━━━━━━━━━━━━━━\n"
+           f"🏷 ধরন: {_dep_kind_bn(kind)}\n"
+           f"📉 সর্বনিম্ন: `{float(m['min_amount'] or 0):g}$`\n"
+           f"⚙️ স্ট্যাটাস: {'🟢 চালু' if int(m['is_active'] or 1) else '🔴 বন্ধ'}")
+    if kind in ("auto", "uid"):
+        lbl = "📤 অ্যাড্রেস" if kind == "auto" else "🆔 Binance Pay ID"
+        txt += f"\n{lbl}: `{(m['address'] or '—')}`"
+        if kind == "uid":
+            _rdy = await asyncio.to_thread(dep_binance_ready)
+            txt += ("\n🔌 API: " + ("✅ সেট আছে" if _rdy else "❌ সেট নেই — ম্যানুয়াল ✅ চলবে"))
+    else:
+        txt += f"\n📝 নির্দেশনা: {_md_esc((m['instructions'] or '—')[:250])}"
+    _sw = []
+    if kind != "uid":
+        _sw.append(InlineKeyboardButton("🆔 UID অটো", callback_data=f"depa:ck:{mid}:uid"))
+    if kind != "auto":
+        _sw.append(InlineKeyboardButton("⚡ BEP-20 অটো", callback_data=f"depa:ck:{mid}:auto"))
+    if kind != "manual":
+        _sw.append(InlineKeyboardButton("✍️ ম্যানুয়াল", callback_data=f"depa:ck:{mid}:manual"))
+    rows = [
+        _sw,
+        [InlineKeyboardButton("🔁 চালু/বন্ধ", callback_data=f"depa:tg:{mid}"),
+         InlineKeyboardButton("🗑 ডিলিট", callback_data=f"depa:del:{mid}")],
+        [InlineKeyboardButton("🔙 মেথড তালিকা", callback_data="depa:methods")],
+    ]
+    await q.edit_message_text(txt, parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _dep_admin_pending(q):
+    rows_db = await asyncio.to_thread(dep_pending, 20)
+    if not rows_db:
+        await q.edit_message_text(
+            "⏳ *পেন্ডিং ডিপোজিট*\n\nকিছু নেই ✅",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 ডিপোজিট", callback_data="adm_dep")]]))
+        return
+    lines = ["⏳ *পেন্ডিং ডিপোজিট*", "━━━━━━━━━━━━━━"]
+    rows = []
+    for r in rows_db:
+        lines.append(f"`#{int(r['id'])}` 👤 `{int(r['user_id'])}` — `{float(r['amount'] or 0):g}$`\n"
+                     f"   {_md_esc(str(r['method_name'] or '')[:26])} · {str(r['created_at'] or '')[:16]}\n"
+                     f"   _{_md_esc(str(r['note'] or '-')[:60])}_")
+        rows.append([
+            InlineKeyboardButton(f"✅ #{int(r['id'])}", callback_data=f"depok:{int(r['id'])}"),
+            InlineKeyboardButton(f"❌ #{int(r['id'])}", callback_data=f"depno:{int(r['id'])}"),
+        ])
+    rows.append([InlineKeyboardButton("🔙 ডিপোজিট", callback_data="adm_dep")])
+    await q.edit_message_text("\n".join(lines), parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _dep_admin_cb(q, ctx, d):
+    uid = q.from_user.id
+    try:
+        if d == "adm_dep":
+            return await _dep_admin_panel(q)
+        if d == "depa:methods":
+            return await _dep_admin_methods(q)
+        if d == "depa:pend":
+            return await _dep_admin_pending(q)
+        if d == "depa:new":
+            ctx.user_data["dep_new"] = {}
+            ctx.user_data["state"] = "depa_new_name"
+            await q.edit_message_text(
+                "➕ *নতুন ডিপোজিট মেথড — ধাপ ১/৪*\n\n"
+                "মেথডের নাম লিখুন (যেমন `Binance Pay (ম্যানুয়াল)`)।\n\n/cancel — বাতিল",
+                parse_mode="Markdown")
+            return
+        if d.startswith("depa:kind:"):
+            kind = d.split(":")[2]
+            info = ctx.user_data.get("dep_new") or {}
+            info["kind"] = kind if kind in ("auto", "uid", "manual") else "manual"
+            ctx.user_data["dep_new"] = info
+            if kind == "uid":
+                ctx.user_data["state"] = "depa_new_addr"
+                await q.edit_message_text(
+                    "🆔 *ধাপ ৩/৪ — আপনার Binance Pay আইডি*\n\n"
+                    "যে Binance অ্যাকাউন্টে টাকা আসবে তার *UID / Pay ID* লিখুন "
+                    "(Binance অ্যাপ → Profile → UID)।\n\n"
+                    "⚠️ Binance API Key/Secret সেট না থাকলে অটো যাচাই হবে না — "
+                    "সেক্ষেত্রে অ্যাডমিন ম্যানুয়াল ✅ করবেন।\n\n/cancel — বাতিল",
+                    parse_mode="Markdown")
+            elif kind == "auto":
+                ctx.user_data["state"] = "depa_new_addr"
+                await q.edit_message_text(
+                    "📤 *ধাপ ৩/৪ — USDT BEP-20 অ্যাড্রেস*\n\n"
+                    "যে ওয়ালেটে USDT আসবে সেই ঠিকানা লিখুন (0x…)\n\n/cancel — বাতিল",
+                    parse_mode="Markdown")
+            else:
+                ctx.user_data["state"] = "depa_new_ins"
+                await q.edit_message_text(
+                    "📝 *ধাপ ৩/৪ — নির্দেশনা*\n\n"
+                    "ইউজারকে যা দেখাবে (Binance UID / bKash নম্বর ইত্যাদি) লিখুন।\n"
+                    "একাধিক লাইনে লিখতে পারেন।\n\n/cancel — বাতিল",
+                    parse_mode="Markdown")
+            return
+        if d.startswith("depa:m:"):
+            return await _dep_admin_method(q, int(d.split(":")[2]))
+        if d.startswith("depa:ck:"):
+            _, _, mid, kind = d.split(":")
+            await asyncio.to_thread(dep_set_kind, int(mid), kind)
+            await q.answer(f"ধরন: {_dep_kind_bn(kind)}", show_alert=True)
+            return await _dep_admin_method(q, int(mid))
+        if d.startswith("depa:tg:"):
+            mid = int(d.split(":")[2])
+            await asyncio.to_thread(dep_method_toggle, mid)
+            return await _dep_admin_method(q, mid)
+        if d.startswith("depa:del:"):
+            mid = int(d.split(":")[2])
+            await asyncio.to_thread(dep_method_del, mid)
+            await q.answer("মেথড ডিলিট হয়েছে", show_alert=True)
+            return await _dep_admin_methods(q)
+        if d.startswith("depok:") or d.startswith("depno:"):
+            oid = int(d.split(":")[1])
+            o = await asyncio.to_thread(dep_row, oid)
+            if not o:
+                await q.answer("ডিপোজিট নেই", show_alert=True)
+                return
+            ok = d.startswith("depok:")
+            if str(o["status"]) != "pending":
+                await q.answer("এটি আগেই প্রসেস হয়েছে", show_alert=True)
+                return
+            n = await asyncio.to_thread(dep_set, oid, "approved" if ok else "rejected", uid)
+            if not n:
+                await q.answer("এটি আগেই প্রসেস হয়েছে", show_alert=True)
+                return
+            amount = float(o["amount"] or 0)
+            if ok:
+                await asyncio.to_thread(add_bal, int(o["user_id"]), amount)
+                try:
+                    bal = await asyncio.to_thread(get_bal, int(o["user_id"]))
+                except Exception:
+                    bal = 0
+                try:
+                    await ctx.bot.send_message(
+                        int(o["user_id"]),
+                        (f"✅ <b>ডিপোজিট অনুমোদিত!</b>\n\n"
+                         f"💵 <b>{amount:g}$</b> যোগ হয়েছে\n"
+                         f"🧾 <code>#{oid}</code>\n"
+                         f"💰 নতুন ব্যালেন্স: <b>{bal:g}$</b>"),
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+                await q.answer(f"✅ {amount:g}$ যোগ হয়েছে", show_alert=True)
+            else:
+                try:
+                    await ctx.bot.send_message(
+                        int(o["user_id"]),
+                        (f"❌ <b>ডিপোজিট বাতিল হয়েছে</b>\n\n"
+                         f"💵 {amount:g}$\n"
+                         f"🧾 <code>#{oid}</code>\n\n"
+                         "সমস্যা হলে সাপোর্টে মেসেজ দিন।"),
+                        parse_mode="HTML")
+                except Exception:
+                    pass
+                await q.answer("বাতিল করা হয়েছে", show_alert=True)
+            try:
+                await q.edit_message_text(f"{q.message.text or ''}\n\n"
+                                          f"{'✅ অনুমোদিত' if ok else '❌ বাতিল'}")
+            except Exception:
+                pass
+            return
+    except Exception as e:
+        log.warning(f"[DEP-ADMIN] {d} ব্যর্থ: {e}")
+        try:
+            await q.answer("সমস্যা হয়েছে", show_alert=True)
+        except Exception:
+            pass
+
+
+async def dep_admin_input(update, ctx, st):
+    """অ্যাডমিন মেথড তৈরির ধাপগুলো। True = হ্যান্ডল হয়েছে।"""
+    uid = update.effective_user.id
+    if not await asyncio.to_thread(is_admin, uid):
+        return False
+    txt = (update.message.text or "").strip()
+    info = ctx.user_data.get("dep_new") or {}
+
+    if st == "depa_new_name":
+        if len(txt) < 2:
+            await update.message.reply_text("❌ নাম খুব ছোট — আবার লিখুন (/cancel)।")
+            return True
+        info["name"] = txt[:80]
+        ctx.user_data["dep_new"] = info
+        ctx.user_data["state"] = "depa_new_kind"
+        await update.message.reply_text(
+            f"⚙️ *ধাপ ২/৪ — ধরন*\n\n`{_md_esc(txt)}`\n\n"
+            "⚡ *অটো (BEP-20)* — ইউজার TxID দিলে বট অন-চেইনে যাচাই করে সাথে সাথে যোগ করবে।\n"
+            "🆔 *অটো (Binance UID)* — ইউজার নিজের Binance UID দিলে বট Binance Pay API "
+            "থেকে পেমেন্ট খুঁজে সাথে সাথে যোগ করবে; না পেলে আপনার কাছে পেন্ডিং যাবে।\n"
+            "✍️ *ম্যানুয়াল* — আপনি নিজে ✅ করবেন (bKash, Nagad ইত্যাদি)।",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚡ অটো (BEP-20 TxID)", callback_data="depa:kind:auto")],
+                [InlineKeyboardButton("🆔 অটো (Binance UID)", callback_data="depa:kind:uid")],
+                [InlineKeyboardButton("✍️ ম্যানুয়াল", callback_data="depa:kind:manual")],
+                [InlineKeyboardButton("❌ বাতিল", callback_data="adm_dep")]]))
+        return True
+
+    if st == "depa_new_addr":
+        info["address"] = txt
+        ctx.user_data["dep_new"] = info
+        info["state_kind"] = info.get("kind")
+        ctx.user_data["state"] = "depa_new_min"
+        await update.message.reply_text(
+            "📉 *ধাপ ৪/৪ — সর্বনিম্ন ডিপোজিট*\n\nশুধু সংখ্যা লিখুন (যেমন `1`)।",
+            parse_mode="Markdown")
+        return True
+
+    if st == "depa_new_ins":
+        info["instructions"] = txt[:900]
+        ctx.user_data["dep_new"] = info
+        ctx.user_data["state"] = "depa_new_min"
+        await update.message.reply_text(
+            "📉 *ধাপ ৪/৪ — সর্বনিম্ন ডিপোজিট*\n\nশুধু সংখ্যা লিখুন (যেমন `1`)।",
+            parse_mode="Markdown")
+        return True
+
+    if st == "depa_new_min":
+        try:
+            mn = float(txt.replace(",", ".").replace("$", "").strip())
+        except Exception:
+            await update.message.reply_text("❌ শুধু সংখ্যা লিখুন (যেমন 1)।")
+            return True
+        info = ctx.user_data.get("dep_new") or {}
+        mid = await asyncio.to_thread(
+            dep_method_add, info.get("name") or "Deposit", info.get("kind") or "manual",
+            info.get("address") or "", info.get("instructions") or "", mn)
+        ctx.user_data.pop("state", None)
+        ctx.user_data.pop("dep_new", None)
+        await update.message.reply_text(
+            f"✅ ডিপোজিট মেথড তৈরি হয়েছে (`#{mid}`)\n\n"
+            f"📋 {_md_esc(info.get('name') or '')}\n"
+            f"🏷 {_dep_kind_bn(info.get('kind'))} · min `{mn:g}$`\n\n"
+            "ইউজাররা এখন ব্যালেন্স → 💳 ডিপোজিটে এটি দেখবে।",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 ডিপোজিট ম্যানেজার", callback_data="adm_dep")]]))
+        return True
+
+    return False
+
+
 # ──────────────────────────── KEYBOARDS ────────────────────────────
 def main_kb(uid=None):
     lang = get_lang(uid) if uid else 'bn'
     b = get_all_btns(lang)
     # লেআউট: Balance | Tasks / Withdraw | Profile / Support (ফুল-width) / Refer | Language
     return ReplyKeyboardMarkup([
+        [b['shop']],
         [b['balance'],       b['tasks']],
         [b['withdraw'],      b['profile']],
-        [b['support']],
-        [b['refer'],         b['language']],
+        [b['support'],       b['refer']],
+        [b['language']],
     ], resize_keyboard=True)
 
 def lang_kb(uid=None, current_lang=None):
@@ -5802,7 +7802,11 @@ async def show_balance(update, ctx):
         f"{T(uid,'balance_greet')}\n\n"
         f"{T(uid,'your_balance')} `{bal}$ USDT`"
         f"{task_promo}",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 ডিপোজিট", callback_data="dep:list")],
+            [InlineKeyboardButton("🧾 ডিপোজিট হিস্ট্রি", callback_data="dep:my")],
+        ])
     )
 
 async def show_support(update, ctx):
@@ -6450,67 +8454,88 @@ async def show_tasks(update, ctx):
         return
 
     btns = []
+    _fb_tasks, _ig_tasks = [], []
 
-    # Regular tasks — per task one button
-    if tasks:
-        # ── Batch: 2 queries (country + all submit counts) পূর্বে N+1 queries ──
-        _task_tcode_list   = [_rget(t, 'task_code', '') or '' for t in tasks]
-        # পুরনো task যাদের code নেই → name দিয়ে fallback query
-        _task_names_nocode = [t['name'] for t, tc in zip(tasks, _task_tcode_list) if not tc]
-        user_country, _submit_counts = await asyncio.gather(
-            asyncio.to_thread(get_user_country, uid),
-            asyncio.to_thread(get_user_task_submit_counts_batch, uid, _task_tcode_list, _task_names_nocode),
-        )
-        user_country = (user_country or "").upper()
-        for task in tasks:
-            tc = _rget(task, 'task_code', '') or ''
-            _lookup = tc if tc else task['name']
-            done_count = _submit_counts.get(_lookup, 0)
-            per_user_limit = _rget(task, 'per_user_limit', 1)
-            if per_user_limit != 0 and done_count >= per_user_limit:
-                continue
-            # Max completions / slots check
-            mc     = _rget(task, 'max_completions', 0)
-            done_c = _rget(task, 'completed_count', 0)
-            if mc > 0 and done_c >= mc:
-                continue
-            # Country restriction check
-            ac = (_rget(task, 'allowed_countries', '') or '').strip().upper()
-            if ac and ac not in ("0", "ALL"):
-                allowed_list = [x.strip() for x in ac.split(",") if x.strip()]
-                if not user_country or user_country not in allowed_list:
-                    continue
-            ticon = task_type_icon(_rget(task, 'task_type', 'other'))
-            slots_info = f"  •  {max(0, mc - done_c)} left" if mc > 0 else ""
-            label = f"{ticon} {task['name']}  •  ${task['price']}{slots_info}"
-            btns.append([InlineKeyboardButton(label, callback_data=f"task_{task['id']}")])
+    async def _val(_v):
+        return _v
 
-    # Categories — সব category-র tasks একটি batch query তে (N queries → 1)
-    if categories:
-        _cat_ids = [cat['id'] for cat in categories]
-        _cat_tasks_map = await asyncio.to_thread(get_all_category_tasks_batch, _cat_ids)
-        _all_cat_tasks_list = [_cat_tasks_map.get(cat['id'], []) for cat in categories]
-        # ── Batch: সব category-র সব task done status — 1 query ──
-        _all_ctasks_flat = [t for ctasks in _all_cat_tasks_list for t in ctasks]
-        _done_map = await asyncio.to_thread(categ_tasks_user_done_batch, uid, _all_ctasks_flat)
-        for cat, _all_ctasks in zip(categories, _all_cat_tasks_list):
-            if not _all_ctasks:
-                continue
-            cat_tasks = [t for t in _all_ctasks if not _done_map.get(t['id'], False)]
-            if cat_tasks:
-                total_earn = sum(t['price'] for t in cat_tasks)
-                task_count = len(cat_tasks)
-                btns.append([InlineKeyboardButton(
-                    f"🗂️ {cat['name']}  •  {task_count} Task  •  ${round(total_earn,2)}",
-                    callback_data=f"categ_{cat['id']}"
-                )])
+    # ── সব স্বাধীন ডেটা একসাথে (আগে একটার পর একটা await ছিল → ধীর) ──
+    _task_tcode_list   = [_rget(t, 'task_code', '') or '' for t in tasks]
+    # পুরনো task যাদের code নেই → name দিয়ে fallback query
+    _task_names_nocode = [t['name'] for t, tc in zip(tasks, _task_tcode_list) if not tc]
+    _cat_ids = [cat['id'] for cat in categories]
+    _tg_ids_all = [t['id'] for t in tg_tasks]
+    (user_country, _submit_counts, _cat_tasks_map, _bio_trk,
+     _fb_tasks, _ig_tasks, _tgt_done_set) = await asyncio.gather(
+        asyncio.to_thread(get_user_country, uid),
+        asyncio.to_thread(get_user_task_submit_counts_batch, uid,
+                          _task_tcode_list, _task_names_nocode) if tasks else _val({}),
+        asyncio.to_thread(get_all_category_tasks_batch, _cat_ids) if _cat_ids else _val({}),
+        asyncio.to_thread(get_bio_task_tracking, uid) if bio_active else _val((False, False)),
+        asyncio.to_thread(_fb_active_tasks_c),
+        asyncio.to_thread(_ig_active_tasks_c),
+        asyncio.to_thread(tg_task_user_done_batch, uid, _tg_ids_all) if _tg_ids_all else _val(set()),
+    )
+    _submit_counts = _submit_counts or {}
+    _cat_tasks_map = _cat_tasks_map or {}
+    _tgt_done_set = _tgt_done_set or set()
+    _all_cat_tasks_list = [_cat_tasks_map.get(cat['id'], []) for cat in categories]
+    _all_ctasks_flat = [t for _l in _all_cat_tasks_list for t in _l]
 
-    # Bio Task — active হলে সবসময় দেখাও
+    # ── দ্বিতীয় wave: যেগুলো আগের ফলাফলের উপর নির্ভর করে ──
+    _fb_map, _ig_map, _done_map = await asyncio.gather(
+        asyncio.to_thread(_fb_counts_map_c, [int(x["id"]) for x in _fb_tasks], uid) if _fb_tasks else _val({}),
+        asyncio.to_thread(_ig_counts_map_c, [int(x["id"]) for x in _ig_tasks], uid) if _ig_tasks else _val({}),
+        asyncio.to_thread(categ_tasks_user_done_batch, uid, _all_ctasks_flat) if _all_ctasks_flat else _val({}),
+    )
+    _fb_map = _fb_map or {}
+    _ig_map = _ig_map or {}
+    _done_map = _done_map or {}
+
+    # ── Regular tasks — per task one button ──────────────────────
+    user_country = (user_country or "").upper()
+    for task in tasks:
+        tc = _rget(task, 'task_code', '') or ''
+        _lookup = tc if tc else task['name']
+        done_count = _submit_counts.get(_lookup, 0)
+        per_user_limit = _rget(task, 'per_user_limit', 1)
+        if per_user_limit != 0 and done_count >= per_user_limit:
+            continue
+        # Max completions / slots check
+        mc     = _rget(task, 'max_completions', 0)
+        done_c = _rget(task, 'completed_count', 0)
+        if mc > 0 and done_c >= mc:
+            continue
+        # Country restriction check
+        ac = (_rget(task, 'allowed_countries', '') or '').strip().upper()
+        if ac and ac not in ("0", "ALL"):
+            allowed_list = [x.strip() for x in ac.split(",") if x.strip()]
+            if not user_country or user_country not in allowed_list:
+                continue
+        ticon = task_type_icon(_rget(task, 'task_type', 'other'))
+        slots_info = f"  •  {max(0, mc - done_c)} left" if mc > 0 else ""
+        label = f"{ticon} {task['name']}  •  ${task['price']}{slots_info}"
+        btns.append([InlineKeyboardButton(label, callback_data=f"task_{task['id']}")])
+
+    # ── Categories ───────────────────────────────────────────────
+    for cat, _all_ctasks in zip(categories, _all_cat_tasks_list):
+        if not _all_ctasks:
+            continue
+        cat_tasks = [t for t in _all_ctasks if not _done_map.get(t['id'], False)]
+        if cat_tasks:
+            total_earn = sum(t['price'] for t in cat_tasks)
+            task_count = len(cat_tasks)
+            btns.append([InlineKeyboardButton(
+                f"🗂️ {cat['name']}  •  {task_count} Task  •  ${round(total_earn,2)}",
+                callback_data=f"categ_{cat['id']}"
+            )])
+
+    # ── Bio Task — active হলে সবসময় দেখাও ───────────────────────
     if bio_active:
-        dr             = bio_task['reward']
-        ar             = (bio_task.get('add_reward', 0) or 0)
-        # দুটো column একটি query তে (পূর্বে 2 DB calls)
-        actively_track, add_done = await asyncio.to_thread(get_bio_task_tracking, uid)
+        dr = bio_task['reward']
+        ar = (bio_task.get('add_reward', 0) or 0)
+        _bio_trk = _bio_trk or (False, False)
+        actively_track, add_done = _bio_trk[0], _bio_trk[1]
         if lang == 'bn':
             if actively_track:
                 bt_label = f"🧬 Bio Task  •  ✅ Tracking চলছে  •  Daily {dr}$"
@@ -6527,12 +8552,8 @@ async def show_tasks(update, ctx):
                 bt_label = f"🧬 Bio Task  •  🆕 {ar}$ + Daily {dr}$"
         btns.append([InlineKeyboardButton(bt_label, callback_data="bio_task_info")])
 
-    # Telegram tasks — ONE grouped button
+    # ── Telegram tasks — ONE grouped button ──────────────────────
     if tg_tasks:
-        # ── slots: tg_tasks data-তেই আছে — thread dispatch লাগে না ──
-        # ── done set: 1 batch query ──
-        _tg_ids = [t['id'] for t in tg_tasks]
-        _tgt_done_set = await asyncio.to_thread(tg_task_user_done_batch, uid, _tg_ids)
         _tgt_slots = [
             (-1 if t['max_completions'] == 0
              else max(0, t['max_completions'] - t['completed_count']))
@@ -6549,12 +8570,9 @@ async def show_tasks(update, ctx):
         )
         btns.append([InlineKeyboardButton(tgt_label, callback_data="tgt_list")])
 
-    # Facebook Tasks — active থাকলে একটাই গ্রুপ বাটন
-    _fb_tasks = await asyncio.to_thread(_fb_active_tasks_c)
+    # ── Facebook Tasks — active থাকলে একটাই গ্রুপ বাটন ─────────────
     if _fb_tasks:
         _fb_left = 0
-        _fb_map = await asyncio.to_thread(
-            _fb_counts_map_c, [int(_x["id"]) for _x in _fb_tasks], uid)
         for _ft in _fb_tasks:
             _tot, _mine = _fb_map.get(int(_ft["id"]), (0, 0))
             _mx = int(_ft.get("max_accounts") or 0)
@@ -6565,12 +8583,9 @@ async def show_tasks(update, ctx):
                      else f"📘 Facebook Tasks ({_fb_left}টি available)")
         btns.append([InlineKeyboardButton(_fb_label, callback_data="fbt_list")])
 
-    # Instagram Tasks — active থাকলে একটাই গ্রুপ বাটন
-    _ig_tasks = await asyncio.to_thread(_ig_active_tasks_c)
+    # ── Instagram Tasks — active থাকলে একটাই গ্রুপ বাটন ────────────
     if _ig_tasks:
         _ig_left = 0
-        _ig_map = await asyncio.to_thread(
-            _ig_counts_map_c, [int(_x["id"]) for _x in _ig_tasks], uid)
         for _it in _ig_tasks:
             _tot, _mine = _ig_map.get(int(_it["id"]), (0, 0))
             _mx = int(_it.get("max_accounts") or 0)
@@ -6796,12 +8811,10 @@ async def show_category_task_rules(update, ctx, task):
 
     sub_btn  = T(uid, 'submit_btn')
     cancel_b = T(uid, 'cancel_inline')
-    _has_vid = bool((_rget(task, 'demo_video_id', '') or '').strip())
-    _kb_rows = []
-    if _has_vid:
-        _vid_lbl = "📹 ভিডিও দেখুন" if lang == 'bn' else "📹 Watch Video"
-        _kb_rows.append([InlineKeyboardButton(_vid_lbl, callback_data=f"ctask_watch_video_{tid}")])
-    _kb_rows.append([InlineKeyboardButton(sub_btn, callback_data=f"ctask_submit_{tid}")])
+    _vid_lbl = "📽 ভিডিও" if lang == 'bn' else "📽 Video"
+    _kb_rows = [[InlineKeyboardButton(sub_btn, callback_data=f"ctask_submit_{tid}")]]
+    # 📽 ভিডিও — Start বাটনের ঠিক নিচে, সবসময় দেখাবে
+    _kb_rows.append([InlineKeyboardButton(_vid_lbl, callback_data=f"ctask_watch_video_{tid}")])
     _kb_rows.append([InlineKeyboardButton(cancel_b, callback_data="task_cancel")])
     max_c2  = _rget(task, 'max_completions', 0)
     done_c2 = _rget(task, 'completed_count', 0)
@@ -6855,6 +8868,8 @@ async def show_category_task_rules(update, ctx, task):
             _cap = "📷 Example Image — এইরকম ছবি দিন" if lang == 'bn' else "📷 Example Image — Submit a photo like this"
             await update.effective_message.reply_photo(_ct_ex_img, caption=_cap)
         except Exception: pass
+    # ── 📽 ডেমো ভিডিও — টাস্ক খোলার সাথেই (বাটনও থাকছে) ────────
+    await _autosend_task_video(update.effective_message, task, lang, "ctask")
 
 async def start_category_task_collect(update, ctx, task_id):
     """Start collecting proof for a category task"""
@@ -7532,6 +9547,7 @@ async def show_language(update, ctx):
 # ──────────────────────────── TASK SUBMIT FLOW ────────────────────────────
 async def show_task_rules(update, ctx, task):
     uid = update.effective_user.id
+    _td0 = _time.monotonic()
     # lang + block check একসাথে parallel
     lang, (_blk, _blk_dt) = await asyncio.gather(
         asyncio.to_thread(get_lang, uid),
@@ -7545,7 +9561,11 @@ async def show_task_rules(update, ctx, task):
     # ── Per-user limit check ─────────────────────────────────────
     per_user_limit = _rget(task, 'per_user_limit', 1)
     _str_tcode     = _rget(task, 'task_code', '') or ''
-    done_count     = await asyncio.to_thread(get_user_task_submit_count, task['name'], uid, _str_tcode)
+    # submit count + fields একসাথে (আগে একটার পর একটা → দেরি)
+    done_count, fields = await asyncio.gather(
+        asyncio.to_thread(get_user_task_submit_count, task['name'], uid, _str_tcode),
+        asyncio.to_thread(get_task_fields, task['id']),
+    )
     lim_lbl        = "∞" if per_user_limit == 0 else str(per_user_limit)
     if per_user_limit != 0 and done_count >= per_user_limit:
         if lang == 'en':
@@ -7554,18 +9574,16 @@ async def show_task_rules(update, ctx, task):
             msg = f"✅ আপনি এই Task ইতিমধ্যে {done_count}/{lim_lbl} বার সম্পন্ন করেছেন। আর জমা দেওয়া যাবে না।"
         await update.effective_message.reply_text(msg, parse_mode="Markdown")
         return
-    fields   = await asyncio.to_thread(get_task_fields, task['id'])
     sub_btn  = T(uid, 'submit_btn')
     cancel_b = T(uid, 'cancel_inline')
-    _has_vid_r = bool((_rget(task, 'demo_video_id', '') or '').strip())
-    _kb_rows_r = []
-    if _has_vid_r:
-        _vid_lbl_r = "📹 ভিডিও দেখুন" if lang == 'bn' else "📹 Watch Video"
-        _kb_rows_r.append([InlineKeyboardButton(_vid_lbl_r, callback_data=f"task_watch_video_{task['id']}")])
-    _kb_rows_r.append([
+    _vid_lbl_r = "📽 ভিডিও" if lang == 'bn' else "📽 Video"
+    _kb_rows_r = [[
         InlineKeyboardButton(sub_btn,  callback_data=f"task_submit_{task['id']}"),
         InlineKeyboardButton(cancel_b, callback_data="task_cancel"),
-    ])
+    ]]
+    # 📽 ভিডিও — Start (জমা দিন) বাটনের ঠিক নিচে, সবসময় দেখাবে
+    _kb_rows_r.append([InlineKeyboardButton(
+        _vid_lbl_r, callback_data=f"task_watch_video_{task['id']}")])
     kb = InlineKeyboardMarkup(_kb_rows_r)
     if lang == 'en':
         rules_text  = (task["rules_en"] if task["rules_en"] else await asyncio.to_thread(translate_to_en, task["rules"])) if task["rules"] else "No special rules."
@@ -7605,6 +9623,10 @@ async def show_task_rules(update, ctx, task):
         f"{confirm_txt}",
         parse_mode="HTML", reply_markup=kb
     )
+    await _autosend_task_video(update.effective_message, task, lang, "task")
+    _td_el = _time.monotonic() - _td0
+    if _td_el > 2:
+        log.warning(f"[SLOW-TASK-DETAIL] uid={uid} tid={_rget(task, 'id', 0)} {_td_el:.1f}s")
     # NOTE: example_image শুধু _ask_next_field এ দেখানো হয় (ছবি জমার সময়),
     # এখানে দেখালে দ্বিতীয়বার দেখায় — তাই এখানে remove করা হয়েছে।
 
@@ -9460,6 +11482,40 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     uid = update.effective_user.id
     st  = ctx.user_data.get("state")
+
+    # ── Admin: FB / IG Task ভিডিও (document হিসেবে) ──
+    if st == "fbt_video_file":
+        try:
+            if await task_video_admin_file(update, ctx, str(st)):
+                return
+        except Exception as _tvd:
+            log.warning(f"[TASK-VIDEO] ডকুমেন্ট আপলোড ব্যর্থ: {_tvd}")
+
+    # ── Admin: Shop স্টক ফাইল (.txt) আপলোড ──
+    if st and str(st).startswith("shopa_txt:") and await asyncio.to_thread(is_admin, uid):
+        pid = int(str(st).split(":")[1])
+        doc = update.message.document
+        try:
+            tf = await ctx.bot.get_file(doc.file_id)
+            raw = await tf.download_as_bytearray()
+            text = bytes(raw).decode("utf-8", "ignore")
+        except Exception as e:
+            await update.message.reply_text(f"❌ ফাইল পড়া যায়নি: {e}")
+            return
+        n = await asyncio.to_thread(shop_add_stock, pid, text)
+        ctx.user_data.pop("state", None)
+        if not n:
+            await update.message.reply_text("❌ ফাইলে কিছু পাওয়া যায়নি (<code>utf-8</code> txt দিন)।",
+                                            parse_mode="HTML")
+            return
+        total = await asyncio.to_thread(shop_stock_count, pid)
+        await update.message.reply_text(
+            f"✅ ফাইল থেকে `{n}` টা স্টক যোগ হয়েছে।\n📥 এখন মোট স্টক: `{total}`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 পণ্যে ফিরুন", callback_data=f"shopa:p:{pid}")]]))
+        return
+
     if st == "adm_restore_db" and await asyncio.to_thread(is_admin, uid):
         # PostgreSQL mode — file restore দরকার নেই
         ctx.user_data.pop("state", None)
@@ -9511,6 +11567,14 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not await _bot_accessible(uid):
         await bot_off_reply(update, uid); return
+
+    # ── Admin: FB / IG Task ভিডিও আপলোড ─────────────────────────
+    if st == "fbt_video_file":
+        try:
+            if await task_video_admin_file(update, ctx, str(st)):
+                return
+        except Exception as _tvf:
+            log.warning(f"[TASK-VIDEO] আপলোড ব্যর্থ: {_tvf}")
 
     # ── Admin: Demo Video (as video message) — Category Task ─────
     if st == "adm_ctask_set_video_file" and await asyncio.to_thread(is_admin, uid):
@@ -10376,6 +12440,12 @@ async def send_admin_panel(msg, uid):
             InlineKeyboardButton("📁 Category যোগ করুন", callback_data="adm_cat_add"),
             InlineKeyboardButton("📁 Category তালিকা",   callback_data="adm_cat_list"),
         ])
+    # Deposit / ডিপোজিট
+    if has_finance or has_settings or uid == ADMIN_ID:
+        rows.append([InlineKeyboardButton("💳 ডিপোজিট ম্যানেজ", callback_data="adm_dep")])
+    # Shop / দোকান
+    if has_tasks or has_finance or uid == ADMIN_ID:
+        rows.append([InlineKeyboardButton("🛒 Shop / দোকান ম্যানেজ", callback_data="adm_shop")])
     # Task Code search
     if has_tasks:
         rows.append([InlineKeyboardButton("🔍 Task Code খুঁজুন", callback_data="adm_task_code_search")])
@@ -11721,7 +13791,9 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         vid = (_rget(t, 'demo_video_id', '') or '').strip() if t else ''
         lang = await asyncio.to_thread(get_lang, uid)
         if not vid:
-            await q.message.reply_text("❌ ভিডিও পাওয়া যায়নি!" if lang == 'bn' else "❌ Video not found!")
+            await q.message.reply_text(
+                "📽 এই টাস্কের ভিডিও এখনো যোগ করা হয়নি।" if lang == 'bn'
+                else "📽 No video has been added to this task yet.")
             return
         try:
             if vid.startswith("http") or vid.startswith("https"):
@@ -11749,7 +13821,9 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         vid = (_rget(t, 'demo_video_id', '') or '').strip() if t else ''
         lang = await asyncio.to_thread(get_lang, uid)
         if not vid:
-            await q.message.reply_text("❌ ভিডিও পাওয়া যায়নি!" if lang == 'bn' else "❌ Video not found!")
+            await q.message.reply_text(
+                "📽 এই টাস্কের ভিডিও এখনো যোগ করা হয়নি।" if lang == 'bn'
+                else "📽 No video has been added to this task yet.")
             return
         try:
             if vid.startswith("http") or vid.startswith("https"):
@@ -13741,7 +15815,9 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         vid = (_rget(t, 'demo_video_id', '') or '').strip() if t else ''
         lang = await asyncio.to_thread(get_lang, uid)
         if not vid:
-            await q.message.reply_text("❌ ভিডিও পাওয়া যায়নি!" if lang == 'bn' else "❌ Video not found!")
+            await q.message.reply_text(
+                "📽 এই টাস্কের ভিডিও এখনো যোগ করা হয়নি।" if lang == 'bn'
+                else "📽 No video has been added to this task yet.")
             return
         try:
             if vid.startswith("http") or vid.startswith("https"):
@@ -13769,7 +15845,9 @@ async def _handle_admin_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE, q,
         vid = (_rget(t, 'demo_video_id', '') or '').strip() if t else ''
         lang = await asyncio.to_thread(get_lang, uid)
         if not vid:
-            await q.message.reply_text("❌ ভিডিও পাওয়া যায়নি!" if lang == 'bn' else "❌ Video not found!")
+            await q.message.reply_text(
+                "📽 এই টাস্কের ভিডিও এখনো যোগ করা হয়নি।" if lang == 'bn'
+                else "📽 No video has been added to this task yet.")
             return
         try:
             if vid.startswith("http") or vid.startswith("https"):
@@ -14016,6 +16094,32 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _rate_allowed(uid, "tx:" + txt.strip().casefold()):
         return
     st   = ctx.user_data.get("state")
+
+    # ── 📽 FB/IG টাস্কের ভিডিও লিংক (অ্যাডমিন) ──
+    if st == "fbt_video_url":
+        try:
+            if await task_video_admin_input(update, ctx, str(st)):
+                return
+        except Exception as _tve:
+            log.warning(f"[TASK-VIDEO] ইনপুট ব্যর্থ: {_tve}")
+
+    # ── 💳 Deposit ইনপুট (ইউজার TxID/পরিমাণ + অ্যাডমিন মেথড তৈরি) ──
+    if st and str(st).startswith(("dep_tx", "dep_amt", "dep_note", "depa_new")):
+        try:
+            if await dep_admin_input(update, ctx, str(st)):
+                return
+            if await dep_input(update, ctx, str(st)):
+                return
+        except Exception as _depe:
+            log.warning(f"[DEP] input ব্যর্থ: {_depe}")
+
+    # ── 🛒 Shop: অ্যাডমিনের ইনপুট (ক্যাটাগরি / পণ্য / স্টক / ডেলিভারি) ──
+    if st and str(st).startswith("shopa_"):
+        try:
+            if await shop_admin_input(update, ctx, str(st)):
+                return
+        except Exception as _shse:
+            log.warning(f"[SHOP] admin input ব্যর্থ: {_shse}")
 
     # ── verify + /start এর আগে বট কাজ করে না ──
     # (রিসেটের পর পুরোনো মেনু-বাটন চাপলে যেন বট চুপ না থাকে — ৬০ সেকেন্ডে একবার verify প্রম্পট)
@@ -16310,6 +18414,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif txt == btns['refer']:    await show_refer(update, ctx)
     elif txt == btns['support']:  await show_support(update, ctx)
     elif txt == btns['withdraw']: await show_withdraw(update, ctx)
+    elif txt == btns['shop']:          await show_shop(update, ctx)
     elif txt == btns['language']:      await show_language(update, ctx)
     else:
         await update.message.reply_text(T(uid,'choose_menu'), parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
@@ -16323,6 +18428,13 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not await _bot_accessible(uid):
         await bot_off_reply(update, uid); return
+
+    if st == "dep_note":
+        try:
+            if await dep_input(update, ctx, "dep_note"):
+                return
+        except Exception as _dpe:
+            log.warning(f"[DEP] photo input ব্যর্থ: {_dpe}")
 
     if st == "adm_bc_photo" and await asyncio.to_thread(is_admin, uid):
         file_id = update.message.photo[-1].file_id
@@ -21019,19 +23131,20 @@ def _task_video_row(task, lang, kind="fb"):
       • tg:<file_id> → বট নিজেই ভিডিওটা পাঠাবে (ওয়েব থেকে আপলোড করা)
     """
     url = (task.get("video_url") or "").strip()
+    _tid = int(task.get("id") or 0)
+    _cb = f"igvid:{_tid}" if str(kind) == "ig" else f"fbvid:{_tid}"
+    _lbl = "📽 ভিডিও" if lang != "en" else "📽 Video"
     if url.startswith("tg:"):
-        _tid = int(task.get("id") or 0)
-        _cb = f"igvid:{_tid}" if str(kind) == "ig" else f"fbvid:{_tid}"
-        _lbl = "📽 Video দেখুন" if lang != "en" else "📽 Watch Video"
         if _tid:
             return [InlineKeyboardButton(_lbl, callback_data=_cb)]
     if url and not url.lower().startswith(("http://", "https://")):
         # "youtu.be/xxxx" ধাঁচে (স্কিম ছাড়া) দিলেও কাজ করবে
         if "." in url and " " not in url:
             url = "https://" + url.lstrip("/")
-    if not url.lower().startswith(("http://", "https://")):
-        return None
-    return [InlineKeyboardButton("📽 Video instruction", url=url)]
+    if url.lower().startswith(("http://", "https://")):
+        return [InlineKeyboardButton(_lbl, url=url)]
+    # ভিডিও এখনো সেট করা নেই — তবু বাটনটা দেখাবে (চাপলে জানাবে)
+    return [InlineKeyboardButton(_lbl, callback_data=_cb)] if _tid else None
 
 
 def _fb_kb(rows):
@@ -21117,6 +23230,7 @@ async def fb_task_rules(q, uid, tid):
     rows.append([InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
                                       callback_data="task_cancel")])
     await _task_reply_ui(q, uid, "\n".join(parts), rows, lang=lang)
+    await _autosend_task_video(q.message, task, lang, "fb")
 
 
 async def fb_task_start(q, uid, tid):
@@ -21829,6 +23943,7 @@ async def adm_fb_list(q, uid, ctx=None):
         rows.append([
             InlineKeyboardButton(f"⬇️ {_nm} (CSV)", callback_data=f"fbx:{t['id']}"),
             InlineKeyboardButton("📢 নোটিফাই", callback_data=f"fbnt:{t['id']}"),
+            InlineKeyboardButton("📽 ভিডিও", callback_data=f"fbvideo:{t['id']}"),
         ])
     rows.append([InlineKeyboardButton("🔄 রিফ্রেশ", callback_data="adm_fb")])
     await q.message.reply_text(
@@ -21908,6 +24023,146 @@ async def adm_fb_export(q, uid, tid):
     await q.answer("✅ পাঠানো হলো")
 
 
+# ── 📽 Task Demo Video (FB / IG) — লিংক বা আপলোড, টাস্ক খুললেই যায় ──
+def _set_task_video(kind, tid, value):
+    tbl = "ig_tasks" if str(kind) == "ig" else "fb_tasks"
+    with _c() as c:
+        c.execute("UPDATE " + tbl + " SET video_url=%s WHERE id=%s",
+                  ((value or "").strip()[:800], int(tid)))
+    try:
+        _TASK_MEMO.clear()
+    except Exception:
+        pass
+    return True
+
+
+def _task_video_raw(task, kind="task"):
+    if str(kind) in ("fb", "ig"):
+        return (task.get("video_url") or "").strip()
+    return (_rget(task, "demo_video_id", "") or "").strip()
+
+
+async def _autosend_task_video(msg, task, lang, kind="task"):
+    """টাস্ক খোলার সাথে সাথেই ডেমো ভিডিও পাঠায় (সেট থাকলে)।"""
+    raw = _task_video_raw(task, kind)
+    if not raw:
+        return False
+    cap = "📽 ভিডিওটি দেখে নিন" if lang != "en" else "📽 Watch the video"
+    if str(kind) not in ("fb", "ig"):
+        # regular / category task — demo_video_id হলো টেলিগ্রাম file_id
+        try:
+            await msg.reply_video(raw, caption=cap)
+            return True
+        except Exception as e:
+            log.debug(f"[TASK-VIDEO] পাঠানো যায়নি tid={_rget(task, 'id', 0)}: {e}")
+            return False
+    try:
+        if raw.startswith("tg:"):
+            await msg.reply_video(raw[3:].strip(), caption=cap)
+            return True
+        u = raw
+        if not u.lower().startswith(("http://", "https://")) and "." in u and " " not in u:
+            u = "https://" + u.lstrip("/")
+        if re.search(r"\.(mp4|mov|webm|m4v|mkv)(\?|#|$)", u.lower()):
+            await msg.reply_video(u, caption=cap)
+            return True
+    except Exception as e:
+        log.debug(f"[TASK-VIDEO] পাঠানো যায়নি tid={_rget(task, 'id', 0)}: {e}")
+    return False
+
+
+async def _video_admin_panel(q, kind, tid):
+    t = await asyncio.to_thread(_ig_task if str(kind) == "ig" else _fb_task, tid)
+    _nm = (t or {}).get("name") or ("Instagram Task" if str(kind) == "ig" else "Facebook Task")
+    _raw = _task_video_raw(t or {}, kind)
+    if _raw.startswith("tg:"):
+        _cur = "✅ আপলোড করা ভিডিও সেট আছে"
+    elif _raw:
+        _cur = f"🔗 `{_md_esc(_raw[:120])}`"
+    else:
+        _cur = "❌ কোনো ভিডিও সেট নেই"
+    _p = "igv" if str(kind) == "ig" else "fbv"
+    rows = [[InlineKeyboardButton("🔗 লিংক দিন", callback_data=f"{_p}url:{tid}"),
+             InlineKeyboardButton("⬆️ ভিডিও আপলোড", callback_data=f"{_p}up:{tid}")]]
+    if _raw:
+        rows.append([InlineKeyboardButton("🗑 ভিডিও মুছুন", callback_data=f"{_p}del:{tid}")])
+    rows.append([InlineKeyboardButton("🔙 Admin Panel",
+                                      callback_data="adm_ig" if str(kind) == "ig" else "adm_fb")])
+    txt = (f"📽 *{_md_esc(str(_nm))} — ভিডিও*\n"
+           "━━━━━━━━━━━━━━\n"
+           f"বর্তমান: {_cur}\n\n"
+           "ইউজার টাস্কে চাপলেই এই ভিডিও চলে যাবে।\n"
+           "• 🔗 লিংক — YouTube / Drive / MP4\n"
+           "• ⬆️ আপলোড — বট নিজেই ভিডিও পাঠাবে (সবচেয়ে নির্ভরযোগ্য)")
+    try:
+        await q.edit_message_text(txt, parse_mode="Markdown",
+                                  reply_markup=InlineKeyboardMarkup(rows),
+                                  disable_web_page_preview=True)
+    except Exception:
+        await q.message.reply_text(txt, parse_mode="Markdown",
+                                   reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def task_video_admin_input(update, ctx, st):
+    """অ্যাডমিন FB/IG টাস্কের ভিডিও লিংক বসানো। True = হ্যান্ডল হয়েছে।"""
+    if st != "fbt_video_url":
+        return False
+    if not await asyncio.to_thread(is_admin, update.effective_user.id):
+        return False
+    kind = ctx.user_data.get("tv_kind") or "fb"
+    tid = int(ctx.user_data.get("tv_tid") or 0)
+    txt = (update.message.text or "").strip()
+    ctx.user_data.pop("state", None)
+    ctx.user_data.pop("tv_kind", None)
+    ctx.user_data.pop("tv_tid", None)
+    u = txt
+    if not u.lower().startswith(("http://", "https://")):
+        if "." in u and " " not in u:
+            u = "https://" + u.lstrip("/")
+        else:
+            await update.message.reply_text(
+                "❌ লিংক ঠিক নয় — https:// দিয়ে শুরু হওয়া ভিডিও লিংক দিন।")
+            return True
+    await asyncio.to_thread(_set_task_video, kind, tid, u)
+    _lbl = "Instagram" if str(kind) == "ig" else "Facebook"
+    await update.message.reply_text(
+        f"✅ *{_lbl} Task ভিডিও সেট হয়েছে!*\n\n🔗 `{_md_esc(u[:150])}`\n\n"
+        "ইউজার টাস্কে চাপলেই এই ভিডিও/লিংক চলে যাবে।",
+        parse_mode="Markdown", disable_web_page_preview=True)
+    return True
+
+
+async def task_video_admin_file(update, ctx, st):
+    """অ্যাডমিন FB/IG টাস্কে ভিডিও ফাইল আপলোড। True = হ্যান্ডল হয়েছে।"""
+    if st != "fbt_video_file":
+        return False
+    msg = update.message
+    if not await asyncio.to_thread(is_admin, update.effective_user.id):
+        return False
+    file_id = ""
+    if getattr(msg, "video", None):
+        file_id = msg.video.file_id
+    elif getattr(msg, "document", None):
+        _d = msg.document
+        if str(getattr(_d, "mime_type", "") or "").startswith("video/"):
+            file_id = _d.file_id
+    kind = ctx.user_data.get("tv_kind") or "fb"
+    tid = int(ctx.user_data.get("tv_tid") or 0)
+    if not file_id or not tid:
+        await msg.reply_text("❌ ভিডিও ফাইল পাননি — video হিসেবে আবার পাঠান (/cancel)।")
+        return True
+    ctx.user_data.pop("state", None)
+    ctx.user_data.pop("tv_kind", None)
+    ctx.user_data.pop("tv_tid", None)
+    await asyncio.to_thread(_set_task_video, kind, tid, "tg:" + file_id)
+    _lbl = "Instagram" if str(kind) == "ig" else "Facebook"
+    await msg.reply_text(
+        f"✅ *{_lbl} Task ভিডিও আপলোড হয়েছে!*\n\n"
+        "ইউজার টাস্কে চাপলেই বট নিজেই ভিডিওটি পাঠাবে।",
+        parse_mode="Markdown")
+    return True
+
+
 # ─── FB Task ক্যালব্যাক রাউটার ───
 async def fb_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """fbt_list / fbtn:<id> / fbr:<id> / fbs:<id> / fbt_cancel / adm_fb / fbx:<id>"""
@@ -21953,8 +24208,37 @@ async def fb_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as _e:
                     log.warning(f'[FB-VIDEO] {_e}')
                     await q.message.reply_text('❌ ভিডিও পাঠানো যায়নি।')
+            elif _vf.lower().startswith(('http://', 'https://')):
+                await q.message.reply_text(
+                    '📽 Video', disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton('🎬 Video', url=_vf)]]))
             else:
-                await q.message.reply_text('❌ ভিডিও পাওয়া যায়নি।')
+                await q.message.reply_text('📽 এই টাস্কের ভিডিও এখনো যোগ করা হয়নি।')
+        elif data.startswith(('fbvideo:', 'fbvurl:', 'fbvup:', 'fbvdel:')):
+            if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
+                return
+            _act, _tid = data.split(':', 1)
+            _tid = int(_tid)
+            if _act == 'fbvideo':
+                await _video_admin_panel(q, 'fb', _tid)
+            elif _act == 'fbvurl':
+                ctx.user_data['state'] = 'fbt_video_url'
+                ctx.user_data['tv_kind'] = 'fb'
+                ctx.user_data['tv_tid'] = _tid
+                await q.message.reply_text(
+                    "🔗 ভিডিওর লিংক পাঠান (YouTube / Drive / MP4)।\n\n/cancel — বাতিল",
+                    disable_web_page_preview=True)
+            elif _act == 'fbvup':
+                ctx.user_data['state'] = 'fbt_video_file'
+                ctx.user_data['tv_kind'] = 'fb'
+                ctx.user_data['tv_tid'] = _tid
+                await q.message.reply_text(
+                    "⬆️ ভিডিওটি এখানে পাঠান (video বা video ফাইল হিসেবে)।\n\n/cancel — বাতিল")
+            else:
+                await asyncio.to_thread(_set_task_video, 'fb', _tid, '')
+                await q.answer('ভিডিও মুছে ফেলা হয়েছে', show_alert=True)
+                await _video_admin_panel(q, 'fb', _tid)
         elif data.startswith('fbnt:'):
             if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
                 return
@@ -22751,6 +25035,7 @@ async def ig_task_rules(q, uid, tid):
     rows.append([InlineKeyboardButton("❌ বাতিল" if lang != "en" else "❌ Cancel",
                                       callback_data="task_cancel")])
     await _task_reply_ui(q, uid, "\n".join(parts), rows, lang=lang)
+    await _autosend_task_video(q.message, task, lang, "ig")
 
 
 async def ig_task_start(q, uid, tid):
@@ -23181,6 +25466,7 @@ async def adm_ig_list(q, uid, ctx=None):
         rows.append([
             InlineKeyboardButton(f"⬇️ {_nm} (CSV)", callback_data=f"igx:{t['id']}"),
             InlineKeyboardButton("📢 নোটিফাই", callback_data=f"ignt:{t['id']}"),
+            InlineKeyboardButton("📽 ভিডিও", callback_data=f"igvideo:{t['id']}"),
         ])
     rows.append([InlineKeyboardButton("🔄 রিফ্রেশ", callback_data="adm_ig")])
     await q.message.reply_text(
@@ -23248,8 +25534,37 @@ async def ig_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as _e:
                     log.warning(f'[IG-VIDEO] {_e}')
                     await q.message.reply_text('❌ ভিডিও পাঠানো যায়নি।')
+            elif _vf.lower().startswith(('http://', 'https://')):
+                await q.message.reply_text(
+                    '📽 Video', disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton('🎬 Video', url=_vf)]]))
             else:
-                await q.message.reply_text('❌ ভিডিও পাওয়া যায়নি।')
+                await q.message.reply_text('📽 এই টাস্কের ভিডিও এখনো যোগ করা হয়নি।')
+        elif data.startswith(('igvideo:', 'igvurl:', 'igvup:', 'igvdel:')):
+            if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
+                return
+            _act, _tid = data.split(':', 1)
+            _tid = int(_tid)
+            if _act == 'igvideo':
+                await _video_admin_panel(q, 'ig', _tid)
+            elif _act == 'igvurl':
+                ctx.user_data['state'] = 'fbt_video_url'
+                ctx.user_data['tv_kind'] = 'ig'
+                ctx.user_data['tv_tid'] = _tid
+                await q.message.reply_text(
+                    "🔗 ভিডিওর লিংক পাঠান (YouTube / Drive / MP4)।\n\n/cancel — বাতিল",
+                    disable_web_page_preview=True)
+            elif _act == 'igvup':
+                ctx.user_data['state'] = 'fbt_video_file'
+                ctx.user_data['tv_kind'] = 'ig'
+                ctx.user_data['tv_tid'] = _tid
+                await q.message.reply_text(
+                    "⬆️ ভিডিওটি এখানে পাঠান (video বা video ফাইল হিসেবে)।\n\n/cancel — বাতিল")
+            else:
+                await asyncio.to_thread(_set_task_video, 'ig', _tid, '')
+                await q.answer('ভিডিও মুছে ফেলা হয়েছে', show_alert=True)
+                await _video_admin_panel(q, 'ig', _tid)
         elif data.startswith('ignt:'):
             if uid != ADMIN_ID and not await asyncio.to_thread(is_admin, uid):
                 return
@@ -23699,10 +26014,12 @@ def main():
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
     app.add_handler(CallbackQueryHandler(cleanup_callback, pattern=r"^cleanup_(junk|logs7|logs30|close)$"))
     app.add_handler(CallbackQueryHandler(sec_callback, pattern=r"^sec_(unban|ignore)_\d+$"))
+    app.add_handler(CallbackQueryHandler(shop_callback, pattern=r"^(shop:|shopa:|shopao:|shopar:|adm_shop$)"))
+    app.add_handler(CallbackQueryHandler(dep_callback, pattern=r"^(dep:|depa:|depok:|depno:|adm_dep$)"))
     app.add_handler(CallbackQueryHandler(moneyreq_callback, pattern=r"^mreq:(ok|no):\d+$"))
     app.add_handler(CallbackQueryHandler(on_resetall_cb, pattern=r"^resetall_(yes|no)$"))
-    app.add_handler(CallbackQueryHandler(fb_callback, pattern=r"^(fbt_list|fbtn:\d+|fbr:\d+|fbs:\d+|fbd:\d+|fbc:\d+|fbt_cancel|adm_fb|fbx:\d+|fbnt:\d+|fbvid:\d+)$"))
-    app.add_handler(CallbackQueryHandler(ig_callback, pattern=r"^(igt_list|igtn:\d+|igtr:\d+|igts:\d+|igc:\d+|igt_cancel|igu:\d+|igd:\d+|adm_ig|igx:\d+|ignt:\d+|igvid:\d+)$"))
+    app.add_handler(CallbackQueryHandler(fb_callback, pattern=r"^(fbt_list|fbtn:\d+|fbr:\d+|fbs:\d+|fbd:\d+|fbc:\d+|fbt_cancel|adm_fb|fbx:\d+|fbnt:\d+|fbvid:\d+|fbvideo:\d+|fbvurl:\d+|fbvup:\d+|fbvdel:\d+)$"))
+    app.add_handler(CallbackQueryHandler(ig_callback, pattern=r"^(igt_list|igtn:\d+|igtr:\d+|igts:\d+|igc:\d+|igt_cancel|igu:\d+|igd:\d+|adm_ig|igx:\d+|ignt:\d+|igvid:\d+|igvideo:\d+|igvurl:\d+|igvup:\d+|igvdel:\d+)$"))
     app.add_handler(CallbackQueryHandler(on_callback))
     # ~filters.VIA_BOT → inline-bot দিয়ে পাঠানো message ignore করো
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_photo, "ph")))
