@@ -182,7 +182,10 @@ def shop_home():
         cat_rows.append([
             f"{esc(c['emoji'] or '🛍')} <b>{esc(c['name'] or '')}</b>",
             num(n),
-            badge("চালু", "ok") if int(c["is_active"] or 1) else badge("বন্ধ", "mut"),
+            badge("চালু", "ok") if _onoff(c["is_active"]) else badge("বন্ধ", "mut"),
+            "<form method='post' action='/admin/shop/cat/%d/toggle' style='display:inline'>"
+            "<button class='btn gray sm' type='submit'>%s</button></form> "
+            % (int(c["id"]), "🔴 বন্ধ" if _onoff(c["is_active"]) else "🟢 চালু"),
             "<form method='post' action='/admin/shop/cat/%d/delete' style='display:inline' "
             "onsubmit=\"return confirm('ক্যাটাগরি + এর পণ্যগুলো ডিলিট হবে?')\">"
             "<button class='gray sm' type='submit'>🗑</button></form>" % int(c["id"]),
@@ -199,7 +202,7 @@ def shop_home():
             _fmt(p["price"]),
             typ,
             badge(f"স্টক {stock}", "ok" if stock > 0 else "err") if typ == "অটো" else badge("—", "mut"),
-            badge("চালু", "ok") if int(p["is_active"] or 1) else badge("বন্ধ", "mut"),
+            badge("চালু", "ok") if _onoff(p["is_active"]) else badge("বন্ধ", "mut"),
             _btn("📥 স্টক", f"/admin/shop/{int(p['id'])}/stock", "btn gray sm")
             + _btn("✏️", f"/admin/shop/{int(p['id'])}", "btn gray sm"),
         ])
@@ -208,7 +211,7 @@ def shop_home():
         head + tools
         + "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
           "<b>📁 ক্যাটাগরি</b>" + _btn("🛒 অর্ডার দেখুন", "/admin/shop/orders", "btn gray sm")
-        + "</div>" + table(["ক্যাটাগরি", "পণ্য", "স্ট্যাটাস", ""], cat_rows,
+        + "</div>" + table(["ক্যাটাগরি", "পণ্য", "স্ট্যাটাস", "অন/অফ", ""], cat_rows,
                            "কোনো ক্যাটাগরি নেই — উপরে যোগ করুন")
         + "</div>"
         + "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
@@ -218,6 +221,16 @@ def shop_home():
         + "</div>"
     )
     return page("Shop / দোকান", body, "shop")
+
+def _onoff(v):
+    """is_active — 0 মানে বন্ধ (`int(v or 1)` লিখলে 0-ও 1 হয়ে যেত)।"""
+    if v is None or v == "":
+        return 1
+    try:
+        return 0 if int(v) == 0 else 1
+    except Exception:
+        return 1
+
 
 
 @wadm.route("/admin/shop/currency", methods=["POST"])
@@ -248,6 +261,21 @@ def shop_cat_add():
        "VALUES (%s,%s,%s,1,%s)", (name, emoji, int(nxt), _now()))
     log_admin("shop_cat_add", 0, name)
     return redirect("/admin/shop?ok=ক্যাটাগরি যোগ হয়েছে")
+
+
+@wadm.route("/admin/shop/cat/<int:cid>/toggle", methods=["POST"])
+def shop_cat_toggle(cid):
+    """ক্যাটাগরি চালু/বন্ধ — বন্ধ হলে বটের দোকানে দেখাবে না।"""
+    g = guard()
+    if g:
+        return g
+    c = one("SELECT is_active FROM shop_categories WHERE id=%s", (cid,))
+    if not c:
+        return redirect("/admin/shop?err=ক্যাটাগরি নেই")
+    new = 0 if int(c["is_active"] or 0) else 1
+    _x("UPDATE shop_categories SET is_active=%s WHERE id=%s", (new, cid))
+    log_admin("shop_cat_toggle", cid, "on" if new else "off")
+    return redirect("/admin/shop?ok=" + ("ক্যাটাগরি চালু হয়েছে" if new else "ক্যাটাগরি বন্ধ হয়েছে"))
 
 
 @wadm.route("/admin/shop/cat/<int:cid>/delete", methods=["POST"])

@@ -429,7 +429,9 @@ def _save(tid=None):
         "password_change_time": (f.get("password_change_time") or "00:00").strip(),
         "fields": json.dumps(_text_to_fields(f.get("fields")), ensure_ascii=False),
         "max_accounts": int(f.get("max_accounts") or 0),
-        "per_user_limit": int(f.get("per_user_limit") or 1),
+        # ⚠️ `or 1` হলে 0 (আনলিমিটেড) সেভই হতো না — হার্ডকোড ১ হয়ে যেত
+        "per_user_limit": (int(str(f.get("per_user_limit")).strip())
+                           if str(f.get("per_user_limit") or "").strip() else 1),
         "is_active": 1 if (f.get("is_active") or "1") == "1" else 0,
         "sheet_url": (f.get("sheet_url") or "").strip(),
         "sheet_columns": json.dumps(_cols_from_orders(f), ensure_ascii=False),

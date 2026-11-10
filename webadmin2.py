@@ -594,6 +594,77 @@ def _secret_link():
         return request.host_url.rstrip("/") + "/admin?k=" + sec
     except Exception:
         return request.host_url.rstrip("/") + "/admin"
+# ── মেনু বাটনের লেখা (বটের Reply Keyboard) — ওয়েব থেকেই বদলানো যায় ──
+MENU_BTNS = (
+    ("tasks",    "📋 Tasks",        "📋 Tasks"),
+    ("profile",  "👤 My Profile",   "👤 My Profile"),
+    ("balance",  "💰 Balance",      "💰 Balance"),
+    ("withdraw", "💸 Withdraw",     "💸 Withdraw"),
+    ("support",  "📞 Support",      "📞 Support"),
+    ("refer",    "🔗 Refer & Earn", "🔗 Refer & Earn"),
+    ("shop",     "🛍 পণ্য কিনুন",   "🛍 Buy Product"),
+    ("language", "🌍 Language",     "🌍 Language"),
+)
+
+
+def _menu_buttons_rows():
+    """menu_buttons টেবিল থেকে BN/EN লেখা — না থাকলে ডিফল্ট।"""
+    cur = {k: (bn, en) for k, bn, en in MENU_BTNS}
+    try:
+        for r in many("SELECT key, label_bn, label_en FROM menu_buttons"):
+            k = str(r.get("key") or "")
+            if k in cur:
+                cur[k] = ((r.get("label_bn") or cur[k][0]), (r.get("label_en") or cur[k][1]))
+    except Exception:
+        pass
+    return cur
+
+
+def _menu_buttons_card():
+    cur = _menu_buttons_rows()
+    rows = ""
+    for k, _bn, _en in MENU_BTNS:
+        bn, en = cur.get(k, ("", ""))
+        rows += (
+            "<div class='form'><label>" + esc(k) + "</label>"
+            "<div style='display:flex;gap:8px;flex-wrap:wrap'>"
+            f"<input name='btn_{k}_bn' value='{esc(bn)}' placeholder='বাংলা' style='flex:1;min-width:140px'>"
+            f"<input name='btn_{k}_en' value='{esc(en)}' placeholder='English' style='flex:1;min-width:140px'>"
+            "</div></div>"
+        )
+    return ("<div class='card'><h3>" + icon("grid") + " মেনু বাটনের লেখা</h3>"
+            "<form method='post' action='/admin/do/menu'>" + rows +
+            "<p class='mut' style='font-size:11px;margin:6px 0 0'>ইউজারদের নিচের কিবোর্ডে "
+            "এই লেখাই দেখাবে (বাংলা ও ইংরেজি আলাদা)। বদলালে সাথে সাথেই কার্যকর।</p>"
+            "<button type='submit' style='margin-top:10px'>Save Menu</button></form></div>")
+
+
+@wadm.route("/admin/do/menu", methods=["POST"])
+def menu_buttons_save():
+    g = guard()
+    if g:
+        return g
+    saved = 0
+    for k, _bn, _en in MENU_BTNS:
+        bn = (request.form.get(f"btn_{k}_bn") or "").strip()[:64]
+        en = (request.form.get(f"btn_{k}_en") or "").strip()[:64]
+        if not bn and not en:
+            continue
+        try:
+            _x("INSERT INTO menu_buttons (key, label_bn, label_en) VALUES (%s,%s,%s) "
+               "ON CONFLICT (key) DO UPDATE SET label_bn=EXCLUDED.label_bn, "
+               "label_en=EXCLUDED.label_en", (k, bn or en, en or bn))
+            saved += 1
+        except Exception:
+            pass
+    try:
+        _fire_settings_changed(["menu_buttons"])
+    except Exception:
+        pass
+    log_admin("menu_buttons_save", 0, str(saved))
+    return redirect("/admin/settings?ok=Menu+buttons+saved")
+
+
 @wadm.route("/admin/settings", methods=["GET"])
 def settings():
     g = guard()
@@ -603,7 +674,9 @@ def settings():
             "sec_ip_retention_days", "notify_security", "bot_status",
             "points_on", "points_block", "reset_on_update", "sec_device_strict",
             "pt_max", "pt_start", "pt_approve", "pt_reject", "pt_dup",
-            "task_notify_mode", "task_notify_channel", "task_notify_daily_max"]
+            "task_notify_mode", "task_notify_channel", "task_notify_daily_max",
+            "min_withdraw", "wd_fee", "commission_pct", "bsc_wallet",
+            "support_owner", "support_bot"]
     vals = settings_all(keys)
     body = (
         f"<div class='grid g2'>"
@@ -682,6 +755,18 @@ def settings():
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>ব্যালান্স/পয়েন্ট মোছা হয় না — শুধু verify আবার করতে হয়। "
         "⚠️ নোটিশ কখনো অটো যায় না: বট /resetall (বা বিল্ড আপডেটের মেসেজে বাটন) চাপলে তখনই সবাইকে যায়, এক বিল্ডে একবার।</p></div>"
         "<button type='submit' style='margin-top:10px'>Save System</button></form></div>"
+        "<div class='card'><h3>" + icon("user") + " Support</h3>"
+        "<form method='post' action='/admin/do/settings'>"
+        "<div class='form'><label>Support owner username (ব্যক্তিগত)</label>"
+        f"<input name='support_owner' value='{esc(vals.get('support_owner') or '')}' "
+        "placeholder='@owner'></div>"
+        "<div class='form'><label>Support bot username</label>"
+        f"<input name='support_bot' value='{esc(vals.get('support_bot') or '')}' "
+        "placeholder='@myhelpbot'></div>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>"
+        "ইউজার 📞 Support চাপলে এই দুটোই দেখাবে।</p>"
+        "<button type='submit' style='margin-top:10px'>Save Support</button></form></div>"
+        + _menu_buttons_card() +
         "<div class='card'><h3>" + icon("trend") + " পয়েন্ট সেটিংস</h3>"
         "<form method='post' action='/admin/do/settings'>"
         "<div class='form'><label>সর্বোচ্চ পয়েন্ট (স্কোর)</label>"
@@ -700,6 +785,24 @@ def settings():
         f"<input name='pt_dup' type='number' min='0' max='100000' value='{esc(vals.get('pt_dup') or 3)}'>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>ডিফল্ট −৩। বদলালে সাথে সাথে বটে কার্যকর (ক্যাশ ১০ মিনিট)।</p></div>"
         "<button type='submit' style='margin-top:10px'>Save Points</button></form></div>"
+        "<div class='card'><h3>" + icon("money") + " Withdraw ও পেমেন্ট</h3>"
+        "<form method='post' action='/admin/do/settings'>"
+        "<div class='form'><label>Min Withdraw ($) — এর কম তুলতে পারবে না</label>"
+        f"<input name='min_withdraw' type='number' step='0.0001' min='0' "
+        f"value='{esc(vals.get('min_withdraw') or '0.05')}'></div>"
+        "<div class='form'><label>Withdraw fee ($)</label>"
+        f"<input name='wd_fee' type='number' step='0.0001' min='0' "
+        f"value='{esc(vals.get('wd_fee') or '0.01')}'></div>"
+        "<div class='form'><label>Refer commission (%)</label>"
+        f"<input name='commission_pct' type='number' step='0.1' min='0' max='100' "
+        f"value='{esc(vals.get('commission_pct') or '10')}'></div>"
+        "<div class='form'><label>USDT BEP-20 ওয়ালেট (ডিপোজিট অ্যাড্রেস)</label>"
+        f"<input name='bsc_wallet' value='{esc(vals.get('bsc_wallet') or '')}' "
+        "placeholder='0x...'></div>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>বদলালে সাথে সাথেই বটে কার্যকর। "
+        "সর্বনিম্ন ডিপোজিট মেথড-ভিত্তিক — <a href='/admin/deposits' style='color:var(--acc)'>"
+        "ডিপোজিট পেজ</a> থেকে বদলান।</p>"
+        "<button type='submit' style='margin-top:10px'>Save Money</button></form></div>"
         "<div class='card'><h3>" + icon("bell") + " Task Notification</h3>"
         "<form method='post' action='/admin/do/settings'>"
         "<div class='form'><label>Task সম্পন্ন / approve হলে নোটিফিকেশন কোথায় যাবে</label>"
@@ -823,6 +926,20 @@ def settings_save():
     if v.isdigit() and int(v) <= 100000:
         settings_set("task_notify_daily_max", v)
         saved.append("task_notify_daily_max")
+    # ── Withdraw / পেমেন্ট / Support (বটের অ্যাডমিন প্যানেলেও আছে) ──
+    for k in ("min_withdraw", "wd_fee", "commission_pct"):
+        v = (request.form.get(k) or "").strip().replace(",", ".").replace("$", "")
+        try:
+            if v != "" and float(v) >= 0:
+                settings_set(k, str(float(v)))
+                saved.append(k)
+        except Exception:
+            pass
+    for k in ("bsc_wallet", "support_owner", "support_bot"):
+        v = (request.form.get(k) or "").strip()[:120]
+        if v:
+            settings_set(k, v)
+            saved.append(k)
     log_admin("settings_save", 0, ",".join(saved))
     return redirect("/admin/settings?ok=Settings+saved")
 # ───────────────── Task Logs — কে কখন কী জমা দিয়েছে + বাল্ক ডিলিট ─────────────────

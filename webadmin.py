@@ -1245,9 +1245,11 @@ def _panel_security_gate():
             except Exception:
                 pass
             return resp
-        if not _gate_ok():
-            # ভুল/গায়েব লিংক → 404 (প্যানেল আছে বোঝাও যাবে না)
-            return Response("Not Found", status=404, mimetype="text/plain")
+        # ⚠️ আগে গেট মিললেই 404 দেওয়া হতো — মালিকের পুরোনো/বুকমার্ক করা
+        # `/admin` লিংক (বা PANEL_URL_SECRET বদলালে) পুরো প্যানেল লক করে দিত।
+        # এখন `/admin` সবসময় লগইন পেজ দেখায়; আসল তালা = পাসওয়ার্ড +
+        # ব্রুট-ফোর্স লক + CSRF + সিকিউরিটি হেডার। `?k=` লিংক আগের মতোই
+        # গেট-কুকি বসিয়ে দেয় (এক ক্লিকে ঢোকার সুবিধা)।
     if request.method in ("POST", "PUT", "DELETE", "PATCH"):
         org = (request.headers.get("Origin") or request.headers.get("Referer") or "")
         if org:
@@ -1310,6 +1312,8 @@ MENU = [
     ("tasks", "/admin/tasks", "Task Management", "task", ""),
     ("taskstats", "/admin/task-stats", "Task Statistics", "trend", ""),
     ("history", "/admin/history", "Task History", "task", ""),
+    ("shop", "/admin/shop", "Shop / দোকান", "money", ""),
+    ("deposits", "/admin/deposits", "Deposits", "wallet", ""),
     ("earnings", "/admin/earnings", "Earnings", "money", ""),
     ("withdrawals", "/admin/withdrawals", "Withdrawals", "wallet", ""),
     ("referrals", "/admin/referrals", "Referrals", "refer", ""),

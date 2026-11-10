@@ -122,7 +122,7 @@ def deposits_home():
             esc(_fmt(m["min_amount"])),
             f"<span class='mono' style='font-size:11px;word-break:break-all'>"
             f"{esc((m['address'] or m['instructions'] or '—')[:60])}</span>",
-            badge("চালু", "ok") if int(m["is_active"] or 1) else badge("বন্ধ", "mut"),
+            badge("চালু", "ok") if _onoff(m["is_active"]) else badge("বন্ধ", "mut"),
             f"<a class='btn gray sm' href='/admin/deposit-method/{int(m['id'])}'>✏️</a>",
         ])
 
@@ -239,7 +239,7 @@ def _form(m=None):
         f"<textarea name='instructions' rows='4' "
         f"placeholder='Binance UID: 123456789&#10;পেমেন্ট করে TxID পাঠান'>{esc(m.get('instructions') or '')}</textarea></div>"
         "<div class='field'><label>সর্বনিম্ন ডিপোজিট</label>"
-        f"<input name='min_amount' value='{esc(str(m.get('min_amount') or 1))}' placeholder='1'></div>"
+        f"<input name='min_amount' value='{esc(str(m.get('min_amount')) if m.get('min_amount') not in (None, '') else '1')}' placeholder='1'></div>"
         f"<label class='chk'><input type='checkbox' name='is_active' value='1'"
         f"{' checked' if act else ''}> বটে দেখাবে (চালু)</label>"
         "<div class='row' style='gap:8px;margin-top:12px'>"
@@ -273,6 +273,16 @@ def _save(mid=0):
             "is_active, sort_order, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (name, kind, addr, ins, mn, act, int(nxt), _now()))
     return int((r or {}).get("id") or 0)
+
+def _onoff(v):
+    """is_active — 0 মানে বন্ধ (`int(v or 1)` লিখলে 0-ও 1 হয়ে যেত)।"""
+    if v is None or v == "":
+        return 1
+    try:
+        return 0 if int(v) == 0 else 1
+    except Exception:
+        return 1
+
 
 
 @wadm.route("/admin/deposit-method/new", methods=["GET", "POST"])
