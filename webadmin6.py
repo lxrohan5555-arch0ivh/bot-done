@@ -371,7 +371,9 @@ def deposit_approve(did):
     if not n:
         return redirect("/admin/deposits?err=এটি আগেই প্রসেস হয়েছে")
     amt = float(d["amount"] or 0)
-    _x("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amt, int(d["user_id"] or 0)))
+    _x("UPDATE users SET balance=balance+%s, dep_balance=COALESCE(dep_balance,0)+%s, "
+       "dep_total=COALESCE(dep_total,0)+%s WHERE user_id=%s",
+       (amt, amt, amt, int(d["user_id"] or 0)))
     queue_user_msg(int(d["user_id"]),
                    f"✅ ডিপোজিট অনুমোদিত!\n\n💵 {_fmt(amt)} যোগ হয়েছে\n🧾 #{did}")
     log_admin("deposit_approve", did, f"uid={d['user_id']} amount={amt}")

@@ -1791,6 +1791,10 @@ _USERS_COLUMN_SQL = (
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS winback_sent_at TEXT DEFAULT ''",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TEXT DEFAULT ''",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS country TEXT DEFAULT ''",
+    # ডিপোজিটের টাকা আলাদা হিসাবে (ব্যালেন্সের ভেতরে থাকলেও চেনা যায়)
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS dep_balance REAL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS dep_total REAL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS dep_withdrawn REAL DEFAULT 0",
 )
 
 
@@ -3763,6 +3767,97 @@ def add_bal(uid, amt):
         return True
     log.warning(f"[add_bal] user_id={uid} DB তে নেই — balance update হয়নি!")
     return False
+
+# ── ডিপোজিটের টাকা: আলাদা হিসাব + withdraw-এ ১৫% কাটা ─────────────
+DEP_WD_CUT_PCT = 0.15          # শুধু ডিপোজিটের টাকায়
+_DEP_COLS_STATE = {"ok": False}
+
+
+def _ensure_dep_cols():
+    """withdrawals টেবিলে dep_used / dep_cut কলাম — একবারই।"""
+    if _DEP_COLS_STATE["ok"]:
+        return True
+    ok = True
+    try:
+        with _c() as c:
+            for _q in (
+                "ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS dep_used REAL DEFAULT 0",
+                "ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS dep_cut REAL DEFAULT 0",
+            ):
+                try:
+                    c.execute(_q)
+                except Exception as _e:
+                    log.debug(f"[DEP-COLS] {str(_e)[:70]}")
+    except Exception as _e:
+        ok = False
+        log.debug(f"[DEP-COLS] ব্যর্থ: {str(_e)[:80]}")
+    _DEP_COLS_STATE["ok"] = ok
+    return ok
+
+
+def add_dep_bal(uid, amt):
+    """ডিপোজিটের টাকা যোগ — balance + dep_balance + dep_total একসাথে।"""
+    try:
+        amt = float(amt or 0)
+    except Exception:
+        amt = 0.0
+    if amt <= 0:
+        return add_bal(uid, amt)
+    with _c() as c:
+        cur = c.execute(
+            "UPDATE users SET balance=balance+%s, "
+            "dep_balance=COALESCE(dep_balance,0)+%s, "
+            "dep_total=COALESCE(dep_total,0)+%s WHERE user_id=%s",
+            (amt, amt, amt, uid))
+        affected = cur.rowcount
+    if affected:
+        _invalidate_user_cache(uid)
+        _mark_dirty()
+        return True
+    log.warning(f"[add_dep_bal] user_id={uid} DB তে নেই — ডিপোজিট যোগ হয়নি!")
+    return add_bal(uid, amt)
+
+
+def get_dep_balance(uid):
+    """ব্যালেন্সের ভেতরে কতটা ডিপোজিটের টাকা আছে।"""
+    try:
+        with _c() as c:
+            r = c.execute(
+                "SELECT COALESCE(dep_balance,0) AS d FROM users WHERE user_id=%s",
+                (uid,)).fetchone()
+        return round(float(r["d"] or 0), 4) if r else 0.0
+    except Exception:
+        return 0.0
+
+
+def wd_dep_split(uid, amt):
+    """(dep_used, dep_cut) — withdraw-এর যে অংশ ডিপোজিটের টাকা, তার ১৫% কাটা।"""
+    try:
+        amt = float(amt or 0)
+    except Exception:
+        amt = 0.0
+    if amt <= 0:
+        return 0.0, 0.0
+    dep = get_dep_balance(uid)
+    used = round(min(amt, dep), 4)
+    cut = round(used * DEP_WD_CUT_PCT, 4)
+    return used, cut
+
+
+def _dep_refund_in_tx(c, wid, uid):
+    """Withdraw বাতিল/ব্যর্থ → ডিপোজিট-হিসাবও ফেরত (ব্যালেন্সের সাথে)।"""
+    try:
+        r = c.execute("SELECT COALESCE(dep_used,0) AS du FROM withdrawals WHERE id=%s",
+                      (wid,)).fetchone()
+        du = float((r or {}).get("du") or 0)
+        if du > 0:
+            c.execute(
+                "UPDATE users SET dep_balance=COALESCE(dep_balance,0)+%s, "
+                "dep_withdrawn=MAX(COALESCE(dep_withdrawn,0)-%s,0) WHERE user_id=%s",
+                (du, du, uid))
+    except Exception as _e:
+        log.debug(f"[DEP-REFUND] #{wid}: {str(_e)[:80]}")
+
 
 def ded_bal(uid, amt):
     """Balance কাটো — negative হতে পারে (unfollow penalty). Returns True if updated."""
@@ -7409,7 +7504,7 @@ def dep_api_test(slug="binance", minutes=120):
     return True, "\n".join(lines)
 
 
-def dep_api_find(provider, ref, want=0.0, minutes=45):
+def dep_api_find(provider, ref, want=0.0, minutes=60):
     """প্রোভাইডার অনুযায়ী পেমেন্ট যাচাই — (amount, txid, err)।"""
     slug = str(provider or "binance").strip().lower()
     if slug in ("", "binance"):
@@ -7832,7 +7927,7 @@ def dep_binance_ready():
     return bool(k and s_)
 
 
-def dep_uid_window(default=45):
+def dep_uid_window(default=60):
     """কত মিনিট আগের Binance Pay লেনদেন খুঁজবে (৫–১৪৪০)।"""
     try:
         v = int(float(get_setting("binance_uid_window") or default))
@@ -7860,16 +7955,16 @@ def _binance_server_offset():
         return _BINANCE_TS_OFF["v"]
 
 
-def _binance_pay_rows(minutes=45):
+def _binance_pay_rows(minutes=60):
     """Binance Pay লেনদেন তালিকা — (rows, err)।"""
     key, sec = get_binance_creds()
     if not (key and sec):
         return [], "Binance API সেট করা নেই — অ্যাডমিন ম্যানুয়াল ✅ করবেন।"
     base = (os.environ.get("BINANCE_API_BASE") or "https://api.binance.com").rstrip("/")
     try:
-        mins = int(minutes or 45)
+        mins = int(minutes or 60)
     except Exception:
-        mins = 45
+        mins = 60
 
     def _fetch(off=0.0):
         end_ms = int((_time.time() + off) * 1000)
@@ -7959,12 +8054,59 @@ def _dep_pay_match(rows, low, dref, want):
     return None
 
 
-def dep_binance_pay_find(ref, want=0.0, minutes=45):
-    """Binance Pay-এ শুধু Order ID / TxID দিয়ে পেমেন্ট খোঁজে — (amount, txid, err)।
+_DEP_OUT_TYPES = {"PAY_REFUND", "CRYPTO_BOX_RF", "C2C_HOLDING_RF", "PAYOUT", "REMITTANCE"}
 
-    ইউজারের UID বা পরিমাণ দিয়ে অনুমান করা হয় না — ভুল ক্রেডিটের ঝুঁকি শূন্য।
-    """
-    r = re.sub(r"\s+", "", str(ref or ""))
+
+def _pay_keys(it):
+    """একটা লেনদেনের সব আইডি — পুরোটা + শুধু ডিজিট (Binance-এর ফরম্যাট বদলায়)।"""
+    keys = set()
+    for k in ("transactionId", "orderId", "prepayId", "merchantTradeNo", "payId", "refundId"):
+        v = str(it.get(k) or "").strip()
+        if not v:
+            continue
+        keys.add(v.casefold())
+        _dg = re.sub(r"\D", "", v)
+        if len(_dg) >= 6:
+            keys.add(_dg)
+    return keys
+
+
+def _pay_is_in(it):
+    """টাকা আমার (অ্যাডমিনের) অ্যাকাউন্টে *ঢুকেছে* কি না — পাঠানো/রিফান্ড বাদ।"""
+    ot = str(it.get("orderType") or "").upper()
+    if ot in _DEP_OUT_TYPES:
+        return False
+    if not ot:
+        return True      # ফরম্যাট অজানা — ব্লক করি না, পেমেন্ট হারাবে না
+    pinfo = it.get("payerInfo") if isinstance(it.get("payerInfo"), dict) else {}
+    rinfo = it.get("receiverInfo") if isinstance(it.get("receiverInfo"), dict) else {}
+    # পাঠানোর সময় payerInfo-তে নিজের binanceId থাকে, receiverInfo-তে শুধু নাম
+    if (pinfo.get("binanceId") or pinfo.get("payerId")) and not (
+            rinfo.get("binanceId") or rinfo.get("accountId")):
+        return False
+    return True
+
+
+def _pay_ref_hit(it, low):
+    """ইউজারের দেওয়া Order ID ওই লেনদেনের সাথে মেলে কি না।"""
+    if not low:
+        return False
+    keys = _pay_keys(it)
+    if low in keys:
+        return True
+    if low.isdigit() and len(low) >= 8:
+        for k in keys:
+            if not k.isdigit() or len(k) < len(low):
+                continue
+            # Binance অ্যাপের Order ID কখনো লম্বা transactionId-র শুরু, কখনো শেষাংশ
+            if k.endswith(low) or (len(low) >= 10 and k.startswith(low)):
+                return True
+    return False
+
+
+def dep_binance_pay_find(ref, want=0.0, minutes=60):
+    """Binance Pay-এ Order ID / TxID দিয়ে পেমেন্ট খোঁজে — (amount, txid, err)।"""
+    r = re.sub(r"[\s\-_]+", "", str(ref or ""))
     if len(r) < 6:
         return 0.0, "", "Order ID ঠিক নয় — পেমেন্টের Order ID দিন।"
     rows, err = _binance_pay_rows(minutes)
@@ -7975,9 +8117,9 @@ def dep_binance_pay_find(ref, want=0.0, minutes=45):
     for it in rows or []:
         if not isinstance(it, dict):
             continue
-        keys = {str(it.get(k) or "").strip().casefold()
-                for k in ("orderId", "transactionId", "prepayId", "merchantTradeNo")}
-        if low not in keys:
+        if not _pay_is_in(it):
+            continue
+        if not _pay_ref_hit(it, low):
             continue
         try:
             amt = float(it.get("amount") or 0)
@@ -7998,11 +8140,191 @@ def dep_binance_pay_find(ref, want=0.0, minutes=45):
     if seen_other:
         return 0.0, "", (f"পেমেন্ট পাওয়া গেছে ({seen_other}) কিন্তু USDT/USD-তে নয় — "
                          "অ্যাডমিন যাচাই করবেন।")
-    return 0.0, "", ("এই Order ID-তে পেমেন্ট পাওয়া যায়নি — Order ID ঠিক আছে কি না "
-                     "দেখুন; নতুন পেমেন্ট হলে ১–২ মিনিট পরে আবার চেক করুন।")
+    return 0.0, "", ("এই Order ID-তে পেমেন্ট পাওয়া যায়নি — নতুন পেমেন্ট হলে "
+                     "বট নিজেই ১ ঘণ্টা ধরে চেক করবে।")
 
 
-def dep_binance_uid_pay(payer_uid, want, minutes=45):
+def _pending_by_amount(v, exclude=0):
+    """একই পরিমাণের অন্য পেন্ডিং ডিপোজিটগুলো।"""
+    try:
+        v = float(v)
+    except Exception:
+        return []
+    out = []
+    try:
+        rows = dep_pending(60)
+    except Exception:
+        return []
+    for o in rows or []:
+        try:
+            if int(o["id"]) == int(exclude or 0):
+                continue
+            if abs(float(o["amount"] or 0) - v) <= 0.011:
+                out.append(o)
+        except Exception:
+            continue
+    return out
+
+
+def dep_amount_match(amount, exclude_oid=0, minutes=60, after_ms=0):
+    """একটাই নতুন ইনকামিং পেমেন্ট + একটাই পেন্ডিং ডিপোজিট একই পরিমাণে → নিশ্চিত ম্যাচ।
+
+    Order ID না মিললেও টাকা আটকে থাকবে না; দুই দিকেই "একটাই" হলে তবেই ক্রেডিট।
+    """
+    try:
+        want = float(amount or 0)
+    except Exception:
+        return None
+    if want <= 0:
+        return None
+    rows, err = _binance_pay_rows(minutes)
+    if err or not rows:
+        return None
+    cands = []
+    for it in rows or []:
+        if not isinstance(it, dict) or not _pay_is_in(it):
+            continue
+        if str(it.get("currency") or "").upper() not in _DEP_STABLE:
+            continue
+        try:
+            amt = float(it.get("amount") or 0)
+        except Exception:
+            continue
+        if amt <= 0 or abs(amt - want) > 0.011:
+            continue
+        if after_ms:
+            try:
+                tt = int(it.get("transactionTime") or 0)
+            except Exception:
+                tt = 0
+            if not tt or tt + 60000 < int(after_ms):
+                continue     # ডিপোজিট শুরুর আগেই আসা পুরোনো পেমেন্ট → অনুমান নয়
+        tx = str(it.get("transactionId") or it.get("orderId") or "").strip()
+        if not tx or dep_txid_used(tx):
+            continue
+        cands.append((round(amt, 6), tx))
+    if len(cands) != 1:
+        return None
+    if _pending_by_amount(want, exclude_oid):
+        return None
+    return cands[0]
+
+
+def _dep_created_ms(o):
+    """ডিপোজিট কতক্ষণ আগে তৈরি — মিলিসেকেন্ড।"""
+    v = str(o["created_at"] or "").strip()
+    if not v:
+        return 0
+    try:
+        import datetime as _dtm
+        if "T" in v:
+            dt = _dtm.datetime.fromisoformat(v.replace("Z", "+00:00"))
+        else:
+            try:
+                dt = _dtm.datetime.strptime(v[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                dt = _dtm.datetime.strptime(v[:16], "%Y-%m-%d %H:%M")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pytz.timezone("Asia/Dhaka"))
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+class _DepCtx:
+    """_dep_auto_credit-এর জন্য ছোট ctx — শুধু bot দরকার।"""
+
+    def __init__(self, bot):
+        self.bot = bot
+
+
+async def _dep_watch_once(bot):
+    """পেন্ডিং Binance ডিপোজিট একবার চেক করে পাওয়া গেলে সাথে সাথে ক্রেডিট।"""
+    if not await asyncio.to_thread(dep_binance_ready):
+        return 0
+    win = await asyncio.to_thread(dep_uid_window)
+    win = max(60, int(win or 60))   # কমপক্ষে ১ ঘণ্টা — পুরোনো সেটিং ৪৫ থাকলেও
+    try:
+        rows_pend = await asyncio.to_thread(dep_pending, 40)
+    except Exception:
+        return 0
+    now_ms = int(_time.time() * 1000)
+    todo = []
+    for o in rows_pend or []:
+        try:
+            m = await asyncio.to_thread(dep_method, int(o["method_id"] or 0))
+        except Exception:
+            continue
+        if not m or dep_method_provider(m) != "binance":
+            continue
+        ts = _dep_created_ms(o)
+        if ts and now_ms - ts > win * 60 * 1000 + 180000:
+            continue          # ১ ঘণ্টার বেশি পুরোনো — আর অটো চেক নয়
+        todo.append((o, m))
+    if not todo:
+        return 0
+    rows, err = await asyncio.to_thread(_binance_pay_rows, win + 5)
+    if err or not rows:
+        return 0
+    done = 0
+    for o, m in todo:
+        oid = int(o["id"])
+        try:
+            amt = float(o["amount"] or 0)
+        except Exception:
+            amt = 0.0
+        hit = None
+        ref = (_dep_note_ref(o["note"]) or "").strip()
+        if ref:
+            low = ref.casefold()
+            for it in rows:
+                if not isinstance(it, dict) or not _pay_is_in(it):
+                    continue
+                if not _pay_ref_hit(it, low):
+                    continue
+                if str(it.get("currency") or "").upper() not in _DEP_STABLE:
+                    continue
+                try:
+                    a = float(it.get("amount") or 0)
+                except Exception:
+                    continue
+                tx = str(it.get("transactionId") or it.get("orderId") or "").strip()
+                if a > 0 and tx and not dep_txid_used(tx):
+                    hit = (round(a, 6), tx)
+                    break
+        if not hit and amt > 0:
+            _ct = _dep_created_ms(o) or 0
+            if not _ct or now_ms - _ct >= 60000:
+                hit = await asyncio.to_thread(dep_amount_match, amt, oid, win + 5, _ct)
+        if not hit:
+            continue
+        g, tx = hit
+        n = await asyncio.to_thread(dep_set, oid, "approved", 0)
+        if not n:
+            continue
+        await asyncio.to_thread(dep_attach_txid, oid, tx)
+        try:
+            await _dep_auto_credit(_DepCtx(bot), int(o["user_id"]), m,
+                                   float(g or amt), tx, oid)
+        except Exception as _ce:
+            log.warning(f"[DEP-WATCH] #{oid} ক্রেডিট বার্তা ব্যর্থ: {_ce}")
+        log.info(f"[DEP-WATCH] #{oid} অটো ক্রেডিট {g}$ tx={tx}")
+        done += 1
+    return done
+
+
+async def _dep_watch_loop(bot):
+    """প্রতি ৪৫ সেকেন্ডে পেন্ডিং ডিপোজিট চেক — ইউজারকে বাটন চাপতে হয় না।"""
+    await asyncio.sleep(25)
+    while True:
+        try:
+            await _dep_watch_once(bot)
+        except Exception as e:
+            log.debug(f"[DEP-WATCH] {str(e)[:150]}")
+        await asyncio.sleep(60)
+
+
+def dep_binance_uid_pay(payer_uid, want, minutes=60):
     """শুধু পাঠানো অ্যাকাউন্টের UID দিয়ে পেমেন্ট খোঁজা (পুরোনো কলের জন্য)।"""
     pu = re.sub(r"\D", "", str(payer_uid or ""))
     if not (6 <= len(pu) <= 14):
@@ -8196,12 +8518,15 @@ async def _dep_recheck(q, ctx, oid):
         return
     _prov = dep_method_provider(m)
     _win = await asyncio.to_thread(dep_uid_window)
-    # ধাপে ধাপে বড় উইন্ডো — দেরিতে আসা পেমেন্টও যাতে ধরা পড়ে (কনফিগ → ৩ ঘণ্টা → ২৪ ঘণ্টা)
-    got, tx, err = 0.0, "", ""
-    for _w in sorted({int(_win or 45), 180, 1440}):
-        got, tx, err = await asyncio.to_thread(dep_api_find, _prov, buid, amt, _w)
-        if tx and not err:
-            break
+    _win = max(60, int(_win or 60))   # কমপক্ষে শেষ ১ ঘণ্টা
+    # একবারই — শেষ ১ ঘণ্টার লেনদেন
+    got, tx, err = await asyncio.to_thread(dep_api_find, _prov, buid, amt, _win)
+    _age = int(_time.time() * 1000) - (_dep_created_ms(o) or 0)
+    if not (tx and not err) and buid and amt > 0 and (not _age or _age >= 60000):
+        _u = await asyncio.to_thread(dep_amount_match, amt, oid, _win,
+                                     _dep_created_ms(o))
+        if _u:
+            got, tx, err = _u[0], _u[1], ""
     if not (tx and not err):
         await q.answer(("❌ " + (err or "পেমেন্ট এখনো পাওয়া যায়নি"))[:190], show_alert=True)
         try:
@@ -8231,7 +8556,7 @@ async def _dep_recheck(q, ctx, oid):
 
 async def _dep_auto_credit(ctx, uid, m, amount, txid, oid):
     """অটো ডিপোজিট সফল — ব্যালেন্স যোগ + ইউজার ও অ্যাডমিনকে জানাও।"""
-    await asyncio.to_thread(add_bal, uid, amount)
+    await asyncio.to_thread(add_dep_bal, uid, amount)
     try:
         bal = await asyncio.to_thread(get_bal, uid)
     except Exception:
@@ -8470,12 +8795,8 @@ async def dep_input(update, ctx, st):
         except Exception:
             _amt2 = 0.0
         _win2 = await asyncio.to_thread(dep_uid_window)
-        _got2, _tx2, _err2 = 0.0, "", ""
-        for _w in sorted({int(_win2 or 45), 180, 1440}):
-            _got2, _tx2, _err2 = await asyncio.to_thread(
-                dep_api_find, _prov, ref, _amt2, _w)
-            if _tx2 and not _err2:
-                break
+        _got2, _tx2, _err2 = await asyncio.to_thread(
+            dep_api_find, _prov, ref, _amt2, _win2)
         if _tx2 and not _err2:
             n = await asyncio.to_thread(dep_set, _oid, "approved", 0)
             if n:
@@ -8591,27 +8912,10 @@ async def dep_input(update, ctx, st):
             return True
         wait_msg = await update.message.reply_text("🔎 Binance Pay-এ Order ID খোঁজা হচ্ছে…")
         _win = await asyncio.to_thread(dep_uid_window)
+        _win = max(60, int(_win or 60))   # Order ID দিলে শেষ ১ ঘণ্টার টাকা চেক
         _prov = dep_method_provider(m)
-        _ready = await asyncio.to_thread(dep_provider_ready, _prov)
-        _tries = 3 if _ready else 1
-        _got, _tx, _err = 0.0, "", ""
-        for _i in range(_tries):
-            # ছোট উইন্ডো → ৩ ঘণ্টা → ২৪ ঘণ্টা (দেরিতে আসা পেমেন্টও ধরা পড়বে)
-            for _w in sorted({int(_win or 45), 180, 1440}):
-                _got, _tx, _err = await asyncio.to_thread(dep_api_find, _prov, ref, amt, _w)
-                if _tx and not _err:
-                    break
-            if _tx and not _err:
-                break
-            if _i < _tries - 1:
-                try:
-                    await wait_msg.edit_text(
-                        f"🔎 *পেমেন্ট খোঁজা হচ্ছে… ({_i + 2}/{_tries})*\n\n"
-                        "Binance-এ পেমেন্ট দেখা যেতে কয়েক সেকেন্ড লাগে — অপেক্ষা করুন।",
-                        parse_mode="Markdown")
-                except Exception:
-                    pass
-                await asyncio.sleep(7)
+        # একবারই — শেষ ১ ঘণ্টার লেনদেন (টাকা ১–৩ মিনিটেই পৌঁছায়)
+        _got, _tx, _err = await asyncio.to_thread(dep_api_find, _prov, ref, amt, _win)
         ctx.user_data.pop("state", None)
         ctx.user_data.pop("dep_mid", None)
         ctx.user_data.pop("dep_uid_amt", None)
@@ -8633,8 +8937,9 @@ async def dep_input(update, ctx, st):
             f"⏳ *ডিপোজিট যাচাই বাকি*\n\n"
             f"🧾 `#{oid}`\n💵 `{amt:g}$`\n🔗 `{ref}`\n\n"
             f"কারণ: {_why}\n\n"
-            "১-২ মিনিট পরে *🔁 আবার চেক* চাপুন — পাওয়া গেলে সাথে সাথে "
-            "ব্যালেন্স যোগ হবে। না পেলে অ্যাডমিন নিজে যাচাই করে ✅ করবেন।",
+            "🤖 বট এখন নিজেই *১ ঘণ্টা ধরে* অটো চেক করবে — টাকা আমার "
+            "Binance-এ পৌঁছালেই ব্যালেন্স যোগ হয়ে যাবে।\n"
+            "সাথে সাথে দেখতে চাইলে *🔁 আবার চেক* চাপুন।",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔁 আবার চেক", callback_data=f"dep:re:{oid}")],
@@ -9122,7 +9427,7 @@ async def _dep_admin_cb(q, ctx, d):
                 return
             amount = float(o["amount"] or 0)
             if ok:
-                await asyncio.to_thread(add_bal, int(o["user_id"]), amount)
+                await asyncio.to_thread(add_dep_bal, int(o["user_id"]), amount)
                 try:
                     bal = await asyncio.to_thread(get_bal, int(o["user_id"]))
                 except Exception:
@@ -10098,7 +10403,7 @@ def _profile_stats(uid):
     Total earned-এ ধরা পড়বে; pending টাস্কের টাকা এতে যোগ হয় না।
     """
     _z = {"completed": 0, "pending": 0, "rejected": 0,
-          "earned": 0.0, "withdrawn": 0.0, "hold": 0.0}
+          "earned": 0.0, "withdrawn": 0.0, "hold": 0.0, "dep_bal": 0.0}
     try:
         with _c() as c:
             subs = c.execute(
@@ -10171,6 +10476,19 @@ def _profile_stats(uid):
             _z["completed"] = _z["completed"] - _live_fi + _hn
     except Exception:
         pass
+    # ── ডিপোজিটের টাকা "Total earned"-এ নয় — আলাদা দেখানো হয় ──
+    try:
+        with _c() as c:
+            _dr = c.execute(
+                "SELECT COALESCE(dep_balance,0) AS db, COALESCE(dep_withdrawn,0) AS dw "
+                "FROM users WHERE user_id=%s", (uid,)).fetchone()
+        _db_bal = float((_dr or {}).get("db") or 0)
+        _db_wd = float((_dr or {}).get("dw") or 0)
+    except Exception:
+        _db_bal = _db_wd = 0.0
+    _z["dep_bal"]   = round(_db_bal, 2)
+    _z["earned"]    = round(_z["earned"] - _db_bal - _db_wd, 2)
+
     _z["earned"]    = round(_z["earned"], 2)
     _z["withdrawn"] = round(_z["withdrawn"], 2)
     _z["hold"]      = round(_z["hold"], 2)
@@ -10180,11 +10498,17 @@ async def show_profile(update, ctx):
     user = update.effective_user
     uid  = user.id
     # balance + user + কাউন্টার — তিনটাই parallel
-    bal, _u, st = await asyncio.gather(
+    bal, _u, st, _lang = await asyncio.gather(
         asyncio.to_thread(get_bal, uid),
         asyncio.to_thread(get_user, uid),
         asyncio.to_thread(_profile_stats, uid),
+        asyncio.to_thread(get_lang, uid),
     )
+    _dep_bal = float(st.get("dep_bal") or 0)
+    _dep_line = ""
+    if _dep_bal > 0.004:
+        _dep_line = (f"💰 *{'Deposit balance' if _lang == 'en' else 'ডিপোজিট ব্যালেন্স'}:* "
+                     f"`${_dep_bal:.2f}`\n")
     _name = _md_esc(user.full_name or user.username or "—")
     if user.username and user.full_name:
         _name += f" (@{_md_esc(user.username)})"
@@ -10196,6 +10520,7 @@ async def show_profile(update, ctx):
         f"{T(uid,'pf_pending')} `{st['pending']}`\n"
         f"{T(uid,'pf_rejected')} `{st['rejected']}`\n\n"
         f"{T(uid,'pf_earned')} `${st['earned']:.2f}`\n"
+        f"{_dep_line}"
         f"{T(uid,'pf_withdrawn')} `${st['withdrawn']:.2f}`\n"
         f"{T(uid,'pf_available')} `${float(bal or 0):.2f}`\n"
         f"{T(uid,'pf_on_hold')} `${st['hold']:.2f}`\n\n"
@@ -12847,7 +13172,8 @@ async def receive_wd_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if amt > bal:
         await update.message.reply_text(T(uid,'wd_no_bal', bal=bal, amt=amt), parse_mode="Markdown", reply_markup=cancel_kb(uid))
         return
-    net_amt = round(amt - fee, 4)
+    _dused, _dcut = await asyncio.to_thread(wd_dep_split, uid, amt)
+    net_amt = round(amt - fee - _dcut, 4)
     if net_amt <= 0:
         err = (f"❌ *Amount too low.* After fee `${fee}`, nothing remains."
                if lang=='en' else
@@ -12869,7 +13195,10 @@ async def show_wd_confirmation(msg, ctx, uid):
         asyncio.to_thread(get_wd_fee),
         asyncio.to_thread(get_lang, uid),
     )
-    net_amt = round(amt - fee, 4)
+    _du, _cut = await asyncio.to_thread(wd_dep_split, uid, amt)
+    net_amt = round(amt - fee - _cut, 4)
+    _cut_en = (f"🏦 *Deposit cut (15%):* `${_cut:.4f}`\n" if _cut else "")
+    _cut_bn = (f"🏦 *ডিপোজিট থেকে ১৫% কাটা:* `${_cut:.4f}`\n" if _cut else "")
     masked  = addr   # ইউজার নিজের wallet সব জায়গায় ফুল দেখবে
     if lang == 'en':
         txt = (
@@ -12879,6 +13208,7 @@ async def show_wd_confirmation(msg, ctx, uid):
             f"━━━━━━━━━━━━━━━━\n"
             f"💵 *Debit (from balance):* `${amt:.4f}`\n"
             f"📉 *Fee:* `${fee:.4f}`\n"
+            f"{_cut_en}"
             f"💰 *You will receive:* `${net_amt:.4f}`\n"
             f"━━━━━━━━━━━━━━━━\n\n"
             f"✅ Press *Confirm* to submit, or edit below."
@@ -12896,6 +13226,7 @@ async def show_wd_confirmation(msg, ctx, uid):
             f"━━━━━━━━━━━━━━━━\n"
             f"💵 *কাটা যাবে:* `${amt:.4f}`\n"
             f"📉 *ফি:* `${fee:.4f}`\n"
+            f"{_cut_bn}"
             f"💰 *পাবেন:* `${net_amt:.4f}`\n"
             f"━━━━━━━━━━━━━━━━\n\n"
             f"✅ সঠিক হলে *Confirm* করুন, ভুল থাকলে নিচে এডিট করুন।"
@@ -12930,7 +13261,12 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.to_thread(get_wd_fee),
         asyncio.to_thread(get_lang, uid),
     )
-    net_amt = round(amt - fee, 4)
+    # ── ডিপোজিটের টাকার অংশে ১৫% কাটা (ইনকামের টাকায় নয়) ──
+    await asyncio.to_thread(_ensure_dep_cols)
+    dep_used, dep_cut = await asyncio.to_thread(wd_dep_split, uid, amt)
+    net_amt = round(amt - fee - dep_cut, 4)
+    _cut_en = (f"🏦 *Deposit cut (15%):* `${dep_cut:.4f}`\n" if dep_cut else "")
+    _cut_bn = (f"🏦 *ডিপোজিট থেকে ১৫% কাটা:* `${dep_cut:.4f}`\n" if dep_cut else "")
 
     # ── Security Check 2 + INSERT: একই transaction এ balance কাটো ও withdrawal তৈরি করো ──
     # এটা atomic — মাঝে crash হলেও টাকা হারাবে না।
@@ -12946,23 +13282,28 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         with _c() as c:
             # Step 1: balance check + deduct (atomic)
             ded = c.execute(
-                "UPDATE users SET balance=balance-%s WHERE user_id=%s AND balance >= %s",
-                (amt, uid, amt)
+                "UPDATE users SET balance=balance-%s, "
+                "dep_balance=MAX(COALESCE(dep_balance,0)-%s,0), "
+                "dep_withdrawn=COALESCE(dep_withdrawn,0)+%s "
+                "WHERE user_id=%s AND balance >= %s",
+                (amt, dep_used, dep_used, uid, amt)
             )
             if ded.rowcount == 0:
                 return None, "insufficient"
             # Step 2: insert withdrawal (same connection/transaction)
             cur = c.execute(
                 """
-                INSERT INTO withdrawals (user_id, amount, fee, address, requested_at, scheduled_at)
-                SELECT %s, %s, %s, %s, %s, %s
+                INSERT INTO withdrawals (user_id, amount, fee, dep_used, dep_cut,
+                                         address, requested_at, scheduled_at)
+                SELECT %s, %s, %s, %s, %s, %s, %s, %s
                 WHERE NOT EXISTS (
                     SELECT 1 FROM withdrawals
                     WHERE user_id=%s AND status IN ('pending','processing','gas_pending')
                 )
                 RETURNING id
                 """,
-                (uid, amt, fee, address, now(), _sched_at, uid)
+                (uid, amt, round(float(fee) + float(dep_cut), 4), dep_used, dep_cut,
+                 address, now(), _sched_at, uid)
             )
             _wid = cur.lastrowid
             if _wid is None:
@@ -13018,6 +13359,7 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━\n"
             f"💵 *Debit:* `${amt:.4f}`\n"
             f"📉 *Fee:* `${fee:.4f}`\n"
+            f"{_cut_en}"
             f"💰 *You will receive:* `${net_amt:.4f}`\n"
             f"━━━━━━━━━━━━━━━━\n\n"
             f"{_pay_line}"
@@ -13030,6 +13372,7 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━\n"
             f"💵 *কাটা হয়েছে:* `${amt:.4f}`\n"
             f"📉 *ফি:* `${fee:.4f}`\n"
+            f"{_cut_bn}"
             f"💰 *পাবেন:* `${net_amt:.4f}`\n"
             f"━━━━━━━━━━━━━━━━\n\n"
             f"{_pay_line}"
@@ -15816,6 +16159,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                         _already = True
                     else:
                         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (wamt, wuser))
+                        _dep_refund_in_tx(c, wid, wuser)
                         _invalidate_user_cache(wuser)
                 return _already
             _gc_already = await asyncio.to_thread(_db_5770)
@@ -15896,6 +16240,7 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                         return True  # already processed
                     # শুধু এই transaction-ই reject করেছে — refund safe
                     c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (wamt, wuser))
+                    _dep_refund_in_tx(c, wid, wuser)
                     _invalidate_user_cache(wuser)
                 return False
             _wr_already = await asyncio.to_thread(_db_5828)
@@ -19730,6 +20075,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         else:
                             # শুধু এই transaction-ই reject করেছে — refund safe
                             c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (wamt, wuser))
+                            _dep_refund_in_tx(c, wid, wuser)
                             _invalidate_user_cache(wuser)
                     return _wdr_already
                 _wdr_already = await asyncio.to_thread(_db_8766)
@@ -24433,6 +24779,7 @@ async def job_auto_withdraw(context):
                             log.warning(f"[AUTO-WD] #{wid}: TX fail কিন্তু tx_hash আছে বা processing নেই — refund skip (double-spend guard)।")
                             return False
                         c.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (amt, uid))
+                        _dep_refund_in_tx(c, wid, uid)
                         _invalidate_user_cache(uid)
                     return True
                 _db_12286_ok = await asyncio.to_thread(_db_12286)
@@ -28266,6 +28613,14 @@ def main():
         _background_tasks.add(_watcher_task)
         _watcher_task.add_done_callback(_bg_task_done)
         log.info("✅ Pending-notification watcher started (প্রতি ৩০ সেকেন্ড চেক করবে)")
+        # ── Binance ডিপোজিট অটো-ওয়াচ (১ ঘণ্টা, প্রতি ৪৫ সে.) ──
+        try:
+            _depw = asyncio.create_task(_dep_watch_loop(application.bot))
+            _background_tasks.add(_depw)
+            _depw.add_done_callback(_bg_task_done)
+            log.info("✅ Binance deposit auto-watch started (৬০ মিনিট উইন্ডো)")
+        except Exception as _dwe:
+            log.warning(f"[DEP-WATCH] চালু হয়নি: {_dwe}")
         # ── Step 4: পুরানো bio users কে নতুন text জানাও (একবারই) ──
         _bio_notify_task = asyncio.create_task(_notify_bio_text_change(application.bot))
         _background_tasks.add(_bio_notify_task)
