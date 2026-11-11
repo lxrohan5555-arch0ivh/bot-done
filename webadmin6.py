@@ -12,6 +12,9 @@ from flask import request, redirect
 from webadmin import (
     wadm, page, guard, table, badge, esc, num, one, many, _x, log_admin,
     queue_user_msg,
+    tg_admin_notify,
+    mask_uname,
+    ch_http_send,
 )
 from webadmin2 import settings_all, settings_set
 
@@ -98,13 +101,21 @@ def deposits_home():
     today = one("SELECT COALESCE(SUM(amount),0) AS s FROM deposits "
                 "WHERE status='approved' AND created_at LIKE %s",
                 (time.strftime("%Y-%m-%d") + "%",)) or {}
-    sql = "SELECT * FROM deposits WHERE 1=1"
+    sql = "SELECT * FROM deposits WHERE COALESCE(admin_hidden,0)=0"
     args = []
     if st:
         sql += " AND status=%s"
         args.append(st)
     sql += " ORDER BY id DESC LIMIT 200"
-    rows_db = many(sql, tuple(args))
+    try:
+        rows_db = many(sql, tuple(args))
+    except Exception:
+        try:
+            _x("ALTER TABLE deposits ADD COLUMN IF NOT EXISTS "
+               "admin_hidden INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        rows_db = many(sql, tuple(args))
 
     head = ("<div class='grid g-kpi'>"
             + _kpi("পেন্ডিং", num(len(pend)), "warn" if pend else "")
@@ -366,6 +377,13 @@ def deposit_approve(did):
     d = one("SELECT * FROM deposits WHERE id=%s", (did,))
     if not d:
         return redirect("/admin/deposits?err=ডিপোজিট নেই")
+    try:
+        import bot as _bchk
+        if _bchk.dep_tx_used(str(d["txid"] or ""), did):
+            return redirect("/admin/deposits?err="
+                            "এই TxID আগে ব্যবহার হয়ে গেছে — একই TxID দিয়ে দ্বিতীয়বার হবে না")
+    except Exception:
+        pass
     n = _x("UPDATE deposits SET status='approved', reviewed_by=%s, reviewed_at=%s "
            "WHERE id=%s AND status='pending'", (0, _now(), did))
     if not n:
@@ -374,9 +392,31 @@ def deposit_approve(did):
     _x("UPDATE users SET balance=balance+%s, dep_balance=COALESCE(dep_balance,0)+%s, "
        "dep_total=COALESCE(dep_total,0)+%s WHERE user_id=%s",
        (amt, amt, amt, int(d["user_id"] or 0)))
+    try:
+        import bot as _bdep
+        _bdep.dep_tx_mark(str(d["txid"] or ""), int(d["user_id"] or 0), amt)
+    except Exception:
+        pass
+    try:
+        _u = one("SELECT full_name, username FROM users WHERE user_id=%s",
+                 (int(d["user_id"] or 0),)) or {}
+        _txt = ("🟡 AUTO-APPROVED DEPOSIT!\n\n"
+                f"👤 User: {mask_uname(_u.get('full_name') or _u.get('username') or d['user_id'])}\n"
+                f"🟡 Method: {str(d['method_name'] or 'Binance Pay')[:40]}\n")
+        if str(d["txid"] or "").strip():
+            _txt += f"🧾 TrxID: {str(d['txid']).strip()[:40]}\n"
+        _txt += f"💰 Amount: ${_fmt(amt)}\n✅ Funded Successfully"
+        ch_http_send(_txt)
+    except Exception:
+        pass
     queue_user_msg(int(d["user_id"]),
                    f"✅ ডিপোজিট অনুমোদিত!\n\n💵 {_fmt(amt)} যোগ হয়েছে\n🧾 #{did}")
     log_admin("deposit_approve", did, f"uid={d['user_id']} amount={amt}")
+    try:
+        tg_admin_notify(f"💳 <b>Deposit approved (web)</b>\n\n🧾 #{did}"
+                        f"\n👤 <code>{int(d['user_id'] or 0)}</code>\n💵 {_fmt(amt)}")
+    except Exception:
+        pass
     return redirect("/admin/deposits?ok=ব্যালেন্স যোগ হয়েছে")
 
 
@@ -397,6 +437,11 @@ def deposit_reject(did):
                    f"❌ ডিপোজিট বাতিল হয়েছে\n\n💵 {_fmt(d['amount'])}\n🧾 #{did}\n\n"
                    "সমস্যা হলে সাপোর্টে মেসেজ দিন।")
     log_admin("deposit_reject", did, f"uid={d['user_id']}")
+    try:
+        tg_admin_notify(f"❌ <b>Deposit rejected (web)</b>\n\n🧾 #{did}"
+                        f"\n👤 <code>{int(d['user_id'] or 0)}</code>")
+    except Exception:
+        pass
     return redirect("/admin/deposits?ok=বাতিল করা হয়েছে")
 
 

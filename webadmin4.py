@@ -207,7 +207,7 @@ def _form(task=None):
   <div class='form'><label>Task নাম</label>
     <input name='name' value='{v('name')}' placeholder='ইনস্টাগ্রাম 2fa' required></div>
   <div class='form'><label>প্রতি অ্যাকাউন্টে পেমেন্ট ($)</label>
-    <input name='price' type='number' step='0.01' min='0' value='{v('price', '0')}'></div>
+    <input name='price' type='number' step='0.0001' min='0.0001' value='{v('price', '0')}'></div>
 </div>
 <div class='form'><label>Rules (বাংলা)</label>
   <textarea name='rules_bn' rows='6' placeholder='• নিজের Instagram অ্যাকাউন্ট দিতে হবে&#10;• একই Username একবারই'>{

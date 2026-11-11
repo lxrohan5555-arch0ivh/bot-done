@@ -770,8 +770,16 @@ def _tr_net(key):
         url = ("https://translate.googleapis.com/translate_a/single"
                "?client=gtx&sl=bn&tl=en&dt=t&q=" + urllib.parse.quote(key))
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=2) as r:
-            data = _json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                data = _json.loads(r.read())
+        except Exception:
+            # sl=auto দিয়ে আরেকবার (মিশ্র ভাষার লেখাও অনুবাদ হয়)
+            url2 = ("https://translate.googleapis.com/translate_a/single"
+                    "?client=gtx&sl=auto&tl=en&dt=t&q=" + urllib.parse.quote(key))
+            req2 = urllib.request.Request(url2, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req2, timeout=5) as r:
+                data = _json.loads(r.read())
         out = "".join(seg[0] for seg in data[0] if seg[0]).strip()
     except Exception:
         _TR_OFF_TILL = _time.time() + _TR_FAIL_COOLDOWN
@@ -860,6 +868,18 @@ def translate_to_en(text):
             for _ln in todo:
                 done[_ln] = _tr_line(_ln)
     return "\n".join(done.get(ln, ln) for ln in parts)
+
+
+def tr_for_user(uid, text):
+    """ইউজারের ভাষা অনুযায়ী টেক্সট (en হলে Google অনুবাদ, DB-তে ক্যাশ)।"""
+    try:
+        if not text or not isinstance(text, str):
+            return text
+        if get_lang(uid) != "en":
+            return text
+        return translate_to_en(text)
+    except Exception:
+        return text
 
 
 def md_escape(text):
@@ -3650,7 +3670,7 @@ POINT_DUP_PHOTO   = 3    # একই ছবি ২য়বার = −৩ প�
 POINT_BLOCK_AT    = 0    # পয়েন্ট ০ হলেই block (০ ছাড়া আর কিছুতে block নয়)
 
 # ── বিল্ড ট্যাগ: এই মান বদলালেই পরের বার বট চালু হলে সব ইউজার আবার নতুন করে শুরু করবে ──
-BOT_BUILD = "2026-11-02.6"
+BOT_BUILD = "2026-11-11.1"
 POINT_BLOCK_DAYS  = 2    # ০ হলে ২ দিন task বন্ধ
 WALLET_CHANGE_HOLD_HOURS = 6   # ওয়ালেট বদলের পর এত ঘণ্টা payout hold
 WINBACK_INACTIVE_DAYS    = 14  # এত দিন না আসলে উইনব্যাক মেসেজ
@@ -3795,7 +3815,29 @@ def _ensure_dep_cols():
     return ok
 
 
-def add_dep_bal(uid, amt):
+def _dep_ch_post_credit(uid, amt, method="", txid=""):
+    """ডিপোজিট ক্রেডিট → চ্যানেলে (বট ইনস্ট্যান্স ছাড়াই — সব ক্রেডিট-পথ থেকে চলে)।"""
+    nm = str(uid)
+    try:
+        with _c() as c:
+            r = c.execute("SELECT full_name, username FROM users WHERE user_id=%s",
+                          (int(uid),)).fetchone()
+        if r:
+            nm = r["full_name"] or r["username"] or str(uid)
+    except Exception:
+        pass
+    txt = ("🟡 AUTO-APPROVED DEPOSIT!\n\n"
+           f"👤 User: {_mask_uname(nm)}\n"
+           f"🟡 Method: {str(method or 'Binance Pay')[:40]}\n")
+    if str(txid or "").strip():
+        txt += f"🧾 TrxID: {_ch_mask_tx(txid)}\n"
+    txt += (f"💰 Amount: ${_amt(float(amt or 0))}\n"
+            "✅ Funded Successfully")
+    log.info(f"[DEP-CH] ক্রেডিট নোটিশ uid={uid} → চ্যানেল")
+    return dep_ch_http_send(txt)
+
+
+def add_dep_bal(uid, amt, method="", txid=""):
     """ডিপোজিটের টাকা যোগ — balance + dep_balance + dep_total একসাথে।"""
     try:
         amt = float(amt or 0)
@@ -3813,6 +3855,10 @@ def add_dep_bal(uid, amt):
     if affected:
         _invalidate_user_cache(uid)
         _mark_dirty()
+        try:
+            _dep_ch_post_credit(uid, amt, method, txid)
+        except Exception as _ce:
+            log.warning(f"[DEP-CH] নোটিশ ব্যর্থ uid={uid}: {str(_ce)[:120]}")
         return True
     log.warning(f"[add_dep_bal] user_id={uid} DB তে নেই — ডিপোজিট যোগ হয়নি!")
     return add_bal(uid, amt)
@@ -3857,6 +3903,40 @@ def _dep_refund_in_tx(c, wid, uid):
                 (du, du, uid))
     except Exception as _e:
         log.debug(f"[DEP-REFUND] #{wid}: {str(_e)[:80]}")
+
+
+def _dep_backfill():
+    """পুরোনো (এই ফিচারের আগের) অনুমোদিত ডিপোজিট → dep_balance/dep_total একবারে হিসাব।"""
+    try:
+        if (get_setting("dep_backfill_v1") or "") == "done":
+            return 0
+    except Exception:
+        pass
+    n = 0
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT u.user_id, COALESCE(u.balance,0) AS bal, "
+                "  COALESCE((SELECT SUM(d.amount) FROM deposits d "
+                "            WHERE d.user_id=u.user_id AND d.status='approved'),0) AS dep "
+                "  FROM users u WHERE COALESCE(u.dep_total,0)=0 "
+                "   AND COALESCE(u.dep_balance,0)=0").fetchall()
+            for r in rows:
+                try:
+                    bal = float(r["bal"] or 0)
+                    dep = float(r["dep"] or 0)
+                except Exception:
+                    continue
+                if dep <= 0:
+                    continue
+                c.execute("UPDATE users SET dep_total=%s, dep_balance=%s WHERE user_id=%s",
+                          (round(dep, 4), round(min(bal, dep), 4), int(r["user_id"])))
+                n += 1
+        set_setting("dep_backfill_v1", "done")
+        log.info(f"[DEP-BF] {n} ইউজারের ডিপোজিট-হিসাব ব্যাকফিল হয়েছে")
+    except Exception as _e:
+        log.debug(f"[DEP-BF] {str(_e)[:100]}")
+    return n
 
 
 def ded_bal(uid, amt):
@@ -5096,7 +5176,16 @@ def record_bio_payment(user_id, date_str, amount) -> bool:
             "VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING",
             (user_id, date_str, amount, now())
         )
-        return bool(cur.rowcount)
+        _paid_ok = bool(cur.rowcount)
+    if _paid_ok:
+        # পেমেন্ট হয়ে গেলে ওই ইউজারের অপ্রয়োজনীয় bio ডেটা সাথে সাথে ডিলিট
+        try:
+            with _c() as c:
+                c.execute("DELETE FROM bio_task_tracking WHERE user_id=%s "
+                          "AND COALESCE(add_reward_received,0)=1", (user_id,))
+        except Exception:
+            pass
+    return _paid_ok
     # ⚠️ পুরনো record সাথে সাথে মোছা হয় না — দৈনিক cleanup বয়স অনুযায়ী মুছবে
 
 def get_bio_task_history(user_id, limit=7):
@@ -6428,7 +6517,7 @@ async def shop_notify_channel(bot, oid, uid, p, qty, total):
 async def dep_notify_channel(bot, oid, uid, m, amount, txid):
     """💳 অটো-অনুমোদিত ডিপোজিট → উইথড্র চ্যানেলে নোটিশ।"""
     try:
-        nm = await _ch_user_label(uid)
+        nm = _mask_uname(await _ch_user_label(uid))
         _k = str((m or {}).get("kind") or "uid")
         _method = {"uid": "Binance Pay", "auto": "USDT BEP-20"}.get(_k)
         if not _method:
@@ -6442,6 +6531,156 @@ async def dep_notify_channel(bot, oid, uid, m, amount, txid):
         await post_withdraw_channel(bot, txt, with_btn=True)
     except Exception as e:
         log.warning(f"[DEP] চ্যানেল নোটিফাই ব্যর্থ #{oid}: {e}")
+
+
+def _mask_uname(name):
+    """চ্যানেলে ইউজারের নাম আধা-মাস্ক: `Zia uddin` → `Zia***n`."""
+    t = str(name or "").strip()
+    if not t:
+        return "***"
+    if t.isdigit():
+        return t[:2] + "***" + t[-1:]
+    core = t[1:] if t.startswith("@") else t
+    if len(core) <= 3:
+        return core[:1] + "***"
+    return core[:3] + "***" + core[-1:]
+
+
+_USED_TX_DDL = [False]
+
+
+def _used_tx_ddl():
+    """used_txids টেবিল + deposits.admin_hidden কলাম — একবারই।"""
+    if _USED_TX_DDL[0]:
+        return
+    try:
+        with _c() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS used_txids ("
+                      "txid TEXT PRIMARY KEY, user_id BIGINT DEFAULT 0, "
+                      "amount REAL DEFAULT 0, created_at TEXT DEFAULT '')")
+        try:
+            with _c() as c:
+                c.execute("ALTER TABLE deposits ADD COLUMN IF NOT EXISTS "
+                          "admin_hidden INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            try:      # SQLite/পুরোনো PG — IF NOT EXISTS ছাড়া
+                with _c() as c:
+                    c.execute("ALTER TABLE deposits ADD COLUMN admin_hidden "
+                              "INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass
+        _USED_TX_DDL[0] = True
+    except Exception as e:
+        log.debug(f"[USEDTX] ddl: {str(e)[:100]}")
+
+
+def _tx_key(txid=""):
+    return re.sub(r"\s+", "", str(txid or "")).upper()[:120]
+
+
+def dep_tx_used(txid="", exclude_oid=0):
+    """এই TxID আগে একবারও ব্যবহার হয়েছে কি না — ডিপোজিট রো ডিলিট হলেও ধরা পড়ে।"""
+    k = _tx_key(txid)
+    if not k:
+        return False
+    _used_tx_ddl()
+    try:
+        with _c() as c:
+            if c.execute("SELECT 1 FROM used_txids WHERE txid=%s", (k,)).fetchone():
+                return True
+    except Exception:
+        pass
+    try:
+        with _c() as c:
+            row = c.execute(
+                "SELECT id FROM deposits WHERE id<>%s AND LOWER(COALESCE(txid,''))=%s LIMIT 1",
+                (int(exclude_oid or 0), k.lower())).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def dep_tx_mark(txid="", uid=0, amount=0.0):
+    """TxID চিরতরে 'ব্যবহৃত' হিসেবে চিহ্নিত করো (ডিপোজিট রো মুছলেও থাকে)।"""
+    k = _tx_key(txid)
+    if not k:
+        return False
+    _used_tx_ddl()
+    try:
+        with _c() as c:
+            c.execute("INSERT INTO used_txids (txid,user_id,amount,created_at) "
+                      "VALUES (%s,%s,%s,%s) ON CONFLICT (txid) DO NOTHING",
+                      (k, int(uid or 0), float(amount or 0), now()))
+        return True
+    except Exception as e:
+        log.debug(f"[USEDTX] mark: {str(e)[:80]}")
+        return False
+
+
+def dep_hide_old(hours=24):
+    """approved/rejected ডিপোজিট ১ দিন পর অ্যাডমিন প্যানেল থেকে সরাও
+    (রো মুছি না — ইউজারের হিস্ট্রি অটুট থাকে)।"""
+    _used_tx_ddl()
+    cut = _time.time() * 1000 - int(hours) * 3600 * 1000
+    ids = []
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT id, created_at, COALESCE(admin_hidden,0) AS h FROM deposits "
+                "WHERE status IN ('approved','rejected')").fetchall()
+        for r in rows:
+            if int(r["h"] or 0):
+                continue
+            ms = _dep_created_ms(r) or 0
+            if ms and ms <= cut:
+                ids.append(int(r["id"]))
+        if ids:
+            with _c() as c:
+                for i in ids:
+                    c.execute("UPDATE deposits SET admin_hidden=1 WHERE id=%s", (i,))
+    except Exception as e:
+        log.debug(f"[DEP-HIDE] {str(e)[:100]}")
+        return 0
+    return len(ids)
+
+
+def _dep_ch_id():
+    """ডিপোজিট চ্যানেল আইডি — setting → env → withdraw channel।"""
+    try:
+        v = get_setting("deposit_ch_id")
+        if v:
+            return int(str(v).strip())
+    except Exception:
+        pass
+    try:
+        v = (os.environ.get("DEPOSIT_CH_ID") or "").strip()
+        if v:
+            return int(v)
+    except Exception:
+        pass
+    try:
+        return int(WITHDRAW_CH_ID)
+    except Exception:
+        return 0
+
+
+def dep_ch_http_send(text):
+    """বট ইনস্ট্যান্স ছাড়া (Flask থেকে) চ্যানেলে পোস্ট।"""
+    tok = (os.environ.get("BOT_TOKEN") or "").strip()
+    cid = _dep_ch_id()
+    if not (tok and cid):
+        return False
+    try:
+        body = _json.dumps({"chat_id": cid, "text": str(text)[:3900],
+                            "disable_web_page_preview": True}).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot" + tok + "/sendMessage",
+            data=body, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=8).read()
+        return True
+    except Exception as e:
+        log.warning(f"[DEP-CH] চ্যানেলে পাঠানো যায়নি: {str(e)[:120]}")
+        return False
 
 
 def _shop_item_html(p, line):
@@ -7457,8 +7696,16 @@ def dep_method_provider(m):
     return v or "binance"
 
 
+def _dep_slug(slug):
+    """প্রোভাইডার নাম এক করা — Binance এর যেকোনো বানান ঠিক 'binance'।"""
+    v = str(slug or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not v or "binance" in v:
+        return "binance"
+    return v
+
+
 def dep_provider_ready(slug):
-    slug = str(slug or "").strip().lower()
+    slug = _dep_slug(slug)
     if slug == "binance":
         return dep_binance_ready()
     k, sec, _extra = get_pay_creds(slug)
@@ -7478,11 +7725,19 @@ def dep_api_test(slug="binance", minutes=120):
     _off = _binance_server_offset()
     rows, err = _binance_pay_rows(minutes)
     if err:
+        _px = (os.environ.get("BINANCE_PROXY")
+               or os.environ.get("BINANCE_HTTPS_PROXY") or "").strip()
         return False, (f"❌ *API কাজ করছে না*\n\n`{_md_esc(str(err)[:300])}`\n\n"
+                       f"🔌 *Proxy:* `{'সেট' if _px else 'নেই'}`\n\n"
                        "সম্ভাব্য কারণ:\n"
                        "• Key-তে *Enable Reading* + *Binance Pay* পারমিশন নেই\n"
-                       "• Render সার্ভারের IP ব্লকড (API Key-তে IP সীমা খুলে দিন)\n"
-                       "• ভুল Key/Secret")
+                       "• Render সার্ভারের IP ব্লকড\n"
+                       "• ভুল Key/Secret\n\n"
+                       "💡 *IP সীমা কখনো বাধ্যতামূলক নয়* — Key-তে *Unrestricted* থাকলেই চলে।\n"
+                       "`451/403` মানে Binance এই ডেটাসেন্টার IP ব্লক করেছে:\n"
+                       "• Render → Settings → *Region = Singapore* → Redeploy, অথবা\n"
+                       "• `BINANCE_PROXY` env দিন (Singaapore VPS/proxy)।\n"
+                       "এর মধ্যে ডিপোজিট পেন্ডিং হবে — অ্যাডমিন ✅ চাপলেই টাকা যোগ হবে।")
     if not rows:
         return True, (f"✅ *API ঠিক আছে* (কোনো এরর নেই)\n\n"
                       f"🕒 সার্ভার সময়ের পার্থক্য: `{_off:+.1f}s`\n"
@@ -7506,8 +7761,8 @@ def dep_api_test(slug="binance", minutes=120):
 
 def dep_api_find(provider, ref, want=0.0, minutes=60):
     """প্রোভাইডার অনুযায়ী পেমেন্ট যাচাই — (amount, txid, err)।"""
-    slug = str(provider or "binance").strip().lower()
-    if slug in ("", "binance"):
+    slug = _dep_slug(provider)
+    if slug == "binance":
         return dep_binance_pay_find(ref, want, minutes)
     # কাস্টম প্রোভাইডার — জেনেরিক GET: {extra}/{base}/…
     key, sec, extra = get_pay_creds(slug)
@@ -7904,11 +8159,23 @@ _DEP_STABLE = {"USDT", "USDC", "BUSD", "FDUSD", "BNFCR"}
 def get_binance_creds():
     """(api_key, api_secret) — pay_apis টেবিল → পুরোনো settings → env।"""
     k = s_ = ""
+    # অ্যাডমিন যেভাবেই সেভ করুন (binance / binance_pay / name="Binance Pay") — খুঁজে নাও
     try:
-        r = pay_api("binance")
-        if r:
-            k = str(r["api_key"] or "").strip()
-            s_ = str(r["api_secret"] or "").strip()
+        for _slug in ("binance", "binance_pay", "binancepay", "binance_pay_api"):
+            r = pay_api(_slug)
+            if r and str(r["api_key"] or "").strip():
+                k = str(r["api_key"] or "").strip()
+                s_ = str(r["api_secret"] or "").strip()
+                break
+        if not (k and s_):
+            with _c() as c:
+                r = c.execute(
+                    "SELECT slug, api_key, api_secret FROM pay_apis "
+                    "WHERE LOWER(COALESCE(slug,'')) LIKE 'binance%' "
+                    "  AND COALESCE(api_key,'')<>'' LIMIT 1").fetchone()
+            if r:
+                k = str(r["api_key"] or "").strip()
+                s_ = str(r["api_secret"] or "").strip()
     except Exception:
         pass
     if not (k and s_):
@@ -7955,55 +8222,140 @@ def _binance_server_offset():
         return _BINANCE_TS_OFF["v"]
 
 
+_BINANCE_HOSTS = ("https://api.binance.com", "https://api1.binance.com",
+                  "https://api2.binance.com", "https://api3.binance.com",
+                  "https://api-gcp.binance.com")
+_BINANCE_LAST_ERR = {"at": 0.0, "msg": ""}
+_DEP_ERR_ALERT = {"at": 0.0}
+
+
+def _binance_bases():
+    """কোন হোস্টগুলো চেষ্টা করব — BINANCE_API_BASE থাকলে সেটাই আগে।"""
+    env = (os.environ.get("BINANCE_API_BASE") or "").strip().rstrip("/")
+    out = [env] if env else []
+    for h in _BINANCE_HOSTS:
+        if h not in out:
+            out.append(h)
+    return out
+
+
+def _binance_opener():
+    """BINANCE_PROXY থাকলে ওটা দিয়ে যাও — Render-এর IP Binance ব্লক করলে কাজে লাগে।"""
+    px = (os.environ.get("BINANCE_PROXY")
+          or os.environ.get("BINANCE_HTTPS_PROXY") or "").strip()
+    try:
+        if px:
+            return urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": px, "https": px}))
+    except Exception as _e:
+        log.warning(f"[BINANCE] proxy সেট করা যায়নি: {str(_e)[:80]}")
+    return urllib.request.build_opener()
+
+
 def _binance_pay_rows(minutes=60):
-    """Binance Pay লেনদেন তালিকা — (rows, err)।"""
+    """Binance Pay লেনদেন তালিকা — (rows, err)। ব্যর্থ হলে আসল কারণ ফেরত দেয়।"""
     key, sec = get_binance_creds()
     if not (key and sec):
-        return [], "Binance API সেট করা নেই — অ্যাডমিন ম্যানুয়াল ✅ করবেন।"
-    base = (os.environ.get("BINANCE_API_BASE") or "https://api.binance.com").rstrip("/")
+        return [], ("Binance API Key/Secret সেট করা নেই — অ্যাডমিন প্যানেল → "
+                    "Binance API Key ও Secret দিন।")
     try:
-        mins = int(minutes or 60)
+        mins = max(5, int(minutes or 60))
     except Exception:
         mins = 60
+    opener = _binance_opener()
 
-    def _fetch(off=0.0):
+    def _call(base, off, use_time=True):
         end_ms = int((_time.time() + off) * 1000)
-        params = {"startTime": end_ms - max(5, mins) * 60 * 1000, "endTime": end_ms,
-                  "limit": 100, "recvWindow": 20000, "timestamp": end_ms}
-        qs = urllib.parse.urlencode(params)
+        params = {"limit": 100, "recvWindow": 20000, "timestamp": end_ms}
+        if use_time:
+            params["startTime"] = end_ms - mins * 60 * 1000
+            params["endTime"] = end_ms
+        qs = urllib.parse.urlencode(sorted(params.items()))
         sig = hmac.new(sec.encode(), qs.encode(), hashlib.sha256).hexdigest()
-        _url = f"{base}/sapi/v1/pay/transactions?{qs}&signature={sig}"
+        url = f"{base}/sapi/v1/pay/transactions?{qs}&signature={sig}"
+        req = urllib.request.Request(
+            url, headers={"X-MBX-APIKEY": key, "User-Agent": "TaskEarnBot/1.0"})
         try:
-            _req = urllib.request.Request(
-                _url, headers={"X-MBX-APIKEY": key, "User-Agent": "TaskEarnBot/1.0"})
-            with urllib.request.urlopen(_req, timeout=20) as _resp:
-                _body = _resp.read().decode("utf-8", "ignore")
-            return (_json.loads(_body) if _body.strip() else {}), ""
+            with opener.open(req, timeout=20) as r:
+                body = r.read().decode("utf-8", "ignore")
+            return (_json.loads(body) if body.strip() else {}), "", 200
         except urllib.error.HTTPError as e:
             try:
-                return _json.loads(e.read().decode("utf-8", "ignore")), ""
+                raw = e.read().decode("utf-8", "ignore")
+                return (_json.loads(raw) if raw.strip() else {}), "", int(e.code)
             except Exception:
-                return {}, f"Binance API HTTP {e.code} — Key/সার্ভার চেক করুন।"
+                return {}, f"Binance HTTP {e.code}", int(e.code)
         except Exception as e:
-            return {}, f"Binance API-তে সংযোগ হয়নি: {str(e)[:90]}"
+            return {}, f"Binance-এ সংযোগ হয়নি: {str(e)[:90]}", 0
 
-    js, err = _fetch(_BINANCE_TS_OFF["v"])
+    err = ""
+    for base in _binance_bases():
+        js, _e, http = _call(base, _BINANCE_TS_OFF["v"], True)
+        if _e:
+            err = _e
+            continue
+        code = str(js.get("code") or "").strip() if isinstance(js, dict) else ""
+        if code in ("-1021", "-1022"):
+            # ঘড়ির পার্থক্য → সার্ভার টাইম নিয়ে আবার
+            js, _e, http = _call(base, _binance_server_offset(), True)
+            if _e:
+                err = _e
+                continue
+            code = str(js.get("code") or "").strip() if isinstance(js, dict) else ""
+        if code in ("", "000000", "0"):
+            rows = js.get("data") if isinstance(js.get("data"), list) else []
+            _cut = (_time.time() - mins * 60) * 1000
+            keep = []
+            for it in rows:
+                if not isinstance(it, dict):
+                    continue
+                try:
+                    tt = int(float(it.get("transactionTime") or 0))
+                except Exception:
+                    tt = 0
+                if tt and tt < _cut:
+                    continue          # উইন্ডোর বাইরের পুরোনো লেনদেন বাদ
+                keep.append(it)
+            return keep, ""
+        # প্যারামিটার এরর → startTime/endTime ছাড়া (শেষ ৯০ দিন) নিয়ে নিজে ফিল্টার
+        if code in ("-1102", "-1100", "-1106", "-1128", "-1130"):
+            js2, _e2, _h2 = _call(base, _BINANCE_TS_OFF["v"], False)
+            c2 = str(js2.get("code") or "").strip() if isinstance(js2, dict) else ""
+            if c2 in ("", "000000", "0"):
+                rows = js2.get("data") if isinstance(js2.get("data"), list) else []
+                _cut = (_time.time() - mins * 60) * 1000
+                keep = []
+                for it in rows:
+                    if not isinstance(it, dict):
+                        continue
+                    try:
+                        tt = int(float(it.get("transactionTime") or 0))
+                    except Exception:
+                        tt = 0
+                    if tt and tt < _cut:
+                        continue
+                    keep.append(it)
+                return keep, ""
+            code = c2 or code
+            js = js2 if isinstance(js2, dict) and js2 else js
+        msg = str(js.get("msg") or js.get("message") or code) if isinstance(js, dict) else ""
+        if http in (451, 403):
+            err = ("Binance এই সার্ভারের IP ব্লক করেছে (HTTP 451/403) — "
+                   "Render-এর region বদলান বা BINANCE_PROXY সেট করুন")
+            break
+        if code == "-2015":
+            err = ("Binance API Key অনুমতি/IP সমস্যা (-2015) — Key-তে Enable Reading + "
+                   "Binance Pay দিন, IP সীমা খুলে দিন")
+            break
+        err = f"Binance API: {msg or code or ('HTTP %s' % http)}"
+        if code in ("-2014", "-1022", "-1003", "-2008"):
+            break          # key/permission — হোস্ট বদলে লাভ নেই
     if err:
+        _BINANCE_LAST_ERR["at"] = _time.time()
+        _BINANCE_LAST_ERR["msg"] = err
+        log.warning(f"[BINANCE] Pay API ব্যর্থ: {err}")
         return [], err
-    if isinstance(js, dict) and str(js.get("code") or "").strip() in ("-1021", "-1022"):
-        # ঘড়ি এগিয়ে/পিছিয়ে — সার্ভার টাইম নিয়ে আবার চেষ্টা
-        _off = _binance_server_offset()
-        js, err = _fetch(_off)
-        if err:
-            return [], err
-    if not isinstance(js, dict):
-        return [], "Binance API থেকে সঠিক উত্তর আসেনি।"
-    code = str(js.get("code") or "").strip()
-    if code and code not in ("000000", "0"):
-        return [], f"Binance API: {str(js.get('msg') or js.get('message') or code)[:90]}"
-    rows = js.get("data") if isinstance(js.get("data"), list) else []
-    return rows, ""
-
+    return [], "Binance API থেকে সঠিক উত্তর আসেনি।"
 
 
 def _dep_pay_match(rows, low, dref, want):
@@ -8265,6 +8617,18 @@ async def _dep_watch_once(bot):
         return 0
     rows, err = await asyncio.to_thread(_binance_pay_rows, win + 5)
     if err or not rows:
+        if err:
+            _nw = _time.time()
+            if _nw - float(_DEP_ERR_ALERT.get("at") or 0) > 1800:
+                _DEP_ERR_ALERT["at"] = _nw
+                try:
+                    await notify_full_admins(
+                        bot, f"⚠️ *Binance ডিপোজিট API কাজ করছে না*\n\n"
+                             f"`{_md_esc(str(err)[:250])}`\n\n"
+                             "অটো-চেক বন্ধ থাকলেও ডিপোজিট পেন্ডিং থাকবে — "
+                             "অ্যাডমিন প্যানেল থেকে ✅ করুন বা Key ঠিক করুন।")
+                except Exception:
+                    pass
         return 0
     done = 0
     for o, m in todo:
@@ -8556,7 +8920,28 @@ async def _dep_recheck(q, ctx, oid):
 
 async def _dep_auto_credit(ctx, uid, m, amount, txid, oid):
     """অটো ডিপোজিট সফল — ব্যালেন্স যোগ + ইউজার ও অ্যাডমিনকে জানাও।"""
-    await asyncio.to_thread(add_dep_bal, uid, amount)
+    # একই TxID দ্বিতীয়বার এলে ক্রেডিট নয় — বাতিল করে জানাও
+    try:
+        if await asyncio.to_thread(dep_tx_used, txid, oid):
+            await asyncio.to_thread(dep_set, oid, "rejected", 0)
+            try:
+                await ctx.bot.send_message(
+                    uid, ("⚠️ <b>এই TxID আগে ব্যবহার হয়ে গেছে</b>\n\n"
+                         f"🧾 <code>{html.escape(str(txid))}</code>\n"
+                         "একই TxID দিয়ে দ্বিতীয়বার ডিপোজিট হবে না।\n"
+                         "নতুন পেমেন্টের TxID দিন।"), parse_mode="HTML")
+            except Exception:
+                pass
+            log.info(f"[DEP] duplicate TxID বাতিল #{oid} uid={uid}")
+            return
+    except Exception:
+        pass
+    await asyncio.to_thread(add_dep_bal, uid, amount,
+                            str((m or {}).get("name") or ""), str(txid or ""))
+    try:
+        await asyncio.to_thread(dep_tx_mark, txid, uid, amount)
+    except Exception:
+        pass
     try:
         bal = await asyncio.to_thread(get_bal, uid)
     except Exception:
@@ -8582,7 +8967,6 @@ async def _dep_auto_credit(ctx, uid, m, amount, txid, oid):
             f"🔗 `{txid}`")
     except Exception:
         pass
-    await dep_notify_channel(ctx.bot, oid, uid, m, amount, txid)
 
 
 async def dep_callback(update, ctx):
@@ -8597,7 +8981,8 @@ async def dep_callback(update, ctx):
         pass
 
     # ── অ্যাডমিন: pending অনুমোদন / মেথড ম্যানেজ ──
-    if d.startswith("depok:") or d.startswith("depno:") or d == "adm_dep" or d.startswith("depa:"):
+    if (d.startswith("depok:") or d.startswith("depno:") or d == "adm_dep"
+            or d == "depdiag" or d.startswith("depa:")):
         if not await asyncio.to_thread(is_admin, uid):
             return
         try:
@@ -8932,7 +9317,7 @@ async def dep_input(update, ctx, st):
             dep_new, uid, m, amt, "", _note, "pending")
         _why = (f"{dep_provider_label(_prov)} API সেট করা নেই"
                 if not await asyncio.to_thread(dep_provider_ready, _prov)
-                else "পেমেন্ট এখনো পাওয়া যায়নি")
+                else (_err or "পেমেন্ট এখনো পাওয়া যায়নি"))
         await wait_msg.edit_text(
             f"⏳ *ডিপোজিট যাচাই বাকি*\n\n"
             f"🧾 `#{oid}`\n💵 `{amt:g}$`\n🔗 `{ref}`\n\n"
@@ -9225,6 +9610,21 @@ async def _dep_admin_pending(q):
 async def _dep_admin_cb(q, ctx, d):
     uid = q.from_user.id
     try:
+        if d == "depdiag":
+            try:
+                await q.answer("টেস্ট চলছে…")
+            except Exception:
+                pass
+            _ok2, _rep2 = await asyncio.to_thread(dep_api_test, "binance", 120)
+            _px2 = (os.environ.get("BINANCE_PROXY")
+                    or os.environ.get("BINANCE_HTTPS_PROXY") or "").strip()
+            await q.edit_message_text(
+                f"🔁 *Binance টেস্ট — {'✅ ঠিক আছে' if _ok2 else '❌ সমস্যা'}*\n"
+                f"build: `{BOT_BUILD}` · Proxy: `{'সেট' if _px2 else 'নেই'}`\n"
+                "━━━━━━━━━━━━━━\n\n" + _rep2, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔁 আবার টেস্ট", callback_data="depdiag")]]))
+            return
         if d == "adm_dep":
             return await _dep_admin_panel(q)
         if d == "depa:methods":
@@ -9421,13 +9821,22 @@ async def _dep_admin_cb(q, ctx, d):
                         "⚠️ এই TxID/প্রমাণ আগেই অন্য ডিপোজিটে ব্যবহার হয়েছে — "
                         "ডাবল ক্রেডিট হবে না!", show_alert=True)
                     return
+                if await asyncio.to_thread(dep_tx_used, str(o["txid"] or ""), oid):
+                    await q.answer(
+                        "⚠️ এই TxID আগে একবার ব্যবহার হয়ে গেছে — একই TxID দিয়ে "
+                        "দ্বিতীয়বার ডিপোজিট হবে না!", show_alert=True)
+                    return
             n = await asyncio.to_thread(dep_set, oid, "approved" if ok else "rejected", uid)
             if not n:
                 await q.answer("এটি আগেই প্রসেস হয়েছে", show_alert=True)
                 return
             amount = float(o["amount"] or 0)
             if ok:
-                await asyncio.to_thread(add_dep_bal, int(o["user_id"]), amount)
+                await asyncio.to_thread(add_dep_bal, int(o["user_id"]), amount,
+                                        str(o["method_name"] or ""),
+                                        str(o["txid"] or ""))
+                await asyncio.to_thread(dep_tx_mark, str(o["txid"] or ""),
+                                        int(o["user_id"]), amount)
                 try:
                     bal = await asyncio.to_thread(get_bal, int(o["user_id"]))
                 except Exception:
@@ -10404,6 +10813,17 @@ def _profile_stats(uid):
     """
     _z = {"completed": 0, "pending": 0, "rejected": 0,
           "earned": 0.0, "withdrawn": 0.0, "hold": 0.0, "dep_bal": 0.0}
+    # ডিপোজিট-হিসাব আগেই নাও — বাকি query ব্যর্থ হলেও ডিপোজিট ব্যালেন্স ঠিক দেখাবে
+    try:
+        with _c() as c:
+            _dr0 = c.execute(
+                "SELECT COALESCE(dep_balance,0) AS db, COALESCE(dep_withdrawn,0) AS dw "
+                "FROM users WHERE user_id=%s", (uid,)).fetchone()
+        _db_bal = float((_dr0 or {}).get("db") or 0)
+        _db_wd = float((_dr0 or {}).get("dw") or 0)
+    except Exception:
+        _db_bal = _db_wd = 0.0
+    _z["dep_bal"] = round(_db_bal, 2)
     try:
         with _c() as c:
             subs = c.execute(
@@ -10477,15 +10897,6 @@ def _profile_stats(uid):
     except Exception:
         pass
     # ── ডিপোজিটের টাকা "Total earned"-এ নয় — আলাদা দেখানো হয় ──
-    try:
-        with _c() as c:
-            _dr = c.execute(
-                "SELECT COALESCE(dep_balance,0) AS db, COALESCE(dep_withdrawn,0) AS dw "
-                "FROM users WHERE user_id=%s", (uid,)).fetchone()
-        _db_bal = float((_dr or {}).get("db") or 0)
-        _db_wd = float((_dr or {}).get("dw") or 0)
-    except Exception:
-        _db_bal = _db_wd = 0.0
     _z["dep_bal"]   = round(_db_bal, 2)
     _z["earned"]    = round(_z["earned"] - _db_bal - _db_wd, 2)
 
@@ -10505,10 +10916,9 @@ async def show_profile(update, ctx):
         asyncio.to_thread(get_lang, uid),
     )
     _dep_bal = float(st.get("dep_bal") or 0)
-    _dep_line = ""
-    if _dep_bal > 0.004:
-        _dep_line = (f"💰 *{'Deposit balance' if _lang == 'en' else 'ডিপোজিট ব্যালেন্স'}:* "
-                     f"`${_dep_bal:.2f}`\n")
+    # সবসময় দেখাও (ডিপোজিট না থাকলে $0.00)
+    _dep_line = (f"💰 *{'Deposit balance' if _lang == 'en' else 'ডিপোজিট ব্যালেন্স'}:* "
+                 f"`${_dep_bal:.2f}`\n")
     _name = _md_esc(user.full_name or user.username or "—")
     if user.username and user.full_name:
         _name += f" (@{_md_esc(user.username)})"
@@ -24693,7 +25103,8 @@ async def job_auto_withdraw(context):
                 try:
                     _urow       = await asyncio.to_thread(get_user, uid)
                     _uname_plain = (_urow["full_name"] or _urow["username"] or str(uid)) if _urow else str(uid)
-                    _uname_plain = _uname_plain.split('@')[0].strip() or str(uid)
+                    _uname_plain = _mask_uname(
+                        _uname_plain.split('@')[0].strip() or str(uid))
                     _uhandle_plain = f"@{_urow['username']}" if (_urow and _urow.get("username")) else "নেই"
                     # Plain text — no parse_mode — সবচেয়ে reliable, কোনো escape সমস্যা নেই
                     admin_ch_msg = (
@@ -28573,6 +28984,7 @@ def main():
                 await asyncio.to_thread(get_setting, "bot_status")
                 await asyncio.to_thread(_ensure_indexes)      # একবারই — বাকি সময় ফ্ল্যাগ
                 await asyncio.to_thread(_backfill_devices)    # পুরোনো হ্যাশ → devices
+                await asyncio.to_thread(_dep_backfill)        # পুরোনো ডিপোজিট-হিসাব
                 log.info("🔥 [WARMUP] DB pool + caches প্রস্তুত")
             except Exception as _we:
                 log.warning(f"[WARMUP] ব্যর্থ: {_we}")
@@ -28615,10 +29027,61 @@ def main():
         log.info("✅ Pending-notification watcher started (প্রতি ৩০ সেকেন্ড চেক করবে)")
         # ── Binance ডিপোজিট অটো-ওয়াচ (১ ঘণ্টা, প্রতি ৪৫ সে.) ──
         try:
-            _depw = asyncio.create_task(_dep_watch_loop(application.bot))
+            _depw = None   # ব্যাকগ্রাউন্ড ১-ঘণ্টা ওয়াচার বন্ধ (ইউজারের অনুরোধ)
             _background_tasks.add(_depw)
             _depw.add_done_callback(_bg_task_done)
-            log.info("✅ Binance deposit auto-watch started (৬০ মিনিট উইন্ডো)")
+            log.info("ℹ️ Binance deposit auto-watch বন্ধ — শুধু বাটনে চাপলে চেক হবে")
+
+            async def _dep_boot_report(minutes=60):
+                """বুট/আপডেটের পর অ্যাডমিনকে পূর্ণ ডায়াগনস্টিক DM (সবসময়)।"""
+                _host = (os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "").strip()
+                _px = (os.environ.get("BINANCE_PROXY")
+                       or os.environ.get("BINANCE_HTTPS_PROXY") or "").strip()
+                _head = (f"🚀 *বট চালু — নতুন ফাইল লোড হয়েছে*\n"
+                         f"build: `{BOT_BUILD}`\n"
+                         f"🌍 হোস্ট: `{_host or 'লোকাল'}`\n"
+                         f"🔌 Proxy: `{'সেট' if _px else 'নেই'}`\n"
+                         f"🕒 {now()}\n━━━━━━━━━━━━━━")
+                _kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔁 Binance আবার টেস্ট", callback_data="depdiag")]])
+                try:
+                    if not await asyncio.to_thread(dep_binance_ready):
+                        _t = ("\n\n⚠️ *Binance API সেট করা নেই*\n"
+                              "Admin → 💳 ডিপোজিট → 🔌 API Key/Secret দিন।")
+                    else:
+                        _ok, _rep = await asyncio.to_thread(
+                            dep_api_test, "binance", int(minutes))
+                        _t = "\n\n" + _rep
+                        log.info(f"[BINANCE] boot self-test {'OK' if _ok else 'FAIL'}")
+                    await application.bot.send_message(
+                        ADMIN_ID, _head + _t, parse_mode="Markdown", reply_markup=_kb)
+                except Exception as _be:
+                    log.debug(f"[BINANCE] boot report: {str(_be)[:120]}")
+
+            async def _dep_api_boot_check():
+                await asyncio.sleep(25)
+                await _dep_boot_report(60)
+
+            _depchk = asyncio.create_task(_dep_api_boot_check())
+            _background_tasks.add(_depchk)
+            _depchk.add_done_callback(_bg_task_done)
+
+            async def _dep_hide_loop():
+                """approved/rejected ডিপোজিট ১ দিন পর অ্যাডমিন তালিকা থেকে সরাও।"""
+                await asyncio.sleep(90)
+                while True:
+                    try:
+                        _hn = await asyncio.to_thread(dep_hide_old, 24)
+                        if _hn:
+                            log.info(f"[DEP-HIDE] {_hn}টি পুরোনো ডিপোজিট অ্যাডমিন "
+                                     "তালিকা থেকে সরানো হলো (ইউজার হিস্ট্রি অটুট)")
+                    except Exception as _he:
+                        log.debug(f"[DEP-HIDE] {str(_he)[:100]}")
+                    await asyncio.sleep(1800)
+
+            _dhide = asyncio.create_task(_dep_hide_loop())
+            _background_tasks.add(_dhide)
+            _dhide.add_done_callback(_bg_task_done)
         except Exception as _dwe:
             log.warning(f"[DEP-WATCH] চালু হয়নি: {_dwe}")
         # ── Step 4: পুরানো bio users কে নতুন text জানাও (একবারই) ──

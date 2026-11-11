@@ -1461,6 +1461,11 @@ def login():
     r.set_cookie(COOKIE, f"{exp}.{_sign(exp)}", max_age=int(days * 86400),
                  httponly=True, samesite="Strict", secure=_is_https(), path="/")
     log_admin("web_login", 0, ip)
+    try:
+        tg_admin_notify(f"🔐 <b>Web panel login</b>\n\n👤 <code>{esc(u)}</code>"
+                        f"\n🌐 IP: <code>{esc(ip)}</code>")
+    except Exception:
+        pass
     return r
 
 
@@ -1618,7 +1623,101 @@ def queue_broadcast(text):
     return _queue_push("broadcast", msg=text)
 
 
+def mask_uname(name):
+    """চ্যানেলে নাম আধা-মাস্ক: `Zia uddin` → `Zia***n`."""
+    x = str(name or "").strip()
+    if not x:
+        return "***"
+    if x.isdigit():
+        return x[:2] + "***" + x[-1:]
+    core = x[1:] if x.startswith("@") else x
+    if len(core) <= 3:
+        return core[:1] + "***"
+    return core[:3] + "***" + core[-1:]
+
+
+def ch_http_send(text):
+    """চ্যানেলে পোস্ট — Flask থেকে সরাসরি Bot API (bot import লাগে না)।"""
+    import json as _json
+    import urllib.request as _ur
+    tok = (os.environ.get("BOT_TOKEN") or "").strip()
+    if not tok:
+        return False
+    cid = 0
+    for _k in ("deposit_ch_id", "withdraw_ch_id"):
+        try:
+            _r = one("SELECT value FROM settings WHERE key=%s", (_k,))
+            _v = str((_r or {}).get("value") or "").strip()
+            if _v.lstrip("-").isdigit():
+                cid = int(_v)
+                break
+        except Exception:
+            continue
+    if not cid:
+        try:
+            cid = int(os.environ.get("DEPOSIT_CH_ID") or 0)
+        except Exception:
+            cid = 0
+    if not cid:
+        return False
+    try:
+        body = _json.dumps({"chat_id": cid, "text": str(text)[:3900],
+                            "disable_web_page_preview": True}).encode("utf-8")
+        req = _ur.Request("https://api.telegram.org/bot" + tok + "/sendMessage",
+                          data=body, headers={"Content-Type": "application/json"})
+        _ur.urlopen(req, timeout=8).read()
+        return True
+    except Exception as e:
+        try:
+            import logging as _lg
+            _lg.warning(f"[CH] চ্যানেল পোস্ট ব্যর্থ: {str(e)[:120]}")
+        except Exception:
+            pass
+        return False
+
+
+def tg_admin_notify(text):
+    """অ্যাডমিনদের Telegram DM — ওয়েব প্যানেলের ঘটনা জানাতে (dependency ছাড়া)।"""
+    import json as _json
+    import urllib.request as _ur
+    tok = (os.environ.get("BOT_TOKEN") or "").strip()
+    if not tok:
+        return 0
+    ids = set()
+    try:
+        for _r in many("SELECT user_id FROM admins"):
+            try:
+                ids.add(int(_r["user_id"]))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        import bot as _b
+        ids.add(int(_b.ADMIN_ID))
+    except Exception:
+        pass
+    sent = 0
+    for uid in ids:
+        try:
+            body = _json.dumps({"chat_id": uid, "text": text,
+                                "parse_mode": "HTML"}).encode("utf-8")
+            req = _ur.Request("https://api.telegram.org/bot" + tok + "/sendMessage",
+                              data=body, headers={"Content-Type": "application/json"})
+            _ur.urlopen(req, timeout=8).read()
+            sent += 1
+        except Exception:
+            continue
+    return sent
+
+
 def queue_user_msg(user_id, text):
+    # গ্রাহক ইংরেজি ভাষা选 করলে ওয়েব-মেসেজও ইংরেজিতে (Google ক্যাশ)
+    try:
+        import bot as _bi18n
+        text = _bi18n.tr_for_user(user_id, text)
+    except Exception:
+        pass
     """একজন ইউজারকে বটে মেসেজ (যেমন অ্যাডমিন ব্যালেন্স যোগ করলে)।"""
     return _queue_push("dm", user_id=user_id, msg=text)
 
