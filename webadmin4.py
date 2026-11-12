@@ -58,7 +58,9 @@ _DDL = (
         created_at      TEXT DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS idx_igsub_task ON ig_submissions (task_id)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_igsub_name ON ig_submissions (task_id, ig_username)",
+    "DROP INDEX IF EXISTS uq_igsub_name",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_igsub_name_pw ON ig_submissions "
+    "(task_id, ig_username, COALESCE(ig_password,''))",
     "ALTER TABLE ig_submissions ADD COLUMN IF NOT EXISTS paid INTEGER DEFAULT 1",
     "ALTER TABLE ig_submissions ADD COLUMN IF NOT EXISTS notified INTEGER DEFAULT 1",
     "ALTER TABLE ig_submissions ADD COLUMN IF NOT EXISTS reviewed_at TEXT DEFAULT ''",
@@ -660,6 +662,10 @@ def igtask_subs(tid):
             f"<span class='mono'>{esc(s.get('login_password') or '-')}</span>",
             st_badge(s.get("status")),
             badge("Sheet ✓", "ok") if int(s.get("synced") or 0) else badge("Sheet -", "mut"),
+            "<form method='post' action='/admin/do/igsub/%d/approve' style='display:inline'>"
+            "<button class='btn green sm'>✅</button></form>" % int(s["id"]),
+            "<form method='post' action='/admin/do/igsub/%d/reject' style='display:inline;margin-left:4px'>"
+            "<button class='btn gray sm'>❌</button></form>" % int(s["id"]),
             "<form method='post' action='/admin/do/igsub/%d/delete' style='display:inline'>"
             "<button class='btn gray sm'>🗑</button></form>" % int(s["id"]),
         ])
@@ -693,7 +699,8 @@ def igtask_review(tid):
         return redirect(f"/admin/igtask/{tid}/subs?ok=⚠️ কোনো Username দেওয়া হয়নি")
     if action not in ("approve", "reject"):
         return redirect(f"/admin/igtask/{tid}/subs?ok=⚠️ কাজ বোঝা যায়নি")
-    done, miss = review_apply(tid, tokens, action, "ig_submissions", "ig_username")
+    done, miss = review_apply_lines(tid, request.form.get("ids") or "",
+                                    action, "ig_submissions", "ig_username")
     log_admin("igtask_review", tid, f"{action} {done}/{len(tokens)}")
     msg = f"{'✅ approve' if action == 'approve' else '❌ reject'}: {done} টি"
     if miss:
@@ -701,6 +708,28 @@ def igtask_review(tid):
     if action == "reject" and done:
         msg += " · টাকা যোগ হবে না"
     return redirect(f"/admin/igtask/{tid}/subs?ok={msg}")
+
+
+@wadm.route("/admin/do/igsub/<int:sid>/approve", methods=["POST"])
+def igsub_approve(sid):
+    g = guard()
+    if g:
+        return g
+    s = one("SELECT task_id FROM ig_submissions WHERE id=%s", (sid,))
+    n = review_one(int(s["task_id"]), sid, "approve", "ig_submissions", "ig_username") if s else 0
+    return redirect(f"/admin/igtask/{int(s['task_id'])}/subs?ok=" +
+                    ("✅ approve হয়েছে" if n else "⚠️ আগেই প্রসেস হয়েছে") if s else "/admin/igtasks")
+
+
+@wadm.route("/admin/do/igsub/<int:sid>/reject", methods=["POST"])
+def igsub_reject(sid):
+    g = guard()
+    if g:
+        return g
+    s = one("SELECT task_id FROM ig_submissions WHERE id=%s", (sid,))
+    n = review_one(int(s["task_id"]), sid, "reject", "ig_submissions", "ig_username") if s else 0
+    return redirect(f"/admin/igtask/{int(s['task_id'])}/subs?ok=" +
+                    ("❌ reject হয়েছে" if n else "⚠️ আগেই প্রসেস হয়েছে") if s else "/admin/igtasks")
 
 
 @wadm.route("/admin/do/igsub/<int:sid>/delete", methods=["POST"])

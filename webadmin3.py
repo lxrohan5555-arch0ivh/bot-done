@@ -61,7 +61,9 @@ _DDL = (
         created_at      TEXT DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS idx_fbsub_task ON fb_submissions (task_id)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_fbsub_uid ON fb_submissions (task_id, fb_uid)",
+    "DROP INDEX IF EXISTS uq_fbsub_uid",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_fbsub_uid_pw ON fb_submissions "
+    "(task_id, fb_uid, COALESCE(fb_password,''))",
     "ALTER TABLE fb_submissions ADD COLUMN IF NOT EXISTS paid INTEGER DEFAULT 1",
     "ALTER TABLE fb_submissions ADD COLUMN IF NOT EXISTS notified INTEGER DEFAULT 1",
     "ALTER TABLE fb_submissions ADD COLUMN IF NOT EXISTS reviewed_at TEXT DEFAULT ''",
@@ -717,6 +719,10 @@ def fbtask_subs(tid):
             f"<span class='mono'>{esc(s.get('login_password') or '-')}</span>",
             st_badge(s.get("status")),
             badge("Sheet ✓", "ok") if int(s.get("synced") or 0) else badge("Sheet -", "mut"),
+            "<form method='post' action='/admin/do/fbsub/%d/approve' style='display:inline'>"
+            "<button class='btn green sm'>✅</button></form>" % int(s["id"]),
+            "<form method='post' action='/admin/do/fbsub/%d/reject' style='display:inline;margin-left:4px'>"
+            "<button class='btn gray sm'>❌</button></form>" % int(s["id"]),
             "<form method='post' action='/admin/do/fbsub/%d/delete' style='display:inline'>"
             "<button class='btn gray sm'>🗑</button></form>" % int(s["id"]),
         ])
@@ -750,7 +756,8 @@ def fbtask_review(tid):
         return redirect(f"/admin/fbtask/{tid}/subs?ok=⚠️ কোনো UID দেওয়া হয়নি")
     if action not in ("approve", "reject"):
         return redirect(f"/admin/fbtask/{tid}/subs?ok=⚠️ কাজ বোঝা যায়নি")
-    done, miss = review_apply(tid, tokens, action, "fb_submissions", "fb_uid")
+    done, miss = review_apply_lines(tid, request.form.get("ids") or "",
+                                    action, "fb_submissions", "fb_uid")
     log_admin("fbtask_review", tid, f"{action} {done}/{len(tokens)}")
     msg = f"{'✅ approve' if action == 'approve' else '❌ reject'}: {done} টি"
     if miss:
@@ -758,6 +765,28 @@ def fbtask_review(tid):
     if action == "reject" and done:
         msg += " · টাকা যোগ হবে না"
     return redirect(f"/admin/fbtask/{tid}/subs?ok={msg}")
+
+
+@wadm.route("/admin/do/fbsub/<int:sid>/approve", methods=["POST"])
+def fbsub_approve(sid):
+    g = guard()
+    if g:
+        return g
+    s = one("SELECT task_id FROM fb_submissions WHERE id=%s", (sid,))
+    n = review_one(int(s["task_id"]), sid, "approve", "fb_submissions", "fb_uid") if s else 0
+    return redirect(f"/admin/fbtask/{int(s['task_id'])}/subs?ok=" +
+                    ("✅ approve হয়েছে" if n else "⚠️ আগেই প্রসেস হয়েছে") if s else "/admin/fbtasks")
+
+
+@wadm.route("/admin/do/fbsub/<int:sid>/reject", methods=["POST"])
+def fbsub_reject(sid):
+    g = guard()
+    if g:
+        return g
+    s = one("SELECT task_id FROM fb_submissions WHERE id=%s", (sid,))
+    n = review_one(int(s["task_id"]), sid, "reject", "fb_submissions", "fb_uid") if s else 0
+    return redirect(f"/admin/fbtask/{int(s['task_id'])}/subs?ok=" +
+                    ("❌ reject হয়েছে" if n else "⚠️ আগেই প্রসেস হয়েছে") if s else "/admin/fbtasks")
 
 
 @wadm.route("/admin/do/fbsub/<int:sid>/delete", methods=["POST"])

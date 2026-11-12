@@ -57,6 +57,16 @@ _DDL = (
         delivered_at TEXT DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS shop_stock_unsold ON shop_stock (product_id, sold)",
+    """CREATE TABLE IF NOT EXISTS shop_plans (
+        id          BIGSERIAL PRIMARY KEY,
+        category_id BIGINT NOT NULL,
+        label       TEXT DEFAULT '',
+        kind        TEXT DEFAULT 'days',
+        value       REAL DEFAULT 0,
+        sort_order  INTEGER DEFAULT 0,
+        is_active   INTEGER DEFAULT 1,
+        created_at  TEXT DEFAULT ''
+    )""",
 )
 
 _inited = False
@@ -79,6 +89,7 @@ def _init():
         "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS ref_pct REAL DEFAULT -1",
         "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS fields TEXT DEFAULT ''",
         "ALTER TABLE shop_orders ADD COLUMN IF NOT EXISTS delivered_at TEXT DEFAULT ''",
+        "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS plan_id BIGINT DEFAULT 0",
     ):
         try:
             _x(m)
@@ -209,6 +220,26 @@ def shop_home():
         "<button class='ok sm' type='submit'>যোগ করুন</button></form>"
         "<div class='mut' style='font-size:12px;margin-top:6px'>ইউজার বটে এই ক্যাটাগরিগুলো বাটন হিসেবে দেখবে।</div>"
         "</div>"
+        "<div class='card'><b>⏱ মেয়াদ / প্যাক যোগ (VPN, Proxy ইত্যাদি)</b>"
+        "<form method='post' action='/admin/shop/plan/add' class='row' "
+        "style='gap:8px;margin-top:8px;flex-wrap:wrap'>"
+        "<select name='category_id' required style='min-width:140px'>"
+        + "".join(f"<option value='{int(c['id'])}'>{esc(c['name'] or '')}</option>" for c in cats)
+        + "</select>"
+        "<select name='kind'><option value='days'>দিন</option><option value='mb'>MB / GB</option></select>"
+        "<input name='value' placeholder='3 / 7 / 5120' style='max-width:120px' inputmode='decimal'>"
+        "<input name='label' placeholder='ঐচ্ছিক নাম (যেমন ৭ দিন)' style='max-width:180px'>"
+        "<button class='ok sm' type='submit'>যোগ করুন</button></form>"
+        "<div class='mut' style='font-size:12px;margin-top:6px'>ইউজার VPN-এ চাপলে আগে এখানকার "
+        "মেয়াদ/প্যাক বাটন দেখবে, তারপর সেই প্ল্যানের পণ্য। MB দিলে Proxy-র ডাটা প্যাকও হয়।</div>"
+        + "".join(
+            f"<div class='row' style='gap:6px;margin-top:6px;align-items:center'>"
+            f"<span>{esc(_plan_txt(pl))}</span>"
+            f"<span class='mut'>· cat#{int(pl['category_id'])}</span>"
+            f"<form method='post' action='/admin/shop/plan/{int(pl['id'])}/delete' style='display:inline'>"
+            f"<button class='gray sm' type='submit'>🗑</button></form></div>"
+            for pl in _plans())
+        + "</div>"
         "<div class='card'><b>💱 মুদ্রা</b>"
         "<form method='post' action='/admin/shop/currency' class='row' style='gap:8px;margin-top:8px'>"
         f"<input name='currency' value='{cur}' placeholder='$' style='max-width:120px'>"
@@ -289,6 +320,49 @@ def shop_currency():
     return redirect("/admin/shop?ok=মুদ্রা সেভ হয়েছে")
 
 
+@wadm.route("/admin/shop/plan/add", methods=["POST"])
+def shop_plan_add():
+    g = guard()
+    if g:
+        return g
+    _init()
+    try:
+        cid = int(request.form.get("category_id") or 0)
+    except Exception:
+        cid = 0
+    if not cid:
+        return redirect("/admin/shop?err=ক্যাটাগরি বেছে নিন")
+    kind = "mb" if str(request.form.get("kind") or "days").lower() == "mb" else "days"
+    try:
+        val = float((request.form.get("value") or "0").replace(",", "."))
+    except Exception:
+        val = 0
+    label = (request.form.get("label") or "").strip()[:60]
+    if val <= 0 and not label:
+        return redirect("/admin/shop?err=মেয়াদ/MB সংখ্যা দিন")
+    nxt = (one("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shop_plans WHERE category_id=%s",
+               (cid,)) or {}).get("n") or 1
+    _x("INSERT INTO shop_plans (category_id,label,kind,value,sort_order,is_active,created_at) "
+       "VALUES (%s,%s,%s,%s,%s,1,%s)", (cid, label, kind, val, int(nxt), _now()))
+    log_admin("shop_plan_add", cid, f"{kind} {val}")
+    return redirect("/admin/shop?ok=মেয়াদ/প্যাক যোগ হয়েছে")
+
+
+@wadm.route("/admin/shop/plan/<int:plid>/delete", methods=["POST"])
+def shop_plan_del(plid):
+    g = guard()
+    if g:
+        return g
+    _init()
+    try:
+        _x("UPDATE shop_products SET plan_id=0 WHERE plan_id=%s", (plid,))
+        _x("DELETE FROM shop_plans WHERE id=%s", (plid,))
+    except Exception:
+        pass
+    log_admin("shop_plan_del", plid, "plan removed")
+    return redirect("/admin/shop?ok=প্ল্যান ডিলিট হয়েছে")
+
+
 @wadm.route("/admin/shop/cat/add", methods=["POST"])
 def shop_cat_add():
     g = guard()
@@ -299,9 +373,18 @@ def shop_cat_add():
     emoji = (request.form.get("emoji") or "🛍").strip()[:8] or "🛍"
     if not name:
         return redirect("/admin/shop?err=নাম দিন")
+    # টেবিল লেজি-ক্রিয়েটেড — প্রথমবার যোগ করার সময় না থাকলে INSERT ফেল করত
+    try:
+        import bot as _b
+        _b._shop_ddl()
+    except Exception:
+        pass
     nxt = (one("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shop_categories") or {}).get("n") or 1
-    _x("INSERT INTO shop_categories (name, emoji, sort_order, is_active, created_at) "
-       "VALUES (%s,%s,%s,1,%s)", (name, emoji, int(nxt), _now()))
+    try:
+        _x("INSERT INTO shop_categories (name, emoji, sort_order, is_active, created_at) "
+           "VALUES (%s,%s,%s,1,%s)", (name, emoji, int(nxt), _now()))
+    except Exception as _ce:
+        return redirect("/admin/shop?err=ক্যাটাগরি যোগ হয়নি: " + str(_ce)[:60])
     log_admin("shop_cat_add", 0, name)
     return redirect("/admin/shop?ok=ক্যাটাগরি যোগ হয়েছে")
 
@@ -335,6 +418,35 @@ def shop_cat_del(cid):
     return redirect("/admin/shop?ok=ক্যাটাগরি ডিলিট হয়েছে")
 
 
+def _plans(cid=None):
+    try:
+        if cid is None:
+            return many("SELECT * FROM shop_plans ORDER BY category_id, sort_order, id")
+        return many("SELECT * FROM shop_plans WHERE category_id=%s ORDER BY sort_order, id", (int(cid),))
+    except Exception:
+        return []
+
+
+def _plan_txt(pl):
+    try:
+        v = float(pl["value"] or 0)
+    except Exception:
+        v = 0.0
+    vs = int(v) if v == int(v) else round(v, 2)
+    if str(pl["kind"] or "days") == "mb":
+        return f"{vs} MB" if v < 1024 else f"{round(v/1024, 2)} GB"
+    return f"{vs} দিন"
+
+
+def _plan_options(sel=0):
+    out = "<option value='0'>— কোনো প্ল্যান নেই (সব মেয়াদে দেখাবে) —</option>"
+    for pl in _plans():
+        out += (f"<option value='{int(pl['id'])}'"
+                f"{' selected' if int(sel or 0) == int(pl['id']) else ''}>"
+                f"{esc(_plan_txt(pl))} · cat#{int(pl['category_id'])}</option>")
+    return out
+
+
 # ───────────────────────── পণ্য ফর্ম ─────────────────────────
 def _form(p=None):
     p = p or {}
@@ -351,6 +463,10 @@ def _form(p=None):
         f"<input name='name' value='{name}' placeholder='Outlook Trusted' required></div>"
         "<div class='field'><label>ক্যাটাগরি</label>"
         f"<select name='category_id'>{_cat_options(p.get('category_id') or 0)}</select></div>"
+        "<div class='field'><label>⏱ মেয়াদ / প্যাক (ক্যাটাগরিতে প্ল্যান থাকলে)</label>"
+        f"<select name='plan_id'>{_plan_options(p.get('plan_id') or 0)}</select>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>প্ল্যান বানাবেন শপ পেজে "
+        "মেয়াদ/প্যাক যোগ থেকে। ভরা থাকলে বটে আগে প্ল্যান বাটন দেখাবে।</p></div>"
         "<div class='field'><label>দাম (ব্যালেন্স থেকে কাটা হবে)</label>"
         f"<input name='price' value='{price}' placeholder='0.78' required></div>"
         "<div class='field'><label>ডেলিভারি ধরন</label>"
@@ -405,16 +521,20 @@ def _save(pid=0):
     _flds = [x.strip()[:24] for x in str(request.form.get("fields") or "").replace(",", "\n")
              .replace("|", "\n").replace(";", "\n").splitlines() if x.strip()][:8]
     fields = "|".join(_flds)
+    try:
+        plan_id = int(request.form.get("plan_id") or 0)
+    except Exception:
+        plan_id = 0
     if pid:
         _x("UPDATE shop_products SET category_id=%s, name=%s, description=%s, price=%s, "
-           "deliver_type=%s, ref_pct=%s, fields=%s, is_active=%s WHERE id=%s",
-           (cid, name, desc, price, typ, ref_pct, fields, active, pid))
+           "deliver_type=%s, ref_pct=%s, fields=%s, plan_id=%s, is_active=%s WHERE id=%s",
+           (cid, name, desc, price, typ, ref_pct, fields, plan_id, active, pid))
         return pid
     nxt = (one("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shop_products") or {}).get("n") or 1
     r = one("INSERT INTO shop_products (category_id, name, description, price, deliver_type, "
-            "ref_pct, fields, is_active, sort_order, created_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (cid, name, desc, price, typ, ref_pct, fields, active, int(nxt), _now()))
+            "ref_pct, fields, plan_id, is_active, sort_order, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (cid, name, desc, price, typ, ref_pct, fields, plan_id, active, int(nxt), _now()))
     return int((r or {}).get("id") or 0)
 
 

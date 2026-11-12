@@ -1566,6 +1566,87 @@ def review_apply(tid, tokens, action, table, idcol):
     return done, len(tokens) - done
 
 
+def uid_lock_reason(table, tid, sid, idcol):
+    """এই সিটের UID আগেই approve/rejected হলে কারণ ফেরত দাও (নাহলে '')।"""
+    if table not in ("fb_submissions", "ig_submissions") or idcol not in ("fb_uid", "ig_username"):
+        return ""
+    try:
+        r = one(f"SELECT a.status FROM {table} a WHERE a.task_id=%s AND a.id<>%s "
+                f"AND a.status IN ('approved','rejected') AND lower(trim(a.{idcol})) = "
+                f"(SELECT lower(trim(b.{idcol})) FROM {table} b WHERE b.id=%s) LIMIT 1",
+                (int(tid), int(sid), int(sid)))
+        return str((r or {}).get("status") or "")
+    except Exception:
+        return ""
+
+
+def review_one(tid, sid, action, table, idcol=""):
+    """একটি নির্দিষ্ট সিট (id) approve/reject — একই UID-তে ভিন্ন পাসওয়ার্ড হলেও আলাদা।"""
+    if table not in ("fb_submissions", "ig_submissions"):
+        return 0
+    if action == "approve" and uid_lock_reason(table, tid, sid, idcol):
+        return 0
+    status = "approved" if action == "approve" else "rejected"
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    n = _x(f"UPDATE {table} SET status=%s, notified=0, reviewed_at=%s "
+           "WHERE id=%s AND task_id=%s AND status='pending'", (status, stamp, int(sid), int(tid)))
+    if n:
+        _fire_review_changed()
+    return int(n or 0)
+
+
+def review_apply_lines(tid, raw, action, table, idcol):
+    """লাইন-ভিত্তিক review:
+       • `#123`        → শুধু ওই সিট (id)
+       • `uid|password`→ ওই UID-র ঠিক ওই পাসওয়ার্ডের সিট
+       • `uid`         → পুরোনো আচরণ (প্রথম pending)
+    """
+    if table not in ("fb_submissions", "ig_submissions") or idcol not in ("fb_uid", "ig_username"):
+        return 0, 0
+    pwcol = "fb_password" if idcol == "fb_uid" else "ig_password"
+    status = "approved" if action == "approve" else "rejected"
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    done = miss = 0
+    for line in str(raw or "").splitlines():
+        tk = line.strip().strip(",").strip()
+        if not tk:
+            continue
+        row = None
+        if tk.startswith("#") and tk[1:].strip().isdigit():
+            row = one(f"SELECT id FROM {table} WHERE id=%s AND task_id=%s "
+                      "AND status='pending'", (int(tk[1:].strip()), int(tid)))
+        elif "|" in tk:
+            _u, _p = tk.split("|", 1)
+            row = one(f"SELECT id FROM {table} WHERE task_id=%s "
+                      f"AND lower(trim({idcol}))=lower(%s) "
+                      f"AND COALESCE({pwcol},'')=%s AND status='pending' "
+                      "ORDER BY id LIMIT 1",
+                      (int(tid), _u.strip(), _p.strip()))
+        elif tk.isdigit():
+            row = one(f"SELECT id FROM {table} WHERE task_id=%s AND lower(trim({idcol}))=lower(%s) "
+                      "AND status='pending' ORDER BY id LIMIT 1", (int(tid), tk))
+        if not row and "," in tk:
+            for part in [x.strip() for x in tk.split(",") if x.strip()]:
+                if part.isdigit():
+                    row = one(f"SELECT id FROM {table} WHERE task_id=%s "
+                              f"AND lower(trim({idcol}))=lower(%s) AND status='pending' "
+                              "ORDER BY id LIMIT 1", (int(tid), part))
+                    if row:
+                        break
+        if not row:
+            miss += 1
+            continue
+        if action == "approve" and uid_lock_reason(table, tid, int(row["id"]), idcol):
+            miss += 1
+            continue
+        _x(f"UPDATE {table} SET status=%s, notified=0, reviewed_at=%s "
+           "WHERE id=%s AND status='pending'", (status, stamp, int(row["id"])))
+        done += 1
+    if done:
+        _fire_review_changed()
+    return done, miss
+
+
 def review_counts(table, tid):
     """pending / approved / rejected কাউন্ট।"""
     cnt = {"pending": 0, "approved": 0, "rejected": 0}
