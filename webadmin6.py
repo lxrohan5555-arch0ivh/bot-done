@@ -45,6 +45,13 @@ _DDL = (
         reviewed_at TEXT DEFAULT ''
     )""",
     "CREATE INDEX IF NOT EXISTS deposits_user ON deposits (user_id, id)",
+    "ALTER TABLE deposit_methods ADD COLUMN IF NOT EXISTS qr_photo TEXT DEFAULT ''",
+    "ALTER TABLE deposit_methods ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'binance'",
+    "ALTER TABLE deposits ADD COLUMN IF NOT EXISTS proof TEXT DEFAULT ''",
+    "ALTER TABLE deposits ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT 'manual'",
+    "ALTER TABLE deposits ADD COLUMN IF NOT EXISTS uniq_code TEXT DEFAULT ''",
+    "CREATE UNIQUE INDEX IF NOT EXISTS deposits_uniq_code "
+    "ON deposits (uniq_code) WHERE COALESCE(uniq_code,'') <> ''",
 )
 
 _inited = False
@@ -81,7 +88,7 @@ def _kpi(label, value, tone=""):
 
 
 _KIND_BN = {"auto": "⚡ অটো (BEP-20)", "uid": "🆔 অটো (Binance UID)",
-            "manual": "✍️ ম্যানুয়াল"}
+            "manual": "✍️ ম্যানুয়াল", "qr": "🇧🇩 Bangla QR পেমেন্ট"}
 _ST_BN = {"pending": ("⏳ অপেক্ষমাণ", "warn"), "approved": ("✅ অনুমোদিত", "ok"),
           "rejected": ("❌ বাতিল", "err")}
 
@@ -139,10 +146,16 @@ def deposits_home():
 
     prow = []
     for r in pend:
+        _code = str(r.get("uniq_code") or "") if hasattr(r, "get") else ""
+        if not _code:
+            _nt = str(r["note"] or "")
+            if "Note:" in _nt:
+                _code = _nt.split("Note:", 1)[1].split("·")[0].strip()[:12]
         prow.append([
             f"<span class='mono'>#{int(r['id'])}</span>",
             f"<a class='mono' href='/admin/user/{int(r['user_id'] or 0)}'>{int(r['user_id'] or 0)}</a>",
             esc(_fmt(r["amount"])),
+            f"<b class='mono' style='letter-spacing:1px'>{esc(_code or '—')}</b>",
             esc(str(r["method_name"] or "")[:30]),
             f"<span class='mono' style='font-size:11px;word-break:break-all'>"
             f"{esc(str(r['note'] or '')[:60])}</span>",
@@ -161,6 +174,7 @@ def deposits_home():
             f"<span class='mono'>#{int(r['id'])}</span>",
             f"<a class='mono' href='/admin/user/{int(r['user_id'] or 0)}'>{int(r['user_id'] or 0)}</a>",
             esc(_fmt(r["amount"])),
+            f"<span class='mono'>{esc(str((r.get('uniq_code') if hasattr(r, 'get') else '') or '')[:12] or '—')}</span>",
             esc(str(r["method_name"] or "")[:26]),
             badge(lbl, kind),
             f"<span class='mono' style='font-size:11px'>"
@@ -197,9 +211,40 @@ def deposits_home():
         "</form></div>"
     )
 
+    _q = settings_all(["qr_image", "qr_min_bdt", "qr_fee_bdt", "qr_rate", "qr_note"])
+    _qimg = (_q.get("qr_image") or "").strip()
+    qr_card = (
+        "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
+        "<b>🇧🇩 Bangla QR পেমেন্ট — সেটিংস</b>"
+        + (badge("✅ সেট আছে", "ok") if _qimg else badge("❌ QR নেই", "err"))
+        + "</div>"
+        "<form method='post' action='/admin/deposits/qr' style='margin-top:10px'>"
+        "<div class='field'><label>QR কোডের ছবি (লিংক বা Telegram file_id)</label>"
+        f"<input name='qr_image' value='{esc(_qimg)}' "
+        "placeholder='https://… অথবা বটে ছবি পাঠিয়ে পাওয়া file_id'></div>"
+        "<div class='grid g2'>"
+        "<div class='field'><label>সর্বনিম্ন ডিপোজিট (৳)</label>"
+        f"<input name='qr_min_bdt' value='{esc(_q.get('qr_min_bdt') or '100')}'></div>"
+        "<div class='field'><label>ফি (৳) — ইউজার ফি সহ দেবে</label>"
+        f"<input name='qr_fee_bdt' value='{esc(_q.get('qr_fee_bdt') or '0')}'></div>"
+        "<div class='field'><label>রেট — ১ ডলার = কত ৳</label>"
+        f"<input name='qr_rate' value='{esc(_q.get('qr_rate') or '125')}'></div>"
+        "</div>"
+        "<div class='field'><label>নোট (ইউজার QR পেজে দেখবে)</label>"
+        f"<input name='qr_note' value='{esc(_q.get('qr_note') or '')}' "
+        "placeholder='বিকাশ/নগদ/রকেট — Payment অপশন থেকে পাঠান'></div>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>ফি বাদ দিয়ে শুধু আসল টাকার "
+        "ডলার যোগ হবে। উদাহরণ: ৫০০ ৳ + ১০ ৳ ফি, রেট ১২৫ → ইউজার দেবে ৫১০ ৳, পাবে ৪$। "
+        "ইউজার Proof-এ নাম্বারের শেষ ৪ ডিজিট দেবে (TrxID নয়) — রিকোয়েস্ট এখানে "
+        "পেন্ডিং হিসেবে আসবে, আপনি ✅ করবেন।</p>"
+        "<button class='ok' type='submit' style='margin-top:10px'>💾 সেভ করুন</button>"
+        "</form></div>"
+    )
+
     body = (
         head
         + api_card
+        + qr_card
         + "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
           "<b>📋 ডিপোজিট মেথড</b>"
           "<a class='btn ok sm' href='/admin/deposit-method/new'>➕ নতুন মেথড</a></div>"
@@ -209,7 +254,7 @@ def deposits_home():
           "⚡ অটো = ইউজার TxID দিলে বট BSC-তে USDT BEP-20 ট্রান্সফার যাচাই করে সাথে সাথে ব্যালেন্স যোগ করে। "
           "✍️ ম্যানুয়াল = আপনি এখান থেকে ✅ করবেন।</div></div>"
         + "<div class='card'><b>⏳ পেন্ডিং ডিপোজিট (" + num(len(pend)) + ")</b>"
-        + table(["#", "ইউজার", "পরিমাণ", "মেথড", "নোট / TxID", "সময়", ""], prow,
+        + table(["#", "ইউজার", "পরিমাণ", "কোড (Note to Payee)", "মেথড", "নোট / TxID", "সময়", ""], prow,
                 "কোনো পেন্ডিং ডিপোজিট নেই ✅")
         + "</div>"
         + "<div class='card'><div class='row' style='gap:8px;margin-bottom:8px'>"
@@ -217,7 +262,7 @@ def deposits_home():
           + _tab("✅ অনুমোদিত", "?st=approved", st == "approved")
           + _tab("❌ বাতিল", "?st=rejected", st == "rejected")
         + "</div>"
-        + table(["#", "ইউজার", "পরিমাণ", "মেথড", "স্ট্যাটাস", "TxID", "সময়"], drows,
+        + table(["#", "ইউজার", "পরিমাণ", "কোড", "মেথড", "স্ট্যাটাস", "TxID", "সময়"], drows,
                 "কোনো ডিপোজিট নেই")
         + "</div>"
     )
@@ -240,6 +285,7 @@ def _form(m=None):
         f"<option value='uid'{' selected' if kind == 'uid' else ''}>🆔 অটো — Binance Pay (পরিমাণ + অর্ডার আইডি)</option>"
         f"<option value='auto'{' selected' if kind == 'auto' else ''}>⚡ অটো — BEP-20 TxID অন-চেইনে যাচাই</option>"
         f"<option value='manual'{' selected' if kind == 'manual' else ''}>✍️ ম্যানুয়াল — আমি ✅ করব</option>"
+        f"<option value='qr'{' selected' if kind == 'qr' else ''}>🇧🇩 Bangla QR পেমেন্ট (QR স্ক্যান)</option>"
         f"</select>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>🆔 UID: ইউজার কত ডলার পাঠিয়েছে + "
         "অর্ডার আইডি/TxID দিলে বট Binance Pay হিস্ট্রি থেকে পেমেন্ট খুঁজে সাথে সাথে ব্যালেন্স যোগ করে; "
@@ -265,7 +311,7 @@ def _save(mid=0):
     if not name:
         return 0
     kind = (request.form.get("kind") or "manual").strip().lower()
-    if kind not in ("auto", "uid", "manual"):
+    if kind not in ("auto", "uid", "manual", "qr"):
         kind = "manual"
     addr = (request.form.get("address") or "").strip()[:120]
     ins = (request.form.get("instructions") or "").strip()[:1200]
@@ -443,6 +489,41 @@ def deposit_reject(did):
     except Exception:
         pass
     return redirect("/admin/deposits?ok=বাতিল করা হয়েছে")
+
+
+# ───────────────────────── QR সেটিংস ─────────────────────────
+@wadm.route("/admin/deposits/qr", methods=["POST"])
+def deposits_qr_save():
+    g = guard()
+    if g:
+        return g
+    _init()
+    img = (request.form.get("qr_image") or "").strip()[:400]
+    note = (request.form.get("qr_note") or "").strip()[:300]
+    def _num(k, dflt):
+        try:
+            return f"{float((request.form.get(k) or '').replace(',', '.').strip()):g}"
+        except Exception:
+            return dflt
+    settings_set("qr_image", img)
+    settings_set("qr_note", note)
+    settings_set("qr_min_bdt", _num("qr_min_bdt", "100"))
+    settings_set("qr_fee_bdt", _num("qr_fee_bdt", "0"))
+    _rate = _num("qr_rate", "125")
+    try:
+        if float(_rate) <= 0:
+            _rate = "125"
+    except Exception:
+        _rate = "125"
+    settings_set("qr_rate", _rate)
+    try:
+        import bot as _bq
+        _bq.dep_qr_method()
+        _bq.qr_activate()
+    except Exception:
+        pass
+    log_admin("deposits_qr_save", 0, "qr settings")
+    return redirect("/admin/deposits?ok=QR+সেটিংস+সেভ+হয়েছে")
 
 
 # ───────────────────────── Binance API সেটিং ─────────────────────────

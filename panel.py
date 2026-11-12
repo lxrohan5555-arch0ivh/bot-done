@@ -379,6 +379,11 @@ def _device_hash(payload: dict, with_did: bool = True) -> str:
     with_did=True  → নতুন ফরম্যাট (localStorage did + GPU) — অনেক নির্ভুল
     with_did=False → পুরোনো ফরম্যাট — আগের ইউজারদের সাথে মেলাতে লাগে
     """
+    # ⚠️ ফিঙ্গারপ্রিন্ট অসম্পূর্ণ (JS বন্ধ/ব্লক) হলে ফাঁকা — নাহলে ফাঁকা payload-এর
+    # হ্যাশ সবার জন্য একই হয়ে যেত এবং প্রথমজন verify করার পর বাকি সবাই
+    # "একই ডিভাইস" হিসেবে ব্লক খেত।
+    if not (payload.get("platform") and payload.get("screen") and payload.get("dpr")):
+        return ""
     parts = [
         str(payload.get("ua", ""))[:300], str(payload.get("platform", "")),
         str(payload.get("tz", "")), str(payload.get("lang", "")),
@@ -467,6 +472,24 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = "", ua: str = ""):
                 r6 = cur.fetchone()
                 if int((r6 or {}).get("n") or 0) >= max(1, dlim):
                     return "device"
+            # ── একই ফোন-প্রোফাইল কিন্তু ভিন্ন ব্রাউজার ও ভিন্ন IP → ব্লক নয়, অ্যালার্ট
+            #    (একই মডেলের দুইটা আলাদা ফোনকেও ধরা পড়তে পারে, তাই অ্যাডমিন দেখে ঠিক করবেন)
+            if coarse:
+                try:
+                    cur.execute(
+                        "SELECT COUNT(DISTINCT user_id) AS n FROM devices "
+                        "WHERE device_hash=%s AND user_id<>%s", (coarse, uid))
+                    _rc = cur.fetchone()
+                    if int((_rc or {}).get("n") or 0) >= 1:
+                        cur.execute(
+                            "INSERT INTO security_alerts (kind, user_id, related_uid, ip, country, "
+                            "device_hash, detail, status, created_at) "
+                            "VALUES ('same_phone',%s,0,%s,'',%s,%s,'new',%s)",
+                            (uid, ip, coarse,
+                             "একই ফোন-প্রোফাইল (ভিন্ন ব্রাউজার/IP) — ম্যানুয়ালি দেখুন",
+                             str(int(time.time()))))
+                except Exception:
+                    pass
             # ── ফলব্যাক: একই IP + একই ফোন প্রোফাইল = একই ফোন ──
             # (ভিন্ন ব্রাউজার/ইন-অ্যাপ ব্রাউজারে localStorage did আলাদা হলেও ধরা পড়বে)
             if coarse and ip:

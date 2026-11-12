@@ -19,6 +19,12 @@ from webadmin import (
     review_one, review_apply_lines,
 )
 
+def _ts_now():
+    """created_at — বটের now() ফরম্যাটে সময়।"""
+    import time as _t
+    return _t.strftime("%Y-%m-%d %H:%M")
+
+
 _DDL = (
     """CREATE TABLE IF NOT EXISTS ig_tasks (
         id                    BIGSERIAL PRIMARY KEY,
@@ -66,6 +72,17 @@ _DDL = (
     "ALTER TABLE ig_submissions ADD COLUMN IF NOT EXISTS notified INTEGER DEFAULT 1",
     "ALTER TABLE ig_submissions ADD COLUMN IF NOT EXISTS reviewed_at TEXT DEFAULT ''",
     "ALTER TABLE ig_tasks ADD COLUMN IF NOT EXISTS video_url TEXT DEFAULT ''",
+    """CREATE TABLE IF NOT EXISTS ig_pw_groups (
+        id          BIGSERIAL PRIMARY KEY,
+        task_id     BIGINT NOT NULL,
+        password    TEXT DEFAULT '',
+        seats_total INTEGER DEFAULT 0,
+        per_user    INTEGER DEFAULT 0,
+        is_active   INTEGER DEFAULT 1,
+        note        TEXT DEFAULT '',
+        created_at  TEXT DEFAULT ''
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ig_pw_groups_u ON ig_pw_groups (task_id, password)",
 )
 _READY = [False]
 
@@ -469,10 +486,12 @@ def igtasks():
         return g
     _init()
     rows = many("SELECT * FROM ig_tasks ORDER BY id DESC")
+    _cnt = {int(r["task_id"]): int(r.get("n") or 0) for r in many(
+        "SELECT task_id, COUNT(*) AS n FROM ig_submissions GROUP BY task_id")}
     trs = []
     for t in rows:
         tid = int(t["id"])
-        total = scal("SELECT COUNT(*) FROM ig_submissions WHERE task_id=%s", (tid,))
+        total = _cnt.get(tid, 0)
         trs.append([
             f"<a class='mono' href='/admin/igtask/{tid}'>#{tid}</a>",
             f"<a href='/admin/igtask/{tid}'>{esc(t['name'])}</a>",
@@ -484,6 +503,8 @@ def igtasks():
             badge("Sheet ✓", "ok") if (t.get("sheet_url") or "").strip() else "—",
             f"<a class='btn gray sm' href='/admin/igtask/{tid}'>Edit</a> "
             f"<a class='btn gray sm' href='/admin/igtask/{tid}/subs'>Submissions</a> "
+            f"<a class='btn gray sm' href='/admin/igtask/{tid}/passwords'>🔑 Passwords</a> "
+            f"<a class='btn gray sm' href='/admin/igtask/{tid}/passwords/new'>➕ পাসওয়ার্ড</a> "
             f"<a class='btn gray sm' href='/admin/igtask/{tid}/export.xlsx'>Excel</a> "
             f"<a class='btn gray sm' href='/admin/igtask/{tid}/export.csv'>CSV</a> "
             f"<a class='btn gray sm' href='/admin/igtask/{tid}/notify'>📢</a>",
@@ -586,6 +607,167 @@ def igtask_delete(tid):
     return redirect("/admin/igtasks?ok=মুছে ফেলা হয়েছে")
 
 
+# ───────────────── Instagram পাসওয়ার্ড-গ্রুপ (সিট) ─────────────────
+def _int_form(name, dflt=0):
+    try:
+        return int(float((request.form.get(name) or "").replace(",", ".").strip()))
+    except Exception:
+        return dflt
+
+
+def _ig_pw_form(t, g=None, tid=0):
+    g = g or {}
+    _pw = str(g.get("password") or request.args.get("pw") or "")
+    _seats = g.get("seats_total") if g.get("seats_total") not in (None, "") else 0
+    _per = g.get("per_user") if g.get("per_user") not in (None, "") else 0
+    return (
+        "<div class='card'><h3>🔑 পাসওয়ার্ড + সিট (Instagram)</h3>"
+        "<form method='post'>"
+        "<div class='field'><label>পাসওয়ার্ড</label>"
+        f"<input name='password' value='{esc(_pw)}' placeholder='Instagram অ্যাকাউন্টের পাসওয়ার্ড' required></div>"
+        "<div class='field'><label>এই পাসওয়ার্ডে মোট কত জন / সিট নেবে</label>"
+        f"<input name='seats_total' value='{esc(str(_seats))}' placeholder='যেমন 20'>"
+        "<p class='mut' style='font-size:11px;margin:4px 0 0'>০ = সীমা নেই।</p></div>"
+        "<div class='field'><label>একজন ইউজার সর্বোচ্চ কয়টা দিতে পারবে</label>"
+        f"<input name='per_user' value='{esc(str(_per))}' placeholder='যেমন 2'>"
+        "<p class='mut' style='font-size:11px;margin:4px 0 0'>০ = সীমা নেই।</p></div>"
+        "<div class='field'><label>নোট (ঐচ্ছিক)</label>"
+        f"<input name='note' value='{esc(str(g.get('note') or ''))}'></div>"
+        "<div class='row' style='gap:8px;margin-top:12px'>"
+        "<button class='ok' type='submit'>💾 সেভ করুন</button>"
+        f"<a class='btn gray' href='/admin/igtask/{tid}/passwords'>বাতিল</a></div>"
+        "</form></div>"
+    )
+
+
+@wadm.route("/admin/igtask/<int:tid>/passwords", methods=["GET"])
+def igtask_passwords(tid):
+    g = guard()
+    if g:
+        return g
+    _init()
+    t = one("SELECT * FROM ig_tasks WHERE id=%s", (tid,))
+    if not t:
+        return page("Not found", "<div class='card'>Task নেই</div>", "igtasks", status=404)
+    groups = many("SELECT * FROM ig_pw_groups WHERE task_id=%s ORDER BY id", (tid,))
+    agg = {}
+    for r in many(
+            "SELECT COALESCE(ig_password,'') AS pw, COUNT(*) AS n, "
+            "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pend, "
+            "SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) AS appr, "
+            "SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS rej "
+            "FROM ig_submissions WHERE task_id=%s GROUP BY COALESCE(ig_password,'')", (tid,)):
+        agg[str(r.get("pw") or "")] = r
+    trs, seen = [], set()
+    for g2 in groups:
+        _pw = str(g2.get("password") or "")
+        seen.add(_pw)
+        r = agg.get(_pw) or {}
+        used = int(r.get("n") or 0)
+        seats = int(g2.get("seats_total") or 0)
+        per = int(g2.get("per_user") or 0)
+        trs.append([
+            f"<span class='mono'>{esc(_pw) or '-'}</span>"
+            + (f"<div class='mut' style='font-size:11px'>{esc(str(g2.get('note') or ''))}</div>"
+               if str(g2.get("note") or "").strip() else ""),
+            (f"<b>{num(used)}</b> / {num(seats)}" if seats else f"{num(used)} / ∞")
+            + (badge("ভরা", "err") if (seats and used >= seats) else ""),
+            num(per) if per else "∞",
+            badge(str(int(r.get("pend") or 0)), "mut"),
+            badge(str(int(r.get("appr") or 0)), "ok"),
+            badge(str(int(r.get("rej") or 0)), "err"),
+            f"<a class='btn gray sm' href='/admin/igtask/{tid}/subs?pw={_q(_pw)}'>👁 সাবমিশন</a>",
+            f"<a class='btn gray sm' href='/admin/igtask/{tid}/passwords/{int(g2['id'])}/edit'>✏️ Edit</a>",
+            "<form method='post' action='/admin/do/igtask/%d/pwgroup/%d/delete' "
+            "style='display:inline' onsubmit=\"return confirm('গ্রুপটা মুছে যাবে (জমাগুলো থাকবে)?')\">"
+            "<button class='btn gray sm' type='submit'>🗑</button></form>" % (tid, int(g2["id"])),
+        ])
+    for pw, r in agg.items():
+        if not pw or pw in seen:
+            continue
+        trs.append([
+            f"<span class='mono'>{esc(pw)}</span>"
+            "<div class='mut' style='font-size:11px'>গ্রুপ নেই (পুরোনো)</div>",
+            f"{num(r.get('n') or 0)} / —", "—",
+            badge(str(int(r.get("pend") or 0)), "mut"),
+            badge(str(int(r.get("appr") or 0)), "ok"),
+            badge(str(int(r.get("rej") or 0)), "err"),
+            f"<a class='btn gray sm' href='/admin/igtask/{tid}/subs?pw={_q(pw)}'>👁 সাবমিশন</a>",
+            f"<a class='btn gray sm' href='/admin/igtask/{tid}/passwords/new?pw={_q(pw)}'>➕ গ্রুপ বানান</a>",
+            "",
+        ])
+    body = (
+        "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
+        f"<h3>🔑 পাসওয়ার্ড ও সিট — {esc(t.get('name') or '')}</h3>"
+        "<div class='row' style='gap:6px'>"
+        f"<a class='btn ok sm' href='/admin/igtask/{tid}/passwords/new'>➕ নতুন পাসওয়ার্ড</a>"
+        f"<a class='btn gray sm' href='/admin/igtask/{tid}/subs'>⟨ সব সাবমিশন</a></div></div>"
+        "<p class='mut' style='font-size:12px'>প্রতিটি পাসওয়ার্ড আলাদা গ্রুপ — নিজের সিট আর "
+        "একজনের লিমিট। সিট ভরে গেলে নতুন ইউজার এই পাসওয়ার্ড পাবে না। 👁 চাপলে শুধু ওই "
+        "পাসওয়ার্ডের জমা — সেখানেই ✅/❌।</p>"
+        + table(["পাসওয়ার্ড", "সিট", "একজন", "Pending", "Approved", "Rejected", "", "", ""],
+                trs, "কোনো পাসওয়ার্ড নেই — ➕ নতুন পাসওয়ার্ড চাপুন")
+        + "</div>"
+    )
+    return page(f"Passwords — {t.get('name') or 'IG'}", body, "igtasks",
+                toast=request.args.get("ok"), err=request.args.get("err"))
+
+
+@wadm.route("/admin/igtask/<int:tid>/passwords/new", methods=["GET", "POST"])
+def igtask_pw_new(tid):
+    g = guard()
+    if g:
+        return g
+    _init()
+    t = one("SELECT * FROM ig_tasks WHERE id=%s", (tid,))
+    if not t:
+        return page("Not found", "<div class='card'>Task নেই</div>", "igtasks", status=404)
+    if request.method == "POST":
+        pw = (request.form.get("password") or "").strip()
+        if not pw:
+            return page("নতুন পাসওয়ার্ড", _ig_pw_form(t, None, tid), "igtasks", err="পাসওয়ার্ড দিন")
+        _x("INSERT INTO ig_pw_groups (task_id, password, seats_total, per_user, is_active, "
+           "note, created_at) VALUES (%s,%s,%s,%s,1,%s,%s)",
+           (tid, pw[:80], _int_form("seats_total", 0), _int_form("per_user", 0),
+            (request.form.get("note") or "").strip()[:120], _ts_now()))
+        log_admin("igtask_pw_new", tid, f"pw={pw[:20]}")
+        return redirect(f"/admin/igtask/{tid}/passwords?ok=" + _q("✅ পাসওয়ার্ড যোগ হয়েছে"))
+    return page("নতুন পাসওয়ার্ড", _ig_pw_form(t, None, tid), "igtasks")
+
+
+@wadm.route("/admin/igtask/<int:tid>/passwords/<int:gid>/edit", methods=["GET", "POST"])
+def igtask_pw_edit(tid, gid):
+    g = guard()
+    if g:
+        return g
+    _init()
+    t = one("SELECT * FROM ig_tasks WHERE id=%s", (tid,))
+    row = one("SELECT * FROM ig_pw_groups WHERE id=%s AND task_id=%s", (gid, tid))
+    if not t or not row:
+        return page("Not found", "<div class='card'>পাসওয়ার্ড পাওয়া যায়নি</div>",
+                    "igtasks", status=404)
+    if request.method == "POST":
+        pw = (request.form.get("password") or "").strip() or str(row.get("password") or "")
+        _x("UPDATE ig_pw_groups SET password=%s, seats_total=%s, per_user=%s, note=%s "
+           "WHERE id=%s AND task_id=%s",
+           (pw[:80], _int_form("seats_total", 0), _int_form("per_user", 0),
+            (request.form.get("note") or "").strip()[:120], gid, tid))
+        log_admin("igtask_pw_edit", tid, f"gid={gid}")
+        return redirect(f"/admin/igtask/{tid}/passwords?ok=" + _q("✅ সেভ হয়েছে"))
+    return page("পাসওয়ার্ড এডিট", _ig_pw_form(t, row, tid), "igtasks")
+
+
+@wadm.route("/admin/do/igtask/<int:tid>/pwgroup/<int:gid>/delete", methods=["POST"])
+def igtask_pw_group_del(tid, gid):
+    g = guard()
+    if g:
+        return g
+    _init()
+    _x("DELETE FROM ig_pw_groups WHERE id=%s AND task_id=%s", (gid, tid))
+    log_admin("igtask_pw_group_del", tid, f"gid={gid}")
+    return redirect(f"/admin/igtask/{tid}/passwords?ok=" + _q("গ্রুপ ডিলিট হয়েছে (জমাগুলো আছে)"))
+
+
 @wadm.route("/admin/igtask/<int:tid>/notify", methods=["GET", "POST"])
 def igtask_notify(tid):
     """এই টাস্কের নোটিফিকেশন — নিজের লেখা মেসেজ সব verified ইউজারকে (বট পাঠাবে)।"""
@@ -646,10 +828,19 @@ def igtask_subs(tid):
         p = max(1, int(request.args.get("page") or 1))
     except Exception:
         p = 1
-    rows = many(
-        "SELECT s.*, COALESCE(u.username,'') AS username FROM ig_submissions s "
-        "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s "
-        "ORDER BY s.id DESC LIMIT 100 OFFSET %s", (tid, (p - 1) * 100))
+    _pw_filter = (request.args.get("pw") or "").strip()
+    if _pw_filter:
+        rows = many(
+            "SELECT s.*, COALESCE(u.username,'') AS username FROM ig_submissions s "
+            "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s "
+            "AND COALESCE(s.ig_password,'')=%s "
+            "ORDER BY s.id DESC LIMIT 100 OFFSET %s",
+            (tid, _pw_filter, (p - 1) * 100))
+    else:
+        rows = many(
+            "SELECT s.*, COALESCE(u.username,'') AS username FROM ig_submissions s "
+            "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s "
+            "ORDER BY s.id DESC LIMIT 100 OFFSET %s", (tid, (p - 1) * 100))
     trs = []
     for s in rows:
         trs.append([
@@ -674,7 +865,10 @@ def igtask_subs(tid):
         review_kpi(review_counts("ig_submissions", tid))
         + review_card(tid, "ig")
         + f"<div class='card'><div class='row' style='justify-content:space-between'>"
-        f"<h3>{esc(t['name'])} — জমা তথ্য</h3>"
+        f"<h3>{esc(t['name'])} — জমা তথ্য"
+        + (f" · পাসওয়ার্ড: <span class='mono'>{esc(_pw_filter)}</span> "
+           f"<a class='btn gray sm' href='/admin/igtask/{tid}/subs'>সব দেখুন</a>"
+           if _pw_filter else "") + "</h3>"
         f"<a class='btn gray sm' href='/admin/igtask/{tid}/export.xlsx'>⬇️ Excel</a>"
         f"<a class='btn gray sm' href='/admin/igtask/{tid}/export.csv'>CSV</a></div>"
         + table(["Date", "User", "Acc#", "Instagram Username", "Login Username",
