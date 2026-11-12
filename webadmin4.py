@@ -16,6 +16,7 @@ from webadmin import (
     review_counts, review_kpi, _fire_settings_changed, _fire_review_changed,
     xlsx_bytes, queue_task_notify, export_table, queue_user_msg, queue_broadcast,
     vid_value,
+    review_one, review_apply_lines,
 )
 
 _DDL = (
@@ -694,7 +695,8 @@ def igtask_review(tid):
         return g
     _init()
     action = (request.form.get("action") or "").strip().lower()
-    tokens = review_tokens(request.form.get("ids") or "")
+    _raw_ids = request.form.get("ids") or ""
+    tokens = [ln.strip() for ln in _raw_ids.splitlines() if ln.strip()]
     if not tokens:
         return redirect(f"/admin/igtask/{tid}/subs?ok=⚠️ কোনো Username দেওয়া হয়নি")
     if action not in ("approve", "reject"):
@@ -737,8 +739,13 @@ def igsub_delete(sid):
     g = guard()
     if g:
         return g
-    s = one("SELECT task_id FROM ig_submissions WHERE id=%s", (sid,))
+    s = one("SELECT task_id, user_id, COALESCE(status,'pending') AS st FROM ig_submissions WHERE id=%s", (sid,))
     if s:
+        try:
+            from webadmin import hist_add
+            hist_add(s.get("user_id") or 0, "ig", s.get("st") or "pending", 1)
+        except Exception:
+            pass
         _x("DELETE FROM ig_submissions WHERE id=%s", (sid,))
         _x("UPDATE ig_tasks SET total_done=GREATEST(0, COALESCE(total_done,0)-1) WHERE id=%s",
            (int(s["task_id"]),))

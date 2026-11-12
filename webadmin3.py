@@ -4,6 +4,7 @@
 /admin/fbtask/<id> (এডিট + জমা তথ্য), CSV export, সাবমিশন মুছে ফেলা।
 """
 import json
+import time
 
 from urllib.parse import quote as _q
 
@@ -12,7 +13,8 @@ from flask import request, redirect, Response
 from webadmin import (
     wadm, page, guard, table, badge, esc, icon, num, money, one, many, scal, _x,
     log_admin, pager, st_badge, review_card, review_tokens, review_apply,
-    review_counts, review_kpi, _fire_settings_changed, _fire_review_changed,
+    review_counts, review_kpi, _fire_settings_changed, _fire_review_changed, hist_add,
+    review_one, review_apply_lines,
     xlsx_bytes, queue_task_notify, export_table, queue_user_msg, queue_broadcast,
     vid_value,
 )
@@ -531,6 +533,7 @@ def fbtasks():
             badge("Sheet ✓", "ok") if (t.get("sheet_url") or "").strip() else "—",
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}'>Edit</a> "
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs'>Submissions</a> "
+            f"<a class='btn gray sm' href='/admin/fbtask/{tid}/passwords'>🔑 Passwords</a> "
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/export.xlsx'>Excel</a> "
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/export.csv'>CSV</a> "
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/notify'>📢</a>",
@@ -682,6 +685,92 @@ def _notify_form(t, tid, default_text=None):
     )
 
 
+@wadm.route("/admin/fbtask/<int:tid>/passwords", methods=["GET"])
+def fbtask_passwords(tid):
+    """এই টাস্কের পাসওয়ার্ড তালিকা — প্রতি পাসওয়ার্ড = আলাদা সিট گروه।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    t = one("SELECT * FROM fb_tasks WHERE id=%s", (tid,))
+    if not t:
+        return page("Not found", "<div class='card'>Task নেই</div>", "fbtasks", status=404)
+    rows = many(
+        "SELECT COALESCE(fb_password,'') AS pw, COUNT(*) AS n, "
+        "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pend, "
+        "SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) AS appr, "
+        "SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS rej "
+        "FROM fb_submissions WHERE task_id=%s GROUP BY COALESCE(fb_password,'') "
+        "ORDER BY n DESC, pw", (tid,))
+    trs = []
+    for r in rows:
+        _pw = str(r.get("pw") or "")
+        trs.append([
+            f"<span class='mono'>{esc(_pw) or '-'}</span>",
+            num(r.get("n") or 0),
+            badge(str(int(r.get("pend") or 0)), "mut"),
+            badge(str(int(r.get("appr") or 0)), "ok"),
+            badge(str(int(r.get("rej") or 0)), "err"),
+            f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs?pw={_q(_pw)}'>👁 তথ্য দেখুন</a>",
+            "<form method='post' action='/admin/do/fbtask/%d/password/delete' "
+            "style='display:inline' onsubmit=\"return confirm('এই পাসওয়ার্ডের সব সিট "
+            "ডিলিট হবে — তালিকা ও DB থেকে মুছে যাবে, কিন্তু ইউজার প্রোফাইলের "
+            "মোট হিসাব আগের মতোই থাকবে। "
+            "চালিয়ে যাবেন?')\">"
+            "<input type='hidden' name='pw' value='%s'>"
+            "<button class='btn gray sm' type='submit'>🗑 ডিলিট</button></form>"
+            % (tid, esc(_pw)),
+        ])
+    body = (
+        "<div class='card'><div class='row' style='justify-content:space-between'>"
+        f"<h3>🔑 পাসওয়ার্ড তালিকা — {esc(t.get('name') or '')}</h3>"
+        f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs'>⟨ সব সাবমিশন</a></div>"
+        "<p class='mut' style='font-size:12px'>প্রতিটি পাসওয়ার্ড আলাদা সিট — আলাদা "
+        "approve/reject, আলাদা তথ্য। নতুন পাসওয়ার্ডে জমা হলে এখানে নতুন লাইন নিজেই "
+        "যোগ হবে। 🗑 চাপলে ওই পাসওয়ার্ডের সব সিট তালিকা ও DB থেকে মুছে যাবে।</p>"
+        + table(["পাসওয়ার্ড", "সিট", "Pending", "Approved", "Rejected", "তথ্য", ""],
+                trs, "কোনো পাসওয়ার্ড নেই")
+        + "</div>"
+    )
+    return page(f"Passwords — {t.get('name') or 'FB'}", body, "fbtasks",
+                toast=request.args.get("ok"))
+
+
+def fbtask_pw_delete_do(tid, pw):
+    """পাসওয়ার্ডের সব সিট ডিলিট — আগে হিসাব seat_archive-এ রাখে।"""
+    _pw = (pw or "").strip()
+    n = 0
+    try:
+        _x("CREATE TABLE IF NOT EXISTS seat_archive ("
+           "user_id BIGINT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, "
+           "n BIGINT NOT NULL DEFAULT 0, updated_at TEXT DEFAULT '', "
+           "UNIQUE(user_id, kind, status))")
+        for _r in many("SELECT user_id, COALESCE(status,'pending') AS st, COUNT(*) AS n "
+                       "FROM fb_submissions WHERE task_id=%s AND COALESCE(fb_password,'')=%s "
+                       "GROUP BY user_id, COALESCE(status,'pending')", (int(tid), _pw)):
+            hist_add(_r["user_id"] or 0, "fb", str(_r["st"]), int(_r["n"] or 0))
+    except Exception:
+        pass
+    try:
+        n = _x("DELETE FROM fb_submissions WHERE task_id=%s AND COALESCE(fb_password,'')=%s",
+               (int(tid), _pw))
+    except Exception:
+        n = 0
+    log_admin("fbtask_pw_delete", tid, f"pw={_pw[:20]} rows={n}")
+    return n
+
+
+@wadm.route("/admin/do/fbtask/<int:tid>/password/delete", methods=["POST"])
+def fbtask_password_delete(tid):
+    g = guard()
+    if g:
+        return g
+    _init()
+    _pw = (request.form.get("pw") or "").strip()
+    n = fbtask_pw_delete_do(tid, _pw)
+    return redirect(f"/admin/fbtask/{tid}/passwords?ok=" + _q(f"{n} টি সিট ডিলিট হয়েছে"))
+
+
 @wadm.route("/admin/fbtask/<int:tid>/subs", methods=["GET"])
 def fbtask_subs(tid):
     g = guard()
@@ -695,10 +784,19 @@ def fbtask_subs(tid):
         p = max(1, int(request.args.get("page") or 1))
     except Exception:
         p = 1
-    rows = many(
-        "SELECT s.*, COALESCE(u.username,'') AS username FROM fb_submissions s "
-        "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s "
-        "ORDER BY s.id DESC LIMIT 100 OFFSET %s", (tid, (p - 1) * 100))
+    _pw_filter = (request.args.get("pw") or "").strip()
+    if _pw_filter:
+        rows = many(
+            "SELECT s.*, COALESCE(u.username,'') AS username FROM fb_submissions s "
+            "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s "
+            "AND COALESCE(s.fb_password,'')=%s "
+            "ORDER BY s.id DESC LIMIT 100 OFFSET %s",
+            (tid, _pw_filter, (p - 1) * 100))
+    else:
+        rows = many(
+            "SELECT s.*, COALESCE(u.username,'') AS username FROM fb_submissions s "
+            "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s "
+            "ORDER BY s.id DESC LIMIT 100 OFFSET %s", (tid, (p - 1) * 100))
     trs = []
     for s in rows:
         try:
@@ -719,6 +817,8 @@ def fbtask_subs(tid):
             f"<span class='mono'>{esc(s.get('login_password') or '-')}</span>",
             st_badge(s.get("status")),
             badge("Sheet ✓", "ok") if int(s.get("synced") or 0) else badge("Sheet -", "mut"),
+            "<a class='btn gray sm' href='/admin/fbsub/%d' title='জমা তথ্য দেখুন'>👁</a>"
+            % int(s["id"]),
             "<form method='post' action='/admin/do/fbsub/%d/approve' style='display:inline'>"
             "<button class='btn green sm'>✅</button></form>" % int(s["id"]),
             "<form method='post' action='/admin/do/fbsub/%d/reject' style='display:inline;margin-left:4px'>"
@@ -730,11 +830,14 @@ def fbtask_subs(tid):
         review_kpi(review_counts("fb_submissions", tid))
         + review_card(tid, "fb")
         + f"<div class='card'><div class='row' style='justify-content:space-between'>"
-        f"<h3>{esc(t['name'])} — জমা তথ্য</h3>"
+        f"<h3>{esc(t['name'])} — জমা তথ্য"
+        + (f" · পাসওয়ার্ড: <span class='mono'>{esc(_pw_filter)}</span>"
+           f" <a class='btn gray sm' href='/admin/fbtask/{tid}/subs'>সব দেখুন</a>"
+           if _pw_filter else "") + "</h3>"
         f"<a class='btn gray sm' href='/admin/fbtask/{tid}/export.xlsx'>⬇️ ডাউনলোড (Excel)</a>"
         f"<a class='btn gray sm' href='/admin/fbtask/{tid}/export.csv'>CSV</a></div>"
         + table(["Date", "User", "Acc#", "Facebook UID", "FB Password", "Cookies",
-                 "Login Name", "Login Pass", "Status", "Sheet", ""], trs,
+                 "Login Name", "Login Pass", "Status", "Sheet", "জমা তথ্য", "", "", "", ""], trs,
                 "এখনো কোনো জমা নেই")
         + pager(f"/admin/fbtask/{tid}/subs", p, len(rows) == 100)
         + "</div>"
@@ -751,20 +854,135 @@ def fbtask_review(tid):
         return g
     _init()
     action = (request.form.get("action") or "").strip().lower()
-    tokens = review_tokens(request.form.get("ids") or "")
+    _raw_ids = request.form.get("ids") or ""
+    tokens = [ln.strip() for ln in _raw_ids.splitlines() if ln.strip()]
     if not tokens:
         return redirect(f"/admin/fbtask/{tid}/subs?ok=⚠️ কোনো UID দেওয়া হয়নি")
     if action not in ("approve", "reject"):
         return redirect(f"/admin/fbtask/{tid}/subs?ok=⚠️ কাজ বোঝা যায়নি")
-    done, miss = review_apply_lines(tid, request.form.get("ids") or "",
-                                    action, "fb_submissions", "fb_uid")
+    done, miss = review_apply_lines(tid, _raw_ids, action, "fb_submissions", "fb_uid")
     log_admin("fbtask_review", tid, f"{action} {done}/{len(tokens)}")
-    msg = f"{'✅ approve' if action == 'approve' else '❌ reject'}: {done} টি"
+    _cc = review_counts("fb_submissions", tid)
+    msg = (f"{'✅ approve' if action == 'approve' else '❌ reject'}: {done} টি সিট"
+           f" · pending {_cc.get('pending',0)} · approved {_cc.get('approved',0)}"
+           f" · rejected {_cc.get('rejected',0)}")
     if miss:
         msg += f" · পাওয়া যায়নি {miss} টি"
     if action == "reject" and done:
         msg += " · টাকা যোগ হবে না"
     return redirect(f"/admin/fbtask/{tid}/subs?ok={msg}")
+
+
+def _fb_seat_fields(t, s):
+    """এই সিটের দেখানোর মতো সব তথ্য — [(লেবেল, মান)]।"""
+    try:
+        _d = json.loads(s.get("data") or "{}")
+    except Exception:
+        _d = {}
+    out = []
+    for f in _task_fields(t):
+        k = str(f.get("key") or "")
+        if not k:
+            continue
+        v = _d.get(k, "")
+        if isinstance(v, (dict, list)):
+            v = json.dumps(v, ensure_ascii=False)
+        out.append((str(f.get("label_bn") or f.get("label_en") or k), str(v or "")))
+    if not out:
+        for k, v in (_d or {}).items():
+            out.append((str(k), str(v or "")))
+    return out
+
+
+def _fb_seat_text(t, s):
+    lines = [f"Task: {t.get('name') or ''}",
+             f"Seat: #{int(s.get('id') or 0)}  (Account #{int(s.get('account_no') or 0)})",
+             f"Facebook UID: {s.get('fb_uid') or ''}",
+             f"Password: {s.get('fb_password') or ''}",
+             f"Login Name: {s.get('login_first') or ''} {s.get('login_last') or ''}".strip(),
+             f"Login Password: {s.get('login_password') or ''}",
+             f"Status: {s.get('status') or ''}",
+             f"User ID: {int(s.get('user_id') or 0)}",
+             f"Time: {s.get('created_at') or ''}", ""]
+    for lb, v in _fb_seat_fields(t, s):
+        lines.append(f"{lb}: {v}")
+    return "\n".join(lines)
+
+
+@wadm.route("/admin/fbsub/<int:sid>", methods=["GET"])
+def fbsub_view(sid):
+    g = guard()
+    if g:
+        return g
+    _init()
+    s = one("SELECT * FROM fb_submissions WHERE id=%s", (sid,))
+    if not s:
+        return page("Not found", "<div class='card'>এই জমা পাওয়া যায়নি</div>",
+                    "fbtasks", status=404)
+    t = one("SELECT * FROM fb_tasks WHERE id=%s", (int(s["task_id"]),)) or {}
+    tid = int(s["task_id"])
+    rows = [[esc(lb), f"<span class='mono'>{esc(v) if v else '-'}</span>"]
+            for lb, v in _fb_seat_fields(t, s)]
+    body = (
+        "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
+        f"<h3>👁 সিট #{sid} — শুধু এই পাসওয়ার্ডের জমা</h3>"
+        f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs'>← তালিকায় ফিরুন</a></div>"
+        f"<p class='mut' style='font-size:12px;margin:6px 0 10px'>"
+        f"Task: <b>{esc(t.get('name') or '')}</b> · "
+        f"UID: <span class='mono'>{esc(s.get('fb_uid') or '-')}</span> · "
+        f"Password: <span class='mono'>{esc(s.get('fb_password') or '-')}</span> · "
+        f"Status: {st_badge(s.get('status'))}</p>"
+        + table(["তথ্য", "মান"], rows, "কোনো তথ্য নেই")
+        + "<div class='row' style='gap:8px;margin-top:12px;flex-wrap:wrap'>"
+        f"<a class='btn gray sm' href='/admin/fbsub/{sid}/download.txt'>⬇️ এই সিট ডাউনলোড (.txt)</a>"
+        f"<a class='btn gray sm' href='/admin/fbsub/{sid}/download.csv'>⬇️ CSV</a>"
+        f"<form method='post' action='/admin/do/fbsub/{sid}/approve' style='display:inline'>"
+        "<button class='btn green sm' type='submit'>✅ Approve</button></form>"
+        f"<form method='post' action='/admin/do/fbsub/{sid}/reject' style='display:inline'>"
+        "<button class='btn gray sm' type='submit'>❌ Reject</button></form>"
+        f"<form method='post' action='/admin/do/fbsub/{sid}/delete' style='display:inline' "
+        "onsubmit=\"return confirm('এই সিটটি মুছে ফেলবেন?')\">"
+        "<button class='btn gray sm' type='submit'>🗑 ডিলিট</button></form></div></div>"
+    )
+    return page(f"সিট #{sid} — {t.get('name') or 'FB'}", body, "fbtasks",
+                toast=request.args.get("ok"))
+
+
+@wadm.route("/admin/fbsub/<int:sid>/download.txt", methods=["GET"])
+def fbsub_download_txt(sid):
+    g = guard()
+    if g:
+        return g
+    _init()
+    s = one("SELECT * FROM fb_submissions WHERE id=%s", (sid,))
+    if not s:
+        return Response("not found", status=404, mimetype="text/plain")
+    t = one("SELECT * FROM fb_tasks WHERE id=%s", (int(s["task_id"]),)) or {}
+    txt = _fb_seat_text(t, s)
+    return Response(txt, mimetype="text/plain",
+                    headers={"Content-Disposition":
+                             f"attachment; filename=fb_seat_{sid}.txt"})
+
+
+@wadm.route("/admin/fbsub/<int:sid>/download.csv", methods=["GET"])
+def fbsub_download_csv(sid):
+    g = guard()
+    if g:
+        return g
+    _init()
+    s = one("SELECT * FROM fb_submissions WHERE id=%s", (sid,))
+    if not s:
+        return Response("not found", status=404, mimetype="text/plain")
+    t = one("SELECT * FROM fb_tasks WHERE id=%s", (int(s["task_id"]),)) or {}
+    import csv
+    import io as _io
+    buf = _io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([lb for lb, _ in _fb_seat_fields(t, s)])
+    w.writerow([v for _, v in _fb_seat_fields(t, s)])
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition":
+                             f"attachment; filename=fb_seat_{sid}.csv"})
 
 
 @wadm.route("/admin/do/fbsub/<int:sid>/approve", methods=["POST"])
@@ -794,8 +1012,9 @@ def fbsub_delete(sid):
     g = guard()
     if g:
         return g
-    s = one("SELECT task_id FROM fb_submissions WHERE id=%s", (sid,))
+    s = one("SELECT task_id, user_id, COALESCE(status,'pending') AS st FROM fb_submissions WHERE id=%s", (sid,))
     if s:
+        hist_add(s.get("user_id") or 0, "fb", s.get("st") or "pending", 1)
         _x("DELETE FROM fb_submissions WHERE id=%s", (sid,))
         _x("UPDATE fb_tasks SET total_done=GREATEST(0, COALESCE(total_done,0)-1) WHERE id=%s",
            (int(s["task_id"]),))

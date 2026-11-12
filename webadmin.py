@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import html
 import json
+import logging
 import os
 import time
 import threading
@@ -1215,6 +1216,9 @@ def _login_ok(ip):
         _LOGIN_FAILS.pop(ip, None)
 
 
+log = logging.getLogger("webadmin")
+
+
 @wadm.before_request
 def _panel_security_gate():
     """১) গোপন লিংক (?k=) ২) CSRF (cross-site POST ব্লক)।"""
@@ -1272,8 +1276,9 @@ def _panel_security_headers(resp):
         _t0p = request.environ.get("_teb_t0")
         if _t0p:
             _dtp = time.time() - _t0p
+            resp.headers["X-Resp-Time"] = f"{_dtp:.2f}s"
             if _dtp > 1.5:
-                print(f"[SLOW] panel {request.method} {request.path} {_dtp:.2f}s")
+                log.warning(f"[WEB-SLOW] {request.method} {request.path} {_dtp:.2f}s")
     except Exception:
         pass
     try:
@@ -1509,15 +1514,24 @@ def review_card(tid, kind="fb"):
     idname = "Facebook UID" if is_fb else "Instagram Username"
     act = (f"/admin/do/fbtask/{tid}/review" if is_fb
            else f"/admin/do/igtask/{tid}/review")
-    ph = ("61595645847047&#10;61595657606938" if is_fb
-          else "johhrpv67&#10;tania_9")
+    ph = ("61595645847047|Pass123&#10;61595645847047|Other456"
+          if is_fb else "johhrpv67|Pass123&#10;tania_9|Pass456")
+    try:
+        _c = review_counts("fb_submissions" if is_fb else "ig_submissions", tid)
+        _tot = int(_c.get("pending", 0) + _c.get("approved", 0) + _c.get("rejected", 0))
+    except Exception:
+        _tot = 0
     return (
         "<div class='card'>"
         "<h3>✅ Approve / ❌ Reject</h3>"
-        f"<p class='mut' style='font-size:12px;margin:6px 0 10px'>প্রতি লাইনে একটা {idname} দিন। "
-        "যেগুলো অ্যাকাউন্ট ঠিক আছে সেগুলো একবার ✅ Approve চাপুন; "
-        "ভুল/ব্যান করা আইডি আলাদা লিস্টে দিয়ে ❌ Reject চাপুন। "
-        "টাকা যোগ আর ইউজারকে নোটিফিকেশন — বট নিজেই পাঠাবে।</p>"
+        f"<p class='mut' style='font-size:12px;margin:6px 0 10px'>"
+        f"<b>সিট = {idname} + পাসওয়ার্ড</b> — একই UID-র পাসওয়ার্ড আলাদা হলে সেটা "
+        f"<b>আলাদা সিট</b>, আলাদা approve/reject, আলাদা হিসাব। "
+        f"মোট সিট এখন: <b>{_tot}</b><br>"
+        f"লিখুন প্রতি লাইনে <code>UID|পাসওয়ার্ড</code> — শুধু ওই পাসওয়ার্ডের সিটটাই "
+        f"approve/reject হবে। শুধু <code>UID</code> দিলে ওই UID-র প্রথম pending সিট, "
+        f"আর <code>#12</code> দিলে ওই সারির সিট। "
+        f"প্রতিটি সারির পাশেও আলাদা ✅ / ❌ / 🗑 বাটন আছে।</p>"
         f"<form method='post' action='{act}'>"
         f"<textarea name='ids' rows='5' style='width:100%;padding:10px;border-radius:11px' "
         f"placeholder='{ph}'></textarea>"
@@ -1532,7 +1546,7 @@ def review_tokens(raw):
     """লাইনে/কমায়/স্পেসে লেখা UID বা Username — ডুপ্লিকেট বাদ।"""
     import re as _re
     out, seen = [], set()
-    for part in _re.split(r"[\s,;|]+", str(raw or "")):
+    for part in _re.split(r"[\s,;]+", str(raw or "")):
         t = part.strip().lstrip("@").strip()
         if not t:
             continue
@@ -1645,6 +1659,22 @@ def review_apply_lines(tid, raw, action, table, idcol):
     if done:
         _fire_review_changed()
     return done, miss
+
+
+def hist_add(user_id, kind, status, n=1):
+    """ডিলিট হওয়া সারির হিসাব — বটের প্রোফাইলে চিরকাল দেখাবে।"""
+    try:
+        _x("CREATE TABLE IF NOT EXISTS user_hist (user_id BIGINT NOT NULL, kind TEXT NOT NULL, "
+           "status TEXT NOT NULL, n BIGINT NOT NULL DEFAULT 0, updated_at TEXT DEFAULT '', "
+           "UNIQUE(user_id, kind, status))")
+        _x("INSERT INTO user_hist (user_id,kind,status,n,updated_at) VALUES (%s,%s,%s,%s,%s) "
+           "ON CONFLICT (user_id,kind,status) DO UPDATE SET "
+           "n = user_hist.n + EXCLUDED.n, updated_at = EXCLUDED.updated_at",
+           (int(user_id or 0), str(kind), str(status or "pending"), int(n or 0),
+            time.strftime("%Y-%m-%d %H:%M")))
+        return True
+    except Exception:
+        return False
 
 
 def review_counts(table, tid):

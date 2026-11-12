@@ -771,14 +771,14 @@ def _tr_net(key):
                "?client=gtx&sl=bn&tl=en&dt=t&q=" + urllib.parse.quote(key))
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         try:
-            with urllib.request.urlopen(req, timeout=5) as r:
+            with urllib.request.urlopen(req, timeout=2.5) as r:
                 data = _json.loads(r.read())
         except Exception:
             # sl=auto দিয়ে আরেকবার (মিশ্র ভাষার লেখাও অনুবাদ হয়)
             url2 = ("https://translate.googleapis.com/translate_a/single"
                     "?client=gtx&sl=auto&tl=en&dt=t&q=" + urllib.parse.quote(key))
             req2 = urllib.request.Request(url2, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req2, timeout=5) as r:
+            with urllib.request.urlopen(req2, timeout=2.5) as r:
                 data = _json.loads(r.read())
         out = "".join(seg[0] for seg in data[0] if seg[0]).strip()
     except Exception:
@@ -870,14 +870,26 @@ def translate_to_en(text):
     return "\n".join(done.get(ln, ln) for ln in parts)
 
 
+_TR_MEM = {}
+
+
 def tr_for_user(uid, text):
-    """ইউজারের ভাষা অনুযায়ী টেক্সট (en হলে Google অনুবাদ, DB-তে ক্যাশ)।"""
+    """ইউজারের ভাষা অনুযায়ী টেক্সট (en হলে Google অনুবাদ, মেমরি + DB ক্যাশ)।"""
     try:
         if not text or not isinstance(text, str):
             return text
         if get_lang(uid) != "en":
             return text
-        return translate_to_en(text)
+        _mk = str(text)[:200]
+        _hit = _TR_MEM.get(_mk)
+        if _hit is not None:
+            return _hit
+        _out = translate_to_en(text)
+        if _out and _out != text:
+            if len(_TR_MEM) > 4000:      # মেমরি সীমিত রাখি
+                _TR_MEM.clear()
+            _TR_MEM[_mk] = _out
+        return _out
     except Exception:
         return text
 
@@ -5689,6 +5701,53 @@ def _build_user_profile(uid, u=None):
         wd_app    = _count(c.execute("SELECT COUNT(*) FROM withdrawals WHERE user_id=%s AND status='approved'", (uid,)).fetchone())
         tg_done   = _count(c.execute("SELECT COUNT(*) FROM tg_task_completions WHERE user_id=%s",  (uid,)).fetchone())
         cat_done  = _count(c.execute("SELECT COUNT(*) FROM category_task_completions WHERE user_id=%s", (uid,)).fetchone())
+        # FB / IG সিট হিসাব (approved / rejected / pending)
+        _fb_st = {"approved": 0, "rejected": 0, "pending": 0, "total": 0}
+        _ig_st = {"approved": 0, "rejected": 0, "pending": 0, "total": 0}
+        try:
+            c.execute("CREATE TABLE IF NOT EXISTS seat_archive ("
+                      "user_id BIGINT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, "
+                      "n BIGINT NOT NULL DEFAULT 0, updated_at TEXT DEFAULT '', "
+                      "UNIQUE(user_id, kind, status))")
+        except Exception:
+            pass
+        for _tbl, _dst in (("fb_submissions", _fb_st), ("ig_submissions", _ig_st)):
+            try:
+                for _r in c.execute(
+                        "SELECT COALESCE(status,'pending') AS st, COUNT(*) AS n "
+                        f"FROM {_tbl} WHERE user_id=%s GROUP BY COALESCE(status,'pending')",
+                        (uid,)).fetchall():
+                    _k = str(_r["st"])
+                    if _k in _dst:
+                        _dst[_k] = int(_r["n"] or 0)
+                    _dst["total"] += int(_r["n"] or 0)
+            except Exception:
+                pass
+        # আগে ডিলিট হওয়া সারির হিসাব (user_hist) — প্রোফাইলে যোগ হবে
+        _hist = {}
+        try:
+            c.execute("CREATE TABLE IF NOT EXISTS user_hist ("
+                      "user_id BIGINT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, "
+                      "n BIGINT NOT NULL DEFAULT 0, updated_at TEXT DEFAULT '', "
+                      "UNIQUE(user_id, kind, status))")
+        except Exception:
+            pass
+        try:
+            for _r in c.execute(
+                    "SELECT kind, status, n FROM user_hist WHERE user_id=%s",
+                    (uid,)).fetchall():
+                _hist[(str(_r["kind"]), str(_r["status"]))] = int(_r["n"] or 0)
+        except Exception:
+            _hist = {}
+        for _kind, _dst in (("fb", _fb_st), ("ig", _ig_st)):
+            for _k in ("approved", "rejected", "pending"):
+                _n = _hist.get((_kind, _k), 0)
+                if _n:
+                    _dst[_k] += _n
+                    _dst["total"] += _n
+        # উইথড্র / টাস্কের ডিলিট-হিসাবও আগের গণনার সাথে যোগ
+        _wd_arch = {k: _hist.get(("wd", k), 0) for k in ("approved", "pending", "rejected")}
+        _tk_arch = {k: _hist.get(("task", k), 0) for k in ("approved", "pending", "rejected")}
     name_str  = _md_esc(f"@{u['username']}" if u["username"] else (u["full_name"] or "Unknown"))
     ban_icon  = "🚫 Banned" if u["is_banned"] else "✅ Active"
     ref_by    = u["referred_by"]
@@ -5723,10 +5782,16 @@ def _build_user_profile(uid, u=None):
         f"🔰 *Status:* {ban_icon}\n\n"
         f"👥 *Referred By:* {ref_by_str}\n"
         f"🔗 *মোট Referrals:* `{ref_count}` জন\n\n"
-        f"📋 *Task Submissions:* `{sub_count}` টি ✅`{sub_app}` approved\n"
-        f"💸 *Withdrawals:* `{wd_count}` টি ✅`{wd_app}` approved\n"
+        f"📋 *Task Submissions:* `{sub_count + _tk_arch['approved'] + _tk_arch['pending'] + _tk_arch['rejected']}` টি "
+        f"✅`{sub_app + _tk_arch['approved']}` approved\n"
+        f"💸 *Withdrawals:* `{wd_count + _wd_arch['approved'] + _wd_arch['pending'] + _wd_arch['rejected']}` টি "
+        f"✅`{wd_app + _wd_arch['approved']}` approved\n"
         f"📡 *TG Tasks Done:* `{tg_done}` টি\n"
-        f"📁 *Category Tasks Done:* `{cat_done}` টি"
+        f"📁 *Category Tasks Done:* `{cat_done}` টি\n"
+        f"📘 *FB সিট:* `{_fb_st['total']}` — ✅`{_fb_st['approved']}` "
+        f"❌`{_fb_st['rejected']}` ⏳`{_fb_st['pending']}`\n"
+        f"📸 *IG সিট:* `{_ig_st['total']}` — ✅`{_ig_st['approved']}` "
+        f"❌`{_ig_st['rejected']}` ⏳`{_ig_st['pending']}`"
     )
     ban_btn = (InlineKeyboardButton("✅ Unban", callback_data=f"adm_uunban_{uid}")
                if u["is_banned"] else InlineKeyboardButton("🚫 Ban", callback_data=f"adm_uban_{uid}"))
@@ -5884,6 +5949,10 @@ def _shop_plan_ddl():
     try:
         with _c() as c:
             c.execute("ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS plan_id BIGINT DEFAULT 0")
+            try:
+                c.execute("ALTER TABLE shop_categories ADD COLUMN IF NOT EXISTS plan_kind TEXT DEFAULT ''")
+            except Exception:
+                pass
     except Exception:
         try:
             with _c() as c:
@@ -6492,7 +6561,8 @@ async def _shop_show_cat(q, cid, plan_id=None):
         if _plan:
             title = f"{title} — {shop_plan_label(_plan)}"
     # ── প্ল্যান স্টেজ: মেয়াদ (৩ দিন/৭ দিন) বা MB প্যাক ──
-    if plan_id is None and cid:
+    _pk_cat = str(_rget(cat, "plan_kind", "") or "").strip().lower() if cat else ""
+    if plan_id is None and cid and _pk_cat in ("days", "mb"):
         _plans = await asyncio.to_thread(shop_plans, cid)
         if _plans:
             _rows = [[InlineKeyboardButton(shop_plan_label(pl),
@@ -6797,6 +6867,35 @@ def dep_tx_mark(txid="", uid=0, amount=0.0):
     except Exception as e:
         log.debug(f"[USEDTX] mark: {str(e)[:80]}")
         return False
+
+
+_PERF_IDX = [False]
+
+
+def _perf_indexes():
+    """হট কুয়েরির ইনডেক্স — প্রথম بارেই তৈরি, পরে skip।"""
+    if _PERF_IDX[0]:
+        return
+    try:
+        with _c() as c:
+            for _q2 in (
+                "CREATE INDEX IF NOT EXISTS idx_wd_user_status ON withdrawals(user_id, status)",
+                "CREATE INDEX IF NOT EXISTS idx_gm_user_status ON gmails(user_id, status)",
+                "CREATE INDEX IF NOT EXISTS idx_dep_user_status ON deposits(user_id, status)",
+                "CREATE INDEX IF NOT EXISTS idx_dep_status_created ON deposits(status, created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_fb_task_status ON fb_submissions(task_id, status)",
+                "CREATE INDEX IF NOT EXISTS idx_ig_task_status ON ig_submissions(task_id, status)",
+                "CREATE INDEX IF NOT EXISTS idx_comm_user ON commissions(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_userhist_user ON user_hist(user_id)",
+            ):
+                try:
+                    c.execute(_q2)
+                except Exception:
+                    pass
+        _PERF_IDX[0] = True
+        log.info("[PERF] hot indexes ready")
+    except Exception as _ie:
+        log.debug(f"[PERF] index: {str(_ie)[:80]}")
 
 
 def dep_hide_old(hours=24):
@@ -8528,6 +8627,44 @@ def _binance_pay_rows(minutes=60):
         except Exception as e:
             return {}, f"Binance-এ সংযোগ হয়নি: {str(e)[:90]}", 0
 
+    def _hisrec(base):
+        """Binance-এ ঢোকা USDT ডিপোজিট — Pay API-তে না দেখালেও এখানে থাকে।"""
+        out = []
+        end_ms = int((_time.time() + _BINANCE_TS_OFF["v"]) * 1000)
+        params = {"coin": "USDT", "limit": 100, "recvWindow": 20000,
+                  "timestamp": end_ms, "startTime": end_ms - mins * 60 * 1000}
+        qs = urllib.parse.urlencode(sorted(params.items()))
+        sig = hmac.new(sec.encode(), qs.encode(), hashlib.sha256).hexdigest()
+        url = f"{base}/sapi/v1/capital/deposit/hisrec?{qs}&signature={sig}"
+        req = urllib.request.Request(
+            url, headers={"X-MBX-APIKEY": key, "User-Agent": "TaskEarnBot/1.0"})
+        try:
+            with opener.open(req, timeout=20) as r:
+                body = r.read().decode("utf-8", "ignore")
+            js2 = _json.loads(body) if body.strip() else None
+        except Exception:
+            return out
+        if not isinstance(js2, list):
+            return out
+        for d in js2:
+            if not isinstance(d, dict):
+                continue
+            try:
+                if int(d.get("status") or 1) not in (1, 6, 7):
+                    continue
+                amt2 = float(d.get("amount") or 0)
+            except Exception:
+                continue
+            if amt2 <= 0:
+                continue
+            out.append({"transactionId": str(d.get("txId") or ""),
+                        "orderId": str(d.get("id") or ""),
+                        "amount": amt2,
+                        "currency": str(d.get("coin") or "USDT").upper(),
+                        "transactionTime": d.get("insertTime") or 0,
+                        "orderType": "DEPOSIT"})
+        return out
+
     err = ""
     for base in _binance_bases():
         js, _e, http = _call(base, _BINANCE_TS_OFF["v"], True)
@@ -8556,6 +8693,10 @@ def _binance_pay_rows(minutes=60):
                 if tt and tt < _cut:
                     continue          # উইন্ডোর বাইরের পুরোনো লেনদেন বাদ
                 keep.append(it)
+            try:
+                keep.extend(_hisrec(base) or [])
+            except Exception:
+                pass
             return keep, ""
         # প্যারামিটার এরর → startTime/endTime ছাড়া (শেষ ৯০ দিন) নিয়ে নিজে ফিল্টার
         if code in ("-1102", "-1100", "-1106", "-1128", "-1130"):
@@ -8575,6 +8716,10 @@ def _binance_pay_rows(minutes=60):
                     if tt and tt < _cut:
                         continue
                     keep.append(it)
+                try:
+                    keep.extend(_hisrec(base) or [])
+                except Exception:
+                    pass
                 return keep, ""
             code = c2 or code
             js = js2 if isinstance(js2, dict) and js2 else js
@@ -8688,11 +8833,17 @@ def _pay_ref_hit(it, low):
         return True
     if low.isdigit() and len(low) >= 8:
         for k in keys:
-            if not k.isdigit() or len(k) < len(low):
+            if not k.isdigit() or len(k) < 6:
                 continue
-            # Binance অ্যাপের Order ID কখনো লম্বা transactionId-র শুরু, কখনো শেষাংশ
-            if k.endswith(low) or (len(low) >= 10 and k.startswith(low)):
+            # Order ID কখনো লম্বা transactionId-র শুরু/শেষাংশ, কখনো বেশি-কম ডিজিট
+            if k.endswith(low) or k.startswith(low):
                 return True
+            if len(k) >= 8 and len(low) >= 8:
+                # ইউজার বেশি/কম ডিজিট লিখলেও (কপি-পেস্টে অতিরিক্ত ০) ধরা পড়বে
+                if k in low or low in k:
+                    return True
+                if low.endswith(k[-8:]) or k.endswith(low[-8:]):
+                    return True
     return False
 
 
@@ -8732,8 +8883,8 @@ def dep_binance_pay_find(ref, want=0.0, minutes=60):
     if seen_other:
         return 0.0, "", (f"পেমেন্ট পাওয়া গেছে ({seen_other}) কিন্তু USDT/USD-তে নয় — "
                          "অ্যাডমিন যাচাই করবেন।")
-    return 0.0, "", ("এই Order ID-তে পেমেন্ট পাওয়া যায়নি — নতুন পেমেন্ট হলে "
-                     "বট নিজেই ১ ঘণ্টা ধরে চেক করবে।")
+    return 0.0, "", ("এই Order ID-তে পেমেন্ট পাওয়া যায়নি।\n"
+                     "🔁 *আবার চেক* চাপুন অথবা 📤 *অ্যাডমিনকে পাঠান*।")
 
 
 def _pending_by_amount(v, exclude=0):
@@ -9132,6 +9283,11 @@ async def _dep_recheck(q, ctx, oid):
         if _u:
             got, tx, err = _u[0], _u[1], ""
     if not (tx and not err):
+        if err:
+            try:
+                await _dep_api_alert(getattr(ctx, "bot", None), err, f"recheck #{oid}")
+            except Exception:
+                pass
         await q.answer(("❌ " + (err or "পেমেন্ট এখনো পাওয়া যায়নি"))[:190], show_alert=True)
         try:
             await q.edit_message_reply_markup(InlineKeyboardMarkup([
@@ -9156,6 +9312,117 @@ async def _dep_recheck(q, ctx, oid):
             parse_mode="HTML")
     except Exception:
         pass
+
+
+_DEP_API_ALERT_TS = {}
+
+
+def depchk_report(ref, mins=1440):
+    """/depchk — একই Order ID বারবার যাচাই। (text, found?)"""
+    r = re.sub(r"[\s\-_]+", "", str(ref or ""))
+    if not (r.isdigit() and 6 <= len(r) <= 40):
+        return ("❌ Order ID-তে শুধু সংখ্যা দিন (৬–৪০ ডিজিট)।\n"
+                "ব্যবহার: `/depchk 465225173378539520`"), False
+    try:
+        mins = max(5, min(1440 * 7, int(mins or 1440)))
+    except Exception:
+        mins = 1440
+    rows, err = _binance_pay_rows(mins)
+    head = (f"🔎 *Order ID চেক*\n\n🔗 `{r}`\n"
+            f"⏱ শেষ {mins} মিনিট · 📊 API থেকে পাওয়া লেনদেন: *{len(rows or [])}*\n\n")
+    if err:
+        return (head + f"⚠️ *API সমস্যা:*\n`{_md_esc(str(err)[:300])}`\n\n"
+                "_(এই মেসেজ অ্যাডমিনকেও পাঠানো হবে)_"), False
+    low = r.casefold()
+    hit = None
+    for it in rows or []:
+        if not isinstance(it, dict):
+            continue
+        if _pay_ref_hit(it, low):
+            hit = it
+            break
+    if not hit:
+        return (head + "❌ এই Order ID-র কোনো পেমেন্ট পাওয়া যায়নি।\n\n"
+                "💡 Binance → Pay → History → ওই পেমেন্ট → *Transaction ID* কপি করে "
+                "আবার `/depchk <ID>` দিন।"), False
+    amt = hit.get("amount") or 0
+    cur = str(hit.get("currency") or "").upper()
+    tid = str(hit.get("transactionId") or hit.get("orderId") or "")
+    tt = hit.get("transactionTime") or 0
+    try:
+        _when = datetime.fromtimestamp(int(tt) / 1000).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        _when = "—"
+    _used = dep_txid_used(tid)
+    return (head + "✅ *পেমেন্ট পাওয়া গেছে!*\n\n"
+            f"💵 `{float(amt):g} {cur or 'USDT'}`\n"
+            f"🧾 TxID: `{_md_esc(tid)}`\n"
+            f"🕒 {_when}\n"
+            f"🔁 আগে ব্যবহার হয়েছে: {'হ্যাঁ ⚠️' if _used else 'না ✅'}\n\n"
+            "_(এটি শুধু যাচাই — ব্যালেন্স যোগ হয় না)_"), True
+
+
+async def _dep_api_alert(bot, err, where=""):
+    """Binance API PROBLEM হলে অ্যাডমিনকে DM — ২০ মিনিটে একবার একই এররে।"""
+    e = str(err or "").strip()
+    if not e:
+        return
+    _now_m = _time.monotonic()
+    _last = _DEP_API_ALERT_TS.get(e[:80])
+    if _last and _now_m - _last < 1200:
+        return
+    _DEP_API_ALERT_TS[e[:80]] = _now_m
+    try:
+        await notify_full_admins(
+            bot,
+            "⚠️ *Binance API সমস্যা*\n\n"
+            f"`{_md_esc(e[:300])}`\n\n"
+            f"📍 কোথায়: {_md_esc(where or 'ডিপোজিট চেক')}\n"
+            "🔧 ঠিক করতে: `/depchk <order id>` দিয়ে আবার চেক করুন, অথবা "
+            "Binance API Key/IP/permission দেখুন।")
+    except Exception:
+        pass
+
+
+async def cmd_depchk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: /depchk <order id> [minutes] — একই ID বারবার চেক।"""
+    user = update.effective_user
+    if not user:
+        return
+    _ok = False
+    try:
+        _ok = bool(await asyncio.to_thread(is_admin, user.id))
+    except Exception:
+        _ok = (int(user.id) == int(ADMIN_ID))
+    if not _ok:
+        return
+    args = ctx.args or []
+    if not args:
+        await update.message.reply_text(
+            "ব্যবহার: `/depchk <order id> [minutes]`\n"
+            "যেমন: `/depchk 465225173378539520 1440`\n"
+            "_(শুধু অ্যাডমিন — ব্যালেন্স যোগ করে না, শুধু যাচাই)_",
+            parse_mode="Markdown")
+        return
+    _mins = 1440
+    if len(args) > 1:
+        try:
+            _mins = int(args[1])
+        except Exception:
+            _mins = 1440
+    ctx.user_data["depchk_ref"] = args[0]
+    ctx.user_data["depchk_mins"] = _mins
+    txt, found = await asyncio.to_thread(depchk_report, args[0], _mins)
+    await update.message.reply_text(txt, parse_mode="Markdown",
+                                    reply_markup=InlineKeyboardMarkup([[
+                                        InlineKeyboardButton(
+                                            "🔁 আবার চেক",
+                                            callback_data="depchk:re")]]))
+    if not found and "API সমস্যা" in txt:
+        try:
+            await _dep_api_alert(ctx.bot, "API সমস্যা — /depchk", "/depchk")
+        except Exception:
+            pass
 
 
 async def _dep_auto_credit(ctx, uid, m, amount, txid, oid):
@@ -9244,6 +9511,34 @@ async def dep_callback(update, ctx):
             return await _dep_show_my(q)
         if d.startswith("dep:m:"):
             return await _dep_method_page(q, int(d.split(":")[2]))
+        if d == "depchk:re":
+            _r = ctx.user_data.get("depchk_ref")
+            if not _r:
+                await q.answer("আগে /depchk <order id> দিন", show_alert=True)
+                return
+            try:
+                _ok = bool(await asyncio.to_thread(is_admin, uid))
+            except Exception:
+                _ok = (int(uid) == int(ADMIN_ID))
+            if not _ok:
+                await q.answer("শুধু অ্যাডমিন", show_alert=True)
+                return
+            _mins = ctx.user_data.get("depchk_mins") or 1440
+            txt2, found2 = await asyncio.to_thread(depchk_report, _r, _mins)
+            try:
+                await q.edit_message_text(
+                    txt2, parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔁 আবার চেক",
+                                             callback_data="depchk:re")]]))
+            except Exception:
+                await q.message.reply_text(
+                    txt2, parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔁 আবার চেক",
+                                             callback_data="depchk:re")]]))
+            await q.answer("✅ আবার চেক হয়েছে" if found2 else "এখনো পাওয়া যায়নি")
+            return
         if d.startswith("dep:re:"):
             return await _dep_recheck(q, ctx, int(d.split(":")[2]))
         if d.startswith("dep:fix:"):
@@ -9258,7 +9553,7 @@ async def dep_callback(update, ctx):
                 "✏️ *সঠিক Order ID দিন*\n\n"
                 f"🧾 ডিপোজিট `#{oid}` · 💵 `{float(o['amount'] or 0):g}$`\n\n"
                 "📱 Binance অ্যাপ → Pay → History → ওই পেমেন্টে চাপ দিন → "
-                "*Order ID* কপি করে এখানে পাঠান।\n"
+                "*Transaction ID* (বা Order ID) কপি করে এখানে পাঠান।\n"
                 "_(শুধু সংখ্যা, ৮–৩০ ডিজিট)_\n\n/cancel — বাতিল",
                 parse_mode="Markdown")
             return
@@ -9562,9 +9857,8 @@ async def dep_input(update, ctx, st):
             f"⏳ *ডিপোজিট যাচাই বাকি*\n\n"
             f"🧾 `#{oid}`\n💵 `{amt:g}$`\n🔗 `{ref}`\n\n"
             f"কারণ: {_why}\n\n"
-            "🤖 বট এখন নিজেই *১ ঘণ্টা ধরে* অটো চেক করবে — টাকা আমার "
-            "Binance-এ পৌঁছালেই ব্যালেন্স যোগ হয়ে যাবে।\n"
-            "সাথে সাথে দেখতে চাইলে *🔁 আবার চেক* চাপুন।",
+            "🔁 *আবার চেক* চাপুন — টাকা পৌঁছালেই ব্যালেন্স যোগ হবে।\n"
+            "কয়েকবার চেষ্টা করেও না হলে 📤 *অ্যাডমিনকে পাঠান*।",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔁 আবার চেক", callback_data=f"dep:re:{oid}")],
@@ -16073,6 +16367,28 @@ async def _rate_allowed(uid, key):
         pass
     return False
 
+_PERF = {}
+
+
+def perf_report(limit=12):
+    """ধীর হ্যান্ডলারের তালিকা — গড় সময় অনুযায়ী।"""
+    rows = sorted(_PERF.items(), key=lambda kv: -(kv[1][1] / max(1, kv[1][0])))[:limit]
+    if not rows:
+        return "এখনো কোনো হ্যান্ডলার চলে নি।"
+    out = ["⏱ *হ্যান্ডলার টাইমিং*", ""]
+    for nm, (n, tot, mx) in rows:
+        out.append(f"`{nm}` — {n} বার · গড় {tot / max(1, n):.2f}s · সর্বোচ্চ {mx:.2f}s")
+    return "\n".join(out)
+
+
+async def cmd_perf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: ধীর হ্যান্ডলার দেখাও।"""
+    u = update.effective_user
+    if not u or int(u.id) != int(ADMIN_ID):
+        return
+    await update.message.reply_text(perf_report(), parse_mode="Markdown")
+
+
 def _gate(fn, kind="cmd"):
     """হ্যান্ডলার র‍্যাপার: গেট পাস না করলে হ্যান্ডলার চলবেই না।"""
     async def _wrapped(update, ctx):
@@ -16097,8 +16413,14 @@ def _gate(fn, kind="cmd"):
             return await fn(update, ctx)
         finally:
             _dt = _time.monotonic() - _t0
+            _nm = f"{getattr(fn, '__name__', '?')} ({kind})"
+            _st = _PERF.setdefault(_nm, [0, 0.0, 0.0])
+            _st[0] += 1
+            _st[1] += _dt
+            if _dt > _st[2]:
+                _st[2] = _dt
             if _dt > 1.2:      # ⏱️ ধীর ধাপ খুঁজতে Render log-এ [SLOW] লাইন
-                log.warning(f"[SLOW] {getattr(fn, '__name__', '?')} ({kind}) {_dt:.2f}s")
+                log.warning(f"[SLOW] {_nm} {_dt:.2f}s")
     return _wrapped
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -19658,6 +19980,21 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
         except Exception as _tve:
             log.warning(f"[TASK-VIDEO] ইনপুট ব্যর্থ: {_tve}")
+
+    # ── 🔁 স্টেট হারালেও (বট রিস্টার্ট/আপডেট) শুধু Order ID পাঠালে কাজ করবে ──
+    if not st and re.fullmatch(r"\d{8,30}", (update.message.text or "").strip()):
+        try:
+            _pend0 = [o for o in dep_of_user(uid) if str(o["status"]) == "pending"]
+        except Exception:
+            _pend0 = []
+        if _pend0:
+            _newst = f"dep_fix_ref:{int(_pend0[0]['id'])}"
+            ctx.user_data["state"] = _newst
+            try:
+                if await dep_input(update, ctx, _newst):
+                    return
+            except Exception as _dpe:
+                log.warning(f"[DEP] stateless ref ব্যর্থ: {_dpe}")
 
     # ── 💳 Deposit ইনপুট (ইউজার TxID/পরিমাণ + অ্যাডমিন মেথড তৈরি) ──
     if st and str(st).startswith(("dep_tx", "dep_amt", "dep_note", "dep_uid", "dep_proof",
@@ -26365,6 +26702,18 @@ def _fb_uid_exists(tid, fb_uid, fb_pass=None):
         return bool(r)
     except Exception:
         return False
+# ── অটো-নাম (লিস্ট খালি থাকলে ব্যবহার হয়) — একবারই ডিফাইন ──
+_AUTO_FIRST = ["arif", "sabbir", "rakib", "noyon", "shanto", "tanvir", "mehedi",
+               "asif", "rakib", "fahim", "jubayer", "sajid", "nobin", "sohel"]
+_AUTO_LAST = ["hasan", "islam", "ahmed", "hossain", "rahman", "khan", "chowdhury",
+              "mia", "uddin", "akash", "sarker", "talukder"]
+# ── IG availability cache ──
+_IG_AVAIL = {}
+_IG_AVAIL_TTL = 3600.0
+_IG_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
 def _auto_name(which):
     return random.choice(_AUTO_FIRST if which == "first" else _AUTO_LAST)
 
@@ -29329,6 +29678,7 @@ def main():
                 await asyncio.to_thread(get_all_btns, "en")
                 await asyncio.to_thread(get_setting, "bot_status")
                 await asyncio.to_thread(_ensure_indexes)      # একবারই — বাকি সময় ফ্ল্যাগ
+                await asyncio.to_thread(_perf_indexes)        # hot-path ইনডেক্স
                 await asyncio.to_thread(_backfill_devices)    # পুরোনো হ্যাশ → devices
                 await asyncio.to_thread(_dep_backfill)        # পুরোনো ডিপোজিট-হিসাব
                 log.info("🔥 [WARMUP] DB pool + caches প্রস্তুত")
@@ -29804,6 +30154,8 @@ def main():
     app.add_handler(_CmH(_on_bot_blocked))
 
     app.add_handler(CommandHandler("start",       _gate(cmd_start)))
+    app.add_handler(CommandHandler("depchk",      cmd_depchk))
+    app.add_handler(CommandHandler("perf",        cmd_perf))
     app.add_handler(CommandHandler("security",    _gate(cmd_security)))
     app.add_handler(CommandHandler("webadmin",    _gate(cmd_webadmin)))
     app.add_handler(CommandHandler("vfrtest",     _gate(cmd_vfrtest)))
