@@ -730,8 +730,6 @@ def _pw_group_form(t, g=None, tid=0):
         "<div class='field'><label>একজন ইউজার সর্বোচ্চ কয়টা দিতে পারবে</label>"
         f"<input name='per_user' value='{esc(str(_per))}' placeholder='যেমন 2'>"
         "<p class='mut' style='font-size:11px;margin:4px 0 0'>০ = সীমা নেই।</p></div>"
-        "<div class='field'><label>নোট (ঐচ্ছিক)</label>"
-        f"<input name='note' value='{esc(str(g.get('note') or ''))}' placeholder='যেমন: ঢাকা অ্যাকাউন্ট'></div>"
         "<div class='row' style='gap:8px;margin-top:12px'>"
         "<button class='ok' type='submit'>💾 সেভ করুন</button>"
         f"<a class='btn gray' href='/admin/fbtask/{tid}/passwords'>বাতিল</a></div>"
@@ -763,21 +761,19 @@ def fbtask_passwords(tid):
         _pw = str(g2.get("password") or "")
         seen.add(_pw)
         r = agg.get(_pw) or {}
-        used = int(r.get("n") or 0)
+        used = int(r.get("n") or 0) - int(r.get("rej") or 0)   # ❌ সিট খালি রাখে
         seats = int(g2.get("seats_total") or 0)
         per = int(g2.get("per_user") or 0)
         full = bool(seats and used >= seats)
         trs.append([
-            f"<span class='mono'>{esc(_pw) or '-'}</span>"
-            + (f"<div class='mut' style='font-size:11px'>{esc(str(g2.get('note') or ''))}</div>"
-               if str(g2.get("note") or "").strip() else ""),
+            f"<span class='mono'>{esc(_pw) or '-'}</span>",
             (f"<b>{num(used)}</b> / {num(seats)}" if seats else f"{num(used)} / ∞")
             + (badge("ভরা", "err") if full else ""),
             num(per) if per else "∞",
             badge(str(int(r.get("pend") or 0)), "mut"),
             badge(str(int(r.get("appr") or 0)), "ok"),
             badge(str(int(r.get("rej") or 0)), "err"),
-            f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs?pw={_q(_pw)}'>👁 সাবমিশন</a>",
+            f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs?pw={_q(_pw)}'>📄 শীট</a>",
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/passwords/{int(g2['id'])}/edit'>✏️ Edit</a>",
             "<form method='post' action='/admin/do/fbtask/%d/pwgroup/%d/delete' "
             "style='display:inline' onsubmit=\"return confirm('গ্রুপটা মুছে যাবে (জমাগুলো থাকবে)?')\">"
@@ -799,6 +795,32 @@ def fbtask_passwords(tid):
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/passwords/new?pw={_q(pw)}'>➕ গ্রুপ বানান</a>",
             "",
         ])
+    # ── পাসওয়ার্ড বাটন — প্রতিটি বাটনে ওই পাসওয়ার্ডের শীট খোলে ──
+    _pwbtns = []
+    for _g2 in groups:
+        _pw2 = str(_g2.get("password") or "").strip()
+        if not _pw2:
+            continue
+        _r2 = agg.get(_pw2) or {}
+        _used2 = int(_r2.get("n") or 0)
+        _seats2 = int(_g2.get("seats_total") or 0)
+        _pwbtns.append(
+            f"<a class='btn' href='/admin/fbtask/{tid}/pw/{int(_g2['id'])}' "
+            "style='display:block;margin:6px 0;text-align:left;padding:12px 14px'>"
+            f"🔑 <span class='mono'>{esc(_pw2)}</span>"
+            f" · আইডি <b>{num(_used2)}</b>/{num(_seats2) if _seats2 else '∞'}"
+            f"<div class='mut' style='font-size:12px;margin-top:4px'>"
+            f"⏳ {num(_r2.get('pend') or 0)} · ✅ {num(_r2.get('appr') or 0)}"
+            f" · ❌ {num(_r2.get('rej') or 0)} — ভিতরে সব দেখুন ›</div></a>")
+    _pwcard = ("<div class='card'><b>🔑 পাসওয়ার্ড বাটন</b>"
+               "<div class='mut' style='font-size:12px;margin-top:4px'>যে পাসওয়ার্ডে চাপ দিবেন, "
+               "ওই পাসওয়ার্ডের নিজের পেজ খুলবে — ওখানেই সব আইডি, ✅ approve / ❌ reject, ➕ নতুন সিট।</div>"
+               + ("".join(_pwbtns) if _pwbtns else
+                  "<div class='mut' style='margin-top:8px'>এখনো কোনো পাসওয়ার্ড নেই — নিচে যোগ করুন।</div>")
+               + f"<a class='btn ok sm' href='/admin/fbtask/{tid}/passwords/new' "
+                 "style='margin-top:8px'>➕ নতুন পাসওয়ার্ড → নতুন শীট</a>"
+               + "</div>")
+
     body = (
         "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
         f"<h3>🔑 পাসওয়ার্ড ও সিট — {esc(t.get('name') or '')}</h3>"
@@ -809,7 +831,9 @@ def fbtask_passwords(tid):
         "একজনের লিমিট। ইউজার টাস্ক শুরু করলে যে গ্রুপে সিট খালি আছে সেটার পাসওয়ার্ড পাবে; "
         "সিট ভরে গেলে নতুন কেউ ওই পাসওয়ার্ড পাবে না। 👁 চাপলে শুধু ওই পাসওয়ার্ডের জমা — "
         "সেখানেই ✅/❌ করা যায়।</p>"
-        + table(["পাসওয়ার্ড", "সিট", "একজন", "Pending", "Approved", "Rejected", "", "", ""],
+        + _pwcard
+        + table(["পাসওয়ার্ড", "আইডি / সিট", "একজন", "Pending", "Approved", "Rejected",
+                 "শীট", "", ""],
                 trs, "কোনো পাসওয়ার্ড নেই — ➕ নতুন পাসওয়ার্ড চাপুন")
         + "</div>"
     )
@@ -832,9 +856,9 @@ def fbtask_pw_new(tid):
             return page("নতুন পাসওয়ার্ড", _pw_group_form(t, None, tid), "fbtasks",
                         err="পাসওয়ার্ড দিন")
         _x("INSERT INTO fb_pw_groups (task_id, password, seats_total, per_user, is_active, "
-           "note, created_at) VALUES (%s,%s,%s,%s,1,%s,%s)",
+           "note, created_at) VALUES (%s,%s,%s,%s,1,'',%s)",
            (tid, pw[:80], _int_form("seats_total", 0), _int_form("per_user", 0),
-            (request.form.get("note") or "").strip()[:120], _ts_now()))
+            _ts_now()))
         log_admin("fbtask_pw_new", tid, f"pw={pw[:20]}")
         return redirect(f"/admin/fbtask/{tid}/passwords?ok=" + _q("✅ পাসওয়ার্ড যোগ হয়েছে"))
     return page("নতুন পাসওয়ার্ড", _pw_group_form(t, None, tid), "fbtasks")
@@ -853,10 +877,9 @@ def fbtask_pw_edit(tid, gid):
                     "fbtasks", status=404)
     if request.method == "POST":
         pw = (request.form.get("password") or "").strip() or str(row.get("password") or "")
-        _x("UPDATE fb_pw_groups SET password=%s, seats_total=%s, per_user=%s, note=%s "
+        _x("UPDATE fb_pw_groups SET password=%s, seats_total=%s, per_user=%s "
            "WHERE id=%s AND task_id=%s",
-           (pw[:80], _int_form("seats_total", 0), _int_form("per_user", 0),
-            (request.form.get("note") or "").strip()[:120], gid, tid))
+           (pw[:80], _int_form("seats_total", 0), _int_form("per_user", 0), gid, tid))
         log_admin("fbtask_pw_edit", tid, f"gid={gid}")
         return redirect(f"/admin/fbtask/{tid}/passwords?ok=" + _q("✅ সেভ হয়েছে"))
     return page("পাসওয়ার্ড এডিট", _pw_group_form(t, row, tid), "fbtasks")
@@ -906,6 +929,105 @@ def fbtask_password_delete(tid):
     _pw = (request.form.get("pw") or "").strip()
     n = fbtask_pw_delete_do(tid, _pw)
     return redirect(f"/admin/fbtask/{tid}/passwords?ok=" + _q(f"{n} টি সিট ডিলিট হয়েছে"))
+
+
+@wadm.route("/admin/do/fbtask/<int:tid>/pw/<int:gid>/seat", methods=["POST"])
+def fbtask_pw_seat(tid, gid):
+    """এই পাসওয়ার্ডে আরও সিট যোগ — সিট ভরে গেলে নতুন ইউজার আবার এই পাসওয়ার্ড পাবে।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    g2 = one("SELECT * FROM fb_pw_groups WHERE id=%s AND task_id=%s", (gid, tid))
+    if not g2:
+        return redirect(f"/admin/fbtask/{tid}/passwords?err=" + _q("পাসওয়ার্ড নেই"))
+    try:
+        n = int(request.form.get("n") or 1)
+    except Exception:
+        n = 1
+    n = max(1, min(n, 500))
+    _x("UPDATE fb_pw_groups SET seats_total=COALESCE(seats_total,0)+%s WHERE id=%s", (n, gid))
+    log_admin("fbtask_pw_seat", gid, f"+{n} seats")
+    _back = (request.form.get("back") or "").strip()
+    if _back == "subs":
+        return redirect(f"/admin/fbtask/{tid}/subs?pw=" + _q(str(g2.get("password") or ""))
+                        + "&ok=" + _q(f"✅ {n} টি নতুন সিট যোগ হয়েছে"))
+    return redirect(f"/admin/fbtask/{tid}/pw/{gid}?ok=" + _q(f"✅ {n} টি নতুন সিট যোগ হয়েছে"))
+
+
+@wadm.route("/admin/fbtask/<int:tid>/pw/<int:gid>", methods=["GET"])
+def fbtask_pw_view(tid, gid):
+    """একটা পাসওয়ার্ডের সব কিছু — সিট, ⏳✅❌, আইডির তালিকা, নতুন সিট।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    t = one("SELECT * FROM fb_tasks WHERE id=%s", (tid,))
+    g2 = one("SELECT * FROM fb_pw_groups WHERE id=%s AND task_id=%s", (gid, tid))
+    if not t or not g2:
+        return page("Not found", "<div class='card'>পাসওয়ার্ড নেই</div>", "fbtasks", status=404)
+    _pw = str(g2.get("password") or "")
+    _cnt = one("SELECT COUNT(*) AS n, "
+               "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pend, "
+               "SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) AS appr, "
+               "SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS rej "
+               "FROM fb_submissions WHERE task_id=%s AND COALESCE(fb_password,'')=%s",
+               (tid, _pw)) or {}
+    used = int(_cnt.get("n") or 0) - int(_cnt.get("rej") or 0)   # ❌ সিট খালি রাখে
+    seats = int(g2.get("seats_total") or 0)
+    per = int(g2.get("per_user") or 0)
+    left = (seats - used) if seats else -1
+    rows = many("SELECT id, user_id, account_no, fb_uid, status, created_at "
+                "FROM fb_submissions WHERE task_id=%s AND COALESCE(fb_password,'')=%s "
+                "ORDER BY id DESC LIMIT 30", (tid, _pw))
+    trs = []
+    for r in rows:
+        trs.append([
+            f"<span class='mono'>{esc(str(r.get('created_at') or ''))}</span>",
+            f"<a class='mono' href='/admin/user/{int(r['user_id'])}'>{int(r['user_id'])}</a>",
+            num(r.get("account_no") or 0),
+            f"<span class='mono'>{esc(r.get('fb_uid') or '-')}</span>",
+            st_badge(r.get("status")),
+            "<a class='btn gray sm' href='/admin/fbsub/%d'>👁</a>" % int(r["id"]),
+        ])
+    body = (
+        "<div class='card'>"
+        "<div class='row' style='justify-content:space-between;align-items:center'>"
+        f"<h3>🔑 <span class='mono'>{esc(_pw)}</span></h3>"
+        f"<div class='row' style='gap:6px'>"
+        f"<a class='btn gray sm' href='/admin/fbtask/{tid}/passwords'>‹ সব পাসওয়ার্ড</a>"
+        f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs?pw={_q(_pw)}'>📄 শীট</a>"
+        f"<a class='btn gray sm' href='/admin/fbtask/{tid}/passwords/{gid}/edit'>✏️ Edit</a>"
+        "</div></div>"
+        "<div class='row' style='gap:10px;flex-wrap:wrap;margin-top:10px'>"
+        f"<div class='card' style='flex:1;min-width:120px'><div class='mut'>আইডি / সিট</div>"
+        f"<b style='font-size:20px'>{num(used)} / {num(seats) if seats else '∞'}</b>"
+        + (badge("ভরা", "err") if seats and used >= seats else
+           (badge(f"{num(left)} সিট খালি", "ok") if seats else ""))
+        + "</div>"
+        f"<div class='card' style='flex:1;min-width:120px'><div class='mut'>⏳ Pending</div>"
+        f"<b style='font-size:20px'>{num(_cnt.get('pend') or 0)}</b></div>"
+        f"<div class='card' style='flex:1;min-width:120px'><div class='mut'>✅ Approved</div>"
+        f"<b style='font-size:20px'>{num(_cnt.get('appr') or 0)}</b></div>"
+        f"<div class='card' style='flex:1;min-width:120px'><div class='mut'>❌ Rejected</div>"
+        f"<b style='font-size:20px'>{num(_cnt.get('rej') or 0)}</b></div>"
+        f"<div class='card' style='flex:1;min-width:120px'><div class='mut'>একজন নিতে পারবে</div>"
+        f"<b style='font-size:20px'>{num(per) if per else '∞'}</b></div>"
+        "</div>"
+        "<div class='row' style='gap:8px;margin-top:12px;align-items:center'>"
+        f"<form method='post' action='/admin/do/fbtask/{tid}/pw/{gid}/seat' class='row' "
+        "style='gap:8px;align-items:center'>"
+        "<input name='n' value='1' inputmode='numeric' style='max-width:90px' aria-label='কত সিট'>"
+        "<button class='btn ok sm' type='submit'>➕ নতুন সিট</button>"
+        "<span class='mut' style='font-size:12px'>সিট বাড়ালে বট আবার এই পাসওয়ার্ড নতুন ইউজারকে দেবে।</span>"
+        "</form></div></div>"
+        "<div class='card'><b>এই পাসওয়ার্ডে জমা হওয়া আইডি</b>"
+        + table(["Date", "User", "Acc#", "Facebook UID", "Status", "জমা তথ্য"], trs,
+                "এখনো কেউ এই পাসওয়ার্ডে আইডি জমা দেয়নি")
+        + f"<div class='mut' style='font-size:12px;margin-top:6px'>সর্বশেষ ৩০টি — "
+          f"<a href='/admin/fbtask/{tid}/subs?pw={_q(_pw)}'>সব দেখুন / ✅ ❌ করুন</a></div></div>")
+    return page(f"পাসওয়ার্ড — {t.get('name') or 'FB'}", body, "fbtasks",
+                toast=request.args.get("ok"), err=request.args.get("err"))
 
 
 @wadm.route("/admin/fbtask/<int:tid>/subs", methods=["GET"])
@@ -963,8 +1085,30 @@ def fbtask_subs(tid):
             "<form method='post' action='/admin/do/fbsub/%d/delete' style='display:inline'>"
             "<button class='btn gray sm'>🗑</button></form>" % int(s["id"]),
         ])
+    _pwcard2 = ""
+    if _pw_filter:
+        _g3 = one("SELECT * FROM fb_pw_groups WHERE task_id=%s AND password=%s",
+                  (tid, _pw_filter))
+        if _g3:
+            _s3 = int(_g3.get("seats_total") or 0)
+            _u3 = len(rows) if len(rows) < 100 else int(
+                (one("SELECT COUNT(*) AS n FROM fb_submissions WHERE task_id=%s "
+                     "AND COALESCE(fb_password,'')=%s AND COALESCE(status,'pending')<>'rejected'",
+                     (tid, _pw_filter)) or {}).get("n") or 0)
+            _pwcard2 = (
+                "<div class='card'><b>🔑 <span class='mono'>%s</span></b>"
+                " <a class='btn gray sm' href='/admin/fbtask/%d/pw/%d'>পাসওয়ার্ডের নিজের পেজ ›</a>"
+                "<div class='mut' style='font-size:12px;margin:6px 0'>আইডি %s / %s</div>"
+                "<form method='post' action='/admin/do/fbtask/%d/pw/%d/seat' class='row' "
+                "style='gap:8px;align-items:center'>"
+                "<input type='hidden' name='back' value='subs'>"
+                "<input name='n' value='1' inputmode='numeric' style='max-width:90px'>"
+                "<button class='btn ok sm' type='submit'>➕ নতুন সিট</button></form></div>"
+                % (esc(_pw_filter), tid, int(_g3["id"]), num(_u3),
+                   num(_s3) if _s3 else "∞", tid, int(_g3["id"])))
     body = (
-        review_kpi(review_counts("fb_submissions", tid))
+        _pwcard2
+        + review_kpi(review_counts("fb_submissions", tid))
         + review_card(tid, "fb")
         + f"<div class='card'><div class='row' style='justify-content:space-between'>"
         f"<h3>{esc(t['name'])} — জমা তথ্য"

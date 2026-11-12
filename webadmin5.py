@@ -192,6 +192,96 @@ def _btn(text, url, cls="btn"):
 
 
 # ───────────────────────── ওভারভিউ ─────────────────────────
+@wadm.route("/admin/shop/onoff", methods=["POST"])
+def shop_onoff():
+    """দোকান চালু/বন্ধ সুইচ।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    val = "off" if (request.form.get("val") or "").strip().lower() == "off" else "on"
+    try:
+        import bot as _bs
+        _bs.set_setting("shop_on", val)
+    except Exception as _e:
+        _x("INSERT INTO settings (key,value) VALUES ('shop_on',%s) "
+           "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (val,))
+    log_admin("shop_onoff", 0, val)
+    return redirect("/admin/shop?ok=" + __import__("urllib.parse", fromlist=["quote"]).quote(
+        "🛍 দোকান " + ("চালু করা হয়েছে" if val == "on" else "বন্ধ করা হয়েছে")))
+
+
+@wadm.route("/admin/shop/mailcode", methods=["POST"])
+def shop_mailcode_save():
+    """🎫 মেইল কোড — লিংক, সার্ভিস, প্রম্পট।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    form = request.form
+    vals = {
+        "mailcode_on": "off" if (form.get("mailcode_on") or "").strip().lower() == "off" else "on",
+        "mailcode_link": (form.get("mailcode_link") or "").strip()[:400],
+        "mailcode_api": (form.get("mailcode_api") or "").strip()[:400],
+        "mailcode_key": (form.get("mailcode_key") or "").strip()[:200],
+        "mailcode_prompt_bn": (form.get("mailcode_prompt_bn") or "").strip()[:900],
+        "mailcode_prompt_en": (form.get("mailcode_prompt_en") or "").strip()[:900],
+    }
+    try:
+        import bot as _bs
+        for k, v in vals.items():
+            _bs.set_setting(k, v)
+    except Exception:
+        for k, v in vals.items():
+            _x("INSERT INTO settings (key,value) VALUES (%s,%s) "
+               "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k, v))
+    log_admin("shop_mailcode", 0, "saved")
+    return redirect("/admin/shop?ok=" + __import__("urllib.parse", fromlist=["quote"]).quote(
+        "🎫 মেইল কোড সেটিংস সেভ হয়েছে"))
+
+
+@wadm.route("/admin/shop/closedmsg", methods=["POST"])
+def shop_closed_msg_save():
+    """দোকান/ডিপোজিট বন্ধের সময় ইউজারকে যা দেখাবে — নিজের লেখা।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    keys = ("shop_closed_bn", "shop_closed_en", "dep_closed_bn", "dep_closed_en")
+    _reset = (request.form.get("reset") or "") == "1"
+    try:
+        import bot as _bs
+        for k in keys:
+            _bs.set_setting(k, "" if _reset else (request.form.get(k) or "").strip()[:600])
+    except Exception:
+        for k in keys:
+            _x("INSERT INTO settings (key,value) VALUES (%s,%s) "
+               "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+               (k, (request.form.get(k) or "").strip()[:600]))
+    log_admin("shop_closed_msg", 0, "saved")
+    return redirect("/admin/shop?ok=" + __import__("urllib.parse", fromlist=["quote"]).quote(
+        "✍️ বন্ধের বার্তা সেভ হয়েছে"))
+
+
+@wadm.route("/admin/shop/deponoff", methods=["POST"])
+def shop_dep_lock():
+    """দোকান বন্ধ থাকলে ডিপোজিটও বন্ধ থাকবে কি না — সুইচ।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    val = "off" if (request.form.get("val") or "").strip().lower() == "off" else "on"
+    try:
+        import bot as _bs
+        _bs.set_setting("shop_off_dep", val)
+    except Exception as _e:
+        _x("INSERT INTO settings (key,value) VALUES ('shop_off_dep',%s) "
+           "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (val,))
+    log_admin("shop_dep_lock", 0, val)
+    return redirect("/admin/shop?ok=" + __import__("urllib.parse", fromlist=["quote"]).quote(
+        "💳 ডিপোজিট নিয়ম সেভ হয়েছে"))
+
+
 @wadm.route("/admin/shop", methods=["GET"])
 def shop_home():
     g = guard()
@@ -216,6 +306,133 @@ def shop_home():
                    "warn" if int((pend or {}).get("n") or 0) else "")
             + _kpi("ডেলিভারি হয়েছে", num((sold or {}).get("n") or 0))
             + "</div>")
+
+    # ── দোকান চালু/বন্ধ + ডিপোজিট লক ──
+    try:
+        import bot as _bs2
+        _s_on = bool(_bs2.shop_on())
+        _d_lock = bool(_bs2.shop_off_dep_on())
+    except Exception:
+        _s_on, _d_lock = True, True
+    switch_card = (
+        "<div class='card'>"
+        + ("<b>🛍 দোকান: <span style='color:#2e7d32'>চালু</span></b>"
+           if _s_on else
+           "<b>🔒 দোকান: <span style='color:#c62828'>বন্ধ</span></b>")
+        + "<div class='mut' style='font-size:12px;margin:6px 0'>"
+        + ("ইউজার এখন কেনাকাটা করতে পারছে।"
+           if _s_on else
+           "ইউজার এখন '🔒 দোকান এখন বন্ধ' মেসেজ দেখবে — অ্যাডমিন বটে ঢুকতে পারবেন।")
+        + "</div>"
+        + "<form method='post' action='/admin/shop/onoff' style='display:inline'>"
+        + "<input type='hidden' name='val' value='%s'>" % ("off" if _s_on else "on")
+        + "<button class='%s sm' type='submit'>%s</button></form>"
+        % ("gray" if _s_on else "ok",
+           "⏸ দোকান বন্ধ করুন" if _s_on else "▶️ দোকান চালু করুন")
+        + "<div style='margin-top:14px;padding-top:10px;border-top:1px solid #ddd'>"
+        + "<b>💳 ডিপোজিট</b>"
+        + "<div class='mut' style='font-size:12px;margin:6px 0'>"
+        + ("দোকান বন্ধ থাকলে ডিপোজিটও বন্ধ থাকবে।"
+           if _d_lock else
+           "দোকান বন্ধ থাকলেও ডিপোজিট চালু থাকবে।")
+        + "</div>"
+        + "<form method='post' action='/admin/shop/deponoff' style='display:inline'>"
+        + "<input type='hidden' name='val' value='%s'>" % ("off" if _d_lock else "on")
+        + "<button class='gray sm' type='submit'>%s</button></form>"
+        % ("✅ দোকান বন্ধ = ডিপোজিট বন্ধ (বদলাতে চাপুন)"
+           if _d_lock else
+           "⬜ দোকান বন্ধেও ডিপোজিট চালু (বদলাতে চাপুন)")
+        + "</div></div>")
+
+    # ── বন্ধের সময় ইউজারকে যা দেখাবে (নিজের লেখা) ──
+    try:
+        import bot as _bs3
+        # খালি থাকলে বটের নিজের লেখাটাই বাক্সে দেখা যাবে — নতুন করে লিখতে হবে না
+        _mbn = esc(_bs3.closed_msg_custom("shop_closed_bn")
+                   or _bs3.closed_msg_default("shop_closed_bn"))
+        _men = esc(_bs3.closed_msg_custom("shop_closed_en")
+                   or _bs3.closed_msg_default("shop_closed_en"))
+        _dbn = esc(_bs3.closed_msg_custom("dep_closed_bn")
+                   or _bs3.closed_msg_default("dep_closed_bn"))
+        _den = esc(_bs3.closed_msg_custom("dep_closed_en")
+                   or _bs3.closed_msg_default("dep_closed_en"))
+    except Exception:
+        _mbn = _men = _dbn = _den = ""
+    msg_card = (
+        "<div class='card'><b>✍️ বন্ধের সময় ইউজারকে যা দেখাবে</b>"
+        "<div class='mut' style='font-size:12px;margin:6px 0'>"
+        "বাক্সে এখন বটের নিজের লেখাই আছে — নতুন করে লিখতে হবে না। "
+        "যেটুকু বদলাতে চান শুধু সেটুকু বদলে সেভ করুন।</div>"
+        "<form method='post' action='/admin/shop/closedmsg'>"
+        "<div class='field'><label>🛍 দোকান বন্ধ — বাংলা</label>"
+        f"<textarea name='shop_closed_bn' rows='3' style='width:100%' "
+        f"placeholder='🔒 দোকান এখন বন্ধ — অ্যাডমিন চালু করলে আবার কেনাকাটা করতে পারবেন।'>{_mbn}</textarea></div>"
+        "<div class='field'><label>🛍 Shop closed — English</label>"
+        f"<textarea name='shop_closed_en' rows='2' style='width:100%' "
+        f"placeholder='🔒 Shop is closed right now.'>{_men}</textarea></div>"
+        "<div class='field'><label>💳 ডিপোজিট বন্ধ — বাংলা</label>"
+        f"<textarea name='dep_closed_bn' rows='3' style='width:100%' "
+        f"placeholder='🔒 ডিপোজিট এখন বন্ধ — দোকান বন্ধ থাকায় ডিপোজিটও বন্ধ আছে।'>{_dbn}</textarea></div>"
+        "<div class='field'><label>💳 Deposit closed — English</label>"
+        f"<textarea name='dep_closed_en' rows='2' style='width:100%' "
+        f"placeholder='🔒 Deposit is closed right now.'>{_den}</textarea></div>"
+        "<div class='row' style='gap:8px;margin-top:8px'>"
+        "<button class='ok sm' type='submit'>💾 বার্তা সেভ করুন</button>"
+        "<button class='gray sm' type='submit' formaction='/admin/shop/closedmsg' "
+        "name='reset' value='1' "
+        "onclick=\"return confirm('সব বাক্স বটের নিজের লেখায় ফিরে যাবে?')\">"
+        "↩️ ডিফল্টে ফিরে যান</button></div>"
+        "<div class='mut' style='font-size:11px;margin-top:6px'>"
+        "সব লেখা সাধারণ টেক্সট হিসেবে যাবে — ইমোজি চলবে, *বোল্ড* মার্কডাউন চলবে না।</div>"
+        "</form></div>")
+
+    # ── 🎫 মেইল কোড সেটিংস ──
+    try:
+        import bot as _bm
+        _m_on = bool(_bm.mailcode_on())
+        _m_link = esc(_bm.mailcode_link())
+        _m_api = esc(str(_bm.get_setting("mailcode_api") or ""))
+        _m_key = esc(str(_bm.get_setting("mailcode_key") or ""))
+        _m_pbn = esc(str(_bm.get_setting("mailcode_prompt_bn") or ""))
+        _m_pen = esc(str(_bm.get_setting("mailcode_prompt_en") or ""))
+    except Exception:
+        _m_on, _m_link, _m_api, _m_key, _m_pbn, _m_pen = True, "", "", "", "", ""
+    _sel = ("<option value='on' selected>চালু</option><option value='off'>বন্ধ</option>"
+            if _m_on else
+            "<option value='on'>চালু</option><option value='off' selected>বন্ধ</option>")
+    mailcard = "".join([
+        "<div class='card'><b>🎫 মেইল কোড নিন</b>",
+        "<div class='mut' style='font-size:12px;margin:6px 0'>",
+        "বটের শপে '🎫 মেইল কোড নিন' বাটন এখান থেকেই নিয়ন্ত্রণ হয়।</div>",
+        "<form method='post' action='/admin/shop/mailcode'>",
+        "<div class='field'><label>অপশন</label>"
+        "<select name='mailcode_on'>" + _sel + "</select></div>",
+        "<div class='field'><label>🔗 লিংক (ইউজার এই লিংকে চাপ দিয়ে কোড নিতে পারবে)</label>",
+        "<input name='mailcode_link' value='" + _m_link + "' placeholder='https://...' "
+        "style='width:100%'></div>",
+        "<div class='field'><label>🤖 বট সিস্টেমের লিংক / সার্ভিস URL "
+        "(টোকেন পাঠালে কোড ফেরত দেবে)</label>",
+        "<input name='mailcode_api' value='" + _m_api +
+        "' placeholder='https://your-server.com/mailcode' style='width:100%'></div>",
+        "<div class='field'><label>সার্ভিস API Key (ঐচ্ছিক)</label>",
+        "<input name='mailcode_key' value='" + _m_key +
+        "' placeholder='secret key' style='width:100%'></div>",
+        "<div class='field'><label>🤖 বট সিস্টেমের বার্তা — বাংলা</label>",
+        "<textarea name='mailcode_prompt_bn' rows='4' style='width:100%' "
+        "placeholder='🤖 বট সিস্টেম&#10;&#10;আপনার মেইল টোকেন (Key) পাঠান:&#10;"
+        "email|password|refresh_token|client_id'>" + _m_pbn + "</textarea></div>",
+        "<div class='field'><label>🤖 Bot system text — English</label>",
+        "<textarea name='mailcode_prompt_en' rows='3' style='width:100%' "
+        "placeholder='🤖 Bot system&#10;&#10;Send your mail token (Key):&#10;"
+        "email|password|refresh_token|client_id'>" + _m_pen + "</textarea></div>",
+        "<button class='ok sm' type='submit'>💾 সেভ করুন</button>",
+        "<div class='mut' style='font-size:11px;margin-top:6px'>",
+        "লিংক/URL খালি থাকলে বট বলবে “সিস্টেম এখনো চালু হয়নি”। লিংকে "
+        "<b>{email}</b>, <b>{password}</b>, <b>{refresh_token}</b>, <b>{client_id}</b> "
+        "বসিয়ে দিলে বট GET রিকোয়েস্ট পাঠাবে (যেমন yoursite.com/api?mail={email}&amp;tok={refresh_token})। "
+        "না থাকলে POST JSON যাবে: email, password, refresh_token, client_id — উত্তরে "
+        "{code: \"123456\"} বা টেক্সট দিলেই হবে।</div></form></div>",
+    ])
 
     # ক্যাটাগরি তৈরি + ক্রেন্সি
     cur = esc(_cur())
@@ -242,18 +459,13 @@ def shop_home():
             f"</option>"
             for c in cats if str(c.get("plan_kind") or "") in ("days", "mb"))
         + "</select>"
-        "<input name='value' placeholder='দিন: 3 / 7 · MB: 5120' style='max-width:140px' inputmode='decimal'>"
+        "<input name='value' placeholder='দিন: 3 / 7 · MB: 5120' style='max-width:170px' inputmode='decimal' "
+        "title='VPN-এ দিনের সংখ্যা, Proxy-তে MB'>"
         "<input name='label' placeholder='ঐচ্ছিক নাম (যেমন ৭ দিন)' style='max-width:180px'>"
         "<button class='ok sm' type='submit'>যোগ করুন</button></form>"
         "<div class='mut' style='font-size:12px;margin-top:6px'>ইউজার VPN-এ চাপলে আগে এখানকার "
         "মেয়াদ/প্যাক বাটন দেখবে, তারপর সেই প্ল্যানের পণ্য। MB দিলে Proxy-র ডাটা প্যাকও হয়।</div>"
-        + "".join(
-            f"<div class='row' style='gap:6px;margin-top:6px;align-items:center'>"
-            f"<span>{esc(_plan_txt(pl))}</span>"
-            f"<span class='mut'>· cat#{int(pl['category_id'])}</span>"
-            f"<form method='post' action='/admin/shop/plan/{int(pl['id'])}/delete' style='display:inline'>"
-            f"<button class='gray sm' type='submit'>🗑</button></form></div>"
-            for pl in _plans())
+        + _plans_grouped(prods)
         + "</div>"
         "<div class='card'><b>💱 মুদ্রা</b>"
         "<form method='post' action='/admin/shop/currency' class='row' style='gap:8px;margin-top:8px'>"
@@ -279,7 +491,9 @@ def shop_home():
                " selected" if _pk == "days" else "",
                " selected" if _pk == "mb" else ""))
         cat_rows.append([
-            f"{esc(c['emoji'] or '🛍')} <b>{esc(c['name'] or '')}</b>",
+            f"<a href='/admin/shop/cat/{int(c['id'])}' style='text-decoration:none'>"
+            f"{esc(c['emoji'] or '🛍')} <b>{esc(c['name'] or '')}</b></a>"
+            f"<div class='mut' style='font-size:11px'>ভিতরে দেখুন ›</div>",
             _pk_sel,
             num(n),
             badge("চালু", "ok") if _onoff(c["is_active"]) else badge("বন্ধ", "mut"),
@@ -310,7 +524,7 @@ def shop_home():
         ])
 
     body = (
-        head + tools
+        head + switch_card + msg_card + mailcard + tools
         + "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
           "<b>📁 ক্যাটাগরি</b>" + _btn("🛒 অর্ডার দেখুন", "/admin/shop/orders", "btn gray sm")
         + "</div>" + table(["ক্যাটাগরি", "ধরন (প্ল্যান)", "পণ্য", "স্ট্যাটাস", "অন/অফ", ""], cat_rows,
@@ -333,6 +547,103 @@ def _onoff(v):
     except Exception:
         return 1
 
+
+
+@wadm.route("/admin/shop/cat/<int:cid>", methods=["GET"])
+def shop_cat_view(cid):
+    """ক্যাটাগরির ভিতরে — কোন কোন মেয়াদ/প্যাক আছে, কত পণ্য, কত স্টক।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    c = one("SELECT * FROM shop_categories WHERE id=%s", (cid,))
+    if not c:
+        return page("পাওয়া যায়নি", "<div class='card'>ক্যাটাগরি নেই</div>", "shop", status=404)
+    _pk = str(c.get("plan_kind") or "")
+    plans = _plans(cid)
+    prods = many(
+        "SELECT p.*, (SELECT COUNT(*) FROM shop_stock s WHERE s.product_id=p.id "
+        "AND COALESCE(s.sold,0)=0) AS stock FROM shop_products p "
+        "WHERE p.category_id=%s ORDER BY p.plan_id, p.sort_order, p.id", (cid,))
+    total_stock = sum(int(p["stock"] or 0) for p in prods)
+
+    head = (
+        "<div class='card'>"
+        f"<a class='btn gray sm' href='/admin/shop'>‹ Shop</a>"
+        f"<h3 style='margin:8px 0 4px'>{esc(c['emoji'] or '🛍')} {esc(c['name'] or '')}</h3>"
+        f"<div class='mut' style='font-size:12px'>ধরন: "
+        + ("দিন (মেয়াদ)" if _pk == "days" else ("MB/GB (Proxy)" if _pk == "mb" else "প্ল্যান নেই"))
+        + f" · মেয়াদ/প্যাক {num(len(plans))} · পণ্য {num(len(prods))} · স্টক {num(total_stock)}"
+        + "</div></div>"
+    )
+
+    # প্ল্যান যোগ (এই ক্যাটাগরির ধরন অনুযায়ীই)
+    add_form = ""
+    if _pk in ("days", "mb"):
+        add_form = (
+            "<div class='card'><b>➕ " + ("নতুন মেয়াদ (দিন)" if _pk == "days" else "নতুন ডাটা প্যাক (MB/GB)")
+            + f" — {esc(c['name'] or '')}</b>"
+            "<form method='post' action='/admin/shop/plan/add' class='row' style='gap:8px;margin-top:8px'>"
+            f"<input type='hidden' name='category_id' value='{int(cid)}'>"
+            + ("<input name='value' placeholder='দিন (যেমন 3, 7, 30)' style='max-width:170px' inputmode='decimal'>"
+               if _pk == "days" else
+               "<input name='value' placeholder='MB (512 / 5120 = 5GB)' style='max-width:200px' inputmode='decimal'>")
+            + ("<input name='label' required placeholder='নিজের নাম (যেমন ১ মাস / India Proxy)' style='max-width:230px'>"
+               if _pk == "mb" else
+               "<input name='label' placeholder='ঐচ্ছিক নাম (যেমন সাপ্তাহিক)' style='max-width:230px'>")
+            + "<button class='ok sm' type='submit'>যোগ করুন</button></form>"
+            "<div class='mut' style='font-size:12px;margin-top:6px'>এই ক্যাটাগরিতে শুধু "
+            + ("দিনের মেয়াদ" if _pk == "days" else "MB/GB প্যাক")
+            + " যোগ হবে — অন্যগুলো আলাদা ক্যাটাগরিতে।</div></div>")
+
+    # প্রতিটি প্ল্যানের ভিতরের পণ্য
+    blocks = []
+    for pl in plans:
+        rows = []
+        for p in prods:
+            if int(p.get("plan_id") or 0) != int(pl["id"]):
+                continue
+            rows.append(_prod_row(p))
+        n, st = _plan_counts(pl, prods)
+        blocks.append(
+            "<div class='card'>"
+            f"<div class='row' style='justify-content:space-between;align-items:center'>"
+            f"<b>📦 {esc(_plan_txt(pl, _pk))}</b>"
+            f"<span class='mut' style='font-size:12px'>পণ্য {num(n)} · স্টক {num(st)}</span>"
+            f"<a class='btn gray sm' href='/admin/shop/plan/{int(pl['id'])}/edit'>✏️ নাম বদলান</a></div>"
+            + table(["পণ্য", "দাম", "ডেলিভারি", "স্টক", "স্ট্যাটাস", ""], rows,
+                    "এই মেয়াদে এখনো কোনো পণ্য নেই")
+            + "</div>")
+    _none = [p for p in prods if not int(p.get("plan_id") or 0)]
+    if _none or not plans:
+        blocks.append(
+            "<div class='card'><b>📦 প্ল্যান ছাড়া পণ্য</b>"
+            + table(["পণ্য", "দাম", "ডেলিভারি", "স্টক", "স্ট্যাটাস", ""],
+                    [_prod_row(p) for p in _none], "কোনো পণ্য নেই")
+            + "</div>")
+
+    body = (head + add_form + "".join(blocks)
+            + "<div class='card'><div class='row' style='gap:8px'>"
+            + _btn("➕ নতুন পণ্য", "/admin/shop/new", "btn ok sm")
+            + _btn("🛒 অর্ডার", f"/admin/shop/orders?c={int(cid)}", "btn gray sm")
+            + "</div></div>")
+    return page(f"Shop — {c['name'] or ''}", body, "shop")
+
+
+def _prod_row(p):
+    _t = str(p.get("deliver_type") or "auto").lower()
+    typ = {"auto": "🤖 অটো", "manual": "✍️ ম্যানুয়াল",
+           "hybrid": "⚡ হাইব্রিড"}.get(_t, "🤖 অটো")
+    stock = int(p.get("stock") or 0)
+    return [
+        f"<a href='/admin/shop/{int(p['id'])}'><b>{esc(p.get('name') or '')}</b></a>",
+        _fmt(p.get("price")),
+        typ,
+        badge(f"স্টক {stock}", "ok" if stock > 0 else "err"),
+        badge("চালু", "ok") if _onoff(p.get("is_active")) else badge("বন্ধ", "mut"),
+        _btn("📥 স্টক", f"/admin/shop/{int(p['id'])}/stock", "btn gray sm")
+        + _btn("✏️", f"/admin/shop/{int(p['id'])}", "btn gray sm"),
+    ]
 
 
 @wadm.route("/admin/shop/currency", methods=["POST"])
@@ -385,12 +696,64 @@ def shop_plan_add():
     label = (request.form.get("label") or "").strip()[:60]
     if val <= 0 and not label:
         return redirect("/admin/shop?err=মেয়াদ/MB সংখ্যা দিন")
+    # দিন শুধু VPN-এর মতো মেয়াদ-ক্যাটাগরিতে; MB ক্যাটাগরিতে দিনের সংখ্যা ঢুকলে আটকায়
+    if kind == "days" and val > 400:
+        return redirect("/admin/shop?err=দিন ৪০০-এর বেশি হতে পারে না — MB/GB দিতে "
+                                "চাইলে Proxy ক্যাটাগরি বেছে নিন")
+    if kind == "mb" and val < 1:
+        return redirect("/admin/shop?err=MB সংখ্যা ১ বা তার বেশি দিন")
+    if kind == "mb" and not label:
+        return redirect("/admin/shop?err=Proxy প্যাকের নিজের নাম দিন (যেমন ১ মাস)")
     nxt = (one("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shop_plans WHERE category_id=%s",
                (cid,)) or {}).get("n") or 1
     _x("INSERT INTO shop_plans (category_id,label,kind,value,sort_order,is_active,created_at) "
        "VALUES (%s,%s,%s,%s,%s,1,%s)", (cid, label, kind, val, int(nxt), _now()))
     log_admin("shop_plan_add", cid, f"{kind} {val}")
     return redirect("/admin/shop?ok=মেয়াদ/প্যাক যোগ হয়েছে")
+
+
+@wadm.route("/admin/shop/plan/<int:plid>/edit", methods=["GET", "POST"])
+def shop_plan_edit(plid):
+    """প্যাকের নিজের নাম / মান / ধরন বদল — পুরোনো প্যাক ঠিক করার জন্যও।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    pl = one("SELECT * FROM shop_plans WHERE id=%s", (plid,))
+    if not pl:
+        return page("পাওয়া যায়নি", "<div class='card'>প্যাক নেই</div>", "shop", status=404)
+    cid = int(pl["category_id"] or 0)
+    if request.method == "POST":
+        lb = (request.form.get("label") or "").strip()[:60]
+        kind = "mb" if (request.form.get("kind") or "").lower() == "mb" else "days"
+        try:
+            val = float((request.form.get("value") or "0").replace(",", "."))
+        except Exception:
+            val = 0.0
+        _x("UPDATE shop_plans SET label=%s, kind=%s, value=%s WHERE id=%s",
+           (lb, kind, val, plid))
+        log_admin("shop_plan_edit", plid, f"{kind} {val} {lb}")
+        return redirect(f"/admin/shop/cat/{cid}?ok=" + __import__("urllib.parse", fromlist=["quote"]).quote("✅ প্যাক সেভ হয়েছে"))
+    _name = esc(str(pl.get("label") or ""))
+    _val = esc(str(int(pl["value"]) if float(pl["value"] or 0) == int(float(pl["value"] or 0))
+                   else pl["value"] or 0))
+    _kind = str(pl.get("kind") or "days")
+    body = (
+        "<div class='card'><a class='btn gray sm' href='/admin/shop/cat/%d'>‹ ক্যাটাগরি</a>" % cid
+        + "<h3 style='margin:8px 0'>✏️ প্যাক এডিট</h3>"
+        "<form method='post'>"
+        "<div class='field'><label>নিজের নাম (বটে ও প্যানেলে এটাই দেখাবে)</label>"
+        f"<input name='label' value='{_name}' placeholder='যেমন ১ মাস / India Proxy 512MB'></div>"
+        "<div class='field'><label>ধরন</label><select name='kind'>"
+        f"<option value='mb'{' selected' if _kind == 'mb' else ''}>MB/GB (Proxy)</option>"
+        f"<option value='days'{' selected' if _kind == 'days' else ''}>দিন (মেয়াদ)</option>"
+        "</select></div>"
+        "<div class='field'><label>মান (হিসাবের জন্য — 512 / 1024 / 3 / 30)</label>"
+        f"<input name='value' value='{_val}' inputmode='decimal'></div>"
+        "<div class='row' style='gap:8px;margin-top:12px'>"
+        "<button class='ok' type='submit'>💾 সেভ করুন</button>"
+        f"<a class='btn gray' href='/admin/shop/cat/{cid}'>বাতিল</a></div></form></div>")
+    return page("প্যাক এডিট", body, "shop")
 
 
 @wadm.route("/admin/shop/plan/<int:plid>/delete", methods=["POST"])
@@ -475,14 +838,58 @@ def _plans(cid=None):
         return []
 
 
-def _plan_txt(pl):
+def _plan_counts(pl, prods):
+    """এই প্ল্যানে কত পণ্য ও কত স্টক আছে — (products, stock)।"""
+    n = st = 0
+    for p in prods or []:
+        try:
+            if int(p.get("plan_id") or 0) != int(pl["id"]):
+                continue
+        except Exception:
+            continue
+        n += 1
+        st += int(p.get("stock") or 0)
+    return n, st
+
+
+def _plans_grouped(prods):
+    """ক্যাটাগরি → তার ভিতরের মেয়াদ/প্যাক — কত পণ্য, কত স্টক।"""
+    cats = {int(c["id"]): c for c in _cats()}
+    plans = _plans()
+    if not plans:
+        return "<div class='mut' style='font-size:12px;margin-top:8px'>এখনো কোনো মেয়াদ/প্যাক নেই।</div>"
+    out = []
+    for cid in dict.fromkeys([int(pl["category_id"]) for pl in plans]):
+        c = cats.get(cid) or {}
+        out.append(
+            f"<div style='margin-top:10px'><a href='/admin/shop/cat/{cid}'>"
+            f"<b>{esc(c.get('emoji') or '🛍')} {esc(c.get('name') or ('cat#' + str(cid)))}</b></a>"
+            f" <span class='mut' style='font-size:12px'>— ভিতরে দেখুন</span></div>")
+        for pl in [x for x in plans if int(x["category_id"]) == cid]:
+            n, st = _plan_counts(pl, prods)
+            out.append(
+                "<div class='row' style='gap:6px;margin-top:6px;align-items:center'>"
+                f"<a href='/admin/shop/cat/{cid}' style='text-decoration:none'>📦 {esc(_plan_txt(pl, c.get('plan_kind')))}</a>"
+                f"<span class='mut' style='font-size:12px'>· পণ্য {num(n)} · স্টক {num(st)}</span>"
+                f"<a class='btn gray sm' href='/admin/shop/plan/{int(pl['id'])}/edit'>✏️</a>"
+                f"<form method='post' action='/admin/shop/plan/{int(pl['id'])}/delete' style='display:inline'>"
+                f"<button class='gray sm' type='submit'>🗑</button></form></div>")
+    return "".join(out)
+
+
+def _plan_txt(pl, cat_kind=""):
+    """প্ল্যানের নাম — নিজের দেওয়া নাম থাকলে সেটাই, নাহলে '৩ দিন' / '৫ GB'।"""
     try:
         v = float(pl["value"] or 0)
     except Exception:
         v = 0.0
     vs = int(v) if v == int(v) else round(v, 2)
-    if str(pl["kind"] or "days") == "mb":
-        return f"{vs} MB" if v < 1024 else f"{round(v/1024, 2)} GB"
+    lb = str(pl["label"] or "").strip()
+    if lb:
+        return lb[:40]
+    _k = str(cat_kind or "").strip().lower() or str(pl["kind"] or "days")
+    if _k == "mb":
+        return f"{vs}"          # Proxy-তে অটো MB/GB নয় — নাম দিতেই হবে
     return f"{vs} দিন"
 
 
@@ -859,6 +1266,11 @@ def shop_order_view(oid):
         if act == "refund":
             _x("UPDATE users SET balance=balance+%s WHERE user_id=%s",
                (float(o["price"] or 0), int(o["user_id"])))
+            try:
+                import bot as _bcache
+                _bcache._invalidate_user_cache(int(o["user_id"]))   # ক্যাশে রিফ্রেশ
+            except Exception:
+                pass
             _x("UPDATE shop_orders SET status='refunded' WHERE id=%s", (oid,))
             queue_user_msg(int(o["user_id"]),
                            f"💸 আপনার অর্ডার #{oid} বাতিল — {_fmt(o['price'])} ফেরত দেওয়া হয়েছে।")

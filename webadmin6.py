@@ -5,6 +5,7 @@
 - /admin/deposit-method/<id>       : মেথড এডিট / টগল / ডিলিট
 - /admin/deposit/<id>/approve|reject : ✅ ব্যালেন্স যোগ / ❌ বাতিল
 """
+import base64
 import time
 
 from flask import request, redirect
@@ -211,17 +212,26 @@ def deposits_home():
         "</form></div>"
     )
 
-    _q = settings_all(["qr_image", "qr_min_bdt", "qr_fee_bdt", "qr_rate", "qr_note"])
+    _q = settings_all(["qr_image", "qr_image_b64", "qr_image_mime",
+                       "qr_min_bdt", "qr_fee_bdt", "qr_rate", "qr_note"])
     _qimg = (_q.get("qr_image") or "").strip()
+    _qb64 = (_q.get("qr_image_b64") or "").strip()
+    _qmime = (_q.get("qr_image_mime") or "image/png").strip() or "image/png"
     qr_card = (
         "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
         "<b>🇧🇩 Bangla QR পেমেন্ট — সেটিংস</b>"
         + (badge("✅ সেট আছে", "ok") if _qimg else badge("❌ QR নেই", "err"))
         + "</div>"
-        "<form method='post' action='/admin/deposits/qr' style='margin-top:10px'>"
-        "<div class='field'><label>QR কোডের ছবি (লিংক বা Telegram file_id)</label>"
+        "<form method='post' action='/admin/deposits/qr' enctype='multipart/form-data' "
+        "style='margin-top:10px'>"
+        + (f"<img src='data:{esc(_qmime)};base64,{_qb64}' alt='QR' "
+           "style='max-width:180px;border-radius:10px;border:1px solid #2a3550;margin:6px 0'>"
+           if _qb64 else "")
+        + "<div class='field'><label>QR কোডের ছবি আপলোড করুন (PNG / JPG)</label>"
+        "<input type='file' name='qr_file' accept='image/png,image/jpeg,image/webp'></div>"
+        "<div class='field'><label>অথবা ছবির লিংক / Telegram file_id</label>"
         f"<input name='qr_image' value='{esc(_qimg)}' "
-        "placeholder='https://… অথবা বটে ছবি পাঠিয়ে পাওয়া file_id'></div>"
+        "placeholder='https://… অথবা file_id (আপলোড করলে এটার দরকার নেই)'></div>"
         "<div class='grid g2'>"
         "<div class='field'><label>সর্বনিম্ন ডিপোজিট (৳)</label>"
         f"<input name='qr_min_bdt' value='{esc(_q.get('qr_min_bdt') or '100')}'></div>"
@@ -439,6 +449,11 @@ def deposit_approve(did):
        "dep_total=COALESCE(dep_total,0)+%s WHERE user_id=%s",
        (amt, amt, amt, int(d["user_id"] or 0)))
     try:
+        import bot as _bcache
+        _bcache._invalidate_user_cache(int(d["user_id"] or 0))   # বটের ক্যাশে পুরোনো ব্যালেন্স না থাকে
+    except Exception:
+        pass
+    try:
         import bot as _bdep
         _bdep.dep_tx_mark(str(d["txid"] or ""), int(d["user_id"] or 0), amt)
     except Exception:
@@ -500,6 +515,34 @@ def deposits_qr_save():
     _init()
     img = (request.form.get("qr_image") or "").strip()[:400]
     note = (request.form.get("qr_note") or "").strip()[:300]
+    # ── QR ছবি আপলোড → base64 করে DB-তে (রিস্টার্টেও থাকে) ──
+    _up = request.files.get("qr_file")
+    if _up and getattr(_up, "filename", ""):
+        try:
+            _raw = _up.read()
+            if _raw and len(_raw) <= 2 * 1024 * 1024:
+                _magic = _raw[:12]
+                if _magic.startswith(b"\x89PNG"):
+                    _mime = "image/png"
+                elif _magic.startswith(b"\xff\xd8"):
+                    _mime = "image/jpeg"
+                elif _magic[:4] == b"RIFF" and _magic[8:12] == b"WEBP":
+                    _mime = "image/webp"
+                else:
+                    _mime = ""
+                if _mime:
+                    settings_set("qr_image_b64", base64.b64encode(_raw).decode("ascii"))
+                    settings_set("qr_image_mime", _mime)
+                    settings_set("qr_image", "")     # আপলোড থাকলে লিংক আর দরকার নেই
+                else:
+                    return redirect("/admin/deposits?err=QR+ছবি+PNG/JPG+হতে+হবে")
+            elif _raw:
+                return redirect("/admin/deposits?err=QR+ছবি+২MB+এর+কম+হতে+হবে")
+        except Exception:
+            return redirect("/admin/deposits?err=QR+ছবি+সেভ+হয়নি")
+    elif img:
+        settings_set("qr_image_b64", "")
+        settings_set("qr_image_mime", "")
     def _num(k, dflt):
         try:
             return f"{float((request.form.get(k) or '').replace(',', '.').strip()):g}"
