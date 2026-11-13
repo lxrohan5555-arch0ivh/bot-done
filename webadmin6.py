@@ -440,9 +440,22 @@ def deposit_approve(did):
                             "এই TxID আগে ব্যবহার হয়ে গেছে — একই TxID দিয়ে দ্বিতীয়বার হবে না")
     except Exception:
         pass
-    n = _x("UPDATE deposits SET status='approved', reviewed_by=%s, reviewed_at=%s "
-           "WHERE id=%s AND status='pending'", (0, _now(), did))
+    # ⚠️ `credited` ফ্ল্যাগ আগে সেট হতো না → বটের অটো-ক্রেডিট/রিট্রাই পরে
+    #    একই ডিপোজিটে আবার টাকা যোগ করতে পারত (ডাবল ক্রেডিট)।
+    try:
+        import bot as _bclaim
+        if not _bclaim.dep_credit_claim(did):
+            return redirect("/admin/deposits?err=এই ডিপোজিটের টাকা আগেই যোগ হয়েছে")
+    except Exception:
+        pass
+    n = _x("UPDATE deposits SET status='approved', credited=1, reviewed_by=%s, "
+           "reviewed_at=%s WHERE id=%s AND status='pending'", (0, _now(), did))
     if not n:
+        try:
+            import bot as _buc
+            _buc.dep_credit_unclaim(did)
+        except Exception:
+            pass
         return redirect("/admin/deposits?err=এটি আগেই প্রসেস হয়েছে")
     amt = float(d["amount"] or 0)
     _x("UPDATE users SET balance=balance+%s, dep_balance=COALESCE(dep_balance,0)+%s, "
@@ -458,16 +471,12 @@ def deposit_approve(did):
         _bdep.dep_tx_mark(str(d["txid"] or ""), int(d["user_id"] or 0), amt)
     except Exception:
         pass
+    # চ্যানেলে একটাই নোটিশ (বটের অটো-ক্রেডিটও একই ফাংশন ব্যবহার করে →
+    # ডিপোজিট আইডি দিয়ে ডুপ্লিকেট আটকে যায়, Deposit ID উপরে + বাটন থাকে)
     try:
-        _u = one("SELECT full_name, username FROM users WHERE user_id=%s",
-                 (int(d["user_id"] or 0),)) or {}
-        _txt = ("🟡 AUTO-APPROVED DEPOSIT!\n\n"
-                f"👤 User: {mask_uname(_u.get('full_name') or _u.get('username') or d['user_id'])}\n"
-                f"🟡 Method: {str(d['method_name'] or 'Binance Pay')[:40]}\n")
-        if str(d["txid"] or "").strip():
-            _txt += f"🧾 TrxID: {str(d['txid']).strip()[:40]}\n"
-        _txt += f"💰 Amount: ${_fmt(amt)}\n✅ Funded Successfully"
-        ch_http_send(_txt)
+        import bot as _bch2
+        _bch2.dep_ch_notify(int(did), int(d["user_id"] or 0), amt,
+                            str(d["method_name"] or ""), str(d["txid"] or ""))
     except Exception:
         pass
     queue_user_msg(int(d["user_id"]),
