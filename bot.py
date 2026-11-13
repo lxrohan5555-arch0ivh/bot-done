@@ -161,7 +161,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-13u"
+BUILD_TAG       = "uid-auto-2026-11-13a4"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -4088,9 +4088,9 @@ def _ensure_dep_cols():
 
 def _dep_ch_kb(oid):
     """চ্যানেল মেসেজের বাটন — ডিপোজিট আইডি কপি + বটে যাওয়ার লিংক।"""
+    # ⚠️ মালিকের নির্দেশ: চ্যানেলে শুধু "VPN / Proxy" লিংক-বাটন থাকবে —
+    #    আইডি কপি আর "বটে যান" বাটন দুটো বাদ।
     row = []
-    if oid:
-        row.append({"text": f"🧾 #{dep_no(oid)}", "copy_text": {"text": str(dep_no(oid))}})
     _un = ""
     for _k in ("bot_username", "bot_uname"):
         try:
@@ -4100,8 +4100,6 @@ def _dep_ch_kb(oid):
                 break
         except Exception:
             pass
-    if _un:
-        row.append({"text": "🛍 বটে যান", "url": f"https://t.me/{_un}"})
     kb = [row] if row else []
     # শপ/উইথড্র নোটিফিকেশনের মতো নিচের লিংক-বাটন (ch_btn_text / ch_btn_url)
     try:
@@ -9338,15 +9336,30 @@ def dep_order_find(order_id, minutes=None):
     oid_s = re.sub(r"[^0-9A-Za-z]", "", _raw)
     if len(oid_s) < 6:
         return None, "", "Order ID খুব ছোট (কমপক্ষে ৬ অক্ষর)"
+    # TxID-তে `_` থাকে (P_A25M…) — তাই হুবহু রূপ আর শুধু-অক্ষর রূপ, দুটোই মেলানো হয়
+    _lows = [x for x in dict.fromkeys([_raw.casefold(), oid_s.casefold()]) if x]
+    # ১) আগেই ক্যাশে পাওয়া লেনদেনে খোঁজা — একবারও API কল না করেই মিলে যেতে পারে
+    try:
+        for it in _bn_cache_union():
+            if not isinstance(it, dict) or not _pay_is_in(it):
+                continue
+            if not any(_pay_ref_hit(it, low) for low in _lows):
+                continue
+            if str(it.get("currency") or "").upper() not in _DEP_STABLE:
+                continue
+            _a = float(it.get("amount") or 0)
+            _tx = str(it.get("transactionId") or it.get("orderId") or "").strip()
+            if _a > 0 and _tx and not dep_txid_used(_tx):
+                return round(_a, 6), _tx, ""
+    except Exception:
+        pass
     try:
         _mins = int(minutes or (dep_check_min() + 2))
         rows, err = _binance_pay_rows(max(5, _mins))
     except Exception as _e:
         return None, "", str(_e)[:160]
-    if err:
+    if err and not rows:
         return None, "", str(err)[:160]
-    # TxID-তে `_` থাকে (P_A25M…) — তাই হুবহু রূপ আর শুধু-অক্ষর রূপ, দুটোই মেলানো হয়
-    _lows = [x for x in dict.fromkeys([_raw.casefold(), oid_s.casefold()]) if x]
     for it in rows or []:
         if not isinstance(it, dict) or not _pay_is_in(it):
             continue
@@ -10209,7 +10222,7 @@ def _binance_pay_rows_raw(minutes=60, win_start_ms=None, win_end_ms=None):
 
 
 _BN_CACHE = {}
-_BN_CACHE_TTL = 140     # সেকেন্ড — Pay API weight ৩০০০, তাই ক্যাশ লম্বা
+_BN_CACHE_TTL = 200     # সেকেন্ড — Pay API weight ৩০০০, তাই ক্যাশ লম্বা
 
 
 def _binance_pay_rows_window(start_ms, end_ms, force=False):
@@ -10261,7 +10274,7 @@ def _binance_pay_rows(minutes=60, force=False):
         if _old and (_now - float(_old[0] or 0)) <= 45:
             return _old[1], _old[2]
         return ((_old[1] if _old else []),
-                f"⏳ Binance রেট-লিমিট — {_wait}s পরে আবার চেষ্টা হবে")
+                f"⏳ যাচাই চলছে (Binance বিরতি {_wait}s)")
     rows, err = _binance_pay_rows_raw(mins)
     if err:
         _bn_gate_hit(err)
@@ -10314,7 +10327,7 @@ def dep_account_uid():
     if not _ok:
         if _UID_CACHE["uid"]:
             return _UID_CACHE["uid"], ""
-        return "", f"⏳ Binance রেট-লিমিট — {_wait}s পরে আবার দেখুন"
+        return "", f"⏳ যাচাই চলছে (Binance বিরতি {_wait}s)"
     off = _binance_server_offset()
     last = ""
     for base in _binance_bases():
@@ -10452,8 +10465,14 @@ def dep_diag_report():
     _bn_left = _bn_ban_left()
     if _bn_left > 0:
         _mm, _ss = _bn_left // 60, _bn_left % 60
-        out.append(f"⛔ *Binance IP ব্যান* — আরও `{_mm} মিনিট {_ss}s`")
-        out.append("এই সময়ে কোনো Binance কল যাবে না। ব্যান শেষ হলে অটো-ক্রেডিট "
+        try:
+            _end = time.strftime("%I:%M %p", time.localtime(
+                time.time() + _bn_left + 6 * 3600))
+        except Exception:
+            _end = "—"
+        out.append(f"⛔ *Binance সাময়িক বিরতি* — আরও `{_mm} মিনিট` "
+                   f"(শেষ হবে ≈ `{_end}`)")
+        out.append("এই সময়ে কোনো Binance কল যাবে না; ব্যালেন্স-ভিত্তিক অটো-ক্রেডিট "
                    "নিজেই আবার চালু হবে; পেন্ডিং ডিপোজিট হারাবে না।")
         try:
             _cv, _age = _bal_cache_get("fund")
@@ -10498,7 +10517,10 @@ def dep_diag_report():
                 rows, err = _cu, ""
         out.append("")
         out.append(_dep_src_line() or "🔌 সোর্স: ?")
-        out.append(f"🔢 গত ২৪ ঘণ্টার লেনদেন: *{len(rows or [])}*")
+        if err:
+            out.append("🔢 গত ২৪ ঘণ্টার লেনদেন: `—` (বিরতির কারণে চেক হয়নি)")
+        else:
+            out.append(f"🔢 গত ২৪ ঘণ্টার লেনদেন: *{len(rows or [])}*")
         try:
             _rl = int(_BN_LAST.get("raw_len") or 0)
         except Exception:
@@ -10878,7 +10900,7 @@ _FUND_BASE_KEY = "dep_fund_base2"
 #    নিচের গার্ড সব কলের আগে সময় দেখে: কম হলে কল-ই করে না (ক্যাশ/পুরোনো
 #    উত্তর দেয়), আর একবার ব্যান খেলে ব্যান শেষ না হওয়া পর্যন্ত চুপ।
 _BN_GATE = {"pay": 0.0, "fund": 0.0, "_all": 0.0, "ban_until": 0.0}
-_BN_MIN_GAP = {"pay": 150.0, "fund": 90.0, "spot": 90.0}   # সেকেন্ড — ব্যান এড়াতে প্রশস্ত
+_BN_MIN_GAP = {"pay": 240.0, "fund": 90.0, "spot": 90.0}   # সেকেন্ড — ব্যান এড়াতে প্রশস্ত
 
 # শেষবার সফলভাবে পড়া ব্যালেন্স — ব্যান/লিমিটের সময় এটাই দেখানো হয়
 # (আগে ব্যান হলে "পড়া যায়নি" লেখা আসত, টাকার পরিমাণ একেবারে হারিয়ে যেত)
@@ -11357,15 +11379,49 @@ async def _dep_watch_once(bot):
         return 0
     # ⚡ ডিফল্টে Pay API (weight ৩০০০) ডাকা হয় না — শুধু ফান্ডিং+স্পট ব্যালেন্স।
     #    চাইলে `/sethome`-এর বদলে settings: dep_pay_watch=1 দিলে আবার চালু হবে।
+    # Order ID দেওয়া পেন্ডিং থাকলে Pay লিস্ট একবার দেখা *দরকার* — নাহলে
+    # শুধু ব্যালেন্স-Δ দিয়ে চেক হয়, আর টাকা ডিপোজিটের আগেই এসে গেলে Δ=০
+    # থাকে (ইউজারের অভিযোগ: "আমি /depchk দিলেই টাকা যোগ হয়")।
+    _has_ref = False
+    for _o0, _m0 in todo:
+        try:
+            if (_dep_note_ref(_o0["note"]) or "").strip():
+                _has_ref = True
+                break
+        except Exception:
+            continue
+    # ⚠️ ডিফল্টে Pay API একেবারেই ডাকা হয় না — এটাই ব্যান না হওয়ার একমাত্র
+    #    নিশ্চিত উপায় (Pay কলে weight ৩০০০)। অটো এখন সম্পূর্ণ
+    #    "ব্যালেন্স-Δ" ভিত্তিক, তাই রেট-লিমিট/ব্যান হলেও টাকা আটকাবে না।
+    #    চাইলে settings-এ dep_pay_watch=1 দিলে Order ID দেখাও চালু হবে।
     _pay_on = False
+    if _has_ref:
+        try:
+            _ban_l = _bn_ban_left()
+        except Exception:
+            _ban_l = 0
+        try:
+            _lastp = float(_BN_GATE.get("pay") or 0)
+        except Exception:
+            _lastp = 0.0
+        # ব্যান না থাকলে এবং শেষ কলের ১০ মিনিট পার হলে → Order ID দেখার অনুমতি
+        # (weight ৩০০০ ÷ ৬০০s = ৩০০/মিনিট; Binance সীমা ~৬০০০/মিনিট — নিরাপদ)
+        if _ban_l <= 0 and (_time.time() - _lastp) >= 600:
+            _pay_on = True
     try:
-        _pv = str(await asyncio.to_thread(get_setting, "dep_pay_watch") or "0")
-        _pay_on = _pv.strip().lower() in ("1", "on", "true", "yes")
+        _pv = str(await asyncio.to_thread(get_setting, "dep_pay_watch") or "")
+        if _pv.strip().lower() in ("1", "on", "true", "yes"):
+            _pay_on = True
+        elif _pv.strip().lower() in ("0", "off", "false", "no"):
+            _pay_on = False
     except Exception:
-        _pay_on = False
+        pass
     rows, err = [], ""
     if _pay_on:
-        rows, err = await asyncio.to_thread(_binance_pay_rows, scan_win + 5)
+        _win = scan_win + 5
+        if _has_ref and _win < 60:
+            _win = 60      # Order ID ডিপোজিটে পুরোনো-নতুন দুটোই খোঁজা হয়
+        rows, err = await asyncio.to_thread(_binance_pay_rows, _win)
     # ফান্ডিং-ফলব্যাক চালু কি না (ডিফল্ট চালু) — Order ID ম্যাচিং *পরে* চলবে
     _fund_on = True
     try:
@@ -11388,12 +11444,9 @@ async def _dep_watch_once(bot):
             except Exception:
                 pass
     done = 0
-    # 🏦 ব্যালেন্স (ফান্ডিং+স্পট) Δ — এটাই মূল অটো, Pay API ছাড়াই ১০০% চলে
-    if _fund_on:
-        try:
-            done += await _dep_fund_auto(bot, todo)
-        except Exception as _fe:
-            log.warning(f"[DEP-FUND] অটো ব্যর্থ: {_fe}")
+    # ⚠️ ব্যালেন্স-Δ ভিত্তিক অটো ক্রেডিট বন্ধ (মালিকের নির্দেশ) — শুধু
+    #    Order ID / TxID মিলে তবেই ক্রেডিট হয়। ব্যালেন্স বাড়লেই টাকা
+    #    যোগ হলে ভুল ক্রেডিটের ঝুঁকি ছিল।
     if not rows:
         return done
     for o, m in todo:
@@ -11437,8 +11490,14 @@ async def _dep_watch_once(bot):
                                               scan_win + 5, _ct, rows)
         if not hit:
             continue
-        g, tx = hit
-        await asyncio.to_thread(dep_attach_txid, oid, tx)
+        g, _btx = hit
+        # মালিকের নির্দেশ: TxID হিসেবে ইউজারের দেওয়া Order ID-টাই রাখা হয়
+        # (Binance আলাদা TxID দিলেও সেটা নয়) — ইউজার যা দেবে সেটাই দেখাবে।
+        tx = ref or _btx
+        try:
+            await asyncio.to_thread(dep_attach_txid, oid, tx)
+        except Exception:
+            pass
         try:
             await _dep_auto_credit(_DepCtx(bot), int(o["user_id"]), m,
                                    float(g or amt), tx, oid)
@@ -11497,9 +11556,12 @@ def _dep_note_uid(note):
 
 def _dep_note_ref(note):
     """note থেকে TxID / Order ID / UID — রি-চেকের জন্য।"""
-    m = re.search(r"Binance:\s*(\S{4,60})", str(note or ""))
-    if m:
-        return m.group(1)
+    _n = str(note or "")
+    for _pat in (r"Binance:\s*(\S{4,60})", r"Order\s*(?:ID)?[:\s]\s*(\S{4,60})",
+                 r"TxID[:\s]\s*(\S{4,80})"):
+        m = re.search(_pat, _n, flags=re.I)
+        if m:
+            return m.group(1).strip(" ,;")
     return _dep_note_uid(note)
 
 
@@ -12650,16 +12712,8 @@ async def dep_callback(update, ctx):
                         _ga, _gt, _ge = 0, "", ""
                     if _ga and _gt:
                         _got = (_ga, _gt, 0, "")
-            if not (_got and _got[1]):
-                # শেষ ভরসা: ফান্ডিং/স্পট ব্যালেন্স বাড়লেই ক্রেডিট
-                try:
-                    _credited = await _dep_try_fund_credit(ctx.bot, _o, _m)
-                except Exception:
-                    _credited = False
-                if _credited:
-                    try: await q.answer("✅ পেমেন্ট পাওয়া গেছে!")
-                    except Exception: pass
-                    return
+            # ⚠️ ব্যালেন্স-ভিত্তিক ফলব্যাক বন্ধ (মালিকের নির্দেশ) — শুধু
+            #    Order ID/TxID মিললেই ক্রেডিট হবে।
             if _got and _got[1]:
                 try: await q.answer("✅ পেমেন্ট পাওয়া গেছে!")
                 except Exception: pass
@@ -12667,7 +12721,7 @@ async def dep_callback(update, ctx):
                                        _got[0] or float(_o["amount"] or 0), _got[1], _oid)
             else:
                 _why = str((_got[3] if _got else "") or "")
-                _busy = ("রেট-লিমিট" in _why or "ব্যান" in _why
+                _busy = ("রেট-লিমিট" in _why or "বিরতি" in _why or "ব্যান" in _why
                          or "banned" in _why.lower() or "-1003" in _why
                          or "too much request" in _why.lower())
                 if _busy:
@@ -12703,21 +12757,51 @@ async def dep_callback(update, ctx):
                     _en_n = (await asyncio.to_thread(get_lang, uid)) == "en"
                 except Exception:
                     _en_n = False
+                _hasref = False
+                try:
+                    _hasref = bool((_dep_note_ref(_o["note"]) or "").strip())
+                except Exception:
+                    _hasref = False
+                if _hasref and not (_got and _got[1]):
+                    # Order ID দেওয়া — কয়েক মিনিট লাগতেই পারে; ভুল
+                    # "পাওয়া যায়নি" না বলে সৎভাবে "যাচাই চলছে" বলা হয়।
+                    try:
+                        await q.answer("⏳ যাচাই চলছে")
+                    except Exception:
+                        pass
+                    try:
+                        await ctx.bot.send_message(
+                            uid,
+                            (f"⏳ *Checking Order ID…*\n\n"
+                             f"🧾 `#{dep_no(_oid)}` · 💵 `{float(_o['amount'] or 0):g}$`\n\n"
+                             "⚡ The bot checks automatically — balance is added the "
+                             "moment it matches.\n🔁 Need again? Tap Check after 2-3 min."
+                             if ((await asyncio.to_thread(get_lang, uid)) == "en") else
+                             f"⏳ *Order ID যাচাই চলছে…*\n\n"
+                             f"🧾 `#{dep_no(_oid)}` · 💵 `{float(_o['amount'] or 0):g}$`\n\n"
+                             "⚡ বট নিজেই চেক করছে — মিললেই ব্যালেন্স যোগ হবে।\n"
+                             "🔁 দরকার হলে ২-৩ মিনিট পর আবার চেক চাপুন।"),
+                            parse_mode="Markdown")
+                    except Exception:
+                        pass
+                    return
                 _reason = str((_got[3] if _got else "") or "")
                 if ("নাম দেওয়া নেই" in _reason or "ডিপোজিটের তথ্য" in _reason
-                        or "রেট-লিমিট" in _reason or "Order ID" in _reason):
+                        or "রেট-লিমিট" in _reason or "বিরতি" in _reason
+                        or "Order ID" in _reason):
                     _reason = ""
                 try:
                     await ctx.bot.send_message(
                         uid,
                         ((f"⏳ *Payment not found yet.*\n\n"
                           + (f"_{_md_esc(_reason[:140])}_\n\n" if _reason else "")
-                          + "Tap *🔁 Check* again after 1 minute. After 5 minutes "
-                          "the admin will verify manually.") if _en_n else
-                         (f"⏳ *এখনো পেমেন্ট পাওয়া যায়নি।*\n\n"
+                          + "The bot keeps checking automatically — the balance "
+                          "is added the moment it matches.\n"
+                          "☝️ Nothing else to do.") if _en_n else
+                         (f"⏳ *এখনো মেলেনি — চেক চলছে।*\n\n"
                           + (f"_{_md_esc(_reason[:140])}_\n\n" if _reason else "")
-                          + "১ মিনিট পর আবার *🔁 চেক* চাপুন। ৫ মিনিট পার হলে "
-                          "অ্যাডমিন ম্যানুয়ালি দেখে ✅ করবেন।")),
+                          + "⚡ বট নিজেই বারবার চেক করছে, মিললেই ব্যালেন্স "
+                          "যোগ হবে।\n☝️ আপনাকে আর কিছু করতে হবে না।")),
                         parse_mode="Markdown")
                 except Exception:
                     pass
@@ -13367,55 +13451,28 @@ async def dep_input(update, ctx, st):
         except Exception as _ge:
             log.debug(f"[DEP-OID] সাথে সাথে চেক ব্যর্থ: {_ge}")
         if _got_a and _got_tx:
-            await _dep_auto_credit(ctx, uid, _m2, float(_got_a or amt), _got_tx, oid)
+            # TxID = ইউজারের দেওয়া Order ID (Binance-এর আলাদা TxID নয়)
+            await _dep_auto_credit(ctx, uid, _m2, float(_got_a or amt), _ord_id, oid)
             return True
-        # Pay API-তে না এলেও টাকা স্পট/ফান্ডিংয়ে জমা থাকলে এখানেই যোগ হবে
-        try:
-            _o0 = await asyncio.to_thread(dep_row, oid)
-            if _o0 and await _dep_try_fund_credit(ctx.bot, _o0, _m2):
-                return True
-        except Exception as _fe:
-            log.debug(f"[DEP-OID] ব্যালেন্স ফলব্যাক ব্যর্থ: {_fe}")
         await update.message.reply_text(
             (f"⏳ *Checking Order ID `{_md_esc(_ord_id)}`…*\n\n"
              f"🧾 `#{dep_no(oid)}` · 💵 `{amt:g}$`\n\n"
-             "⚡ The bot checks automatically every minute.\n"
-             "🔁 You can also tap *Check* after 1 minute.\n"
-             "⏱ Not found in 5 minutes? The admin will verify manually." if _en else
+             "⚡ The bot checks automatically — balance is added the moment it "
+             "matches. You don't need to do anything." if _en else
              f"⏳ *Order ID `{_md_esc(_ord_id)}` যাচাই করা হচ্ছে…*\n\n"
              f"🧾 `#{dep_no(oid)}` · 💵 `{amt:g}$`\n\n"
-             "⚡ বট নিজেই প্রতি মিনিটে চেক করছে, পেমেন্ট পেলেই ব্যালেন্স যোগ হবে।\n"
-             "🔁 ১ মিনিট পর *🔁 চেক* চাপতেও পারেন।\n"
-             "⏱ ৫ মিনিটেও না মিললে অ্যাডমিন নিজে যাচাই করে ✅ করবেন।"),
+             "⚡ বট নিজেই চেক করছে — মিললেই ব্যালেন্স যোগ হবে।\n"
+             "☝️ আপনাকে আর কিছু করতে হবে না।"),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔁 Check" if _en else "🔁 চেক",
                                      callback_data=f"depname:{oid}"),
                 InlineKeyboardButton("🧾 My deposits" if _en else "🧾 আমার ডিপোজিট",
                                      callback_data="dep:my")]]))
-        try:
-            _cap = (f"⚡ *Order ID ডিপোজিট — যাচাই বাকি*\n\n"
-                    f"🧾 `#{dep_no(oid)}` · 👤 `{uid}`\n"
-                    f"💵 `{amt:g}$`\n🔎 Order ID: `{_md_esc(_ord_id)}`\n"
-                    + ("\n✅ বট নিজেই চেক করছে (Binance স্বয়ংক্রিয়)" if (
-                        not _err or "রেট-লিমিট" in str(_err) or "ব্যান" in str(_err))
-                       else f"\n⚠️ _{_md_esc(str(_err)[:120])}_")
-                    + f"\n\n🔎 চেক: `/depchk {oid}`")
-            _kb2 = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ অনুমোদন", callback_data=f"depok:{oid}"),
-                InlineKeyboardButton("❌ বাতিল", callback_data=f"depno:{oid}")]])
-            try:
-                _adms = [ADMIN_ID] + await asyncio.to_thread(_adm_list, "full")
-            except Exception:
-                _adms = [ADMIN_ID]
-            for _a in _adms:
-                try:
-                    await ctx.bot.send_message(_a, _cap, parse_mode="Markdown",
-                                               reply_markup=_kb2)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # ⚠️ আগে Order ID জমা দেওয়ার সাথে সাথেই অ্যাডমিনের কাছে
+        #    "✅ অনুমোদন / ❌ বাতিল" মেসেজ যেত (ইউজারের অভিযোগ) — এখন
+        #    বট নিজেই অটো চেক করে ক্রেডিট দেয়; দরকার হলে অ্যাডমিন
+        #    `/depchk <id>` বা প্যানেল থেকে দেখবেন।
         return True
 
     if st == "dep_uid_name":
@@ -31064,11 +31121,14 @@ def _fb_ask_text(fields, i, lang):
     return f"{i + 1}/{len(fields)}  {q}"
 
 
-async def fb_show_list(q, uid, lang=None):
-    """📘 Facebook Tasks — সব active task এক লিস্টে।"""
+async def fb_show_list(q, uid, lang=None, _allow_only_task_ids=None):
+    """📘 Facebook Tasks — সব active task এক লিস্টে (বা শুধু _allow_only_task_ids)।"""
     if lang is None:
         lang = await asyncio.to_thread(get_lang, uid)
     tasks = await asyncio.to_thread(_fb_active_tasks_c)
+    if _allow_only_task_ids:
+        _ids = {int(x) for x in _allow_only_task_ids if x}
+        tasks = [t for t in tasks if int((t.get("id") if hasattr(t,"get") else t["id"]) or 0) in _ids]
     if not tasks:
         await q.message.reply_text(
             "❌ এখন কোনো Facebook Task নেই।" if lang != "en"
@@ -31138,11 +31198,13 @@ async def fb_task_rules(q, uid, tid):
     await _autosend_task_video(q.message, task, lang, "fb")
 
 
-async def fb_task_start(q, uid, tid, pw=None):
+async def fb_task_start(q, uid, tid, pw=None, _allow_only_task_ids=None):
     """Start → লগইন দাও, তারপর UID (প্রথম ফিল্ড) চাও।
 
     pw দিলে (ইউজার নিজে পাসওয়ার্ড লিখে) ঠিক ওই পাসওয়ার্ডই দেওয়া হয় আর
     জমাটাও ওই পাসওয়ার্ডের নিচে সেভ হয়।
+    _allow_only_task_ids দিলে task list-এ শুধু এই টাস্কগুলোই দেখায়
+    (পাসওয়ার্ড শীট-লিংকে আসলে একটাই পাস = একটা টাস্ক)।
     """
     try:
         await q.answer()          # স্পিনার সাথে সাথে বন্ধ (শিমে no-op)
@@ -32224,7 +32286,7 @@ async def fb_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             _tid2 = int((_grp.get("task_id") if hasattr(_grp, "get") else _grp["task_id"]) or 0)
             _pw2 = str((_grp.get("password") if hasattr(_grp, "get") else _grp["password"]) or "")
-            await fb_task_start(q, uid, _tid2, pw=_pw2)
+            await fb_task_start(q, uid, _tid2, pw=_pw2, _allow_only_task_ids={_tid2})
         elif data.startswith('fbd:'):
             await fb_submit_now(q, uid)
         elif data == 'fbt_cancel':

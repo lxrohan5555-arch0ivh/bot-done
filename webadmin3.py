@@ -767,6 +767,17 @@ def fbtask_passwords(tid):
             "SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS rej "
             "FROM fb_submissions WHERE task_id=%s GROUP BY COALESCE(fb_password,'')", (tid,)):
         agg[str(r.get("pw") or "")] = r
+    # বটের ইউজারনেম — প্রতি সারির "এই পাসওয়ার্ড দিয়ে আইডি নিন" লিংকে লাগে
+    _bu = ""
+    try:
+        for _k in ("bot_username", "bot_uname"):
+            _rr = one("SELECT value FROM settings WHERE key=%s", (_k,))
+            _v = str((_rr["value"] if _rr else "") or "").strip().lstrip("@")
+            if _v:
+                _bu = _v
+                break
+    except Exception:
+        _bu = ""
     trs, seen = [], set()
     for g2 in groups:
         _pw = str(g2.get("password") or "")
@@ -786,6 +797,11 @@ def fbtask_passwords(tid):
             badge(str(int(r.get("pend") or 0)), "mut"),
             badge(str(int(r.get("appr") or 0)), "ok"),
             badge(str(int(r.get("rej") or 0)), "err"),
+            (f"<a class='btn ok sm' target='_blank' "
+             f"href='https://t.me/{esc(_bu)}?start=fbpw_{int(g2['id'])}'>"
+             "🆔 এই পাস দিয়ে আইডি নিন</a>" if _bu else
+             f"<a class='btn ok sm' href='/admin/fbtask/{tid}/pw/{int(g2['id'])}'>"
+             "🆔 এই পাস দিয়ে আইডি নিন</a>"),
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs?pw={_q(_pw)}'>📄 শীট</a>",
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/passwords/{int(g2['id'])}/edit'>✏️ Edit</a>",
             "<form method='post' action='/admin/do/fbtask/%d/pwgroup/%d/delete' "
@@ -804,37 +820,11 @@ def fbtask_passwords(tid):
             badge(str(int(r.get("pend") or 0)), "mut"),
             badge(str(int(r.get("appr") or 0)), "ok"),
             badge(str(int(r.get("rej") or 0)), "err"),
+            "",   # "আইডি নিন" — গ্রুপবিহীন পুরোনো পাসওয়ার্ডে লিংক হয় না
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs?pw={_q(pw)}'>👁 সাবমিশন</a>",
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/passwords/new?pw={_q(pw)}'>➕ গ্রুপ বানান</a>",
             "",
         ])
-    # ── পাসওয়ার্ড বাটন — প্রতিটি বাটনে ওই পাসওয়ার্ডের শীট খোলে ──
-    _pwbtns = []
-    for _g2 in groups:
-        _pw2 = str(_g2.get("password") or "").strip()
-        if not _pw2:
-            continue
-        _r2 = agg.get(_pw2) or {}
-        _used2 = int(_r2.get("n") or 0)
-        _seats2 = int(_g2.get("seats_total") or 0)
-        _pwbtns.append(
-            f"<a class='btn' href='/admin/fbtask/{tid}/pw/{int(_g2['id'])}' "
-            "style='display:block;margin:6px 0;text-align:left;padding:12px 14px'>"
-            f"🔑 <span class='mono'>{esc(_pw2)}</span>"
-            + (" · 🆔 আইডি জমা" if int(_g2.get("collect_ids") or 0) else "")
-            + f" · আইডি <b>{num(_used2)}</b>/{num(_seats2) if _seats2 else '∞'}"
-            f"<div class='mut' style='font-size:12px;margin-top:4px'>"
-            f"⏳ {num(_r2.get('pend') or 0)} · ✅ {num(_r2.get('appr') or 0)}"
-            f" · ❌ {num(_r2.get('rej') or 0)} — ভিতরে সব দেখুন ›</div></a>")
-    _pwcard = ("<div class='card'><b>🔑 পাসওয়ার্ড বাটন</b>"
-               "<div class='mut' style='font-size:12px;margin-top:4px'>যে পাসওয়ার্ডে চাপ দিবেন, "
-               "ওই পাসওয়ার্ডের নিজের পেজ খুলবে — ওখানেই সব আইডি, ✅ approve / ❌ reject, ➕ নতুন সিট।</div>"
-               + ("".join(_pwbtns) if _pwbtns else
-                  "<div class='mut' style='margin-top:8px'>এখনো কোনো পাসওয়ার্ড নেই — নিচে যোগ করুন।</div>")
-               + f"<a class='btn ok sm' href='/admin/fbtask/{tid}/passwords/new' "
-                 "style='margin-top:8px'>➕ নতুন পাসওয়ার্ড → নতুন শীট</a>"
-               + "</div>")
-
     body = (
         "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
         f"<h3>🔑 পাসওয়ার্ড ও সিট — {esc(t.get('name') or '')}</h3>"
@@ -845,9 +835,8 @@ def fbtask_passwords(tid):
         "একজনের লিমিট। ইউজার টাস্ক শুরু করলে যে গ্রুপে সিট খালি আছে সেটার পাসওয়ার্ড পাবে; "
         "সিট ভরে গেলে নতুন কেউ ওই পাসওয়ার্ড পাবে না। 👁 চাপলে শুধু ওই পাসওয়ার্ডের জমা — "
         "সেখানেই ✅/❌ করা যায়।</p>"
-        + _pwcard
         + table(["পাসওয়ার্ড", "আইডি / সিট", "একজন", "Pending", "Approved", "Rejected",
-                 "শীট", "", ""],
+                 "আইডি নিন", "শীট", "Edit", "🗑"],
                 trs, "কোনো পাসওয়ার্ড নেই — ➕ নতুন পাসওয়ার্ড চাপুন")
         + "</div>"
     )
