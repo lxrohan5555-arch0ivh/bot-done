@@ -71,3 +71,10 @@
 - `/admin/shop/onoff`, `/admin/shop/deponoff`, `/admin/shop/closedmsg`, `/admin/shop/mailcode` — শপ চালু/বন্ধ, ডিপোজিট অন/অফ, বন্ধের মেসেজ, মেইল কোড
 - FB পাসওয়ার্ড গ্রুপ: `/admin/fbtask/<tid>/passwords/new`, `/admin/fbtask/<tid>/passwords/<gid>/edit`, `/admin/fbtask/<tid>/pw/<gid>`, seat অ্যাসাইন ও গ্রুপ ডিলিট
 - IG পাসওয়ার্ড গ্রুপ: `/admin/igtask/<tid>/passwords`, `.../new`, `.../<gid>/edit`, গ্রুপ ডিলিট
+
+## 🏦 ডিপোজিট — ব্যালেন্স-ফার্স্ট অটো (রেট-লিমিট/ব্যান মুক্ত)
+- অটো-চেক এখন **ফান্ডিং + স্পট USDT ব্যালেন্সের পার্থক্য** দেখে টাকা যোগ করে — কোনো ভারী API কল নেই।
+- Binance Pay API (weight ৩০০০) ডিফল্টে বন্ধ (`dep_pay_watch=0`)। দরকার হলে চালু করা যায়।
+- Order ID দিলে: Pay API → (না পেলে) ব্যালেন্স-Δ — যেকোনো একটা মিললেই ব্যালেন্স যোগ।
+- ব্যান/লিমিট হলে BOT কোনো কল করে না (DB-তে ব্যান সেভ), ব্যান শেষে নিজেই আবার চালু; টাকা হারায় না।
+- `/depchk <order id>` পেমেন্ট পেলে সেই Order ID-র পেন্ডিং ডিপোজিটে **টাকা যোগ করে দেয়**।

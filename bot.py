@@ -161,7 +161,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-13k"
+BUILD_TAG       = "uid-auto-2026-11-13u"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -9834,8 +9834,25 @@ def dep_uid_window(default=60):
 _BINANCE_TS_OFF = {"v": 0.0}
 
 
+_BINANCE_TS_SEEN = {"at": 0.0}
+
+
 def _binance_server_offset():
-    """Binance সার্ভারের সময়ের সাথে লোকাল ঘড়ির পার্থক্য (সেকেন্ড)।"""
+    """Binance সার্ভারের সময়ের সাথে লোকাল ঘড়ির পার্থক্য (সেকেন্ড)।
+
+    ⚠️ আগে প্রতিটি signed কলে আলাদা করে `/api/v3/time` যেত — ব্যানের সময়ও।
+    এখন ১৫ মিনিট ক্যাশ, আর ব্যান চলাকালে একেবারে কল হয় না (নাহলে ব্যান
+    বারবার লম্বা হয়ে যেত)।
+    """
+    _now = _time.time()
+    if (_BINANCE_TS_SEEN["at"] and
+            (_now - float(_BINANCE_TS_SEEN["at"])) < 900):
+        return _BINANCE_TS_OFF["v"]
+    try:
+        if _bn_ban_left() > 0:
+            return _BINANCE_TS_OFF["v"]
+    except Exception:
+        pass
     base = (os.environ.get("BINANCE_API_BASE") or "https://api.binance.com").rstrip("/")
     try:
         _req = urllib.request.Request(base + "/api/v3/time",
@@ -9845,6 +9862,7 @@ def _binance_server_offset():
         off = float(js.get("serverTime") or 0) / 1000.0 - _time.time()
         if abs(off) < 7200:
             _BINANCE_TS_OFF["v"] = off
+        _BINANCE_TS_SEEN["at"] = _now
         return _BINANCE_TS_OFF["v"]
     except Exception:
         return _BINANCE_TS_OFF["v"]
@@ -10191,7 +10209,7 @@ def _binance_pay_rows_raw(minutes=60, win_start_ms=None, win_end_ms=None):
 
 
 _BN_CACHE = {}
-_BN_CACHE_TTL = 60      # সেকেন্ড — Pay API weight ৩০০০; ২০s খুব কম ছিল, ব্যান হচ্ছিল
+_BN_CACHE_TTL = 140     # সেকেন্ড — Pay API weight ৩০০০, তাই ক্যাশ লম্বা
 
 
 def _binance_pay_rows_window(start_ms, end_ms, force=False):
@@ -10239,9 +10257,11 @@ def _binance_pay_rows(minutes=60, force=False):
     _ok, _wait = _bn_gate("pay", 3000)
     if not _ok:
         _old = _BN_CACHE.get(mins)
-        if _old:
+        # ৪৫s-এর ভেতরের ডেটা হলে চুপচাপ সেটাই দাও, নাহলে সৎভাবে "ব্যস্ত" বলো
+        if _old and (_now - float(_old[0] or 0)) <= 45:
             return _old[1], _old[2]
-        return [], (f"⏳ Binance রেট-লিমিট — {_wait}s পরে আবার চেষ্টা হবে")
+        return ((_old[1] if _old else []),
+                f"⏳ Binance রেট-লিমিট — {_wait}s পরে আবার চেষ্টা হবে")
     rows, err = _binance_pay_rows_raw(mins)
     if err:
         _bn_gate_hit(err)
@@ -10250,6 +10270,30 @@ def _binance_pay_rows(minutes=60, force=False):
         for _k in sorted(_BN_CACHE, key=lambda k: _BN_CACHE[k][0])[:-4]:
             _BN_CACHE.pop(_k, None)
     return rows, err
+
+
+def _bn_cache_union():
+    """সব ক্যাশ-উইন্ডোর লেনদেন একসাথে — রেট-লিমিটেও আগে পাওয়া পেমেন্ট কাজে লাগে।"""
+    out, seen = [], set()
+    try:
+        items = sorted(_BN_CACHE.values(), key=lambda v: float(v[0] or 0))
+    except Exception:
+        items = []
+    for _v in items:
+        try:
+            _rows = _v[1] or []
+        except Exception:
+            continue
+        for it in _rows:
+            if not isinstance(it, dict):
+                continue
+            tx = str(it.get("transactionId") or it.get("orderId") or "")
+            if tx and tx in seen:
+                continue
+            if tx:
+                seen.add(tx)
+            out.append(it)
+    return out
 
 
 _UID_CACHE = {"uid": "", "at": 0.0}
@@ -10370,7 +10414,7 @@ def _dep_raw_probe_now():
     # (weight ৩০০০) কল যেত, IP ব্যান দ্রুত হয়ে যেত। এখন গেট মানে।
     _ok, _wait = _bn_gate("pay", 3000)
     if not _ok:
-        return f"🔬 Raw probe: ⏳ রেট-লিমিট — {_wait}s পরে"
+        return "🔬 Raw probe: ⏳ Binance বিরতি (পরের চেকে)"
     off = _binance_server_offset()
     base = _binance_bases()[0]
     params = {"limit": 10, "recvWindow": 20000,
@@ -10404,6 +10448,36 @@ def _dep_raw_probe_now():
 def dep_diag_report():
     """🩺 পুরো ডিপোজিট সিস্টেমের ডায়াগনস্টিক — `/depchk` (আইডি ছাড়া)।"""
     out = [f"🩺 *ডিপোজিট ডায়াগনস্টিক* · বিল্ড `{BUILD_TAG}`", "━━━━━━━━━━━━━━"]
+    # ⛔ ব্যান চললে কোনো API কল নয় — নাহলে ব্যান বারবার লম্বা হয়
+    _bn_left = _bn_ban_left()
+    if _bn_left > 0:
+        _mm, _ss = _bn_left // 60, _bn_left % 60
+        out.append(f"⛔ *Binance IP ব্যান* — আরও `{_mm} মিনিট {_ss}s`")
+        out.append("এই সময়ে কোনো Binance কল যাবে না। ব্যান শেষ হলে অটো-ক্রেডিট "
+                   "নিজেই আবার চালু হবে; পেন্ডিং ডিপোজিট হারাবে না।")
+        try:
+            _cv, _age = _bal_cache_get("fund")
+            if _cv is not None:
+                _wtxt = f"{_age // 60} মিনিট" if _age >= 60 else f"{_age}s"
+                out.append(f"🏦 শেষ দেখা ব্যালেন্স: `{_cv:g}$` ({_wtxt} আগে)")
+        except Exception:
+            pass
+        try:
+            _ps = dep_pending(30) or []
+        except Exception:
+            _ps = []
+        if _ps:
+            out.append("")
+            out.append(f"⏳ পেন্ডিং ডিপোজিট: *{len(_ps)}* — ব্যান শেষে অটো চেক হবে")
+            for o in _ps[:5]:
+                try:
+                    out.append(f"• `#{dep_no(o['id'])}` — {float(o['amount'] or 0):g}$"
+                               f" · ⏱ {str(o['created_at'] or '')[:16]}")
+                except Exception:
+                    continue
+        out.append("")
+        out.append(f"🔁 চেক শেষ হলে আবার: `/depchk`")
+        return "\n".join(out)
     try:
         _k, _s = get_binance_creds()
         out.append(f"🔑 Key: {'সেট ✅' if _k else 'নেই ❌'} · "
@@ -10417,7 +10491,11 @@ def dep_diag_report():
     except Exception:
         pass
     try:
-        rows, err = _binance_pay_rows(1440)
+        rows, err = _binance_pay_rows(1440, force=True)
+        if err:
+            _cu = _bn_cache_union()
+            if _cu:
+                rows, err = _cu, ""
         out.append("")
         out.append(_dep_src_line() or "🔌 সোর্স: ?")
         out.append(f"🔢 গত ২৪ ঘণ্টার লেনদেন: *{len(rows or [])}*")
@@ -10739,6 +10817,10 @@ def _dep_pay_find_once(r, want=0.0, minutes=60, force=True):
     """একটা উইন্ডোতে Order ID/TxID খোঁজা — (amount, txid, err)।"""
     rows, err = _binance_pay_rows(minutes, force=force)
     if err:
+        _cu = _bn_cache_union()
+        if _cu:
+            rows, err = _cu, ""
+    if err:
         return 0.0, "", err
     low = r.casefold()
     seen_other = ""
@@ -10785,7 +10867,9 @@ def _dep_pay_find_once(r, want=0.0, minutes=60, force=True):
 
 
 _FUND_LAST = {"at": 0.0, "err": "", "bal": 0.0}
-_FUND_BASE_KEY = "dep_fund_base"
+# ⚠️ ফান্ডিং+স্পট যোগ হওয়ায় বেসলাইন নতুন কী-তে — পুরোনো (শুধু ফান্ডিং)
+# বেসের সাথে মিলিয়ে ভুল ক্রেডিট হবে না; প্রথমবার নিজেই বেস সেট হবে।
+_FUND_BASE_KEY = "dep_fund_base2"
 
 
 # ⚠️ Binance রেট-লিমিট: Pay transactions কলে weight ৩০০০, আর IP-র বাজেট
@@ -10794,7 +10878,7 @@ _FUND_BASE_KEY = "dep_fund_base"
 #    নিচের গার্ড সব কলের আগে সময় দেখে: কম হলে কল-ই করে না (ক্যাশ/পুরোনো
 #    উত্তর দেয়), আর একবার ব্যান খেলে ব্যান শেষ না হওয়া পর্যন্ত চুপ।
 _BN_GATE = {"pay": 0.0, "fund": 0.0, "_all": 0.0, "ban_until": 0.0}
-_BN_MIN_GAP = {"pay": 120.0, "fund": 60.0}   # সেকেন্ড — ব্যান এড়াতে প্রশস্ত
+_BN_MIN_GAP = {"pay": 150.0, "fund": 90.0, "spot": 90.0}   # সেকেন্ড — ব্যান এড়াতে প্রশস্ত
 
 # শেষবার সফলভাবে পড়া ব্যালেন্স — ব্যান/লিমিটের সময় এটাই দেখানো হয়
 # (আগে ব্যান হলে "পড়া যায়নি" লেখা আসত, টাকার পরিমাণ একেবারে হারিয়ে যেত)
@@ -10848,23 +10932,94 @@ def _bn_ban_parse(msg):
     return 0.0
 
 
+_BN_BAN_KEY = "bn_ban_until"
+_BN_BAN_LOADED = {"at": 0.0}
+
+
+def _bn_ban_save(until):
+    """ব্যানের শেষ সময় DB-তে রাখো — রিস্টার্ট বা অন্য প্রসেসেও টিকে থাকে।"""
+    try:
+        with _c() as c:
+            c.execute("INSERT INTO bot_meta (key,value) VALUES (%s,%s) "
+                      "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                      (_BN_BAN_KEY, f"{float(until or 0):.0f}"))
+    except Exception:
+        pass
+
+
+def _bn_ban_load():
+    """DB থেকে ব্যান শেষের epoch — ৩০s ক্যাশ।"""
+    now = _time.time()
+    if (now - float(_BN_BAN_LOADED.get("at") or 0)) < 30:
+        return float(_BN_GATE.get("ban_until") or 0)
+    _BN_BAN_LOADED["at"] = now
+    try:
+        with _c() as c:
+            r = c.execute("SELECT value FROM bot_meta WHERE key=%s",
+                          (_BN_BAN_KEY,)).fetchone()
+        v = float(str((r or {}).get("value") or 0) or 0)
+    except Exception:
+        v = 0.0
+    if v > float(_BN_GATE.get("ban_until") or 0):
+        _BN_GATE["ban_until"] = v
+    return float(_BN_GATE.get("ban_until") or 0)
+
+
+def _bn_ban_left():
+    """এখন Binance-এ কত সেকেন্ড ব্যান বাকি (০ = ব্যান নেই)।"""
+    try:
+        ban = max(float(_BN_GATE.get("ban_until") or 0), _bn_ban_load())
+    except Exception:
+        ban = float(_BN_GATE.get("ban_until") or 0)
+    return max(0, int(ban - _time.time()))
+
+
+# ⚡ মিনিটে weight বাজেট (Binance IP-র সীমা ~৬০০০/মিনিট)। Pay = ৩০০০,
+# ফান্ডিং = ৬০, স্পট = ২০। বাজেট শেষ হলে কল যাবে না — ক্যাশ/পুরোনো উত্তর।
+_BN_W = {"t": 0.0, "w": 0}
+_BN_W_MAX = 5400
+
+
+def _bn_weight_ok(weight):
+    now = _time.time()
+    if not _BN_W["t"] or (now - float(_BN_W["t"])) >= 60.0:
+        _BN_W["t"], _BN_W["w"] = now, 0
+    try:
+        w = int(weight or 0)
+    except Exception:
+        w = 0
+    if w and (_BN_W["w"] + w) > _BN_W_MAX:
+        return False, int(60 - (now - float(_BN_W["t"])))
+    _BN_W["w"] += w
+    return True, 0
+
+
 def _bn_gate(tag, weight=0):
     """(ok, বাকি_সেকেন্ড) — এখন কল করা নিরাপদ কি না।"""
     now = _time.time()
-    ban = float(_BN_GATE.get("ban_until") or 0)
+    try:
+        ban = max(float(_BN_GATE.get("ban_until") or 0), _bn_ban_load())
+    except Exception:
+        ban = float(_BN_GATE.get("ban_until") or 0)
     if ban > now:
         return False, int(ban - now)
     gap = float(_BN_MIN_GAP.get(tag) or 0)
     # weight বেশি হলে গ্যাপও বেশি (৩০০০ weight ≈ ৭০s)
     if weight >= 1000:
         gap = max(gap, 70.0)
+    # ব্যান সবে শেষ হলেও ১০ মিনিট ধীরে চলি — নাহলে সাথে সাথে আবার ব্যান হয়
+    if ban and now < ban + 600:
+        gap = max(gap, 300.0)
     last = float(_BN_GATE.get(tag) or 0)
     if last and (now - last) < gap:
         return False, int(gap - (now - last))
     # যেকোনো দুই কলের মাঝে কমপক্ষে ৩s — হঠাৎ ঝাপটা ঠেকায়
     _la = float(_BN_GATE.get("_all") or 0)
-    if _la and (now - _la) < 3.0:
-        return False, int(3.0 - (now - _la))
+    if _la and (now - _la) < 1.0:
+        return False, int(1.0 - (now - _la))
+    _wok, _wwait = _bn_weight_ok(weight)
+    if not _wok:
+        return False, _wwait
     _BN_GATE[tag] = now
     _BN_GATE["_all"] = now
     return True, 0
@@ -10888,12 +11043,14 @@ def _bn_gate_hit(msg):
     _u = _bn_ban_parse(msg)
     if _u:
         _BN_GATE["ban_until"] = _u
+        _bn_ban_save(_u)
         log.warning(f"[BN-BAN] IP ব্যান — {int(_u - _time.time())}s বাকি; "
                     "ততক্ষণ Binance কল বন্ধ")
         return True
     _BN_BACKOFF["n"] = min(4, int(_BN_BACKOFF.get("n") or 0) + 1)
     _wait = (120, 300, 600, 900)[_BN_BACKOFF["n"] - 1]
     _BN_GATE["ban_until"] = _time.time() + _wait
+    _bn_ban_save(_BN_GATE["ban_until"])
     log.warning(f"[BN-LIMIT] রেট-লিমিট — {_wait}s বিরতি (ধাপ {_BN_BACKOFF['n']})")
     return True
 
@@ -10910,7 +11067,7 @@ def funding_usdt_balance():
         return None
     _ok, _wait = _bn_gate("fund", 1)
     if not _ok:
-        _FUND_LAST["err"] = f"⏳ রেট-লিমিট — {_wait}s পরে"
+        _FUND_LAST["err"] = "⏳ Binance বিরতি — পরের চেকে আবার"
         return None
     off = _binance_server_offset()
     for base in _binance_bases():
@@ -10980,16 +11137,51 @@ def _fund_base_set(v):
         return False
 
 
+async def _dep_try_fund_credit(bot, o, m):
+    """Order ID/Pay API না মিললেও ব্যালেন্স (ফান্ডিং+স্পট) বাড়লে ক্রেডিট।
+
+    ⚠️ ইউজারের টাকা অনেক সময় Binance-এর *স্পট* ওয়ালেটে জমা হয় আর Pay API-তে
+    আসে না। তখন শুধু "পেমেন্ট পাওয়া যায়নি" বলা ভুল ছিল — এখন ব্যালেন্সের
+    পার্থক্য দেখে টাকাটা যোগ হয়ে যায়, তাই অটো ১০০% কাজ করে।
+    """
+    try:
+        _cur = await asyncio.to_thread(dep_row, int(o["id"]))
+        if not _cur or str(_cur["status"]) != "pending":
+            return False
+    except Exception:
+        return False
+    try:
+        got = await _dep_fund_auto(bot, [(o, m)])
+    except Exception as _e:
+        log.debug(f"[DEP-FUND-ONE] {_e}")
+        return False
+    return bool(got)
+
+
 async def _dep_fund_auto(bot, todo):
     """ফান্ডিং ওয়ালেট ব্যালেন্স বাড়লে পেন্ডিং UID ডিপোজিট অটো ক্রেডিট।"""
-    bal = await asyncio.to_thread(funding_usdt_balance)
+    bal = await asyncio.to_thread(dep_total_usdt)
     if bal is None:
         return 0
     base = await asyncio.to_thread(_fund_base_get)
     if base is None:
-        await asyncio.to_thread(_fund_base_set, bal)
-        log.info(f"[DEP-FUND] বেসলাইন সেট: {bal:g}$")
-        return 0
+        # ⚠️ প্রথমবার: পেন্ডিং ডিপোজিট থাকলে ব্যালেন্সের ভেতর ওই টাকাগুলোই আছে
+        #    ধরে বেস কমিয়ে দিই — নাহলে নতুন ডিপ্লয়ের সময় জমে থাকা টাকা
+        #    "বেসলাইনে" হারিয়ে যেত আর কোনোদিন ক্রেডিট হত না।
+        _sum = 0.0
+        for _o, _m in (todo or []):
+            try:
+                _sum += float(_o["amount"] or 0)
+            except Exception:
+                continue
+        if todo and _sum > 0:
+            base = max(0.0, round(bal - _sum, 8))
+            await asyncio.to_thread(_fund_base_set, base)
+            log.info(f"[DEP-FUND] বেসলাইন (পেন্ডিং {_sum:g}$ বাদ দিয়ে): {base:g}$")
+        else:
+            await asyncio.to_thread(_fund_base_set, bal)
+            log.info(f"[DEP-FUND] বেসলাইন সেট: {bal:g}$")
+            return 0
     delta = round(bal - base, 6)
     if delta <= 0.009:
         if delta < -0.009:      # অ্যাডমিন নিজে টাকা সরিয়েছে/ইউজ করেছে
@@ -11163,7 +11355,17 @@ async def _dep_watch_once(bot):
         todo.append((o, m))
     if not todo:
         return 0
-    rows, err = await asyncio.to_thread(_binance_pay_rows, scan_win + 5)
+    # ⚡ ডিফল্টে Pay API (weight ৩০০০) ডাকা হয় না — শুধু ফান্ডিং+স্পট ব্যালেন্স।
+    #    চাইলে `/sethome`-এর বদলে settings: dep_pay_watch=1 দিলে আবার চালু হবে।
+    _pay_on = False
+    try:
+        _pv = str(await asyncio.to_thread(get_setting, "dep_pay_watch") or "0")
+        _pay_on = _pv.strip().lower() in ("1", "on", "true", "yes")
+    except Exception:
+        _pay_on = False
+    rows, err = [], ""
+    if _pay_on:
+        rows, err = await asyncio.to_thread(_binance_pay_rows, scan_win + 5)
     # ফান্ডিং-ফলব্যাক চালু কি না (ডিফল্ট চালু) — Order ID ম্যাচিং *পরে* চলবে
     _fund_on = True
     try:
@@ -11171,21 +11373,29 @@ async def _dep_watch_once(bot):
         _fund_on = _fv.strip().lower() not in ("0", "off", "false", "no", "")
     except Exception:
         _fund_on = True
-    if err or not rows:
-        if err:
-            _nw = _time.time()
-            if _nw - float(_DEP_ERR_ALERT.get("at") or 0) > 1800:
-                _DEP_ERR_ALERT["at"] = _nw
-                try:
-                    await notify_full_admins(
-                        bot, f"⚠️ *Binance ডিপোজিট API কাজ করছে না*\n\n"
-                             f"`{_md_esc(str(err)[:250])}`\n\n"
-                             "অটো-চেক বন্ধ থাকলেও ডিপোজিট পেন্ডিং থাকবে — "
-                             "অ্যাডমিন প্যানেল থেকে ✅ করুন বা Key ঠিক করুন।")
-                except Exception:
-                    pass
-        return 0
+    if (err or not rows) and _bn_cache_union():
+        # আগে কোনো কলে পাওয়া লেনদেন ক্যাশে থাকলে সেটাই ব্যবহার করো
+        rows, err = _bn_cache_union(), ""
+    if err and not rows and "রেট-লিমিট" not in str(err) and "ব্যান" not in str(err):
+        _nw = _time.time()
+        if _nw - float(_DEP_ERR_ALERT.get("at") or 0) > 1800:
+            _DEP_ERR_ALERT["at"] = _nw
+            try:
+                await notify_full_admins(
+                    bot, f"⚠️ *Binance ডিপোজিট API কাজ করছে না*\n\n"
+                         f"`{_md_esc(str(err)[:250])}`\n\n"
+                         "ব্যালেন্স-মোড অটো এখনো চলছে — ডিপোজিট পেন্ডিং থাকবে না।")
+            except Exception:
+                pass
     done = 0
+    # 🏦 ব্যালেন্স (ফান্ডিং+স্পট) Δ — এটাই মূল অটো, Pay API ছাড়াই ১০০% চলে
+    if _fund_on:
+        try:
+            done += await _dep_fund_auto(bot, todo)
+        except Exception as _fe:
+            log.warning(f"[DEP-FUND] অটো ব্যর্থ: {_fe}")
+    if not rows:
+        return done
     for o, m in todo:
         oid = int(o["id"])
         try:
@@ -11236,17 +11446,9 @@ async def _dep_watch_once(bot):
             log.warning(f"[DEP-WATCH] #{oid} ক্রেডিট বার্তা ব্যর্থ: {_ce}")
         log.info(f"[DEP-WATCH] #{oid} অটো ক্রেডিট {g}$ tx={tx}")
         done += 1
-    if done:
-        return done
-    # ── Order ID/TxID-তে কিছু মেলেনি → ফান্ডিং-ব্যালেন্স Δ দেখি (UID ট্রান্সফার) ──
-    if _fund_on:
-        try:
-            _n = await _dep_fund_auto(bot, todo)
-            if _n:
-                return _n
-        except Exception as _fe:
-            log.debug(f"[DEP-FUND] {str(_fe)[:120]}")
-    return 0
+    # ব্যালেন্স-Δ অটো ইতিমধ্যেই উপরে একবার চলেছে — এখানে আবার ডাকলে
+    # একই টিক-এ দুইবার ব্যালেন্স পড়া হতো। তাই শেষে আর ডাকা হয় না।
+    return done
 
 
 async def _dep_watch_loop(bot):
@@ -11813,8 +12015,10 @@ def depchk_report(ref, mins=1440):
         mins = 1440
     low = r.casefold()
     hit, err, n_rows, used_win = None, "", 0, mins
-    for w in sorted({mins, 1440, 10080}):
-        rows, err = _binance_pay_rows(w, force=True)
+    for _i, w in enumerate(sorted({mins, 1440, 10080})):
+        rows, err = _binance_pay_rows(w, force=(_i == 0))
+        if err:
+            rows = _bn_cache_union() or rows
         used_win, n_rows = w, len(rows or [])
         if err:
             break
@@ -11914,7 +12118,7 @@ def spot_usdt_balance():
     key, sec = get_binance_creds()
     if not (key and sec):
         return None
-    _ok, _wait = _bn_gate("fund", 20)
+    _ok, _wait = _bn_gate("spot", 20)
     if not _ok:
         return None
     off = _binance_server_offset()
@@ -11929,6 +12133,13 @@ def spot_usdt_balance():
         try:
             with _binance_opener().open(req, timeout=15) as r:
                 js = _json.loads(r.read().decode("utf-8", "ignore") or "{}")
+        except urllib.error.HTTPError as e:
+            try:
+                _sj = _json.loads(e.read().decode("utf-8", "ignore") or "{}")
+                _bn_gate_hit(f"{_sj.get('code')} {_sj.get('msg') or ''}")
+            except Exception:
+                pass
+            continue
         except Exception:
             continue
         tot = 0.0
@@ -11941,6 +12152,21 @@ def spot_usdt_balance():
         _bal_cache_put("spot", tot)
         return round(tot, 8)
     return None
+
+
+def dep_total_usdt():
+    """ফান্ডিং + স্পট মোট USDT — UID/Pay টাকা অনেক সময় স্পটে জমা হয়।
+
+    ⚠️ আগে শুধু ফান্ডিং পড়া হতো, তাই ইউজার টাকা পাঠালেও Δ০ থেকে যেত
+    ("টাকা পাঠালাম কিন্তু যোগ হলো না")। এখন দুই ওয়ালেটের যোগফল ধরা হয়।
+    """
+    f = funding_usdt_balance()
+    if f is not None:
+        _time.sleep(1.1)      # দুই কলে ১s ফাঁক — স্পট কল আটকে যায় না
+    sp = spot_usdt_balance()
+    if f is None and sp is None:
+        return None
+    return round(float(f or 0.0) + float(sp or 0.0), 8)
 
 
 async def cmd_setproxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -12028,6 +12254,55 @@ async def _dep_bal_block():
     return "\n".join(lines)
 
 
+def dep_ref_credit_target(ref):
+    """এই Order ID/TxID-র পেমেন্ট + পেন্ডিং অর্ডার — (oid, amount, txid)।"""
+    r = re.sub(r"\s+", "", str(ref or ""))
+    if len(r) < 6:
+        return 0, 0.0, ""
+    low = r.casefold()
+    hit = None
+    for it in _bn_cache_union():
+        try:
+            if _pay_is_in(it) and _pay_ref_hit(it, low):
+                hit = it
+                break
+        except Exception:
+            continue
+    if not hit:
+        return 0, 0.0, ""
+    txid = str(hit.get("transactionId") or hit.get("orderId") or "").strip()
+    try:
+        amt = float(hit.get("amount") or 0)
+    except Exception:
+        amt = 0.0
+    if not txid:
+        return 0, amt, ""
+    try:
+        _rows = dep_pending(200) or []
+    except Exception:
+        _rows = []
+    # ১) রেফারেন্স (Order ID/TxID) দিয়ে অর্ডার
+    for o in _rows:
+        try:
+            _ref = (_dep_note_ref(o["note"]) or str(o["txid"] or "")).casefold()
+        except Exception:
+            continue
+        if r.casefold() in _ref or (o["txid"] and str(o["txid"]).casefold() == r.casefold()):
+            return int(o["id"]), amt, txid
+    # ২) রেফারেন্স না মিললে পরিমাণ মিলিয়ে (একটাই পেন্ডিং হলে)
+    if amt > 0:
+        _c = []
+        for o in _rows:
+            try:
+                if abs(float(o["amount"] or 0) - amt) <= 0.011:
+                    _c.append(o)
+            except Exception:
+                continue
+        if len(_c) == 1:
+            return int(_c[0]["id"]), amt, txid
+    return 0, amt, txid
+
+
 async def cmd_depchk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Admin-only: /depchk <order id> [minutes] — একই ID বারবার চেক।"""
     user = update.effective_user
@@ -12080,6 +12355,28 @@ async def cmd_depchk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["depchk_ref"] = args[0]
     ctx.user_data["depchk_mins"] = _mins
     txt, found = await asyncio.to_thread(depchk_report, args[0], _mins)
+    # ✅ পেমেন্ট পাওয়া গেলে ওই Order ID-র পেন্ডিং ডিপোজিটে টাকাটা যোগ করে দাও
+    if found:
+        try:
+            _oid_c, _amt_c, _tx_c = await asyncio.to_thread(
+                dep_ref_credit_target, args[0])
+            if _oid_c and _tx_c:
+                _rowc = await asyncio.to_thread(dep_row, _oid_c)
+                if _rowc and str(_rowc["status"] or "") == "pending":
+                    _mc = await asyncio.to_thread(
+                        dep_method, int(_rowc["method_id"] or 0)) or {}
+                    if not _mc.get("id"):
+                        _mc = {"id": int(_rowc["method_id"] or 0),
+                               "name": str(_rowc["method_name"] or ""),
+                               "kind": str(_rowc["kind"] or "uid")}
+                    await _dep_auto_credit(ctx, int(_rowc["user_id"]), _mc,
+                                           _amt_c or float(_rowc["amount"] or 0),
+                                           _tx_c, _oid_c)
+                    txt += (f"\n\n🟢 *#{dep_no(_oid_c)}*-এ টাকা যোগ করা হয়েছে "
+                            "(ব্যালেন্স আপডেট হয়েছে)।")
+                    log.info(f"[DEPCHK] {args[0]} → #{_oid_c} ক্রেডিট ({_tx_c})")
+        except Exception as _ce:
+            log.warning(f"[DEPCHK] অটো ক্রেডিট ব্যর্থ: {_ce}")
     await update.message.reply_text(txt, parse_mode="Markdown",
                                     reply_markup=InlineKeyboardMarkup([[
                                         InlineKeyboardButton(
@@ -12343,12 +12640,62 @@ async def dep_callback(update, ctx):
                       "name": str(_o["method_name"] or ""),
                       "kind": str(_o["kind"] or "uid")}
             _got = await asyncio.to_thread(dep_name_find_for, _o)
+            if not (_got and _got[1]):
+                # Order ID দিয়ে চেষ্টা (নাম দেওয়া না থাকলেও কাজ করবে)
+                _ref_o = (_dep_note_ref(_o["note"]) or str(_o["txid"] or "")).strip()
+                if _ref_o and not _ref_o.upper().startswith("FUND"):
+                    try:
+                        _ga, _gt, _ge = await asyncio.to_thread(dep_order_find, _ref_o)
+                    except Exception:
+                        _ga, _gt, _ge = 0, "", ""
+                    if _ga and _gt:
+                        _got = (_ga, _gt, 0, "")
+            if not (_got and _got[1]):
+                # শেষ ভরসা: ফান্ডিং/স্পট ব্যালেন্স বাড়লেই ক্রেডিট
+                try:
+                    _credited = await _dep_try_fund_credit(ctx.bot, _o, _m)
+                except Exception:
+                    _credited = False
+                if _credited:
+                    try: await q.answer("✅ পেমেন্ট পাওয়া গেছে!")
+                    except Exception: pass
+                    return
             if _got and _got[1]:
                 try: await q.answer("✅ পেমেন্ট পাওয়া গেছে!")
                 except Exception: pass
                 await _dep_auto_credit(ctx, uid, _m,
                                        _got[0] or float(_o["amount"] or 0), _got[1], _oid)
             else:
+                _why = str((_got[3] if _got else "") or "")
+                _busy = ("রেট-লিমিট" in _why or "ব্যান" in _why
+                         or "banned" in _why.lower() or "-1003" in _why
+                         or "too much request" in _why.lower())
+                if _busy:
+                    # ⚠️ Binance ব্যান/লিমিটে "পেমেন্ট নেই" বলা ভুল ছিল —
+                    #    টাকা এসেছে কি না বট তখন দেখতেই পারেনি।
+                    try: await q.answer("⏳ বট এখন ব্যস্ত — একটু পরে")
+                    except Exception: pass
+                    _en_b = False
+                    try:
+                        _en_b = (await asyncio.to_thread(get_lang, uid)) == "en"
+                    except Exception:
+                        _en_b = False
+                    try:
+                        await ctx.bot.send_message(
+                            uid,
+                            ("⏳ *Binance is briefly busy.*\n\n"
+                             "Your deposit is *safe and pending* — the bot keeps "
+                             "checking automatically and will add the balance the "
+                             "moment it gets through.\n\n☝️ Nothing else to do."
+                             if _en_b else
+                             "⏳ *Binance সাময়িকভাবে ব্যস্ত।*\n\n"
+                             "আপনার ডিপোজিট *পেন্ডিং আছে, টাকা নিরাপদ* — বট নিজেই "
+                             "আবার চেক করবে, পেলেই ব্যালেন্স যোগ হবে।\n\n"
+                             "☝️ আপনাকে আর কিছু করতে হবে না।"),
+                            parse_mode="Markdown")
+                    except Exception:
+                        pass
+                    return
                 try: await q.answer("⏳ এখনো পাওয়া যায়নি")
                 except Exception: pass
                 _en_n = False
@@ -12356,17 +12703,21 @@ async def dep_callback(update, ctx):
                     _en_n = (await asyncio.to_thread(get_lang, uid)) == "en"
                 except Exception:
                     _en_n = False
+                _reason = str((_got[3] if _got else "") or "")
+                if ("নাম দেওয়া নেই" in _reason or "ডিপোজিটের তথ্য" in _reason
+                        or "রেট-লিমিট" in _reason or "Order ID" in _reason):
+                    _reason = ""
                 try:
                     await ctx.bot.send_message(
                         uid,
-                        (f"⏳ *Payment not found yet.*\n\n"
-                         f"_{_md_esc(str((_got[3] if _got else '')[:140]))}_\n\n"
-                         "Tap *🔁 Check* again after 1 minute. After 5 minutes the "
-                         "admin will verify manually." if _en_n else
-                         f"⏳ *এখনো পেমেন্ট পাওয়া যায়নি।*\n\n"
-                         f"_{_md_esc(str((_got[3] if _got else '')[:140]))}_\n\n"
-                         "১ মিনিট পর আবার *🔁 চেক* চাপুন। ৫ মিনিট পার হলে "
-                         "অ্যাডমিন ম্যানুয়ালি দেখে ✅ করবেন।"),
+                        ((f"⏳ *Payment not found yet.*\n\n"
+                          + (f"_{_md_esc(_reason[:140])}_\n\n" if _reason else "")
+                          + "Tap *🔁 Check* again after 1 minute. After 5 minutes "
+                          "the admin will verify manually.") if _en_n else
+                         (f"⏳ *এখনো পেমেন্ট পাওয়া যায়নি।*\n\n"
+                          + (f"_{_md_esc(_reason[:140])}_\n\n" if _reason else "")
+                          + "১ মিনিট পর আবার *🔁 চেক* চাপুন। ৫ মিনিট পার হলে "
+                          "অ্যাডমিন ম্যানুয়ালি দেখে ✅ করবেন।")),
                         parse_mode="Markdown")
                 except Exception:
                     pass
@@ -12786,7 +13137,8 @@ async def dep_input(update, ctx, st):
                      if _en else
                      "বিকাশ / নগদ / রকেট বা যেকোনো অ্যাপ থেকে QR স্ক্যান করে পেমেন্ট করবেন।")
         _hdr = f"*{_md_esc(_qnm[:60])}*\n━━━━━━━━━━━━━━\n{_md_esc(_pay_line)}"
-        _sum = _hdr + "\n\n" + _sum
+        # ⚠️ আগে এখানে _hdr একবার যোগ হতো, নিচে আবার — QR ক্যাপশনে
+        # "Bangla QR Payment" ব্লক দুইবার দেখাত। এখন শুধু নিচের একবারই।
         _kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📩 Proof", callback_data="dep:qp")],
             [InlineKeyboardButton("❌ Cancel" if _en else "❌ Cancel",
@@ -13017,6 +13369,13 @@ async def dep_input(update, ctx, st):
         if _got_a and _got_tx:
             await _dep_auto_credit(ctx, uid, _m2, float(_got_a or amt), _got_tx, oid)
             return True
+        # Pay API-তে না এলেও টাকা স্পট/ফান্ডিংয়ে জমা থাকলে এখানেই যোগ হবে
+        try:
+            _o0 = await asyncio.to_thread(dep_row, oid)
+            if _o0 and await _dep_try_fund_credit(ctx.bot, _o0, _m2):
+                return True
+        except Exception as _fe:
+            log.debug(f"[DEP-OID] ব্যালেন্স ফলব্যাক ব্যর্থ: {_fe}")
         await update.message.reply_text(
             (f"⏳ *Checking Order ID `{_md_esc(_ord_id)}`…*\n\n"
              f"🧾 `#{dep_no(oid)}` · 💵 `{amt:g}$`\n\n"
@@ -13038,7 +13397,9 @@ async def dep_input(update, ctx, st):
             _cap = (f"⚡ *Order ID ডিপোজিট — যাচাই বাকি*\n\n"
                     f"🧾 `#{dep_no(oid)}` · 👤 `{uid}`\n"
                     f"💵 `{amt:g}$`\n🔎 Order ID: `{_md_esc(_ord_id)}`\n"
-                    + (f"\n⚠️ _{_md_esc(str(_err)[:120])}_" if _err else "")
+                    + ("\n✅ বট নিজেই চেক করছে (Binance স্বয়ংক্রিয়)" if (
+                        not _err or "রেট-লিমিট" in str(_err) or "ব্যান" in str(_err))
+                       else f"\n⚠️ _{_md_esc(str(_err)[:120])}_")
                     + f"\n\n🔎 চেক: `/depchk {oid}`")
             _kb2 = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ অনুমোদন", callback_data=f"depok:{oid}"),
@@ -33878,7 +34239,7 @@ def main():
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
     app.add_handler(CallbackQueryHandler(cleanup_callback, pattern=r"^cleanup_(junk|logs7|logs30|close)$"))
     app.add_handler(CallbackQueryHandler(sec_callback, pattern=r"^sec_(unban|ignore)_\d+$"))
-    app.add_handler(CallbackQueryHandler(shop_callback, pattern=r"^(shop:|shopa:|shopao:|shopar:|adm_shop$)"))
+    app.add_handler(CallbackQueryHandler(shop_callback, pattern=r"^(shop:|shopa:|shopao:|shopar:|mail:|adm_shop$)"))
     app.add_handler(CallbackQueryHandler(dep_callback, pattern=r"^(dep:|depa:|depok:|depno:|depname:|adm_dep$)"))
     app.add_handler(CallbackQueryHandler(moneyreq_callback, pattern=r"^mreq:(ok|no):\d+$"))
     app.add_handler(CallbackQueryHandler(on_resetall_cb, pattern=r"^resetall_(yes|no)$"))
