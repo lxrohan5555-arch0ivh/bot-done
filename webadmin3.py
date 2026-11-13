@@ -87,6 +87,7 @@ _DDL = (
         created_at  TEXT DEFAULT ''
     )""",
     "CREATE UNIQUE INDEX IF NOT EXISTS fb_pw_groups_u ON fb_pw_groups (task_id, password)",
+    "ALTER TABLE fb_pw_groups ADD COLUMN IF NOT EXISTS collect_ids INTEGER DEFAULT 0",
 )
 _READY = [False]
 
@@ -730,13 +731,16 @@ def _pw_group_form(t, g=None, tid=0):
         "<div class='field'><label>একজন ইউজার সর্বোচ্চ কয়টা দিতে পারবে</label>"
         f"<input name='per_user' value='{esc(str(_per))}' placeholder='যেমন 2'>"
         "<p class='mut' style='font-size:11px;margin:4px 0 0'>০ = সীমা নেই।</p></div>"
-        "<div class='field'><label>নাম | লিংক — প্রতি লাইনে একটা করে</label>"
-        f"<textarea name='name_links' rows='7' placeholder='আমি যত ইচ্ছে এড করতে পারবnhttps://example.com/p1nhttps://example.com/p2'>"
-        f"{esc(request.form.get('name_links','') if request.method=='POST' else '')}</textarea>"
+        # ⚠️ এখানে ভুল করে মেইল-কোডের "নাম | লিংক" বক্স বসে ছিল — বাদ দেওয়া হলো।
+        # এখন এই পাসওয়ার্ডে আইডি (UID) জমা নেওয়ার অপশন।
+        "<div class='field'><label>📝 এই পাসওয়ার্ডে আইডি (UID) জমা নিন</label>"
+        "<label style='display:flex;gap:8px;align-items:center;font-size:13px'>"
+        "<input type='checkbox' name='collect_ids' value='1'"
+        + (" checked" if int(g.get("collect_ids") or 0) else "") +
+        "> চালু — ইউজার এই পাসওয়ার্ডের সিটে শুধু নিজের আইডি (UID) জমা দেবে</label>"
         "<p class='mut' style='font-size:11px;margin:4px 0 0'>"
-        "প্রতি লাইনে <code>নাম | লিংক</code> — লিংকটা হলে ইউজার ক্লিক করলে মেইল চালু হবে।<br>"
-        "কপি বোতা দিয়ে এক ক্লিকে কপি করুন।<br>"
-        "এটা মেইল কোড, কোনো API বা বট-সিস্টেম নয় — অ্যাডমিনকে দেখানোর তালিকা।</p></div>"
+        "বন্ধ থাকলে আগের মতোই পাসওয়ার্ড/কুকিজ নেওয়া হবে। চালু করলে শুধু এই সিটেই "
+        "আইডি জমা হবে — অন্য পাসওয়ার্ডের সিটে প্রভাব পড়বে না।</p></div>"
         "<div class='row' style='gap:8px;margin-top:12px'>"
         "<button class='ok' type='submit'>💾 সেভ করুন</button>"
         f"<a class='btn gray' href='/admin/fbtask/{tid}/passwords'>বাতিল</a></div>"
@@ -772,8 +776,10 @@ def fbtask_passwords(tid):
         seats = int(g2.get("seats_total") or 0)
         per = int(g2.get("per_user") or 0)
         full = bool(seats and used >= seats)
+        _cid_on = int(g2.get("collect_ids") or 0)
         trs.append([
-            f"<span class='mono'>{esc(_pw) or '-'}</span>",
+            f"<span class='mono'>{esc(_pw) or '-'}</span>"
+            + (badge("🆔 আইডি জমা", "ok") if _cid_on else ""),
             (f"<b>{num(used)}</b> / {num(seats)}" if seats else f"{num(used)} / ∞")
             + (badge("ভরা", "err") if full else ""),
             num(per) if per else "∞",
@@ -815,7 +821,8 @@ def fbtask_passwords(tid):
             f"<a class='btn' href='/admin/fbtask/{tid}/pw/{int(_g2['id'])}' "
             "style='display:block;margin:6px 0;text-align:left;padding:12px 14px'>"
             f"🔑 <span class='mono'>{esc(_pw2)}</span>"
-            f" · আইডি <b>{num(_used2)}</b>/{num(_seats2) if _seats2 else '∞'}"
+            + (" · 🆔 আইডি জমা" if int(_g2.get("collect_ids") or 0) else "")
+            + f" · আইডি <b>{num(_used2)}</b>/{num(_seats2) if _seats2 else '∞'}"
             f"<div class='mut' style='font-size:12px;margin-top:4px'>"
             f"⏳ {num(_r2.get('pend') or 0)} · ✅ {num(_r2.get('appr') or 0)}"
             f" · ❌ {num(_r2.get('rej') or 0)} — ভিতরে সব দেখুন ›</div></a>")
@@ -863,9 +870,9 @@ def fbtask_pw_new(tid):
             return page("নতুন পাসওয়ার্ড", _pw_group_form(t, None, tid), "fbtasks",
                         err="পাসওয়ার্ড দিন")
         _x("INSERT INTO fb_pw_groups (task_id, password, seats_total, per_user, is_active, "
-           "note, created_at) VALUES (%s,%s,%s,%s,1, %s, %s)",
+           "note, collect_ids, created_at) VALUES (%s,%s,%s,%s,1, '', %s, %s)",
            (tid, pw[:80], _int_form("seats_total", 0), _int_form("per_user", 0),
-            _q(request.form.get("name_links","") or ""), _ts_now()))
+            1 if request.form.get("collect_ids") else 0, _ts_now()))
         log_admin("fbtask_pw_new", tid, f"pw={pw[:20]}")
         return redirect(f"/admin/fbtask/{tid}/passwords?ok=" + _q("✅ পাসওয়ার্ড যোগ হয়েছে"))
     return page("নতুন পাসওয়ার্ড", _pw_group_form(t, None, tid), "fbtasks")
@@ -884,10 +891,10 @@ def fbtask_pw_edit(tid, gid):
                     "fbtasks", status=404)
     if request.method == "POST":
         pw = (request.form.get("password") or "").strip() or str(row.get("password") or "")
-        _x("UPDATE fb_pw_groups SET password=%s, seats_total=%s, per_user=%s, note=%s "
-           "WHERE id=%s AND task_id=%s",
+        _x("UPDATE fb_pw_groups SET password=%s, seats_total=%s, per_user=%s, "
+           "collect_ids=%s WHERE id=%s AND task_id=%s",
            (pw[:80], _int_form("seats_total", 0), _int_form("per_user", 0),
-            _q(request.form.get("name_links","") or ""), gid, tid))
+            1 if request.form.get("collect_ids") else 0, gid, tid))
         log_admin("fbtask_pw_edit", tid, f"gid={gid}")
         return redirect(f"/admin/fbtask/{tid}/passwords?ok=" + _q("✅ সেভ হয়েছে"))
     return page("পাসওয়ার্ড এডিট", _pw_group_form(t, row, tid), "fbtasks")

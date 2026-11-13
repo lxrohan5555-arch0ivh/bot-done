@@ -19,6 +19,7 @@
 - **API এরর হলে অ্যাডমিন DM** — Binance API ব্যর্থ হলে ২০ মিনিটে একবার অ্যালার্ট।
 - **শপ প্ল্যান সিস্টেম** — `shop_plans` টেবিল; VPN = দিন, Proxy = MB/GB, Mail = সরাসরি মেইল লিস্ট। ইউজার মেয়াদে চাপলে শুধু সেই প্ল্যানের পণ্য দেখাবে।
 - **FB/IG পাসওয়ার্ড-ভিত্তিক সিট** — এক পাসওয়ার্ড = এক আলাদা সিট; আলাদা approve/reject/delete; একই UID আগে approved হলে আবার approve হয় না, reject সবসময় চলে।
+- **🆔 এই পাসওয়ার্ডে আইডি জমা নিন** (`fb_pw_groups.collect_ids`) — পাসওয়ার্ড পেজের চেকবক্স চালু করলে বট ওই সিটে শুধু ইউজারের আইডি (UID) চায় ও শুধু ওই সিটেই জমা নেয়; লিস্টে পাসওয়ার্ডের পাশে 🆔 ব্যাজ দেখায়। পাসওয়ার্ড পেজের ভুল করে বসানো “নাম | লিংক” বক্স বাদ দেওয়া হয়েছে।
 - **স্টক শেষে রিফান্ড নয়** — অ্যাডমিনকে রিমাইন্ডার যায়, অ্যাডমিন 💸 চাপলে সাথে সাথে ফেরত।
 - **`user_hist` আর্কাইভ** — ডিপোজিট/উইথড্র/টাস্ক/FB/IG ডিলিট করলেও হিসাব প্রোফাইলে থেকে যায়।
 - **রেফারেল ফিক্স** — পুরোনো রেফারেল ব্যাকফিল, নিজেকে রেফার ব্লক, ০% কমিশনেও ইভেন্ট গণনা।
@@ -52,3 +53,21 @@
 - টেবিল: `user_hist`, `used_txids`, `shop_plans`
 - কলাম: `shop_products.plan_id`, `shop_categories.plan_kind`, `users.dep_balance`, `users.dep_total`, `users.dep_withdrawn`
 - ইনডেক্স: `uq_fbsub_uid_pw`, `idx_wd_user_status`, `idx_gm_user_status`, `idx_dep_user_status`, `idx_fb_task_status`, `idx_ig_task_status`
+
+---
+
+## ৬) সর্বশেষ রিপো (bot-done) থেকে যোগ হওয়া নতুন অংশ
+
+### নতুন কমান্ড (শুধু মালিক)
+| কমান্ড | কাজ |
+|---|---|
+| `/depfund on` / `/depfund off` | ফান্ডিং ওয়ালেটের USDT বাড়লে সমপরিমাণ পেন্ডিং ডিপোজিট অটো ✅ (UID-তে সাধারণ ট্রান্সফারে Pay API sender দেখায় না বলে) |
+| `/setproxy <url>` / `/setproxy off` | Binance-এর 451 (restricted location) ঠিক করতে HTTP/SOCKS5 proxy সেট |
+
+### নতুন প্যানেল পেজ
+- `/admin/deposits/qr` — ডিপোজিট QR
+- `/admin/shop/cat/<cid>` — একটা ক্যাটাগরির বিস্তারিত
+- `/admin/shop/plan/<plid>/edit` — প্ল্যান এডিট
+- `/admin/shop/onoff`, `/admin/shop/deponoff`, `/admin/shop/closedmsg`, `/admin/shop/mailcode` — শপ চালু/বন্ধ, ডিপোজিট অন/অফ, বন্ধের মেসেজ, মেইল কোড
+- FB পাসওয়ার্ড গ্রুপ: `/admin/fbtask/<tid>/passwords/new`, `/admin/fbtask/<tid>/passwords/<gid>/edit`, `/admin/fbtask/<tid>/pw/<gid>`, seat অ্যাসাইন ও গ্রুপ ডিলিট
+- IG পাসওয়ার্ড গ্রুপ: `/admin/igtask/<tid>/passwords`, `.../new`, `.../<gid>/edit`, গ্রুপ ডিলিট

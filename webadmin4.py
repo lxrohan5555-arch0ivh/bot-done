@@ -748,8 +748,8 @@ def igtask_pw_edit(tid, gid):
                     "igtasks", status=404)
     if request.method == "POST":
         pw = (request.form.get("password") or "").strip() or str(row.get("password") or "")
-        _x("UPDATE ig_pw_groups SET password=%s, seats_total=%s, per_user=%s, note=%s "
-           "WHERE id=%s AND task_id=%s",
+        _x("UPDATE ig_pw_groups SET password=%s, seats_total=%s, per_user=%s, note=%s, "
+           "note=%s WHERE id=%s AND task_id=%s",
            (pw[:80], _int_form("seats_total", 0), _int_form("per_user", 0),
             (request.form.get("note") or "").strip()[:120], gid, tid))
         log_admin("igtask_pw_edit", tid, f"gid={gid}")
