@@ -730,6 +730,13 @@ def _pw_group_form(t, g=None, tid=0):
         "<div class='field'><label>একজন ইউজার সর্বোচ্চ কয়টা দিতে পারবে</label>"
         f"<input name='per_user' value='{esc(str(_per))}' placeholder='যেমন 2'>"
         "<p class='mut' style='font-size:11px;margin:4px 0 0'>০ = সীমা নেই।</p></div>"
+        "<div class='field'><label>নাম | লিংক — প্রতি লাইনে একটা করে</label>"
+        f"<textarea name='name_links' rows='7' placeholder='আমি যত ইচ্ছে এড করতে পারবnhttps://example.com/p1nhttps://example.com/p2'>"
+        f"{esc(request.form.get('name_links','') if request.method=='POST' else '')}</textarea>"
+        "<p class='mut' style='font-size:11px;margin:4px 0 0'>"
+        "প্রতি লাইনে <code>নাম | লিংক</code> — লিংকটা হলে ইউজার ক্লিক করলে মেইল চালু হবে।<br>"
+        "কপি বোতা দিয়ে এক ক্লিকে কপি করুন।<br>"
+        "এটা মেইল কোড, কোনো API বা বট-সিস্টেম নয় — অ্যাডমিনকে দেখানোর তালিকা।</p></div>"
         "<div class='row' style='gap:8px;margin-top:12px'>"
         "<button class='ok' type='submit'>💾 সেভ করুন</button>"
         f"<a class='btn gray' href='/admin/fbtask/{tid}/passwords'>বাতিল</a></div>"
@@ -856,9 +863,9 @@ def fbtask_pw_new(tid):
             return page("নতুন পাসওয়ার্ড", _pw_group_form(t, None, tid), "fbtasks",
                         err="পাসওয়ার্ড দিন")
         _x("INSERT INTO fb_pw_groups (task_id, password, seats_total, per_user, is_active, "
-           "note, created_at) VALUES (%s,%s,%s,%s,1,'',%s)",
+           "note, created_at) VALUES (%s,%s,%s,%s,1, %s, %s)",
            (tid, pw[:80], _int_form("seats_total", 0), _int_form("per_user", 0),
-            _ts_now()))
+            _q(request.form.get("name_links","") or ""), _ts_now()))
         log_admin("fbtask_pw_new", tid, f"pw={pw[:20]}")
         return redirect(f"/admin/fbtask/{tid}/passwords?ok=" + _q("✅ পাসওয়ার্ড যোগ হয়েছে"))
     return page("নতুন পাসওয়ার্ড", _pw_group_form(t, None, tid), "fbtasks")
@@ -877,9 +884,10 @@ def fbtask_pw_edit(tid, gid):
                     "fbtasks", status=404)
     if request.method == "POST":
         pw = (request.form.get("password") or "").strip() or str(row.get("password") or "")
-        _x("UPDATE fb_pw_groups SET password=%s, seats_total=%s, per_user=%s "
+        _x("UPDATE fb_pw_groups SET password=%s, seats_total=%s, per_user=%s, note=%s "
            "WHERE id=%s AND task_id=%s",
-           (pw[:80], _int_form("seats_total", 0), _int_form("per_user", 0), gid, tid))
+           (pw[:80], _int_form("seats_total", 0), _int_form("per_user", 0),
+            _q(request.form.get("name_links","") or ""), gid, tid))
         log_admin("fbtask_pw_edit", tid, f"gid={gid}")
         return redirect(f"/admin/fbtask/{tid}/passwords?ok=" + _q("✅ সেভ হয়েছে"))
     return page("পাসওয়ার্ড এডিট", _pw_group_form(t, row, tid), "fbtasks")
@@ -887,13 +895,29 @@ def fbtask_pw_edit(tid, gid):
 
 @wadm.route("/admin/do/fbtask/<int:tid>/pwgroup/<int:gid>/delete", methods=["POST"])
 def fbtask_pw_group_del(tid, gid):
+    """পাসওয়ার্ড সম্পূর্ণ ডিলিট — ভেতরের সব জমাও ডেটাবেস থেকে মুছে যায়।
+
+    ⚠️ আগে শুধু গ্রুপ রো মুছত, জমাগুলো (fb_submissions) থেকে যেত — তাই পরে
+    হিসাব এলোমেলো হতো। এখন আগে ইউজারের ✅/❌ হিসাব seat_archive-এ রাখা হয়,
+    তারপর জমাগুলো ডিলিট, শেষে গ্রুপ।
+    """
     g = guard()
     if g:
         return g
     _init()
+    _row = one("SELECT * FROM fb_pw_groups WHERE id=%s AND task_id=%s", (gid, tid))
+    if not _row:
+        return redirect(f"/admin/fbtask/{tid}/passwords?err=" + _q("পাসওয়ার্ড পাওয়া যায়নি"))
+    _pw = str(_row.get("password") or "")
+    n = 0
+    try:
+        n = fbtask_pw_delete_do(tid, _pw)
+    except Exception:
+        n = 0
     _x("DELETE FROM fb_pw_groups WHERE id=%s AND task_id=%s", (gid, tid))
-    log_admin("fbtask_pw_group_del", tid, f"gid={gid}")
-    return redirect(f"/admin/fbtask/{tid}/passwords?ok=" + _q("গ্রুপ ডিলিট হয়েছে (জমাগুলো আছে)"))
+    log_admin("fbtask_pw_group_del", tid, f"gid={gid} pw={_pw[:20]} rows={n}")
+    return redirect(f"/admin/fbtask/{tid}/passwords?ok="
+                    + _q(f"✅ পাসওয়ার্ড + ভেতরের {n} টি জমা সম্পূর্ণ ডিলিট হয়েছে"))
 
 
 def fbtask_pw_delete_do(tid, pw):
@@ -967,6 +991,38 @@ def fbtask_pw_view(tid, gid):
     if not t or not g2:
         return page("Not found", "<div class='card'>পাসওয়ার্ড নেই</div>", "fbtasks", status=404)
     _pw = str(g2.get("password") or "")
+    # 🔗 শীট-লিংক: t.me/<bot>?start=fbpw_<gid>
+    _bot_uname = ""
+    try:
+        for _k in ("bot_username", "bot_uname"):
+            _rr = one("SELECT value FROM settings WHERE key=%s", (_k,))
+            _bu = str((_rr["value"] if _rr else "") or "").strip().lstrip("@")
+            if _bu:
+                _bot_uname = _bu
+                break
+    except Exception:
+        _bot_uname = ""
+    _link = (f"https://t.me/{_bot_uname}?start=fbpw_{gid}" if _bot_uname else "")
+    if _link:
+        _share_card = (
+            "<div class='card' style='margin-top:10px'><b>🔗 এই পাসওয়ার্ড দিয়ে আইডি নিন</b>"
+            "<div class='mut' style='font-size:12px;margin:6px 0'>"
+            "এই লিংকটা ইউজারকে পাঠান — বটে চাপলে ঠিক এই পাসওয়ার্ডটাই পাবে, "
+            "আর তার জমা এই শীটেই যাবে।</div>"
+            f"<input id='pwl' value='{esc(_link)}' readonly style='width:100%' "
+            "onclick='this.select()'>"
+            "<div class='row' style='gap:6px;margin-top:6px'>"
+            "<button class='ok sm' type='button' onclick=\"var e=document.getElementById('pwl');"
+            "e.select();navigator.clipboard.writeText(e.value)\">📋 লিংক কপি</button>"
+            "</div></div>"
+        )
+    else:
+        _share_card = (
+            "<div class='card' style='margin-top:10px'><b>🔗 এই পাসওয়ার্ড দিয়ে আইডি নিন</b>"
+            "<div class='mut' style='font-size:12px;margin:6px 0'>"
+            "বটের ইউজারনেম সেট করা নেই — Settings-এ <b>bot_username</b> দিন "
+            "(যেমন TaskEarnBot), তাহলে শেয়ার লিংক তৈরি হবে।</div></div>"
+        )
     _cnt = one("SELECT COUNT(*) AS n, "
                "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pend, "
                "SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) AS appr, "
@@ -999,7 +1055,9 @@ def fbtask_pw_view(tid, gid):
         f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs?pw={_q(_pw)}'>📄 শীট</a>"
         f"<a class='btn gray sm' href='/admin/fbtask/{tid}/passwords/{gid}/edit'>✏️ Edit</a>"
         "</div></div>"
-        "<div class='row' style='gap:10px;flex-wrap:wrap;margin-top:10px'>"
+        "</div></div>"
+        + _share_card +
+
         f"<div class='card' style='flex:1;min-width:120px'><div class='mut'>আইডি / সিট</div>"
         f"<b style='font-size:20px'>{num(used)} / {num(seats) if seats else '∞'}</b>"
         + (badge("ভরা", "err") if seats and used >= seats else

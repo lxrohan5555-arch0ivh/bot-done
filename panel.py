@@ -464,11 +464,14 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = "", ua: str = ""):
                 strict_on = (str(_setting(cur, "sec_device_strict", "on")).strip() or "on") != "off"
             except Exception:
                 strict_on = True
-            if strict_on and coarse and ua:
+            if strict_on and coarse and ua and ip:
+                # ⚠️ আগে IP ছাড়াই ব্লক হতো — একই মডেলের ফোন (একই screen/cores/
+                #    ব্রাউজার ভার্সন) হলেই ভিন্ন লোক ভুলভাবে আটকে যেত।
+                #    এখন একই IP + একই ফোন-প্রোফাইল + একই ব্রাউজার হলে তবেই ব্লক।
                 cur.execute(
                     "SELECT COUNT(DISTINCT user_id) AS n FROM devices "
-                    "WHERE device_hash=%s AND ua=%s AND user_id<>%s",
-                    (coarse, ua, uid))
+                    "WHERE device_hash=%s AND ua=%s AND ip=%s AND user_id<>%s",
+                    (coarse, ua, ip, uid))
                 r6 = cur.fetchone()
                 if int((r6 or {}).get("n") or 0) >= max(1, dlim):
                     return "device"
@@ -746,10 +749,19 @@ transition:width 1s linear}
 
 
 def _shell(inner: str, title: str) -> str:
+    # ⚠️ Telegram-এ লিংক প্রিভিউতে লম্বা URL দেখাত। og:title/description দিলে
+    #    প্রিভিউতে শুধু "Task Earn Bot" লেখা দেখাবে।
     return (
         "<!doctype html><html lang=\"bn\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,maximum-scale=1\">"
         "<meta name=\"robots\" content=\"noindex,nofollow\">"
+        "<meta property=\"og:site_name\" content=\"Task Earn Bot\">"
+        "<meta property=\"og:type\" content=\"website\">"
+        "<meta property=\"og:title\" content=\"Task Earn Bot\">"
+        "<meta property=\"og:description\" content=\"Task Earn Bot — অ্যাকাউন্ট ভেরিফিকেশন\">"
+        "<meta name=\"twitter:card\" content=\"summary\">"
+        "<meta name=\"twitter:title\" content=\"Task Earn Bot\">"
+        "<meta name=\"theme-color\" content=\"#0b0b12\">"
         f"<title>{title}</title><style>{_CSS}</style></head>"
         f"<body><div class=\"card\">{inner}</div>"
         "<div class=\"foot\">Secure Verification Service</div></body></html>"

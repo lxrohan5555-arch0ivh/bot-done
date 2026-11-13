@@ -219,13 +219,32 @@ def shop_mailcode_save():
         return g
     _init()
     form = request.form
+    # ── শুধু নাম + লিংক ── (প্রতি লাইনে: নাম | https://…)
+    import json as _json
+    _rows = []
+    _raw = (form.get("mailcode_links_text") or "").replace("\r", "")
+    for _line in _raw.split("\n"):
+        _line = _line.strip()
+        if not _line:
+            continue
+        if "|" in _line:
+            _nm, _u = _line.split("|", 1)
+        else:
+            _nm, _u = "", _line
+        _nm = _nm.strip()[:40]
+        _u = _u.strip()[:400]
+        if not _u.lower().startswith(("http://", "https://")):
+            continue
+        _rows.append({"name": _nm or _u.split("//")[-1].split("/")[0][:40], "url": _u})
+        if len(_rows) >= 20:
+            break
     vals = {
         "mailcode_on": "off" if (form.get("mailcode_on") or "").strip().lower() == "off" else "on",
-        "mailcode_link": (form.get("mailcode_link") or "").strip()[:400],
-        "mailcode_api": (form.get("mailcode_api") or "").strip()[:400],
-        "mailcode_key": (form.get("mailcode_key") or "").strip()[:200],
-        "mailcode_prompt_bn": (form.get("mailcode_prompt_bn") or "").strip()[:900],
-        "mailcode_prompt_en": (form.get("mailcode_prompt_en") or "").strip()[:900],
+        "mailcode_links": _json.dumps(_rows, ensure_ascii=False)[:4000],
+        "mailcode_link": (_rows[0]["url"] if _rows else ""),
+        # 🤖 বট সিস্টেম (API) আর ব্যবহার হয় না — পুরোনো ডেটা পরিষ্কার
+        "mailcode_api": "",
+        "mailcode_key": "",
     }
     try:
         import bot as _bs
@@ -386,52 +405,37 @@ def shop_home():
         "সব লেখা সাধারণ টেক্সট হিসেবে যাবে — ইমোজি চলবে, *বোল্ড* মার্কডাউন চলবে না।</div>"
         "</form></div>")
 
-    # ── 🎫 মেইল কোড সেটিংস ──
+    # ── 🎫 মেইল কোড সেটিংস (শুধু নাম + লিংক) ──
     try:
         import bot as _bm
         _m_on = bool(_bm.mailcode_on())
-        _m_link = esc(_bm.mailcode_link())
-        _m_api = esc(str(_bm.get_setting("mailcode_api") or ""))
-        _m_key = esc(str(_bm.get_setting("mailcode_key") or ""))
-        _m_pbn = esc(str(_bm.get_setting("mailcode_prompt_bn") or ""))
-        _m_pen = esc(str(_bm.get_setting("mailcode_prompt_en") or ""))
+        _m_rows = _bm.mailcode_links()
     except Exception:
-        _m_on, _m_link, _m_api, _m_key, _m_pbn, _m_pen = True, "", "", "", "", ""
+        _m_on, _m_rows = True, []
     _sel = ("<option value='on' selected>চালু</option><option value='off'>বন্ধ</option>"
             if _m_on else
             "<option value='on'>চালু</option><option value='off' selected>বন্ধ</option>")
+    _txt_val = esc("\n".join(
+        (str(r.get("name") or "") + " | " + str(r.get("url") or "")).strip()
+        for r in _m_rows))
     mailcard = "".join([
         "<div class='card'><b>🎫 মেইল কোড নিন</b>",
         "<div class='mut' style='font-size:12px;margin:6px 0'>",
-        "বটের শপে '🎫 মেইল কোড নিন' বাটন এখান থেকেই নিয়ন্ত্রণ হয়।</div>",
+        "বটের শপে '🎫 মেইল কোড নিন' বাটন এখান থেকেই নিয়ন্ত্রণ হয়। ",
+        "যতগুলো নাম+লিংক দেবেন, বটে ঠিক ততগুলোই বাটন দেখাবে।</div>",
         "<form method='post' action='/admin/shop/mailcode'>",
         "<div class='field'><label>অপশন</label>"
         "<select name='mailcode_on'>" + _sel + "</select></div>",
-        "<div class='field'><label>🔗 লিংক (ইউজার এই লিংকে চাপ দিয়ে কোড নিতে পারবে)</label>",
-        "<input name='mailcode_link' value='" + _m_link + "' placeholder='https://...' "
-        "style='width:100%'></div>",
-        "<div class='field'><label>🤖 বট সিস্টেমের লিংক / সার্ভিস URL "
-        "(টোকেন পাঠালে কোড ফেরত দেবে)</label>",
-        "<input name='mailcode_api' value='" + _m_api +
-        "' placeholder='https://your-server.com/mailcode' style='width:100%'></div>",
-        "<div class='field'><label>সার্ভিস API Key (ঐচ্ছিক)</label>",
-        "<input name='mailcode_key' value='" + _m_key +
-        "' placeholder='secret key' style='width:100%'></div>",
-        "<div class='field'><label>🤖 বট সিস্টেমের বার্তা — বাংলা</label>",
-        "<textarea name='mailcode_prompt_bn' rows='4' style='width:100%' "
-        "placeholder='🤖 বট সিস্টেম&#10;&#10;আপনার মেইল টোকেন (Key) পাঠান:&#10;"
-        "email|password|refresh_token|client_id'>" + _m_pbn + "</textarea></div>",
-        "<div class='field'><label>🤖 Bot system text — English</label>",
-        "<textarea name='mailcode_prompt_en' rows='3' style='width:100%' "
-        "placeholder='🤖 Bot system&#10;&#10;Send your mail token (Key):&#10;"
-        "email|password|refresh_token|client_id'>" + _m_pen + "</textarea></div>",
+        "<div class='field'><label>🔗 নাম | লিংক (প্রতি লাইনে একটা)</label>",
+        "<textarea name='mailcode_links_text' rows='6' style='width:100%' "
+        "placeholder='dongvanfb OTP | https://example.com/otp&#10;"
+        "CODE YAMIN | https://example.com/yamin&#10;"
+        "MailGen | https://mailgen.shop/'>" + _txt_val + "</textarea>",
+        "<div class='mut' style='font-size:11px;margin-top:4px'>",
+        "যেমন: <b>MailGen | https://mailgen.shop/</b> — বটে বাটনের নাম হবে “MailGen”। ",
+        "নাম না দিলে লিংকের সাইটের নাম বসবে।</div></div>",
         "<button class='ok sm' type='submit'>💾 সেভ করুন</button>",
-        "<div class='mut' style='font-size:11px;margin-top:6px'>",
-        "লিংক/URL খালি থাকলে বট বলবে “সিস্টেম এখনো চালু হয়নি”। লিংকে "
-        "<b>{email}</b>, <b>{password}</b>, <b>{refresh_token}</b>, <b>{client_id}</b> "
-        "বসিয়ে দিলে বট GET রিকোয়েস্ট পাঠাবে (যেমন yoursite.com/api?mail={email}&amp;tok={refresh_token})। "
-        "না থাকলে POST JSON যাবে: email, password, refresh_token, client_id — উত্তরে "
-        "{code: \"123456\"} বা টেক্সট দিলেই হবে।</div></form></div>",
+        "</form></div>",
     ])
 
     # ক্যাটাগরি তৈরি + ক্রেন্সি

@@ -1468,7 +1468,7 @@ def login():
     log_admin("web_login", 0, ip)
     try:
         tg_admin_notify(f"🔐 <b>Web panel login</b>\n\n👤 <code>{esc(u)}</code>"
-                        f"\n🌐 IP: <code>{esc(ip)}</code>")
+                        f"\n🌐 IP: <code>{esc(ip)}</code>\n\n✅ <b>অ্যাপ্রুভ পেলেই লগইন হবে</b> — বট admin approve করলেই সেশন ওপেন হবে।")
     except Exception:
         pass
     return r
