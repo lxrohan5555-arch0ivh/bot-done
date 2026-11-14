@@ -874,7 +874,7 @@ def mail_setup():
     if g:
         return g
     v = settings_all(["mail_host", "mail_port", "mail_user", "mail_pass",
-                      "mail_folder", "dep_mail_on"])
+                      "mail_folder", "dep_mail_on", "mail_from", "mail_win_min"])
     _on = str(v.get("dep_mail_on") or "").lower() not in ("0", "off", "false", "no")
     _has = bool(str(v.get("mail_user") or "").strip() and str(v.get("mail_pass") or "").strip())
     _st = {}
@@ -908,6 +908,14 @@ def mail_setup():
         f"<input name='mail_port' value='{esc(v.get('mail_port') or '993')}' inputmode='numeric'></div>"
         "<div class='form'><label>ফোল্ডার</label>"
         f"<input name='mail_folder' value='{esc(v.get('mail_folder') or 'INBOX')}'></div>"
+        "<div class='form'><label>Binance-এর প্রেরকের ঠিকানা "
+        "(শুধু এই ঠিকানা থেকে আসা মেইলই পড়া হবে)</label>"
+        f"<input name='mail_from' "
+        f"value='{esc(v.get('mail_from') or 'do-not-reply@ses.binance.com')}' "
+        "placeholder='do-not-reply@ses.binance.com'></div>"
+        "<div class='form'><label>কত মিনিট আগে/পরে আসা মেইল ধরা হবে</label>"
+        f"<input name='mail_win_min' "
+        f"value='{esc(v.get('mail_win_min') or '60')}' inputmode='numeric'></div>"
         "<div class='form'><label>অটো-চেক</label><select name='dep_mail_on'>"
         f"<option value='1' {'selected' if _on else ''}>চালু (প্রতি ৬০ সেকেন্ডে মেইল পড়বে)</option>"
         f"<option value='0' {'selected' if not _on else ''}>বন্ধ</option>"
@@ -936,7 +944,10 @@ def mail_setup():
         "৩. Gmail → <b>Settings → Forwarding and POP/IMAP</b> → <b>Enable IMAP</b>।<br>"
         "৪. উপরের ফর্মে ইমেইল + App Password দিয়ে <b>সেভ</b> → <b>সংযোগ টেস্ট</b>।<br><br>"
         "<b>নিরাপত্তা:</b> এই ইমেইলে শুধু Binance-এর মেইল আসা উচিত (আলাদা জিমেইল হলে ভালো)। "
-        "মূল Gmail পাসওয়ার্ড কখনো দেবেন না — শুধু App Password।"
+        "মূল Gmail পাসওয়ার্ড কখনো দেবেন না — শুধু App Password।<br><br>"
+        "<b>প্রেরকের ঠিকানা:</b> শুধু এখানে লেখা ঠিকানা থেকে আসা মেইলই বট পড়ে "
+        "(ডিফল্ট <span class='mono'>do-not-reply@ses.binance.com</span>)। "
+        "এতে কেউ Binance-এর নামে ফেক মেইল পাঠালেও বট সেটা গোনে না।"
         "</p></div>"
     )
     return page("Mail Auto-Deposit", _tip + _status + _card + _help, "settings",
@@ -953,6 +964,8 @@ def mail_save():
     _h = (request.form.get("mail_host") or "imap.gmail.com").strip()
     _port = (request.form.get("mail_port") or "993").strip()
     _fold = (request.form.get("mail_folder") or "INBOX").strip()
+    _from = (request.form.get("mail_from") or "").strip()
+    _win = (request.form.get("mail_win_min") or "").strip()
     _on = "1" if (request.form.get("dep_mail_on") or "").strip() in ("1", "on") else "0"
     if _u:
         settings_set("mail_user", _u)
@@ -961,6 +974,9 @@ def mail_save():
     settings_set("mail_host", _h or "imap.gmail.com")
     settings_set("mail_port", _port if _port.isdigit() else "993")
     settings_set("mail_folder", _fold or "INBOX")
+    settings_set("mail_from", _from or "do-not-reply@ses.binance.com")
+    if _win.isdigit() and 1 <= int(_win) <= 1440:
+        settings_set("mail_win_min", _win)
     settings_set("dep_mail_on", _on)
     log_admin("mail_settings", 0, f"on={_on}")
     if _on == "1" and not (settings_get("mail_user") and settings_get("mail_pass")):
@@ -980,8 +996,10 @@ def mail_test():
         return redirect("/admin/mail?e=" + str(_e)[:120])
     if err:
         return redirect("/admin/mail?e=" + str(err)[:160])
-    _lbl = "<br>".join(f"• {float(p.get('amount') or 0):g} USDT — {esc(p.get('sender') or '—')}"
-                       for _m, p in (pays or [])[:5]) or "কোনো নতুন Binance পেমেন্ট মেইল নেই"
+    _lbl = "<br>".join(
+        f"• {float(p.get('amount') or 0):g} USDT — {esc(p.get('sender') or '—')}"
+        f" <span class='mut'>({esc(str(p.get('from') or '')[:60])})</span>"
+        for _m, p in (pays or [])[:5]) or "কোনো নতুন Binance পেমেন্ট মেইল নেই"
     return redirect("/admin/mail?ok=সংযোগ ঠিক · " + str(len(pays or [])) + " টি মেইল · " + _lbl)
 
 

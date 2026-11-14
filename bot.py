@@ -161,7 +161,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-14b8"
+BUILD_TAG       = "uid-auto-2026-11-14b14"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -700,8 +700,8 @@ _EN_FAST = {
     # ── ডিপোজিট ──
     "💳 *ডিপোজিট*": "💳 *Deposit*",
     "নিচের যেকোনো একটি মেথড বেছে নিন।": "Choose one of the methods below.",
-    "⚡ *অটো* — পরিমাণ + TxID/Order ID দিলে সাথে সাথে যাচাই হয়ে ব্যালেন্স যোগ হবে।":
-        "⚡ *Auto* — send the amount + TxID/Order ID and your balance is credited "
+    "⚡ *অটো* — পরিমাণ দিন, Binance থেকে টাকা পাঠান — বট মেইল দেখে ব্যালেন্স যোগ করবে।":
+        "⚡ *Auto* — give the amount and send from Binance; the bot reads the "
         "instantly after verification.",
     "✍️ *ম্যানুয়াল* — আপনি পেমেন্ট করে TxID/স্ক্রিনশট দিলে অ্যাডমিন ✅ করবেন।":
         "✍️ *Manual* — pay and send the TxID/screenshot; the admin will approve it.",
@@ -9723,6 +9723,30 @@ def dep_pending(limit=20):
                          (int(limit),)).fetchall()
 
 
+def dep_find_pending_same(uid, amount, name, minutes=90):
+    """একই ইউজারের একই অঙ্ক+নামের পেন্ডিং ডিপোজিট (ডুপ্লিকেট আটকায়)।"""
+    try:
+        rows = dep_of_user(int(uid), 15) or []
+    except Exception:
+        return None
+    cut = int(_time.time() * 1000) - int(minutes) * 60 * 1000
+    _nm = str(name or "").strip().casefold()
+    for r in rows:
+        try:
+            if str(r["status"] or "") != "pending":
+                continue
+            if abs(float(r["amount"] or 0) - float(amount or 0)) > 1e-6:
+                continue
+            if str(r.get("payer_name") or "").strip().casefold() != _nm:
+                continue
+            if int(_dep_created_ms(r) or 0) < cut:
+                continue
+            return r
+        except Exception:
+            continue
+    return None
+
+
 def dep_of_user(uid, limit=8):
     with _c() as c:
         return c.execute("SELECT * FROM deposits WHERE user_id=%s ORDER BY id DESC LIMIT %s",
@@ -10511,8 +10535,8 @@ def dep_diag_report():
     if _bn_left > 0:
         _mm, _ss = _bn_left // 60, _bn_left % 60
         try:
-            _end = time.strftime("%I:%M %p", time.localtime(
-                time.time() + _bn_left + 6 * 3600))
+            _end = _time.strftime("%I:%M %p", _time.localtime(
+                _time.time() + _bn_left + 6 * 3600))
         except Exception:
             _end = "—"
         out.append(f"⛔ *Binance সাময়িক বিরতি* — আরও `{_mm} মিনিট` "
@@ -11597,6 +11621,10 @@ async def _dep_watch_once(bot):
 # ══════════════════════════════════════════════════════════════════
 _DEP_MAIL = {"at": 0.0, "ok": False, "err": "", "n": 0, "busy": False}
 _DEP_MAIL_SEEN_KEY = "dep_mail_seen"
+# শুধু এই ঠিকানা থেকে আসা মেইল পড়া হয় (ওয়েব প্যানেল থেকে বদলানো যায়)
+_DEP_MAIL_FROM_DEF = "do-not-reply@ses.binance.com"
+# চেক চাপার কত মিনিট আগে/পরে আসা মেইল ধরা হবে (টাইম লক)
+_DEP_MAIL_WIN_MIN = 2
 
 
 def mail_cfg():
@@ -11613,9 +11641,18 @@ def mail_cfg():
         port = 993
     user, pwd = _g("mail_user"), _g("mail_pass")
     folder = _g("mail_folder") or "INBOX"
+    _from = _g("mail_from") or _DEP_MAIL_FROM_DEF
     on = _g("dep_mail_on").lower() not in ("0", "off", "false", "no", "")
     return {"on": bool(on and user and pwd), "host": host, "port": port,
-            "user": user, "pass": pwd, "folder": folder}
+            "user": user, "pass": pwd, "folder": folder, "from": _from}
+
+
+def _mail_win_min():
+    """চেকের কত মিনিট আগে/পরে আসা মেইল ধরা হবে (ডিফল্ট ৬০)।"""
+    try:
+        return max(1, min(1440, int(str(get_setting("mail_win_min") or "60"))))
+    except Exception:
+        return 60
 
 
 def _mail_seen_get():
@@ -11668,18 +11705,49 @@ def _mail_body_text(msg):
     return _re.sub(r"[ \t]+", " ", txt)
 
 
+def _mail_from_ok(from_hdr, want=None):
+    """মেইলটা কি ঠিক আমাদের সেট করা Binance ঠিকানা থেকেই এসেছে?"""
+    if want is None:
+        try:
+            want = mail_cfg().get("from") or ""
+        except Exception:
+            want = ""
+    want = str(want or "").strip().lower()
+    if not want:
+        return True                      # ফাঁকা = সব মেইল (মালিকের পছন্দ)
+    return want in str(from_hdr or "").lower().replace(" ", "")
+
+
+def _mail_subject_ok(subject):
+    """Subject দেখেই বোঝা যায় এটা Binance-এর পেমেন্ট মেইল কি না।"""
+    subj = str(subject or "").lower()
+    if "binance" not in subj:
+        return False
+    return bool("payment receive" in subj or "you received" in subj
+                or "received a payment" in subj or "incoming transfer" in subj
+                or ("payment" in subj and ("receiv" in subj or "transfer" in subj))
+                or ("binance" in subj and "receiv" in subj))
+
+
+def _diag_sample(diag, frm, subj, why):
+    """টেস্টে দেখানোর জন্য শেষ কয়েকটা মেইলের কারণ জমা রাখে।"""
+    try:
+        if len(diag.get("samples") or []) < 10:
+            diag.setdefault("samples", []).append(
+                {"from": frm, "subj": subj, "why": why})
+    except Exception:
+        pass
+
+
 def mail_parse_payment(subject, body):
     """Binance পেমেন্ট-রিসিভ মেইল থেকে (amount, sender, time_ms)।
 
     মেল না হলে None। এই ফাংশনটি নেটওয়ার্ক ছোঁয় না — টেস্ট করা সহজ।
     """
-    subj = str(subject or "").lower()
     txt = str(body or "")
     low = txt.lower()
-    if "binance" not in subj and "binance" not in low:
-        return None
-    if not ("payment receive" in subj or "incoming transfer" in low
-            or "you received" in low or "payment receive" in low):
+    # ⚠️ Subject না মিললে কোনোভাবেই পেমেন্ট নয় (প্রোমো/নিউজ মেইল বাদ)
+    if not _mail_subject_ok(subject):
         return None
     amt = None
     for _pat in (r"amount\s*:?\s*([0-9][0-9,]*\.?[0-9]*)\s*usdt",
@@ -11695,7 +11763,8 @@ def mail_parse_payment(subject, body):
     if not amt or amt <= 0:
         return None
     sender = ""
-    _m2 = _re.search(r"from\s*:?\s*([^\n]{2,60})", txt, _re.I)
+    _m2 = _re.search(r"^[ \t]*from[ \t]*:?[ \t]*([^\n]{2,60})$", txt,
+                     _re.I | _re.M)
     if _m2:
         sender = _re.sub(r"<[^>]*>", " ", _m2.group(1))
         sender = _re.sub(r"\s+", " ", sender).strip(" :|-")
@@ -11712,7 +11781,7 @@ def mail_parse_payment(subject, body):
     return {"amount": amt, "sender": sender[:60], "ts_ms": ts_ms}
 
 
-def _mail_fetch_payments(limit=15):
+def _mail_fetch_payments(limit=40):
     """IMAP থেকে নতুন Binance পেমেন্ট মেইল — [(message_id, payment), ...]।"""
     cfg = mail_cfg()
     if not cfg["on"]:
@@ -11727,11 +11796,21 @@ def _mail_fetch_payments(limit=15):
     except Exception as e:
         return [], f"IMAP সংযোগ ব্যর্থ: {str(e)[:90]}"
     out = []
+    _want = cfg.get("from") or ""
+    _diag = {"all": 0, "from_ok": 0, "parsed": 0, "samples": []}
     try:
         imap.login(cfg["user"], cfg["pass"])
         imap.select(cfg["folder"], readonly=True)
+        # ⚠️ আগে UNSEEN আগে দেখা হত — ইউজার মেইল একবার খুলে ফেললেই
+        #    (পড়া হয়ে গেলেই) সেই পেমেন্ট আর কখনো ধরা পড়ত না। এখন
+        #    পড়া/না-পড়া সব মেইলই দেখা হয়, শুধু শেষ কয়েক দিনের।
+        _since = _time.strftime("%d-%b-%Y", _time.gmtime(_time.time() - 4 * 86400))
         ids = []
-        for crit in ("UNSEEN", "ALL"):
+        _crits = []
+        if _want:
+            _crits.append('(FROM "%s" SINCE %s)' % (_want, _since))
+        _crits += ["(SINCE %s)" % _since, "ALL"]
+        for crit in _crits:
             try:
                 typ, data = imap.search(None, crit)
             except Exception:
@@ -11741,30 +11820,68 @@ def _mail_fetch_payments(limit=15):
                 if ids:
                     break
         for num in ids[-int(limit):]:
+            # ১) শুধু হেডার নামানো হয় (হালকা) — প্রেরক/Subject না মিললে
+            #    পুরো মেইল নামানোই হয় না (Gmail ধীর/ব্লক হয় না)
+            raw_h = None
+            try:
+                typ, data = imap.fetch(
+                    num, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID)])")
+            except Exception:
+                typ, data = "NO", []
+            if typ == "OK" and data:
+                for chunk in data:
+                    if isinstance(chunk, tuple) and len(chunk) > 1:
+                        raw_h = chunk[1]
+                        break
+            _diag["all"] += 1
+            if not raw_h:
+                continue
+            try:
+                hdr = _email.message_from_bytes(raw_h)
+            except Exception:
+                continue
+            _from_hdr = _re.sub(r"\s+", " ", str(hdr.get("From") or ""))[:90]
+            _subj_hdr = _re.sub(r"\s+", " ", str(hdr.get("Subject") or ""))[:80]
+            if not _mail_from_ok(_from_hdr, _want):
+                _diag_sample(_diag, _from_hdr, _subj_hdr, "প্রেরক ঠিকানা মেলেনি")
+                continue
+            _diag["from_ok"] += 1
+            if not _mail_subject_ok(_subj_hdr):
+                _diag_sample(_diag, _from_hdr, _subj_hdr, "Subject পেমেন্টের নয়")
+                continue
+            # ২) এখন পুরো মেইল (শুধু সম্ভাব্য পেমেন্টের জন্য)
+            raw = None
             try:
                 typ, data = imap.fetch(num, "(RFC822)")
             except Exception:
-                continue
-            if typ != "OK" or not data:
-                continue
-            raw = None
-            for chunk in data:
-                if isinstance(chunk, tuple) and len(chunk) > 1:
-                    raw = chunk[1]
-                    break
+                typ, data = "NO", []
+            if typ == "OK" and data:
+                for chunk in data:
+                    if isinstance(chunk, tuple) and len(chunk) > 1:
+                        raw = chunk[1]
+                        break
             if not raw:
                 continue
             try:
                 msg = _email.message_from_bytes(raw)
             except Exception:
                 continue
-            mid = str(msg.get("Message-ID") or num).strip()[:120]
-            pay = mail_parse_payment(msg.get("Subject") or "", _mail_body_text(msg))
+            mid = str(msg.get("Message-ID") or hdr.get("Message-ID")
+                      or num).strip()[:120]
+            pay = mail_parse_payment(msg.get("Subject") or _subj_hdr,
+                                     _mail_body_text(msg))
             if pay:
+                pay["from"] = _from_hdr
+                _diag["parsed"] += 1
+                _diag_sample(_diag, _from_hdr, _subj_hdr, "✅ পেমেন্ট")
                 out.append((mid, pay))
+            else:
+                _diag_sample(_diag, _from_hdr, _subj_hdr,
+                             "বডিতে অঙ্ক/নাম পাওয়া যায়নি")
     except Exception as e:
         return [], f"IMAP পড়া ব্যর্থ: {str(e)[:90]}"
     finally:
+        _DEP_MAIL["diag"] = _diag
         try:
             imap.logout()
         except Exception:
@@ -11785,13 +11902,17 @@ def _mail_name_ok(dep_name, sender):
     return bool(_ta and _tb and (_ta & _tb))
 
 
-def _mail_time_ok(o, ts_ms, early_min=1440, late_min=10):
-    """ইমেইলের নিজের সময় যুক্তিসঙ্গত কি না (আগে পাঠানো টাকাও মিলবে)।
+def _mail_time_ok(o, ts_ms, early_min=None, late_min=None):
+    """মেইলের নিজের সময় কি চেক-উইন্ডোর ভেতরে (ডিফল্ট ±৬০ মিনিট)।
 
-    ইউজার আগে টাকা পাঠিয়ে পরে ডিপোজিট দিতে পারে — তাই মেইল ২৪ ঘণ্টা
-    পুরোনো হলেও চলবে। ডুপ্লিকেট আটকায় ইমেইলের Message-ID, সময় নয়।
-    ভবিষ্যতের (ভুল) সময় থাকলে বাদ।
+    ইউজার "চেক/পাঠিয়েছি" চাপার সময়েই ডিপোজিট তৈরি হয় — তাই ওই সময়ের
+    ২ মিনিট আগে থেকে ২ মিনিট পর পর্যন্ত আসা মেইলই ধরা হয়। এটাই টাইম লক:
+    পরে একই অঙ্ক পাঠালে সেটা নতুন উইন্ডোতে যায়, আগের মেইল আর গোনা হয় না।
     """
+    if early_min is None or late_min is None:
+        _w = _mail_win_min()
+        early_min = _w if early_min is None else early_min
+        late_min = _w if late_min is None else late_min
     try:
         ct = _dep_created_ms(o) or 0
     except Exception:
@@ -11887,6 +12008,57 @@ def _mail_pick_deposit(pay, pendings, max_age_min=0):
     return None                  # একাধিক, নামও মেলেনি → অ্যাডমিন দেখবেন
 
 
+async def _dep_pending_admin_card(ctx, oid):
+    """ইউজার চেক চাপার পরেও মেলেনি → অ্যাডমিনকে *একবার* জানানো।"""
+    try:
+        _o = await asyncio.to_thread(dep_row, int(oid))
+    except Exception:
+        return False
+    if not _o or str(_o["status"]) != "pending":
+        return False
+    _seen_ids = set()
+    try:
+        _seen_ids = set(x for x in str(get_setting("dep_adm_cards") or "").split("|") if x)
+    except Exception:
+        _seen_ids = set()
+    if str(int(oid)) in _seen_ids:
+        return False
+    try:
+        _amt = float(_o["amount"] or 0)
+    except Exception:
+        _amt = 0.0
+    _cap = ("⚡ *Binance নাম-ডিপোজিট — যাচাই বাকি*\n\n"
+            "🧾 `#%s` · 👤 `%s`\n"
+            "💵 `%g$`\n"
+            "🔤 নাম: `%s`\n\n"
+            "🔎 চেক: `/depchk %d`" % (dep_no(int(oid)),
+                                     int(_o["user_id"] or 0), _amt,
+                                     _md_esc(str(_o.get("payer_name") or "")),
+                                     int(oid)))
+    _kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ অনুমোদন", callback_data="depok:%d" % int(oid)),
+        InlineKeyboardButton("❌ বাতিল", callback_data="depno:%d" % int(oid))]])
+    try:
+        _adms = [ADMIN_ID] + await asyncio.to_thread(_adm_list, "full")
+    except Exception:
+        _adms = [ADMIN_ID]
+    _sent = False
+    for _a in _adms:
+        try:
+            await ctx.bot.send_message(_a, _cap, parse_mode="Markdown",
+                                       reply_markup=_kb)
+            _sent = True
+        except Exception:
+            pass
+    if _sent:
+        try:
+            _seen_ids.add(str(int(oid)))
+            set_setting("dep_adm_cards", "|".join(list(_seen_ids)[-300:]))
+        except Exception:
+            pass
+    return _sent
+
+
 async def _dep_mail_once(bot):
     """একবার মেইল পড়ে পেন্ডিং ডিপোজিটে টাকা যোগ করে — (credited_count)।"""
     cfg = mail_cfg()
@@ -11907,7 +12079,7 @@ async def _dep_mail_once(bot):
             if mid in seen:
                 continue
             try:
-                pend = await asyncio.to_thread(dep_pending, 60)
+                pend = await asyncio.to_thread(dep_pending, 300)
             except Exception:
                 pend = []
             o = _mail_pick_deposit(pay, pend)
@@ -11978,9 +12150,26 @@ async def cmd_mail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if err:
             lines.append(f"❌ `{_md_esc(err)}`")
         else:
-            lines.append(f"✅ সংযোগ ঠিক · Binance পেমেন্ট মেইল পাওয়া গেছে: *{len(pays)}*")
+            _flt = str(cfg.get("from") or "").strip() or "সব"
+            _dg = dict(_DEP_MAIL.get("diag") or {})
+            lines.append(f"✅ সংযোগ ঠিক · পেমেন্ট মেইল: *{len(pays)}*")
+            lines.append(f"📨 শুধু এই ঠিকানা থেকে: `{_md_esc(_flt)}`")
+            if _dg:
+                lines.append(f"📥 পড়া মেইল: *{int(_dg.get('all') or 0)}* · "
+                             f"প্রেরক মিলেছে: *{int(_dg.get('from_ok') or 0)}* · "
+                             f"পেমেন্ট: *{int(_dg.get('parsed') or 0)}*")
             for _mid, _p in pays[:4]:
-                lines.append(f"• `{float(_p['amount']):g} USDT` · {_md_esc(_p['sender'] or '—')}")
+                lines.append(f"• `{float(_p['amount']):g} USDT` · "
+                             f"{_md_esc(_p['sender'] or '—')} · "
+                             f"`{_md_esc(str(_p.get('from') or '')[:40])}`")
+            _smp = list(_dg.get("samples") or [])[-4:]
+            if _smp:
+                lines.append("")
+                lines.append("🔍 *শেষ মেইলগুলো কেন গোনা হলো/হলো না*")
+                for _s in _smp:
+                    lines.append(f"• {_md_esc(str(_s.get('why')))} — "
+                                 f"`{_md_esc(str(_s.get('from'))[:36])}` · "
+                                 f"{_md_esc(str(_s.get('subj'))[:46] or '—')}")
         if cfg["on"]:
             lines.append("")
             lines.append("অটো-চেক: চালু ✅ (প্রতি ৬০ সেকেন্ড)")
@@ -12269,13 +12458,15 @@ async def show_deposit(update, ctx=None):
         txt = ("💳 *Deposit*\n"
                "━━━━━━━━━━━━━━\n"
                "Choose any method below.\n\n"
-               "⚡ *Auto* — amount + TxID/Order ID is verified and added instantly.\n"
+               "⚡ *Auto* — give the amount and send from Binance; the bot reads "
+               "the e-mail and adds the balance automatically.\n"
                "✍️ *Manual* — you pay and submit TxID/screenshot; admin approves.")
     else:
         txt = ("💳 *ডিপোজিট*\n"
                "━━━━━━━━━━━━━━\n"
                "নিচের যেকোনো একটি মেথড বেছে নিন।\n\n"
-               "⚡ *অটো* — পরিমাণ + TxID/Order ID দিলে সাথে সাথে যাচাই হয়ে ব্যালেন্স যোগ হবে।\n"
+               "⚡ *অটো* — পরিমাণ দিন, Binance থেকে টাকা পাঠান — বট মেইল দেখে "
+               "নিজেই ব্যালেন্স যোগ করে দেবে।\n"
                "✍️ *ম্যানুয়াল* — আপনি পেমেন্ট করে TxID/স্ক্রিনশট দিলে অ্যাডমিন ✅ করবেন।")
     if not methods:
         txt = ("💳 *Deposit*\n\nNo method has been set up yet.\nTell the admin."
@@ -12370,14 +12561,14 @@ async def _dep_method_page(q, mid):
             lines += ["", "📥 *Send to this Binance Pay ID:*",
                       f"`{pay_id}`" if pay_id else "_Binance Pay ID not set — tell the admin_",
                       "", "📱 Binance app → Pay → Send → enter UID → type the amount and send.",
-                      "", "After sending, give the *Order ID* (Binance app → Pay → "
-                      "History) — the bot matches it and adds the balance in 1–2 min."]
+                      "", "✅ Tap *✅ I have paid* after sending — the bot reads "
+                      "the Binance e-mail and adds the balance automatically."]
         else:
             lines += ["", "📥 *এই Binance Pay আইডিতে পাঠান:*",
                       f"`{pay_id}`" if pay_id else "_Binance Pay ID সেট করা নেই — অ্যাডমিনকে জানান_",
                       "", "📱 Binance অ্যাপ → Pay → Send → UID দিন → পরিমাণ লিখে পাঠান।",
-                      "", "পাঠানোর পর *Order ID* দিন (Binance অ্যাপ → Pay → History) — "
-                      "বট সেটা মিলিয়ে ১–২ মিনিটেই ব্যালেন্স যোগ করবে।"]
+                      "", "✅ পাঠানোর পর *✅ পেমেন্ট করেছি* চাপুন — বট "
+                      "Binance-এর মেইল পড়ে নিজেই ব্যালেন্স যোগ করে দেবে।"]
         if ins:
             lines += ["", "📋 " + ins]
     elif kind == "qr":
@@ -12554,7 +12745,6 @@ async def _dep_recheck(q, ctx, oid):
         try:
             await q.edit_message_reply_markup(InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔁 আবার চেক", callback_data=f"dep:re:{oid}")],
-                [InlineKeyboardButton("✏️ Order ID বদলান", callback_data=f"dep:fix:{oid}")],
                 [InlineKeyboardButton("📤 অ্যাডমিনকে পাঠান (ছবি লাগবে)",
                                       callback_data=f"dep:pf:{oid}")],
                 [InlineKeyboardButton("🧾 আমার ডিপোজিট", callback_data="dep:my")]]))
@@ -12822,7 +13012,7 @@ async def _dep_bal_block():
     try:
         _wd = str(get_setting("dep_fund_watch") or "1").strip().lower()
         _on = _wd not in ("0", "off", "false", "no", "")
-        lines.append("🔄 অটো-ক্রেডিট: শুধু Order ID মিললেই (ব্যালেন্স দেখে নয়)")
+        lines.append("🔄 অটো-ক্রেডিট: পেন্ডিং মিললেই (ব্যালেন্স দেখে নয়)")
         # কত টাকা এখনো "অপেক্ষমাণ" — অর্ডার এলেই অটো ✅ হবে
         if fbal is not None and base is not None:
             _pool = round(float(fbal) - float(base), 6)
@@ -13186,20 +13376,12 @@ async def dep_callback(update, ctx):
             return
 
         if d == "dep:useoid":
-            ctx.user_data["state"] = "dep_uid_oid"
-            _en_o = False
+            # Order ID অপশন বাদ (ইউজারের নির্দেশ) — পুরোনো বাটনে শুধু জানানো হয়
             try:
-                _en_o = (await asyncio.to_thread(get_lang, uid)) == "en"
+                await q.answer("Order ID আর লাগবে না — শুধু 🔁 চেক চাপুন",
+                               show_alert=True)
             except Exception:
-                _en_o = False
-            await q.message.reply_text(
-                ("🧾 *Enter the Binance Order ID*\n\n"
-                 "Binance Pay → History → open the payment → copy *Order ID*.\n\n"
-                 "/cancel — cancel" if _en_o else
-                 "🧾 *Binance Order ID দিন*\n\n"
-                 "Binance Pay → History → পেমেন্টে চাপ → *Order ID* কপি করে পাঠান।\n\n"
-                 "/cancel — বাতিল"),
-                parse_mode="Markdown")
+                pass
             return
 
         if d == "dep:chname":
@@ -13236,7 +13418,7 @@ async def dep_callback(update, ctx):
                 _m = {"id": int(_o["method_id"] or 0),
                       "name": str(_o["method_name"] or ""),
                       "kind": str(_o["kind"] or "uid")}
-            # 📧 মেইল-মোড: নাম দেওয়ার সাথে সাথেই মেইল চেক — অপেক্ষা নয়
+            # 📧 মেইল-মোড: চেক চাপলেই মেইল দেখা হয় — সবসময় একটা উত্তর যায়
             _mail_mode = False
             try:
                 _mail_mode = await asyncio.to_thread(lambda: mail_cfg()["on"])
@@ -13247,41 +13429,95 @@ async def dep_callback(update, ctx):
                     await q.answer("🔎 চেক করা হচ্ছে…")
                 except Exception:
                     pass
-                try:
-                    await _dep_mail_once(ctx.bot)
-                except Exception:
-                    pass
-                _o2 = await asyncio.to_thread(dep_row, _oid)
-                if _o2 and str(_o2["status"]) != "pending":
-                    try:
-                        await q.answer("✅ টাকা যোগ হয়েছে!")
-                    except Exception:
-                        pass
-                    return
                 _lb = False
                 try:
                     _lb = (await asyncio.to_thread(get_lang, uid)) == "en"
                 except Exception:
                     _lb = False
                 try:
-                    await ctx.bot.send_message(
+                    _w = await ctx.bot.send_message(
                         uid,
-                        (f"🔎 *Checking your payment…*\n\n"
-                         f"🧾 `#{dep_no(_oid)}` · 💵 `{float(_o['amount'] or 0):g}$`\n"
-                         f"👤 `{_md_esc(str(_o.get('payer_name') or ''))}`\n\n"
-                         "The bot reads the Binance email and adds the balance the "
-                         "moment the name, amount and email time match.\n"
-                         "☝️ Nothing else to do — you'll get a message here."
-                         if _lb else
-                         f"🔎 *আপনার পেমেন্ট যাচাই করা হচ্ছে…*\n\n"
-                         f"🧾 `#{dep_no(_oid)}` · 💵 `{float(_o['amount'] or 0):g}$`\n"
-                         f"👤 `{_md_esc(str(_o.get('payer_name') or ''))}`\n\n"
-                         "বট Binance-এর মেইল পড়ে দেখছে — নাম, অঙ্ক আর মেইলের সময় "
-                         "মিললেই ব্যালেন্স সাথে সাথে যোগ হবে।\n"
-                         "☝️ আপনাকে আর কিছু করতে হবে না, এখানেই জানিয়ে দেওয়া হবে।"),
+                        ("🔎 *Checking your payment…*" if _lb
+                         else "🔎 *আপনার পেমেন্ট চেক করা হচ্ছে…*"),
                         parse_mode="Markdown")
                 except Exception:
+                    _w = None
+
+                async def _say_check(txt, kb=None):
+                    """এডিট ব্যর্থ হলে নতুন মেসেজ — উত্তর কখনো হারায় না।"""
+                    if _w is not None:
+                        try:
+                            await _w.edit_text(txt, parse_mode="Markdown",
+                                               reply_markup=kb)
+                            return
+                        except Exception:
+                            pass
+                    try:
+                        await ctx.bot.send_message(uid, txt, parse_mode="Markdown",
+                                                   reply_markup=kb)
+                    except Exception:
+                        pass
+
+                _was_busy = bool(_DEP_MAIL.get("busy"))
+                try:
+                    await _dep_mail_once(ctx.bot)
+                except Exception:
                     pass
+                if _was_busy:      # ওয়াচার চলছিল → শেষ হওয়া পর্যন্ত অপেক্ষা
+                    for _wq in range(16):
+                        if not _DEP_MAIL.get("busy"):
+                            break
+                        await asyncio.sleep(0.5)
+                _o2 = await asyncio.to_thread(dep_row, _oid)
+                _amt2 = float(_o["amount"] or 0)
+                if _o2 and str(_o2["status"]) != "pending":
+                    _ok_lbl = ("✅ *Payment found — balance added!*" if _lb
+                               else "✅ *পেমেন্ট পাওয়া গেছে — ব্যালেন্স যোগ হয়েছে!*")
+                    await _say_check(
+                        _ok_lbl + "\n\n" + f"🧾 `#{dep_no(_oid)}` · "
+                        f"💵 `+{float(_o2['amount'] or 0):g}$`")
+                    try:
+                        await q.answer("✅ টাকা যোগ হয়েছে!", show_alert=True)
+                    except Exception:
+                        pass
+                    return
+                try:
+                    _wn2 = _mail_win_min()
+                except Exception:
+                    _wn2 = 60
+                _txt_no = ((f"❌ *Not found yet*\n\n"
+                            f"🧾 `#{dep_no(_oid)}` · 💵 `{_amt2:g}$`\n\n"
+                            f"The bot looks at Binance e-mails within "
+                            f"{_wn2} minutes of this deposit and reads the "
+                            "payer name and amount.\n"
+                            "Paid just now? Wait a few seconds and tap "
+                            "*🔁 Check* again.") if _lb else
+                           (f"❌ *এখনো মেলেনি*\n\n"
+                            f"🧾 `#{dep_no(_oid)}` · 💵 `{_amt2:g}$`\n\n"
+                            f"বট এই ডিপোজিটের ±{_wn2} মিনিটের Binance মেইল "
+                            "দেখে — নাম আর অঙ্ক মিললেই ব্যালেন্স যোগ হয়।\n"
+                            "এইমাত্র টাকা পাঠিয়ে থাকলে কয়েক সেকেন্ড পরে "
+                            "*🔁 চেক* আবার চাপুন।"))
+                try:
+                    _dg2 = dict(_DEP_MAIL.get("diag") or {})
+                    if _dg2:
+                        _dc = (int(_dg2.get("all") or 0),
+                               int(_dg2.get("from_ok") or 0),
+                               int(_dg2.get("parsed") or 0))
+                        _txt_no += (("\n\n📥 Read: %d · sender matched: %d · "
+                                     "payment: %d") if _lb else
+                                    ("\n\n📥 পড়া মেইল: %d · প্রেরক মিলেছে: %d · "
+                                     "পেমেন্ট: %d")) % _dc
+                except Exception:
+                    pass
+                _kb_no = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔁 Check" if _lb else "🔁 চেক",
+                                         callback_data=f"depname:{_oid}"),
+                    InlineKeyboardButton("🧾 My deposits" if _lb else "🧾 আমার ডিপোজিট",
+                                         callback_data="dep:my")]])
+                await _say_check(_txt_no, _kb_no)
+                # ইউজার নিজে চেক চেপেছে — তখনই অ্যাডমিনকে একবার জানানো হয়
+                await _dep_pending_admin_card(ctx, _oid)
                 return
             _got = await asyncio.to_thread(dep_name_find_for, _o)
             if not (_got and _got[1]):
@@ -13539,8 +13775,18 @@ async def _dep_uid_finish(update, ctx, uid, m, amt, name, en=False):
     for _k in ("state", "dep_mid", "dep_uid_amt", "dep_payer_name", "dep_code"):
         ctx.user_data.pop(_k, None)
     _note = (f"Binance নাম: {name}")[:200]
-    oid = await asyncio.to_thread(dep_new, uid, m, amt, "", _note, "pending",
-                                  "binance", "", name)
+    # 🔁 চেক দুবার চাপলে আগের পেন্ডিং ডিপোজিটই ব্যবহার হয় (ডুপ্লিকেট নয়)
+    _dup = None
+    try:
+        _dup = await asyncio.to_thread(dep_find_pending_same, uid, amt, name, 90)
+    except Exception:
+        _dup = None
+    if _dup:
+        oid = int(_dup["id"])
+        log.info(f"[DEP-NAME] আগের পেন্ডিং #{oid} ব্যবহার (ডুপ্লিকেট বন্ধ)")
+    else:
+        oid = await asyncio.to_thread(dep_new, uid, m, amt, "", _note, "pending",
+                                      "binance", "", name)
     _got = None
     _mail_mode = False
     try:
@@ -13559,48 +13805,38 @@ async def _dep_uid_finish(update, ctx, uid, m, amt, name, en=False):
         await _dep_auto_credit(ctx, uid, m, _got[0] or amt,
                                ("" if _mail_mode else _got[1]), oid)
         return oid
+    try:
+        _wn = _mail_win_min()
+    except Exception:
+        _wn = 60
     await update.message.reply_text(
-        (f"⏳ *Checking your payment...*\n\n"
+        (f"⏳ *Your payment is being checked…*\n\n"
          f"🧾 `#{dep_no(oid)}` · 💵 `{amt:g}$`\n"
          f"🔤 Name: `{_md_esc(name)}`\n\n"
-         "💵 *After paying the dollars, tap 🔁 Check after 1 minute* — balance is "
-         "added instantly.\n"
-         "⚡ The bot also checks every minute automatically.\n"
-         "⏳ No time limit — the bot matches the email's own time."
+         f"⚠️ Tap *🔁 Check* right after sending — the bot looks at e-mails "
+         f"within {_wn} minutes of this deposit.\n"
+         "📲 Paid already? Tap *🔁 Check* — the bot reads the Binance e-mail "
+         "and adds the balance at once.\n"
+         "⏱ An e-mail can be counted only once, so an old payment of the "
+         "same amount is never counted twice."
          if en else
-         f"⏳ *আপনার পেমেন্ট যাচাই করা হচ্ছে...*\n\n"
+         f"⏳ *আপনার পেমেন্ট যাচাই চলছে…*\n\n"
          f"🧾 `#{dep_no(oid)}` · 💵 `{amt:g}$`\n"
          f"🔤 নাম: `{_md_esc(name)}`\n\n"
-         "💵 *ডলার পেমেন্ট করে ১ মিনিট পর 🔁 চেক চাপুন* — সাথে সাথে ব্যালেন্স যোগ হবে।\n"
-         "⚡ বট নিজেও প্রতি মিনিটে চেক করছে, টাকা এলে অটো যোগ হবে।\n"
-         "⏳ কোনো সময়সীমা নেই — ইমেইলের নিজের সময় দেখে মিলিয়ে নেওয়া হয়।"),
+         f"⚠️ টাকা পাঠানোর *পরপরই* 🔁 চেক চাপুন — বট এই ডিপোজিটের "
+         f"±{_wn} মিনিটের মেইল দেখে।\n"
+         "📲 টাকা পাঠিয়ে থাকলে *🔁 চেক* চাপুন — বট Binance-এর মেইল পড়ে "
+         "সাথে সাথে ব্যালেন্স যোগ করবে।\n"
+         "⏱ একটা মেইল একবারই গোনা হয় — তাই পুরোনো একই অঙ্কের পেমেন্ট "
+         "ভুলে আবার যোগ হবে না।"),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔁 Check" if en else "🔁 চেক",
                                  callback_data=f"depname:{oid}"),
             InlineKeyboardButton("🧾 My deposits" if en else "🧾 আমার ডিপোজিট",
                                  callback_data="dep:my")]]))
-    try:
-        _cap = (f"⚡ *Binance নাম-ডিপোজিট — যাচাই বাকি*\n\n"
-                f"🧾 `#{dep_no(oid)}` · 👤 `{uid}`\n"
-                f"💵 `{amt:g}$`\n"
-                f"🔤 নাম: `{_md_esc(name)}`\n\n"
-                f"🔎 চেক: `/depchk {oid}`")
-        _kb2 = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ অনুমোদন", callback_data=f"depok:{oid}"),
-            InlineKeyboardButton("❌ বাতিল", callback_data=f"depno:{oid}")]])
-        try:
-            _adms = [ADMIN_ID] + await asyncio.to_thread(_adm_list, "full")
-        except Exception:
-            _adms = [ADMIN_ID]
-        for _a in _adms:
-            try:
-                await ctx.bot.send_message(_a, _cap, parse_mode="Markdown",
-                                           reply_markup=_kb2)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    # ⚠️ অ্যাডমিনকে এখনই পাঠানো হয় না — ইউজার নিজে 🔁 চেক চাপার পরেও
+    #    না মিললে তখন একবার যায় (`_dep_pending_admin_card`)।
     return oid
 
 
@@ -13674,77 +13910,6 @@ async def dep_input(update, ctx, st):
                                                reply_markup=_kb)
                 except Exception:
                     pass
-        return True
-
-    # ── ✏️ ভুল Order ID বদলে আবার যাচাই (পেন্ডিং ডিপোজিট) ──
-    if str(st).startswith("dep_fix_ref:"):
-        try:
-            _oid = int(str(st).split(":")[1])
-        except Exception:
-            ctx.user_data.pop("state", None)
-            return True
-        _o = await asyncio.to_thread(dep_row, _oid)
-        if (not _o or int(_o["user_id"] or 0) != int(uid)
-                or str(_o["status"]) != "pending"):
-            ctx.user_data.pop("state", None)
-            await update.message.reply_text("❌ এই ডিপোজিট এখন আর পেন্ডিং নেই।")
-            return True
-        ref = re.sub(r"[\s\-_]+", "", txt)
-        if txt.strip().casefold() in ("auto", "অটো", "skip", "না", "নাই", "no", "-"):
-            ctx.user_data.pop("state", None)
-            await update.message.reply_text(
-                "⏳ ঠিক আছে — *অটো চেক* নিজেই খুঁজবে।\n"
-                "Order ID বাদ দিয়ে বট পেন্ডিং ডিপোজিটটা পরিমাণ মিলিয়ে "
-                "খুঁজতে থাকবে (প্রতি মিনিটে একবার)।",
-                parse_mode="Markdown")
-            return True
-        if not (ref.isdigit() and 8 <= len(ref) <= 30):
-            await update.message.reply_text(
-                "❌ *Order ID শুধু সংখ্যায় হয়* (৮–৩০ ডিজিট)।\n\n"
-                "📱 Binance অ্যাপ → Pay → History → ওই পেমেন্টে চাপ দিন → "
-                "*Order ID* কপি করে পাঠান।\n\n/cancel — বাতিল",
-                parse_mode="Markdown")
-            return True
-        if await asyncio.to_thread(dep_ref_used, ref):
-            await update.message.reply_text(
-                "⚠️ এই Order ID আগেই অন্য ডিপোজিটে ব্যবহার হয়েছে — নতুন Order ID দিন।")
-            return True
-        await asyncio.to_thread(dep_set_ref, _oid, ref)
-        ctx.user_data.pop("state", None)
-        _msg = await update.message.reply_text("🔎 নতুন Order ID দিয়ে যাচাই হচ্ছে…")
-        _m2 = await asyncio.to_thread(dep_method, int(_o["method_id"] or 0))
-        _prov = dep_method_provider(_m2) if _m2 else "binance"
-        try:
-            _amt2 = float(_o["amount"] or 0)
-        except Exception:
-            _amt2 = 0.0
-        _win2 = await asyncio.to_thread(dep_uid_window)
-        _got2, _tx2, _err2 = await asyncio.to_thread(
-            dep_api_find, _prov, ref, _amt2, _win2)
-        if _tx2 and not _err2:
-            n = await asyncio.to_thread(dep_set, _oid, "approved", 0)
-            if n:
-                await asyncio.to_thread(dep_attach_txid, _oid, _tx2)
-                await _dep_auto_credit(ctx, uid, _m2, float(_got2 or _amt2), _tx2, _oid)
-                try:
-                    await _msg.edit_text(
-                        f"✅ <b>ডিপোজিট পাওয়া গেছে!</b>\n\n"
-                        f"💵 <b>{float(_got2 or _amt2):g}$</b>\n"
-                        f"🧾 <code>#{_oid}</code>\n\nব্যালেন্স যোগ হয়েছে।",
-                        parse_mode="HTML")
-                except Exception:
-                    pass
-                return True
-        await _msg.edit_text(
-            f"⏳ *এখনো পাওয়া যায়নি*\n\n🧾 `#{_oid}`\n🔗 `{ref}`\n\n"
-            "Order ID ঠিক থাকলে ১–২ মিনিট পরে *🔁 আবার চেক* চাপুন। "
-            "নাহলে *📤 অ্যাডমিনকে পাঠান* — ছবিসহ পাঠালে অ্যাডমিন নিজে যাচাই করবেন।",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔁 আবার চেক", callback_data=f"dep:re:{_oid}")],
-                [InlineKeyboardButton("✏️ Order ID বদলান", callback_data=f"dep:fix:{_oid}")],
-                [InlineKeyboardButton("📤 অ্যাডমিনকে পাঠান (ছবি লাগবে)",
-                                      callback_data=f"dep:pf:{_oid}")]]))
         return True
 
     mid = int(ctx.user_data.get("dep_mid") or 0)
@@ -13970,16 +14135,17 @@ async def dep_input(update, ctx, st):
             await update.message.reply_text(
                 (f"💵 *Amount:* `{amt:g}$`\n"
                  f"🔤 *Saved name:* `{_md_esc(_nm0)}`\n\n"
-                 "📲 Send the money with Binance Pay using *this same nickname*.\n"
-                 "✅ Then tap *I've paid — check* — the bot matches the payment "
-                 "and adds the balance automatically.\n\n"
+                 "📲 Now send the money with Binance Pay.\n"
+                 "When the name and amount match, the bot reads the Binance "
+                 "e-mail and adds the balance by itself.\n"
+                 "✅ After sending, tap *✅ I've paid — check*.\n\n"
                  "💡 You only give the nickname once; next time it is reused."
                  if _en else
                  f"💵 *পরিমাণ:* `{amt:g}$`\n"
                  f"🔤 *সেভ করা নাম:* `{_md_esc(_nm0)}`\n\n"
-                 "📲 এই *একই nickname* দিয়ে Binance Pay-তে টাকা পাঠান।\n"
-                 "✅ তারপর *টাকা পাঠিয়েছি — চেক* চাপুন — বট মিলিয়ে ব্যালেন্স "
-                 "যোগ করে দেবে।\n\n"
+                 "📲 এখন Binance Pay দিয়ে টাকা পাঠান।\n"
+                 "নাম আর পরিমাণ মিললে বট নিজেই মেইল দেখে ব্যালেন্স যোগ করে দেবে।\n"
+                 "✅ টাকা পাঠানোর পর *টাকা পাঠিয়েছি — চেক* চাপুন।\n\n"
                  "💡 নাম একবার দিলেই হবে — পরেরবার নিজেই ব্যবহার হবে।"),
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
@@ -13987,9 +14153,7 @@ async def dep_input(update, ctx, st):
                                           else "✅ I've paid — check",
                                           callback_data="dep:nameok")],
                     [InlineKeyboardButton("✏️ নতুন নাম" if not _en else "✏️ New name",
-                                          callback_data="dep:chname"),
-                     InlineKeyboardButton("🧾 Order ID" if not _en else "🧾 Order ID",
-                                          callback_data="dep:useoid")]]))
+                                          callback_data="dep:chname")]]))
             return True
         # নাম সেভ নেই → আগের মতোই নাম চাই
         ctx.user_data["state"] = "dep_uid_name"
@@ -14002,91 +14166,6 @@ async def dep_input(update, ctx, st):
              "Binance App → Profile → Nickname — পুরো নামটা *হুবহু* লিখুন।\n"
              "একবার দিলেই সেভ থাকবে, পরেরবার নিজেই ব্যবহার হবে।\n\n/cancel — বাতিল"),
             parse_mode="Markdown")
-        return True
-
-    if st == "dep_uid_oid":
-        _ord_id = re.sub(r"[^0-9A-Za-z]", "", str(txt or ""))
-        if len(_ord_id) < 6 or len(_ord_id) > 40:
-            await update.message.reply_text(
-                ("❌ *Invalid Order ID*\n\nSend the Order ID / Transaction ID exactly "
-                 "as shown in Binance Pay → History." if _en else
-                 "❌ *Order ID ঠিক নয়*\n\nBinance Pay → History-তে যে Order ID / "
-                 "Transaction ID লেখা আছে সেটাই হুবহু পাঠান।"),
-                parse_mode="Markdown")
-            return True
-        # এক Order ID = এক ডিপোজিট
-        _used = False
-        try:
-            _used = bool(await asyncio.to_thread(dep_ref_used, _ord_id)) or \
-                    bool(await asyncio.to_thread(dep_txid_used, _ord_id))
-        except Exception:
-            _used = False
-        if _used:
-            await update.message.reply_text(
-                ("⚠️ *This Order ID is already used.*\n\nCheck Binance Pay → History "
-                 "and send the Order ID of your new payment." if _en else
-                 "⚠️ *এই Order ID আগেই ব্যবহার করা হয়েছে।*\n\nBinance Pay → History "
-                 "দেখে নতুন পেমেন্টের Order ID পাঠান।"),
-                parse_mode="Markdown")
-            return True
-        try:
-            amt = float(ctx.user_data.get("dep_uid_amt") or 0)
-        except Exception:
-            amt = 0.0
-        if amt <= 0:
-            ctx.user_data["state"] = "dep_uid_amt"
-            await update.message.reply_text(
-                "💵 *কত ডলার পাঠিয়েছেন?*\n\nশুধু সংখ্যা লিখুন (যেমন `10`)।",
-                parse_mode="Markdown")
-            return True
-        _m2 = m
-        if not _m2 or not _m2.get("id"):
-            try:
-                _m2 = await asyncio.to_thread(dep_method, int(ctx.user_data.get("dep_mid") or 0))
-            except Exception:
-                _m2 = None
-        if not _m2:
-            ctx.user_data.pop("state", None)
-            await update.message.reply_text("❌ ডিপোজিট মেথড পাওয়া যায়নি — আবার শুরু করুন।")
-            return True
-        for _k in ("state", "dep_mid", "dep_uid_amt"):
-            ctx.user_data.pop(_k, None)
-        _note = f"Binance: {_ord_id}"[:200]
-        try:
-            oid = await asyncio.to_thread(dep_new, uid, _m2, amt, _ord_id, _note,
-                                          "pending", "binance", "", "")
-        except Exception as _ne:
-            log.warning(f"[DEP-OID] ডিপোজিট তৈরি ব্যর্থ: {_ne}")
-            await update.message.reply_text("❌ সেভ করা যায়নি — আবার চেষ্টা করুন।")
-            return True
-        _got_a, _got_tx, _err = (None, "", "")
-        try:
-            _got_a, _got_tx, _err = await asyncio.to_thread(dep_order_find, _ord_id)
-        except Exception as _ge:
-            log.debug(f"[DEP-OID] সাথে সাথে চেক ব্যর্থ: {_ge}")
-        if _got_a and _got_tx:
-            # TxID = ইউজারের দেওয়া Order ID (Binance-এর আলাদা TxID নয়)
-            await _dep_auto_credit(ctx, uid, _m2, float(_got_a or amt), _ord_id, oid)
-            return True
-        await update.message.reply_text(
-            (f"⏳ *Checking Order ID `{_md_esc(_ord_id)}`…*\n\n"
-             f"🧾 `#{dep_no(oid)}` · 💵 `{amt:g}$`\n\n"
-             "⚡ The bot checks automatically — balance is added the moment it "
-             "matches. You don't need to do anything." if _en else
-             f"⏳ *Order ID `{_md_esc(_ord_id)}` যাচাই করা হচ্ছে…*\n\n"
-             f"🧾 `#{dep_no(oid)}` · 💵 `{amt:g}$`\n\n"
-             "⚡ বট নিজেই চেক করছে — মিললেই ব্যালেন্স যোগ হবে।\n"
-             "☝️ আপনাকে আর কিছু করতে হবে না।"),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔁 Check" if _en else "🔁 চেক",
-                                     callback_data=f"depname:{oid}"),
-                InlineKeyboardButton("🧾 My deposits" if _en else "🧾 আমার ডিপোজিট",
-                                     callback_data="dep:my")]]))
-        # ⚠️ আগে Order ID জমা দেওয়ার সাথে সাথেই অ্যাডমিনের কাছে
-        #    "✅ অনুমোদন / ❌ বাতিল" মেসেজ যেত (ইউজারের অভিযোগ) — এখন
-        #    বট নিজেই অটো চেক করে ক্রেডিট দেয়; দরকার হলে অ্যাডমিন
-        #    `/depchk <id>` বা প্যানেল থেকে দেখবেন।
         return True
 
     if st == "dep_uid_name":
@@ -14226,12 +14305,10 @@ async def _dep_admin_panel(q):
     methods = await asyncio.to_thread(dep_methods, False)
     pend = await asyncio.to_thread(dep_pending, 50)
     auto_n = sum(1 for m in methods if str(m["kind"]) in ("auto", "uid"))
-    _bready = await asyncio.to_thread(dep_binance_ready)
     txt = ("💳 *ডিপোজিট ম্যানেজার*\n"
            "━━━━━━━━━━━━━━\n"
            f"📋 মেথড: `{len(methods)}` (⚡ অটো `{auto_n}`)\n"
            f"⏳ পেন্ডিং: `{len(pend)}`\n\n"
-           f"🔌 Binance API: {'✅ সেট আছে' if _bready else '❌ সেট নেই (UID অটো কাজ করবে না)'}\n\n"
            "⚡ অটো = BEP-20 TxID / Binance UID যাচাই।\n"
            "✍️ ম্যানুয়াল = আপনি ✅ করবেন।")
     try:
@@ -14446,8 +14523,8 @@ async def _dep_admin_cb(q, ctx, d):
                     "🆔 *ধাপ ৩/৪ — আপনার Binance Pay আইডি*\n\n"
                     "যে Binance অ্যাকাউন্টে টাকা আসবে তার *UID / Pay ID* লিখুন "
                     "(Binance অ্যাপ → Profile → UID)।\n\n"
-                    "⚠️ Binance API Key/Secret সেট না থাকলে অটো যাচাই হবে না — "
-                    "সেক্ষেত্রে অ্যাডমিন ম্যানুয়াল ✅ করবেন।\n\n/cancel — বাতিল",
+                    "📧 ইউজার টাকা পাঠিয়ে চেক চাপলে বট Binance-এর মেইল "
+                    "দেখে নিজেই ব্যালেন্স যোগ করবে।\n\n/cancel — বাতিল",
                     parse_mode="Markdown")
             elif kind == "auto":
                 ctx.user_data["state"] = "depa_new_addr"
@@ -15201,32 +15278,8 @@ async def _cmd_start_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Deep link: /start promo_CODE → auto-apply promo
         ctx.user_data["pending_promo"] = args[0][6:].upper()
 
-    # ── অ্যাডমিনের শীট-লিংক (fbpw_<gid>) → ঠিক ওই পাসওয়ার্ডের কার্ড ──
-    _dfp = ctx.user_data.get("deep_fbpw")
-    if _dfp:
-        try:
-            _dgrp = await asyncio.to_thread(_pw_group_by_id, int(_dfp), "fb")
-            _dtask = await asyncio.to_thread(_fb_task, int(_dgrp["task_id"])) if _dgrp else None
-            if _dgrp and _dtask:
-                _dpw = str(_dgrp["password"] or "")
-                _dseats = int(_dgrp["seats_total"] or 0)
-                _dused = await asyncio.to_thread(_pw_used, int(_dgrp["task_id"]), _dpw, "fb")
-                _dleft = (_dseats - _dused) if _dseats else -1
-                await update.message.reply_text(
-                    (f"🔑 *{_md_esc(str(_dtask['name'] or 'FB Task'))}*\n"
-                     f"━━━━━━━━━━━━━━\n"
-                     f"🎫 পাসওয়ার্ড: `{_md_esc(_dpw)}`\n"
-                     + (f"🪑 খালি সিট: `{_dleft}`\n" if _dleft >= 0 else "🪑 সিট: `আনলিমিটেড`\n")
-                     + "\nনিচের বাটনে চাপলে ঠিক এই পাসওয়ার্ড দিয়েই শুরু হবে — "
-                       "আপনার জমা এই শীটেই যাবে।"),
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("▶️ এই পাসওয়ার্ড দিয়ে আইডি নিন",
-                                             callback_data=f"fbspwid:{int(_dfp)}")]]))
-        except Exception as _de:
-            log.debug(f"[DEEP-FBPW] কার্ড ব্যর্থ: {_de}")
-        finally:
-            ctx.user_data.pop("deep_fbpw", None)
+    # ওয়েবের "এই পাস দিয়ে আইডি নিন" লিংক → মাঝের কার্ড ছাড়া
+    # সরাসরি ওই টাস্কে ঢুকে যায় (নিচে verification-এর পরে)।
 
     # ২টা কল একসাথে — আগে ছিল ৩টা একের পর এক (প্রতি RTT = দেরি)
     _u0, _ref_backfilled = await asyncio.gather(
@@ -15306,6 +15359,45 @@ async def _cmd_start_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _background_tasks.add(_sec_t); _sec_t.add_done_callback(_bg_task_done)
     except Exception as _sec_e:
         log.debug(f"[SEC2] start চেক ব্যর্থ: {_sec_e}")
+
+    # ── ওয়েবের শীট-লিংক (fbpw_<gid>) → সরাসরি টাস্ক, মাঝে কার্ড নেই ──
+    _dfp = ctx.user_data.get("deep_fbpw")
+    if _dfp:
+        try:
+            _dl_missing2 = await check_ch(update, ctx)
+            _pstage("channels")
+            if _dl_missing2:
+                await join_prompt(update, uid=user.id)
+                return
+            _dgrp = await asyncio.to_thread(_pw_group_by_id, int(_dfp), "fb")
+            _dtask = (await asyncio.to_thread(_fb_task, int(_dgrp["task_id"]))
+                      if _dgrp else None)
+            if _dgrp and _dtask:
+                _dpw2 = str(_dgrp["password"] or "")
+
+                class _PwQ:
+                    """callback-query-এর মতো ছোট shim — /start মেসেজেই কাজ চালায়।"""
+                    def __init__(self, m):
+                        self.message = m
+
+                    async def answer(self, *a, **k):
+                        return None
+
+                    async def edit_message_text(self, *a, **k):
+                        try:
+                            return await self.message.reply_text(*a, **k)
+                        except Exception:
+                            return None
+
+                ctx.user_data.pop("deep_fbpw", None)
+                await fb_task_start(_PwQ(update.effective_message), user.id,
+                                    int(_dgrp["task_id"]), pw=_dpw2,
+                                    _allow_only_task_ids={int(_dgrp["task_id"])})
+                return
+        except Exception as _dfe:
+            log.debug(f"[DEEP-FBPW] সরাসরি টাস্ক ব্যর্থ: {_dfe}")
+        finally:
+            ctx.user_data.pop("deep_fbpw", None)
 
     if deep_task_type and deep_task_id:
         # ── Channel check — deep link এ আসলেও চ্যানেল জয়েন চেক করো ──
@@ -34437,65 +34529,6 @@ def main():
         # ── Binance ডিপোজিট অটো-ওয়াচ (১ ঘণ্টা, প্রতি ৪৫ সে.) ──
         try:
             log.info("ℹ️ Binance deposit auto-watch বন্ধ — শুধু বাটনে চাপলে চেক হবে")
-
-            async def _dep_boot_report(minutes=60):
-                """বুট/আপডেটের পর অ্যাডমিনকে পূর্ণ ডায়াগনস্টিক DM (সবসময়, ৩ বার চেষ্টা)।"""
-                _host = (os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "").strip()
-                _px = (os.environ.get("BINANCE_PROXY")
-                       or os.environ.get("BINANCE_HTTPS_PROXY") or "").strip()
-                _head = (f"🚀 *বট চালু — নতুন ফাইল লোড হয়েছে*\n"
-                         f"build: `{BOT_BUILD}`\n"
-                         f"🌍 হোস্ট: `{_host or 'লোকাল'}`\n"
-                         f"🔌 Proxy: `{'সেট' if _px else 'নেই'}`\n"
-                         f"🕒 {now()}\n"
-                         "━━━━━━━━━━━━━━\n"
-                         "_নিচে Binance চেকের ফল — কিছু ভুল হলে 🔁 বাটনে চাপুন_")
-                _kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔁 Binance আবার টেস্ট", callback_data="depdiag")]])
-                try:
-                    if not await asyncio.to_thread(dep_binance_ready):
-                        _t = ("\n\n⚠️ *Binance API সেট করা নেই*\n"
-                              "Admin → 💳 ডিপোজিট → 🔌 API Key/Secret দিন।")
-                    else:
-                        _ok, _rep = await asyncio.to_thread(
-                            dep_api_test, "binance", int(minutes))
-                        _t = "\n\n" + _rep
-                        log.info(f"[BINANCE] boot self-test {'OK' if _ok else 'FAIL'}")
-                except Exception as _te:
-                    _t = f"\n\n⚠️ টেস্ট চলেনি: `{str(_te)[:120]}`"
-                _msg = _head + _t
-                for _att in range(3):
-                    try:
-                        await application.bot.send_message(
-                            ADMIN_ID, _msg, parse_mode="Markdown", reply_markup=_kb)
-                        log.info("[BINANCE] boot report পাঠানো হয়েছে")
-                        return
-                    except Exception as _e1:
-                        try:      # Markdown ভাঙলে প্লেইন টেক্সটে
-                            await application.bot.send_message(
-                                ADMIN_ID, _msg.replace("*", "").replace("`", ""),
-                                reply_markup=_kb)
-                            log.info("[BINANCE] boot report (plain) পাঠানো হয়েছে")
-                            return
-                        except Exception as _e2:
-                            log.warning(f"[BINANCE] boot report চেষ্টা {_att+1}/3 ব্যর্থ: "
-                                        f"{str(_e2)[:120]}")
-                            await asyncio.sleep(20)
-                log.error("[BINANCE] boot report ৩ বার ব্যর্থ — ডেলিভারি হয়নি")
-
-            async def _dep_api_boot_check():
-                await asyncio.sleep(20)
-                for _try in range(3):
-                    try:
-                        await _dep_boot_report(60)
-                        return
-                    except Exception as _be:
-                        log.warning(f"[BINANCE] boot check {_try+1}/3: {str(_be)[:120]}")
-                        await asyncio.sleep(30)
-
-            _depchk = asyncio.create_task(_dep_api_boot_check())
-            _background_tasks.add(_depchk)
-            _depchk.add_done_callback(_bg_task_done)
 
             async def _dep_fund_base_init():
                 """বুটে ফান্ডিং-ব্যালেন্স বেসলাইন — পেমেন্ট আগে এলেও ধরা পড়বে।"""

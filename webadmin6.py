@@ -187,31 +187,6 @@ def deposits_home():
         return (f"<a class='btn {'ok' if active else 'gray'} sm' "
                 f"href='/admin/deposits{q}'>{lbl}</a>")
 
-    _api = settings_all(["binance_api_key", "binance_api_secret", "binance_uid_window"])
-    _key_set = bool((_api.get("binance_api_key") or "").strip())
-    _sec_set = bool((_api.get("binance_api_secret") or "").strip())
-    _api_ready = _key_set and _sec_set
-    api_card = (
-        "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
-        "<b>🆔 Binance UID অটো — API সেটিং</b>"
-        + (badge("✅ চালু", "ok") if _api_ready else badge("❌ সেট নেই", "err"))
-        + "</div>"
-        "<form method='post' action='/admin/deposits/api' style='margin-top:10px'>"
-        "<div class='field'><label>Binance API Key</label>"
-        f"<input name='binance_api_key' value='{esc(_api.get('binance_api_key') or '')}' "
-        "placeholder='Binance → API Management → Create API (Enable Reading)'></div>"
-        "<div class='field'><label>Binance API Secret</label>"
-        f"<input name='binance_api_secret' type='password' "
-        f"value='{esc(_api.get('binance_api_secret') or '')}' placeholder='secret key'></div>"
-        "<div class='field'><label>কত মিনিট আগের পেমেন্ট খুঁজবে</label>"
-        f"<input name='binance_uid_window' value='{esc(_api.get('binance_uid_window') or 45)}'></div>"
-        "<p class='mut' style='font-size:11px;margin:6px 0 0'>API Key-তে শুধু "
-        "<b>Enable Reading</b> + Binance Pay permission থাকলেই যথেষ্ট। সেট না থাকলে "
-        "UID মেথড অটো যাচাই না করে পেন্ডিং হিসেবে আপনার কাছে আসবে (ম্যানুয়াল ✅)।</p>"
-        "<button class='ok' type='submit' style='margin-top:10px'>💾 সেভ করুন</button>"
-        "</form></div>"
-    )
-
     _q = settings_all(["qr_image", "qr_image_b64", "qr_image_mime",
                        "qr_min_bdt", "qr_fee_bdt", "qr_rate", "qr_note"])
     _qimg = (_q.get("qr_image") or "").strip()
@@ -253,7 +228,6 @@ def deposits_home():
 
     body = (
         head
-        + api_card
         + qr_card
         + "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
           "<b>📋 ডিপোজিট মেথড</b>"
@@ -297,8 +271,8 @@ def _form(m=None):
         f"<option value='manual'{' selected' if kind == 'manual' else ''}>✍️ ম্যানুয়াল — আমি ✅ করব</option>"
         f"<option value='qr'{' selected' if kind == 'qr' else ''}>🇧🇩 Bangla QR পেমেন্ট (QR স্ক্যান)</option>"
         f"</select>"
-        "<p class='mut' style='font-size:11px;margin:6px 0 0'>🆔 UID: ইউজার কত ডলার পাঠিয়েছে + "
-        "অর্ডার আইডি/TxID দিলে বট Binance Pay হিস্ট্রি থেকে পেমেন্ট খুঁজে সাথে সাথে ব্যালেন্স যোগ করে; "
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>🆔 UID: ইউজার কত ডলার "
+        "পাঠিয়েছে + নাম দিলে বট Binance-এর মেইল পড়ে সাথে সাথে ব্যালেন্স যোগ করে; "
         "না পেলে পেন্ডিং আসে — আপনি ✅/❌ করবেন।</p></div>"
         "<div class='field'><label>USDT BEP-20 অ্যাড্রেস / Binance Pay ID</label>"
         f"<input name='address' value='{esc(m.get('address') or '')}' placeholder='0x… অথবা Binance UID'></div>"
@@ -576,23 +550,3 @@ def deposits_qr_save():
         pass
     log_admin("deposits_qr_save", 0, "qr settings")
     return redirect("/admin/deposits?ok=QR+সেটিংস+সেভ+হয়েছে")
-
-
-# ───────────────────────── Binance API সেটিং ─────────────────────────
-@wadm.route("/admin/deposits/api", methods=["POST"])
-def deposits_api_save():
-    g = guard()
-    if g:
-        return g
-    _init()
-    key = (request.form.get("binance_api_key") or "").strip()
-    sec = (request.form.get("binance_api_secret") or "").strip()
-    win = (request.form.get("binance_uid_window") or "").strip()
-    if key:
-        settings_set("binance_api_key", key)
-    if sec:
-        settings_set("binance_api_secret", sec)
-    if win.isdigit() and 5 <= int(win) <= 1440:
-        settings_set("binance_uid_window", win)
-    log_admin("binance_api_save", 0, "key_set" if key else "key_keep")
-    return redirect("/admin/deposits?ok=Binance+API+সেভ+হয়েছে")

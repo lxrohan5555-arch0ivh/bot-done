@@ -1003,8 +1003,9 @@ def fbtask_pw_view(tid, gid):
         _share_card = (
             "<div class='card' style='margin-top:10px'><b>🔗 এই পাসওয়ার্ড দিয়ে আইডি নিন</b>"
             "<div class='mut' style='font-size:12px;margin:6px 0'>"
-            "এই লিংকটা ইউজারকে পাঠান — বটে চাপলে ঠিক এই পাসওয়ার্ডটাই পাবে, "
-            "আর তার জমা এই শীটেই যাবে।</div>"
+            "এই লিংকটা ইউজারকে পাঠান — চাপলেই বটে সরাসরি এই টাস্ক খুলে যাবে "
+            "(মাঝে কোনো কার্ড নেই), পাসওয়ার্ডও এইটাই পাবে, আর তার জমা এই "
+            "শীটেই যাবে।</div>"
             f"<input id='pwl' value='{esc(_link)}' readonly style='width:100%' "
             "onclick='this.select()'>"
             "<div class='row' style='gap:6px;margin-top:6px'>"
