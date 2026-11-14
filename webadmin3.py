@@ -781,6 +781,13 @@ def fbtask_passwords(tid):
             _bu = str(os.environ.get("BOT_USERNAME") or "").strip().lstrip("@")
     except Exception:
         _bu = ""
+    # এখন সবার জন্য কোন পাসওয়ার্ড চালু আছে (অ্যাডমিনের শেষ চাপ)
+    _cur_gid = 0
+    try:
+        _cur_gid = int(str(one("SELECT value FROM settings WHERE key=%s",
+                               (f"fb_sheet_g{int(tid)}",))["value"] or "0"))
+    except Exception:
+        _cur_gid = 0
     trs, seen = [], set()
     for g2 in groups:
         _pw = str(g2.get("password") or "")
@@ -800,13 +807,13 @@ def fbtask_passwords(tid):
             badge(str(int(r.get("pend") or 0)), "mut"),
             badge(str(int(r.get("appr") or 0)), "ok"),
             badge(str(int(r.get("rej") or 0)), "err"),
-            (f"<form method='post' style='display:flex;gap:4px;align-items:center' "
+            (f"<form method='post' style='display:inline;margin:0' "
              f"action='/admin/do/fbtask/{tid}/pw/{int(g2['id'])}/give'>"
-             "<input name='who' placeholder='@নাম বা ID' required "
-             "style='width:96px;padding:4px 6px;font-size:12px'>"
              "<button class='btn ok sm' type='submit' "
-             "title='এই নামের ইউজার টাস্ক শুরু করলে সরাসরি এই পাসওয়ার্ডই পাবে'>"
-             "🆔 এই পাস দিয়ে আইডি নিন</button></form>"),
+             "title='সব ইউজার টাস্ক শুরু করলে এই পাসওয়ার্ডই পাবে'>"
+             + ("✅ এই পাসওয়ার্ডই চালু" if _cur_gid == int(g2["id"])
+                else "🆔 এই পাসওয়ার্ডে আইডি নিন")
+             + "</button></form>"),
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs?pw={_q(_pw)}'>📄 শীট</a>",
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/passwords/{int(g2['id'])}/edit'>✏️ Edit</a>",
             "<form method='post' action='/admin/do/fbtask/%d/pwgroup/%d/delete' "
@@ -958,9 +965,9 @@ def fbtask_password_delete(tid):
 
 @wadm.route("/admin/do/fbtask/<int:tid>/pw/<int:gid>/give", methods=["POST"])
 def fbtask_pw_give(tid, gid):
-    """নাম/আইডি দিলে ওই ইউজার টাস্ক শুরু করলে সরাসরি এই পাসওয়ার্ডই পাবে।
+    """এই পাসওয়ার্ডটা সবার জন্য চালু — সব ইউজার টাস্কে এটাই পাবে।
 
-    আলাদা করে বটে যাওয়ার লিংক নেই — শুধু ইউজারের জন্য শীটটা লক হয়।
+    কোনো নাম/আইডি লাগে না, কোনো টেলিগ্রাম লিংকও নেই।
     """
     g = guard()
     if g:
@@ -970,36 +977,11 @@ def fbtask_pw_give(tid, gid):
     grp = one("SELECT * FROM fb_pw_groups WHERE id=%s AND task_id=%s", (gid, tid))
     if not t or not grp:
         return redirect(f"/admin/fbtask/{tid}/passwords?err=" + _q("টাস্ক বা পাসওয়ার্ড নেই"))
-    who = (request.form.get("who") or "").strip()
-    if not who:
-        return redirect(f"/admin/fbtask/{tid}/passwords?err=" + _q("নাম বা ID দিন"))
-    u = None
-    try:
-        if who.lstrip("-").isdigit():
-            u = one("SELECT user_id, username, full_name FROM users WHERE user_id=%s",
-                    (int(who),))
-        if not u:
-            _w = who.lstrip("@").strip()
-            u = one("SELECT user_id, username, full_name FROM users "
-                    "WHERE LOWER(username)=LOWER(%s) LIMIT 1", (_w,))
-        if not u:
-            _w = who.lstrip("@").strip()
-            u = one("SELECT user_id, username, full_name FROM users "
-                    "WHERE LOWER(full_name)=LOWER(%s) LIMIT 1", (_w,))
-        if not u:
-            u = one("SELECT user_id, username, full_name FROM users "
-                    "WHERE full_name ILIKE %s ORDER BY user_id DESC LIMIT 1",
-                    ("%" + who.lstrip("@") + "%",))
-    except Exception as e:
-        return redirect(f"/admin/fbtask/{tid}/passwords?err=" + _q("খোঁজা যায়নি: %s" % str(e)[:40]))
-    if not u:
-        return redirect(f"/admin/fbtask/{tid}/passwords?err="
-                        + _q("ইউজার পাওয়া যায়নি: %s" % who))
-    _uid = int(u["user_id"])
-    _key = f"fb_sheet_u{_uid}"
+    _key = f"fb_sheet_g{int(tid)}"
     try:
         _x("INSERT INTO settings (key,value) VALUES (%s,%s) "
-           "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (_key, str(int(gid))))
+           "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+           (_key, str(int(gid))))
     except Exception as e:
         return redirect(f"/admin/fbtask/{tid}/passwords?err="
                         + _q("সেভ হয়নি: %s" % str(e)[:40]))
@@ -1007,10 +989,9 @@ def fbtask_pw_give(tid, gid):
         _fire_settings_changed([_key])
     except Exception:
         pass
-    _nm = ("@" + str(u.get("username") or "")) if u.get("username") else str(u.get("full_name") or _uid)
-    log_admin("fb_pw_give", f"task={tid} gid={gid} pw={grp.get('password')} → {_uid}")
-    return redirect(f"/admin/fbtask/{tid}/passwords?ok=" +
-                    _q(f"{_nm} — এখন টাস্ক শুরু করলে পাসওয়ার্ড «{grp.get('password')}» পাবে"))
+    log_admin("fb_pw_give", f"task={tid} gid={gid} pw={grp.get('password')} (সবার জন্য)")
+    return redirect(f"/admin/fbtask/{tid}/passwords?ok="
+                    + _q(f"এখন সব ইউজার পাসওয়ার্ড «{grp.get('password')}» পাবে"))
 
 
 @wadm.route("/admin/do/fbtask/<int:tid>/pw/<int:gid>/seat", methods=["POST"])

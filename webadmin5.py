@@ -9,6 +9,7 @@
 """
 import time
 
+from urllib.parse import quote as _q
 from flask import request, redirect
 
 from webadmin import (
@@ -443,38 +444,24 @@ def shop_home():
         "<form method='post' action='/admin/shop/cat/add' class='row' style='gap:8px;margin-top:8px'>"
         "<input name='emoji' placeholder='🛍' style='max-width:70px'>"
         "<input name='name' placeholder='ক্যাটাগরির নাম (যেমন VPN)' required>"
-        "<select name='plan_kind'>"
-        "<option value=''>প্ল্যান নেই (Mail ইত্যাদি)</option>"
-        "<option value='days'>মেয়াদ — দিনে (VPN)</option>"
-        "<option value='mb'>ডাটা — MB/GB (Proxy)</option>"
-        "</select>"
         "<button class='ok sm' type='submit'>যোগ করুন</button></form>"
-        "<div class='mut' style='font-size:12px;margin-top:6px'>ইউজার বটে এই ক্যাটাগরিগুলো বাটন হিসেবে দেখবে।</div>"
-        "</div>"
-        "<div class='card'><b>⏱ মেয়াদ / প্যাক যোগ (VPN, Proxy ইত্যাদি)</b>"
+        "<div class='mut' style='font-size:12px;margin-top:6px'>ইউজার বটে এই ক্যাটাগরিগুলো বাটন হিসেবে দেখবে।"
+        "</div></div>"
+        "<div class='card'><b>➕ নতুন প্যাক (ক্যাটাগরির ভিতরে)</b>"
         "<form method='post' action='/admin/shop/plan/add' class='row' "
         "style='gap:8px;margin-top:8px;flex-wrap:wrap'>"
-        # ⚠️ আগে শুধু days/mb ক্যাটাগরি দেখাত — নতুন ক্যাটাগরি যোগ করলে
-        # ড্রপডাউনে আসত না। এখন *সব* ক্যাটাগরি, সাথে ধরন নিজেই বেছে নেওয়া যায়।
         "<select name='category_id' required style='min-width:160px'>"
-        + "".join(
-            f"<option value='{int(c['id'])}'>{esc(c['emoji'] or '🛍')} {esc(c['name'] or '')} — "
-            f"{'দিন' if str(c.get('plan_kind') or '') == 'days' else ('MB/GB' if str(c.get('plan_kind') or '') == 'mb' else 'প্ল্যান নেই')}"
-            f"</option>"
-            for c in cats)
+        + "".join(f"<option value='{int(c['id'])}'>"
+                  f"{esc(c['emoji'] or '🛍')} {esc(c['name'] or '')}</option>"
+                  for c in cats)
         + "</select>"
-        "<select name='plan_kind' style='min-width:120px'>"
-        "<option value=''>ধরন (ক্যাটাগরির মতো)</option>"
-        "<option value='days'>দিন (VPN)</option>"
-        "<option value='mb'>MB/GB (Proxy)</option>"
-        "</select>"
-        "<input name='value' placeholder='দিন: 3 / 7 · MB: 5120' style='max-width:170px' inputmode='decimal' "
-        "title='VPN-এ দিনের সংখ্যা, Proxy-তে MB'>"
-        "<input name='label' placeholder='ঐচ্ছিক নাম (যেমন ৭ দিন)' style='max-width:180px'>"
+        "<input name='label' placeholder='প্যাকের নাম (যেমন ১ মাস / ৭ দিন / India Proxy)' "
+        "required style='min-width:220px'>"
         "<button class='ok sm' type='submit'>যোগ করুন</button></form>"
-        "<div class='mut' style='font-size:12px;margin-top:6px'>ইউজার VPN-এ চাপলে আগে এখানকার "
-        "মেয়াদ/প্যাক বাটন দেখবে, তারপর সেই প্ল্যানের পণ্য। MB দিলে Proxy-র ডাটা প্যাকও হয়।</div>"
-        + _plans_grouped(prods)
+        "<div class='mut' style='font-size:12px;margin-top:6px'>ইউজার ক্যাটাগরিতে চাপলে "
+        "আগে এই প্যাকগুলো দেখবে (কোন প্যাক নিবেন?) — প্যাক বেছে নিলে তার ভিতরের পণ্য।</div>"
+        "</div>"
+        "<div class='card'><b>👀 ইউজার যা দেখবে</b>"
         + _user_preview(cats, prods)
         + "</div>"
         "<div class='card'><b>💱 মুদ্রা</b>"
@@ -488,23 +475,10 @@ def shop_home():
     cat_rows = []
     for c in cats:
         n = sum(1 for p in prods if int(p["category_id"] or 0) == int(c["id"]))
-        _pk = str(c.get("plan_kind") or "")
-        _pk_sel = (
-            "<form method='post' action='/admin/shop/cat/%d/kind' style='display:inline'>"
-            "<select name='plan_kind' onchange=\"this.form.submit()\" style='padding:4px'>"
-            "<option value=''%s>প্ল্যান নেই</option>"
-            "<option value='days'%s>দিন (VPN)</option>"
-            "<option value='mb'%s>MB/GB (Proxy)</option>"
-            "</select></form>"
-            % (int(c["id"]),
-               " selected" if _pk not in ("days", "mb") else "",
-               " selected" if _pk == "days" else "",
-               " selected" if _pk == "mb" else ""))
         cat_rows.append([
             f"<a href='/admin/shop/cat/{int(c['id'])}' style='text-decoration:none'>"
             f"{esc(c['emoji'] or '🛍')} <b>{esc(c['name'] or '')}</b></a>"
             f"<div class='mut' style='font-size:11px'>ভিতরে দেখুন ›</div>",
-            _pk_sel,
             num(n),
             badge("চালু", "ok") if _onoff(c["is_active"]) else badge("বন্ধ", "mut"),
             "<form method='post' action='/admin/shop/cat/%d/toggle' style='display:inline'>"
@@ -537,7 +511,7 @@ def shop_home():
         head + switch_card + msg_card + mailcard + tools
         + "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
           "<b>📁 ক্যাটাগরি</b>" + _btn("🛒 অর্ডার দেখুন", "/admin/shop/orders", "btn gray sm")
-        + "</div>" + table(["ক্যাটাগরি", "ধরন (প্ল্যান)", "পণ্য", "স্ট্যাটাস", "অন/অফ", ""], cat_rows,
+        + "</div>" + table(["ক্যাটাগরি", "পণ্য", "স্ট্যাটাস", "অন/অফ", ""], cat_rows,
                            "কোনো ক্যাটাগরি নেই — উপরে যোগ করুন")
         + "</div>"
         + "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
@@ -569,67 +543,60 @@ def shop_cat_view(cid):
     c = one("SELECT * FROM shop_categories WHERE id=%s", (cid,))
     if not c:
         return page("পাওয়া যায়নি", "<div class='card'>ক্যাটাগরি নেই</div>", "shop", status=404)
-    _pk = str(c.get("plan_kind") or "")
-    plans = _plans(cid)
     prods = many(
         "SELECT p.*, (SELECT COUNT(*) FROM shop_stock s WHERE s.product_id=p.id "
         "AND COALESCE(s.sold,0)=0) AS stock FROM shop_products p "
-        "WHERE p.category_id=%s ORDER BY p.plan_id, p.sort_order, p.id", (cid,))
+        "WHERE p.category_id=%s ORDER BY p.sort_order, p.id", (cid,))
     total_stock = sum(int(p["stock"] or 0) for p in prods)
 
+    plans = _plans(cid)
     head = (
         "<div class='card'>"
         f"<a class='btn gray sm' href='/admin/shop'>‹ Shop</a>"
         f"<h3 style='margin:8px 0 4px'>{esc(c['emoji'] or '🛍')} {esc(c['name'] or '')}</h3>"
-        f"<div class='mut' style='font-size:12px'>ধরন: "
-        + ("দিন (মেয়াদ)" if _pk == "days" else ("MB/GB (Proxy)" if _pk == "mb" else "প্ল্যান নেই"))
-        + f" · মেয়াদ/প্যাক {num(len(plans))} · পণ্য {num(len(prods))} · স্টক {num(total_stock)}"
-        + "</div></div>"
-    )
+        f"<div class='mut' style='font-size:12px'>প্যাক {num(len(plans))} · "
+        f"পণ্য {num(len(prods))} · স্টক {num(total_stock)}</div></div>")
 
-    # প্ল্যান যোগ (এই ক্যাটাগরির ধরন অনুযায়ীই)
-    add_form = ""
-    if _pk in ("days", "mb"):
-        add_form = (
-            "<div class='card'><b>➕ " + ("নতুন মেয়াদ (দিন)" if _pk == "days" else "নতুন ডাটা প্যাক (MB/GB)")
-            + f" — {esc(c['name'] or '')}</b>"
-            "<form method='post' action='/admin/shop/plan/add' class='row' style='gap:8px;margin-top:8px'>"
-            f"<input type='hidden' name='category_id' value='{int(cid)}'>"
-            + ("<input name='value' placeholder='দিন (যেমন 3, 7, 30)' style='max-width:170px' inputmode='decimal'>"
-               if _pk == "days" else
-               "<input name='value' placeholder='MB (512 / 5120 = 5GB)' style='max-width:200px' inputmode='decimal'>")
-            + ("<input name='label' required placeholder='নিজের নাম (যেমন ১ মাস / India Proxy)' style='max-width:230px'>"
-               if _pk == "mb" else
-               "<input name='label' placeholder='ঐচ্ছিক নাম (যেমন সাপ্তাহিক)' style='max-width:230px'>")
-            + "<button class='ok sm' type='submit'>যোগ করুন</button></form>"
-            "<div class='mut' style='font-size:12px;margin-top:6px'>এই ক্যাটাগরিতে শুধু "
-            + ("দিনের মেয়াদ" if _pk == "days" else "MB/GB প্যাক")
-            + " যোগ হবে — অন্যগুলো আলাদা ক্যাটাগরিতে।</div></div>")
+    # ➕ এই ক্যাটাগরিতে নতুন প্যাক — শুধু নাম
+    add_form = (
+        "<div class='card'><b>➕ নতুন প্যাক</b>"
+        "<form method='post' action='/admin/shop/plan/add' class='row' "
+        "style='gap:8px;margin-top:8px'>"
+        f"<input type='hidden' name='category_id' value='{int(cid)}'>"
+        "<input name='label' required placeholder='প্যাকের নাম (যেমন ১ মাস / ৭ দিন / ৫ GB)' "
+        "style='min-width:240px'>"
+        "<button class='ok sm' type='submit'>যোগ করুন</button></form>"
+        "<div class='mut' style='font-size:12px;margin-top:6px'>"
+        "ইউজার এই ক্যাটাগরিতে চাপলে আগে এই প্যাকগুলো দেখবে — প্যাক বেছে নিলে তার ভিতরের পণ্য।"
+        "</div></div>")
 
-    # প্রতিটি প্ল্যানের ভিতরের পণ্য
+    # প্রতিটি প্যাকের ভিতরের পণ্য
     blocks = []
     for pl in plans:
-        rows = []
-        for p in prods:
-            if int(p.get("plan_id") or 0) != int(pl["id"]):
-                continue
-            rows.append(_prod_row(p))
-        n, st = _plan_counts(pl, prods)
+        rows = [_prod_row(p) for p in prods
+                if int(p.get("plan_id") or 0) == int(pl["id"])]
+        n = len(rows)
+        st = sum(int(p.get("stock") or 0) for p in prods
+                 if int(p.get("plan_id") or 0) == int(pl["id"]))
         blocks.append(
             "<div class='card'>"
-            f"<div class='row' style='justify-content:space-between;align-items:center'>"
-            f"<b>📦 {esc(_plan_txt(pl, _pk))}</b>"
+            "<div class='row' style='justify-content:space-between;align-items:center'>"
+            f"<b>📦 {esc(_plan_txt(pl))}</b>"
             f"<span class='mut' style='font-size:12px'>পণ্য {num(n)} · স্টক {num(st)}</span>"
-            f"<a class='btn gray sm' href='/admin/shop/plan/{int(pl['id'])}/edit'>✏️ নাম বদলান</a></div>"
+            f"<a class='btn gray sm' href='/admin/shop/plan/{int(pl['id'])}/edit'>✏️ নাম বদলান</a>"
+            f"<form method='post' action='/admin/shop/plan/{int(pl['id'])}/delete' "
+            "style='display:inline' onsubmit=\"return confirm('প্যাকটা ডিলিট হবে? পণ্যগুলো "
+            "প্যাক ছাড়া হয়ে থাকবে।')\">"
+            "<button class='gray sm' type='submit'>🗑</button></form></div>"
             + table(["পণ্য", "দাম", "ডেলিভারি", "স্টক", "স্ট্যাটাস", ""], rows,
-                    "এই মেয়াদে এখনো কোনো পণ্য নেই")
+                    "এই প্যাকে এখনো কোনো পণ্য নেই")
             + "</div>")
-    _none = [p for p in prods if not int(p.get("plan_id") or 0)]
-    if _none or not plans:
+    _loose = [p for p in prods if not int(p.get("plan_id") or 0)]
+    if _loose or not plans:
         blocks.append(
-            "<div class='card'><b>📦 প্ল্যান ছাড়া পণ্য</b>"
+            "<div class='card'><b>📦 প্যাক ছাড়া পণ্য</b>"
             + table(["পণ্য", "দাম", "ডেলিভারি", "স্টক", "স্ট্যাটাস", ""],
-                    [_prod_row(p) for p in _none], "কোনো পণ্য নেই")
+                    [_prod_row(p) for p in _loose], "কোনো পণ্য নেই")
             + "</div>")
 
     body = (head + add_form + "".join(blocks)
@@ -685,6 +652,7 @@ def shop_cat_kind(cid):
 
 @wadm.route("/admin/shop/plan/add", methods=["POST"])
 def shop_plan_add():
+    """ক্যাটাগরির ভিতরে নতুন প্যাক — শুধু নাম দিলেই হবে (যেমন ১ মাস)।"""
     g = guard()
     if g:
         return g
@@ -694,40 +662,18 @@ def shop_plan_add():
     except Exception:
         cid = 0
     if not cid:
-        return redirect("/admin/shop?err=ক্যাটাগরি বেছে নিন")
-    _cat = one("SELECT plan_kind FROM shop_categories WHERE id=%s", (cid,)) or {}
-    kind = str(request.form.get("plan_kind") or "").strip().lower()
-    if kind not in ("days", "mb"):
-        kind = str(_cat.get("plan_kind") or "").strip().lower()
-    if kind not in ("days", "mb"):
-        return redirect("/admin/shop?err=ধরন বেছে নিন — দিন (VPN) বা MB/GB (Proxy)")
-    # ফর্মে ধরন দিলে ক্যাটাগরির ধরনও সেভ হয়ে যায় (পরে আর ঝামেলা নেই)
-    if str(_cat.get("plan_kind") or "").strip().lower() != kind:
-        try:
-            _x("UPDATE shop_categories SET plan_kind=%s WHERE id=%s", (kind, cid))
-        except Exception:
-            pass
-    try:
-        val = float((request.form.get("value") or "0").replace(",", "."))
-    except Exception:
-        val = 0
+        return redirect("/admin/shop?err=" + _q("ক্যাটাগরি বেছে নিন"))
+    if not one("SELECT id FROM shop_categories WHERE id=%s", (cid,)):
+        return redirect("/admin/shop?err=" + _q("ক্যাটাগরি নেই"))
     label = (request.form.get("label") or "").strip()[:60]
-    if val <= 0 and not label:
-        return redirect("/admin/shop?err=মেয়াদ/MB সংখ্যা দিন")
-    # দিন শুধু VPN-এর মতো মেয়াদ-ক্যাটাগরিতে; MB ক্যাটাগরিতে দিনের সংখ্যা ঢুকলে আটকায়
-    if kind == "days" and val > 400:
-        return redirect("/admin/shop?err=দিন ৪০০-এর বেশি হতে পারে না — MB/GB দিতে "
-                                "চাইলে Proxy ক্যাটাগরি বেছে নিন")
-    if kind == "mb" and val < 1:
-        return redirect("/admin/shop?err=MB সংখ্যা ১ বা তার বেশি দিন")
-    if kind == "mb" and not label:
-        return redirect("/admin/shop?err=Proxy প্যাকের নিজের নাম দিন (যেমন ১ মাস)")
-    nxt = (one("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shop_plans WHERE category_id=%s",
-               (cid,)) or {}).get("n") or 1
+    if not label:
+        return redirect("/admin/shop?err=" + _q("প্যাকের নাম লিখুন (যেমন ১ মাস)"))
+    nxt = (one("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shop_plans "
+               "WHERE category_id=%s", (cid,)) or {}).get("n") or 1
     _x("INSERT INTO shop_plans (category_id,label,kind,value,sort_order,is_active,created_at) "
-       "VALUES (%s,%s,%s,%s,%s,1,%s)", (cid, label, kind, val, int(nxt), _now()))
-    log_admin("shop_plan_add", cid, f"{kind} {val}")
-    return redirect("/admin/shop?ok=মেয়াদ/প্যাক যোগ হয়েছে")
+       "VALUES (%s,%s,'days',0,%s,1,%s)", (cid, label, int(nxt), _now()))
+    log_admin("shop_plan_add", cid, label)
+    return redirect("/admin/shop?ok=" + _q(f"প্যাক «{label}» যোগ হয়েছে"))
 
 
 @wadm.route("/admin/shop/plan/<int:plid>/edit", methods=["GET", "POST"])
@@ -945,11 +891,19 @@ def _plan_txt(pl, cat_kind=""):
 
 
 def _plan_options(sel=0):
-    out = "<option value='0'>— কোনো প্ল্যান নেই (সব মেয়াদে দেখাবে) —</option>"
+    """প্যাকের তালিকা — সাথে ক্যাটাগরির নাম, যাতে ভুল প্যাক না বাছেন।"""
+    out = "<option value='0'>— প্যাক ছাড়া (ক্যাটাগরিতে সরাসরি দেখাবে) —</option>"
+    _cm = {}
+    try:
+        for c in many("SELECT id, name, emoji FROM shop_categories"):
+            _cm[int(c["id"])] = (str(c["emoji"] or "🛍") + " " + str(c["name"] or ""))
+    except Exception:
+        _cm = {}
     for pl in _plans():
+        _cn = _cm.get(int(pl["category_id"] or 0), "")
         out += (f"<option value='{int(pl['id'])}'"
                 f"{' selected' if int(sel or 0) == int(pl['id']) else ''}>"
-                f"{esc(_plan_txt(pl))} · cat#{int(pl['category_id'])}</option>")
+                f"{esc(_plan_txt(pl))}" + (f" — {esc(_cn)}" if _cn else "") + "</option>")
     return out
 
 
@@ -969,10 +923,10 @@ def _form(p=None):
         f"<input name='name' value='{name}' placeholder='Outlook Trusted' required></div>"
         "<div class='field'><label>ক্যাটাগরি</label>"
         f"<select name='category_id'>{_cat_options(p.get('category_id') or 0)}</select></div>"
-        "<div class='field'><label>⏱ মেয়াদ / প্যাক (ক্যাটাগরিতে প্ল্যান থাকলে)</label>"
+        "<div class='field'><label>📦 প্যাক (কোন প্যাকের ভিতরে থাকবে)</label>"
         f"<select name='plan_id'>{_plan_options(p.get('plan_id') or 0)}</select>"
-        "<p class='mut' style='font-size:11px;margin:6px 0 0'>প্ল্যান বানাবেন শপ পেজে "
-        "মেয়াদ/প্যাক যোগ থেকে। ভরা থাকলে বটে আগে প্ল্যান বাটন দেখাবে।</p></div>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>প্যাক বানাবেন উপরে "
+        "“➕ নতুন প্যাক” থেকে। প্যাক না বাছলে পণ্যটা ক্যাটাগরিতে সবার আগে দেখাবে।</p></div>"
         "<div class='field'><label>দাম (ব্যালেন্স থেকে কাটা হবে)</label>"
         f"<input name='price' value='{price}' placeholder='0.78' required></div>"
         "<div class='field'><label>ডেলিভারি ধরন</label>"
