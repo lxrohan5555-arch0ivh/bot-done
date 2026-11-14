@@ -1162,7 +1162,7 @@ def fbtask_subs(tid):
                    num(_s3) if _s3 else "∞", tid, int(_g3["id"])))
     body = (
         _pwcard2
-        + review_kpi(review_counts("fb_submissions", tid))
+        + review_kpi(review_counts("fb_submissions", tid, _pw_filter))
         + review_card(tid, "fb")
         + f"<div class='card'><div class='row' style='justify-content:space-between'>"
         f"<h3>{esc(t['name'])} — জমা তথ্য"

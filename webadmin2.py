@@ -867,6 +867,124 @@ def notify_send():
     return redirect("/admin/notify?ok=✅ পাঠানো শুরু হবে (বট ৬০s-এর মধ্যে)")
 
 
+@wadm.route("/admin/mail", methods=["GET"])
+def mail_setup():
+    """📧 মেইল (IMAP) অটো-ডিপোজিট — সহজ সেটআপ পেজ।"""
+    g = guard()
+    if g:
+        return g
+    v = settings_all(["mail_host", "mail_port", "mail_user", "mail_pass",
+                      "mail_folder", "dep_mail_on"])
+    _on = str(v.get("dep_mail_on") or "").lower() not in ("0", "off", "false", "no")
+    _has = bool(str(v.get("mail_user") or "").strip() and str(v.get("mail_pass") or "").strip())
+    _st = {}
+    try:
+        import bot as _b
+        _st = dict(getattr(_b, "_DEP_MAIL", {}) or {})
+    except Exception:
+        _st = {}
+    _ok = request.args.get("ok")
+    _err = request.args.get("e")
+    _tip = (
+        "<div class='card'><h3>📧 মেইল অটো-ডিপোজিট</h3>"
+        "<p class='mut' style='font-size:12px;line-height:1.7'>"
+        "Binance টাকা পেলেই মেইল পাঠায় — বট সেই মেইল পড়ে টাকা যোগ করে। "
+        "এতে Binance API একটাও ডাকা হয় না, তাই <b>IP ব্যান/রেট-লিমিট হবে না</b>।"
+        "</p></div>"
+    )
+    _card = (
+        "<div class='card'><h3>সেটআপ</h3>"
+        "<form method='post' action='/admin/do/mail'>"
+        "<div class='form'><label>ইমেইল (Gmail)</label>"
+        f"<input name='mail_user' value='{esc(v.get('mail_user') or '')}' "
+        "placeholder='you@gmail.com' autocomplete='off'></div>"
+        "<div class='form'><label>App Password (১৬ অক্ষর)</label>"
+        f"<input name='mail_pass' value='' type='password' autocomplete='new-password' "
+        "placeholder='" + ("সেভ করা আছে — বদলাতে চাইলে নতুন দিন" if _has else "xxxx xxxx xxxx xxxx") + "'></div>"
+        "<div class='form'><label>IMAP সার্ভার</label>"
+        f"<input name='mail_host' value='{esc(v.get('mail_host') or 'imap.gmail.com')}' "
+        "placeholder='imap.gmail.com'></div>"
+        "<div class='form'><label>পোর্ট</label>"
+        f"<input name='mail_port' value='{esc(v.get('mail_port') or '993')}' inputmode='numeric'></div>"
+        "<div class='form'><label>ফোল্ডার</label>"
+        f"<input name='mail_folder' value='{esc(v.get('mail_folder') or 'INBOX')}'></div>"
+        "<div class='form'><label>অটো-চেক</label><select name='dep_mail_on'>"
+        f"<option value='1' {'selected' if _on else ''}>চালু (প্রতি ৬০ সেকেন্ডে মেইল পড়বে)</option>"
+        f"<option value='0' {'selected' if not _on else ''}>বন্ধ</option>"
+        "</select></div>"
+        "<button type='submit'>💾 সেভ করুন</button></form></div>"
+    )
+    _status = (
+        "<div class='card'><h3>অবস্থা</h3>"
+        f"<p>• সেটআপ: {'✅ ঠিক আছে' if (_has and _on) else ('⚠️ নাম/পাসওয়ার্ড নেই' if not _has else '⏸ বন্ধ আছে')}</p>"
+        + (f"<p>• শেষ চেক: {int(time.time() - float(_st.get('at') or 0))}s আগে · "
+           f"{int(_st.get('n') or 0)} টি Binance মেইল</p>" if _st.get("at") else
+           "<p>• শেষ চেক: এখনো হয়নি</p>")
+        + (f"<p>• শেষ এরর: <span class='mono'>{esc(str(_st.get('err'))[:160])}</span></p>"
+           if _st.get("err") else "")
+        + "<form method='post' action='/admin/do/mail/test' style='margin-top:8px'>"
+        "<button class='btn gray' type='submit'>🔎 সংযোগ টেস্ট করুন</button></form>"
+        "<p class='mut' style='font-size:11px;margin-top:8px'>"
+        "টেস্ট শুধু দেখে ইনবক্সে Binance-এর পেমেন্ট মেইল আছে কি না — কোনো টাকা যোগ করে না।</p>"
+        "</div>"
+    )
+    _help = (
+        "<div class='card'><h3>কীভাবে App Password নেবেন</h3>"
+        "<p style='font-size:13px;line-height:1.9'>"
+        "১. Google Account → <b>Security</b> → <b>2-Step Verification</b> চালু করুন।<br>"
+        "২. একই পেজে <b>App passwords</b> → নাম দিন (যেমন Binance) → ১৬ অক্ষরের পাসওয়ার্ড কপি করুন।<br>"
+        "৩. Gmail → <b>Settings → Forwarding and POP/IMAP</b> → <b>Enable IMAP</b>।<br>"
+        "৪. উপরের ফর্মে ইমেইল + App Password দিয়ে <b>সেভ</b> → <b>সংযোগ টেস্ট</b>।<br><br>"
+        "<b>নিরাপত্তা:</b> এই ইমেইলে শুধু Binance-এর মেইল আসা উচিত (আলাদা জিমেইল হলে ভালো)। "
+        "মূল Gmail পাসওয়ার্ড কখনো দেবেন না — শুধু App Password।"
+        "</p></div>"
+    )
+    return page("Mail Auto-Deposit", _tip + _status + _card + _help, "settings",
+                toast=_ok, err=_err)
+
+
+@wadm.route("/admin/do/mail", methods=["POST"])
+def mail_save():
+    g = guard()
+    if g:
+        return g
+    _u = (request.form.get("mail_user") or "").strip()
+    _p = (request.form.get("mail_pass") or "").strip().replace(" ", "")
+    _h = (request.form.get("mail_host") or "imap.gmail.com").strip()
+    _port = (request.form.get("mail_port") or "993").strip()
+    _fold = (request.form.get("mail_folder") or "INBOX").strip()
+    _on = "1" if (request.form.get("dep_mail_on") or "").strip() in ("1", "on") else "0"
+    if _u:
+        settings_set("mail_user", _u)
+    if _p:
+        settings_set("mail_pass", _p)
+    settings_set("mail_host", _h or "imap.gmail.com")
+    settings_set("mail_port", _port if _port.isdigit() else "993")
+    settings_set("mail_folder", _fold or "INBOX")
+    settings_set("dep_mail_on", _on)
+    log_admin("mail_settings", 0, f"on={_on}")
+    if _on == "1" and not (settings_get("mail_user") and settings_get("mail_pass")):
+        return redirect("/admin/mail?e=ইমেইল ও App Password দুটোই দরকার")
+    return redirect("/admin/mail?ok=সেভ হয়েছে")
+
+
+@wadm.route("/admin/do/mail/test", methods=["POST"])
+def mail_test():
+    g = guard()
+    if g:
+        return g
+    try:
+        import bot as _b
+        pays, err = _b._mail_fetch_payments()
+    except Exception as _e:
+        return redirect("/admin/mail?e=" + str(_e)[:120])
+    if err:
+        return redirect("/admin/mail?e=" + str(err)[:160])
+    _lbl = "<br>".join(f"• {float(p.get('amount') or 0):g} USDT — {esc(p.get('sender') or '—')}"
+                       for _m, p in (pays or [])[:5]) or "কোনো নতুন Binance পেমেন্ট মেইল নেই"
+    return redirect("/admin/mail?ok=সংযোগ ঠিক · " + str(len(pays or [])) + " টি মেইল · " + _lbl)
+
+
 @wadm.route("/admin/do/settings", methods=["POST"])
 def settings_save():
     g = guard()

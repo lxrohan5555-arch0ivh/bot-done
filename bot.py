@@ -161,7 +161,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-13a4"
+BUILD_TAG       = "uid-auto-2026-11-14b8"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -9898,6 +9898,35 @@ def _binance_bases():
     return out
 
 
+class _BnBanStop(Exception):
+    """ব্যান চলাকালে কল আটকাতে ব্যবহৃত অভ্যন্তরীণ এক্সসেপশন।"""
+
+
+class _BnGuardedOpener:
+    """ইনারের ওপেনার — ব্যান চললে `open()`-ই ব্যর্থ হয়।
+
+    এতে bot-এর *যেকোনো* কোড-পাথ (ব্যালেন্স, UID, Pay, probe, স্টার্টআপ
+    চেক) ব্যান চলাকালে একটাও HTTP রিকোয়েস্ট পাঠাতে পারে না — ব্যান
+    বারবার লম্বা হওয়ার আসল কারণ এটাই ছিল।
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def open(self, *a, **k):
+        try:
+            if _bn_ban_left() > 0:
+                raise _BnBanStop("binance ban")
+        except _BnBanStop:
+            raise
+        except Exception:
+            pass
+        return self._inner.open(*a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def _binance_opener():
     """BINANCE_PROXY থাকলে ওটা দিয়ে যাও — Render-এর IP Binance ব্লক করলে কাজে লাগে।"""
     px = (os.environ.get("BINANCE_PROXY")
@@ -9909,11 +9938,11 @@ def _binance_opener():
             px = ""
     try:
         if px:
-            return urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": px, "https": px}))
+            return _BnGuardedOpener(urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": px, "https": px})))
     except Exception as _e:
         log.warning(f"[BINANCE] proxy সেট করা যায়নি: {str(_e)[:80]}")
-    return urllib.request.build_opener()
+    return _BnGuardedOpener(urllib.request.build_opener())
 
 
 _BN_LAST = {"at": 0.0, "pay_ok": False, "pay_err": "", "spot_ok": False,
@@ -9946,7 +9975,7 @@ def _dep_src_line():
         return ""
 
 
-def _binance_pay_rows_raw(minutes=60, win_start_ms=None, win_end_ms=None):
+def _binance_pay_rows_raw(minutes=60, win_start_ms=None, win_end_ms=None, _gate_passed=False):
     """Binance থেকে আসা টাকার তালিকা — (rows, err)।
 
     ⚠️ আগে শুধু Binance Pay API (`/sapi/v1/pay/transactions`) দেখা হতো।
@@ -9965,6 +9994,11 @@ def _binance_pay_rows_raw(minutes=60, win_start_ms=None, win_end_ms=None):
         mins = max(5, int(minutes or 60))
     except Exception:
         mins = 60
+    # ⚠️ এই ফাংশনের প্রতিটি কল weight ৩০০০; আগে এখানে গেট ছিল না আর
+    #    পাঁচটা হোস্টেই কল যেত → একবারেই ১৫০০০ weight, সাথে সাথে IP ব্যান।
+    _gok, _gwait = (True, 0) if _gate_passed else _bn_gate("pay", 3000)
+    if not _gok:
+        return [], "⏸ Binance সাময়িক বিরতি — বট নিজেই আবার চেক করবে"
     opener = _binance_opener()
 
     def _call(base, off, use_time=True):
@@ -10059,7 +10093,7 @@ def _binance_pay_rows_raw(minutes=60, win_start_ms=None, win_end_ms=None):
     _onchain = dep_onchain_on()
     pay_rows, pay_err, pay_ok = [], "", False
     spot_rows, spot_ok, spot_err = [], False, ""
-    for base in _binance_bases():
+    for base in _binance_bases()[:1]:      # একবারে এক হোস্ট — ব্যান এড়াতে
         # ── সোর্স ২: অন-চেইন ডিপোজিট (বন্ধ থাকলে একেবারেই কল হবে না) ──
         if _onchain and not spot_ok:
             _sp = _hisrec(base)
@@ -10146,6 +10180,10 @@ def _binance_pay_rows_raw(minutes=60, win_start_ms=None, win_end_ms=None):
             pay_err = ("Binance এই সার্ভারের IP ব্লক করেছে (HTTP 451/403) — "
                        "Render-এর region বদলান বা BINANCE_PROXY সেট করুন")
             break
+        if code in ("-1003", "-1005") or "banned until" in str(msg).lower():
+            _bn_gate_hit(f"{code} {msg}")
+            pay_err = "⏸ Binance সাময়িক বিরতি — বট নিজেই আবার চেক করবে"
+            break
         if code == "-2015":
             pay_err = ("Binance Pay API অনুমতি নেই (-2015) — Key-তে *Enable Reading* দিন, "
                        "Binance Pay পারমিশন না থাকলে UID মেথডে অটো অসম্ভব → "
@@ -10159,7 +10197,8 @@ def _binance_pay_rows_raw(minutes=60, win_start_ms=None, win_end_ms=None):
     #    ছাড়া কল করলে লেনদেন আসে (Binance Pay endpoint-এর আচরণ)। তখন সময়
     #    ছাড়া কল করে নিজে ফিল্টার করি — নাহলে Order ID কখনোই মিলত না।
     if pay_ok and not pay_rows:
-        for base in _binance_bases():
+        _fok, _fwait = _bn_gate("pay", 3000)   # গ্যাপ না হলে আরেকটা ভারী কল নয়
+        for base in (_binance_bases()[:1] if _fok else []):
             js3, _e3, _h3 = _call(base, _BINANCE_TS_OFF["v"], False)
             if _e3:
                 continue
@@ -10274,8 +10313,8 @@ def _binance_pay_rows(minutes=60, force=False):
         if _old and (_now - float(_old[0] or 0)) <= 45:
             return _old[1], _old[2]
         return ((_old[1] if _old else []),
-                f"⏳ যাচাই চলছে (Binance বিরতি {_wait}s)")
-    rows, err = _binance_pay_rows_raw(mins)
+                "⏸ Binance সাময়িক বিরতি — বট নিজেই আবার চেক করবে")
+    rows, err = _binance_pay_rows_raw(mins, _gate_passed=True)
     if err:
         _bn_gate_hit(err)
     _BN_CACHE[mins] = (_now, rows, err)
@@ -10327,10 +10366,11 @@ def dep_account_uid():
     if not _ok:
         if _UID_CACHE["uid"]:
             return _UID_CACHE["uid"], ""
-        return "", f"⏳ যাচাই চলছে (Binance বিরতি {_wait}s)"
+        return "", "⏸ Binance সাময়িক বিরতি — বট নিজেই আবার চেক করবে"
     off = _binance_server_offset()
     last = ""
-    for base in _binance_bases():
+    for base in _binance_bases()[:1]:      # একবারে এক হোস্ট
+
         qs = urllib.parse.urlencode(sorted({
             "timestamp": int((_time.time() + off) * 1000),
             "recvWindow": 20000}.items()))
@@ -10353,11 +10393,13 @@ def dep_account_uid():
                 _bn_gate_hit(last)      # ব্যান হলে গ্লোবালি থামাও
             except Exception:
                 last = f"HTTP {e.code}"
+            if _bn_ban_left() > 0:
+                break                   # ব্যানে আর কোনো হোস্টে আঘাত নয়
         except Exception as e:
             last = str(e)[:120]
     if _UID_CACHE["uid"]:
         return _UID_CACHE["uid"], ""
-    return "", (last[:120] if last else "UID পাওয়া যায়নি")
+    return "", (_bn_soft_err(last, 120) if last else "UID পাওয়া যায়নি")
 
 
 def _bn_name_for_amount(amt):
@@ -10450,10 +10492,13 @@ def _dep_raw_probe_now():
     except urllib.error.HTTPError as e:
         _t = ""
         try:
-            _t = e.read().decode("utf-8", "ignore")[:160]
+            _t = e.read().decode("utf-8", "ignore")[:200]
         except Exception:
             pass
-        return f"🔬 Raw probe: HTTP {e.code}\n`{_md_esc(_t)}`"
+        _soft = _bn_soft_err(_t, 120)
+        if _soft.startswith("⏸"):
+            return f"🔬 Raw probe: {_soft}"
+        return f"🔬 Raw probe: HTTP {e.code}\n`{_md_esc(_soft)}`"
     except Exception as e:
         return f"🔬 Raw probe ব্যর্থ: `{_md_esc(str(e)[:120])}`"
 
@@ -10517,6 +10562,18 @@ def dep_diag_report():
                 rows, err = _cu, ""
         out.append("")
         out.append(_dep_src_line() or "🔌 সোর্স: ?")
+        try:
+            _mc = mail_cfg()
+            if _mc["on"]:
+                _ma = _DEP_MAIL.get("at") or 0
+                _mtxt = (f"{int(_time.time() - _ma)}s আগে" if _ma else "এখনো হয়নি")
+                out.append(f"📧 মেইল সোর্স (Binance ইমেইল): ✅ চালু · শেষ চেক {_mtxt}")
+                if _DEP_MAIL.get("err"):
+                    out.append(f"   ↳ `{_md_esc(str(_DEP_MAIL.get('err'))[:100])}`")
+            else:
+                out.append("📧 মেইল সোর্স: ❌ সেট নেই — `/mail set …` দিয়ে চালু করুন")
+        except Exception:
+            pass
         if err:
             out.append("🔢 গত ২৪ ঘণ্টার লেনদেন: `—` (বিরতির কারণে চেক হয়নি)")
         else:
@@ -10529,7 +10586,9 @@ def dep_diag_report():
             out.append(f"ℹ️ API-তে মোট *{_rl}*টি পুরোনো লেনদেন আছে, "
                        "কিন্তু শেষ ২৪ ঘণ্টায় নতুন পেমেন্ট নেই।")
         if err:
-            out.append(f"⚠️ `{_md_esc(str(err)[:220])}`")
+            _etxt = _bn_soft_err(err, 220)
+            out.append(("⏸ " if _etxt.startswith("⏸") else "⚠️ ")
+                       + f"`{_md_esc(_etxt)}`")
         else:
             if not _BN_LAST.get("pay_ok"):
                 out.append("⚠️ *Binance Pay API বন্ধ* — UID পেমেন্ট অটো মিলবে না\n"
@@ -10544,7 +10603,9 @@ def dep_diag_report():
                            f"data={'লিস্ট' if _BN_LAST.get('raw_has_data') else 'নেই'} · "
                            f"rows=`{int(_BN_LAST.get('raw_len') or 0)}`")
                 if _BN_LAST.get("raw_msg"):
-                    out.append(f"💬 `{_md_esc(str(_BN_LAST.get('raw_msg'))[:100])}`")
+                    _rmsg = _bn_soft_err(_BN_LAST.get("raw_msg"), 100)
+                    if not _rmsg.startswith("⏸"):
+                        out.append(f"💬 `{_md_esc(_rmsg)}`")
                 if _BN_LAST.get("raw_keys"):
                     out.append("🧩 ফিল্ড: `" +
                                _md_esc(", ".join(str(k) for k in _BN_LAST["raw_keys"])) + "`")
@@ -10943,12 +11004,27 @@ def _bal_cache_get(kind):
     return d["v"], max(0, int(_time.time() - float(d["at"] or 0)))
 
 
+def _bn_soft_err(msg, limit=140):
+    """Binance-এর কাঁচা ব্যান/লিমিট লেখা সরিয়ে নরম বার্তা।
+
+    "Way too much request weight used; IP banned until 179..." — এই লেখা
+    গ্রাহককে দেখানো হয় না; শুধু "সাময়িক বিরতি" বলা হয়।
+    """
+    t = str(msg or "").strip()
+    low = t.lower()
+    if ("banned" in low or "-1003" in t or "too much request" in low
+            or "-1005" in t or "too many requests" in low
+            or "http 429" in low or "http 418" in low):
+        return "⏸ Binance সাময়িক বিরতি — বট নিজেই আবার চেক করবে"
+    return t[:limit]
+
+
 def _bn_ban_parse(msg):
     """'IP banned until 1794551155061' → ban শেষের epoch সেকেন্ড।"""
     try:
         m = _re.search(r"banned until\D*(\d{10,})", str(msg or ""))
         if m:
-            return float(m.group(1)) / 1000.0
+            return float(m.group(1)) / 1000.0 + 30.0   # ছোট বাফার
     except Exception:
         pass
     return 0.0
@@ -11092,7 +11168,7 @@ def funding_usdt_balance():
         _FUND_LAST["err"] = "⏳ Binance বিরতি — পরের চেকে আবার"
         return None
     off = _binance_server_offset()
-    for base in _binance_bases():
+    for base in _binance_bases()[:1]:
         params = {"asset": "USDT", "recvWindow": 20000,
                   "timestamp": int((_time.time() + off) * 1000)}
         qs = urllib.parse.urlencode(sorted(params.items()))
@@ -11111,7 +11187,7 @@ def funding_usdt_balance():
             except Exception:
                 _FUND_LAST["err"] = f"HTTP {e.code}"
             _bn_gate_hit(_FUND_LAST["err"])
-            continue
+            break
         except Exception as e:
             _FUND_LAST["err"] = str(e)[:90]
             continue
@@ -11353,6 +11429,13 @@ class _DepCtx:
 
 async def _dep_watch_once(bot):
     """পেন্ডিং Binance ডিপোজিট একবার চেক করে পাওয়া গেলে সাথে সাথে ক্রেডিট।"""
+    # 📧 মেইল-মোড চালু থাকলে Binance API একেবারেই ডাকা হয় না (০ কল, ০ ব্যান);
+    #    টাকা যোগ করে `_dep_mail_once` (job_dep_mail_watch)।
+    try:
+        if await asyncio.to_thread(lambda: mail_cfg()["on"]):
+            return 0
+    except Exception:
+        pass
     if not await asyncio.to_thread(dep_binance_ready):
         return 0
     # ⚠️ ইউজারের চাহিদা: টাকা পেলে সাথে সাথে, না পেলে মাত্র ৫ মিনিট চেক —
@@ -11422,13 +11505,7 @@ async def _dep_watch_once(bot):
         if _has_ref and _win < 60:
             _win = 60      # Order ID ডিপোজিটে পুরোনো-নতুন দুটোই খোঁজা হয়
         rows, err = await asyncio.to_thread(_binance_pay_rows, _win)
-    # ফান্ডিং-ফলব্যাক চালু কি না (ডিফল্ট চালু) — Order ID ম্যাচিং *পরে* চলবে
-    _fund_on = True
-    try:
-        _fv = str(await asyncio.to_thread(get_setting, "dep_fund_watch") or "1")
-        _fund_on = _fv.strip().lower() not in ("0", "off", "false", "no", "")
-    except Exception:
-        _fund_on = True
+    # ⚠️ ফান্ডিং/ব্যালেন্স-Δ ফলব্যাক বন্ধ (মালিকের নির্দেশ) — আর কিছুই লাগে না।
     if (err or not rows) and _bn_cache_union():
         # আগে কোনো কলে পাওয়া লেনদেন ক্যাশে থাকলে সেটাই ব্যবহার করো
         rows, err = _bn_cache_union(), ""
@@ -11508,6 +11585,421 @@ async def _dep_watch_once(bot):
     # ব্যালেন্স-Δ অটো ইতিমধ্যেই উপরে একবার চলেছে — এখানে আবার ডাকলে
     # একই টিক-এ দুইবার ব্যালেন্স পড়া হতো। তাই শেষে আর ডাকা হয় না।
     return done
+
+
+# ══════════════════════════════════════════════════════════════════
+#  📧 Binance ইমেইল → অটো ডিপোজিট (IMAP) — একটাও Binance API কল নেই
+#  Binance টাকা পেলেই মেইল পাঠায়:
+#    "[Binance] Payment Receive Successful - 2026-11-13 14:52:45 (UTC)"
+#    Time: 2026-11-13 14:52:44(UTC) / From: Siddharth sekh / Amount: 0.01 USDT
+#  এই মেইল পড়েই পেন্ডিং ডিপোজিট মিলিয়ে টাকা যোগ করা হয় — তাই IP ব্যান,
+#  rate limit, API permission — কিছুই আর দরকার নেই।
+# ══════════════════════════════════════════════════════════════════
+_DEP_MAIL = {"at": 0.0, "ok": False, "err": "", "n": 0, "busy": False}
+_DEP_MAIL_SEEN_KEY = "dep_mail_seen"
+
+
+def mail_cfg():
+    """IMAP সেটিংস — (host, port, user, pass, folder, on)।"""
+    def _g(k):
+        try:
+            return str(get_setting(k) or "").strip()
+        except Exception:
+            return ""
+    host = _g("mail_host") or "imap.gmail.com"
+    try:
+        port = int(_g("mail_port") or 993)
+    except Exception:
+        port = 993
+    user, pwd = _g("mail_user"), _g("mail_pass")
+    folder = _g("mail_folder") or "INBOX"
+    on = _g("dep_mail_on").lower() not in ("0", "off", "false", "no", "")
+    return {"on": bool(on and user and pwd), "host": host, "port": port,
+            "user": user, "pass": pwd, "folder": folder}
+
+
+def _mail_seen_get():
+    try:
+        raw = str(get_setting(_DEP_MAIL_SEEN_KEY) or "")
+    except Exception:
+        raw = ""
+    return set(x for x in raw.split("|") if x)
+
+
+def _mail_seen_add(mid):
+    try:
+        cur = _mail_seen_get()
+        cur.add(str(mid)[:120])
+        keep = list(cur)[-400:]
+        set_setting(_DEP_MAIL_SEEN_KEY, "|".join(keep))
+    except Exception:
+        pass
+
+
+def _mail_body_text(msg):
+    """মেইলের সব টেক্সট (HTML হলে ট্যাগ বাদ) এক স্ট্রিং-এ।"""
+    chunks = []
+    for part in (msg.walk() if hasattr(msg, "walk") else [msg]):
+        try:
+            ctype = str(part.get_content_type() or "")
+        except Exception:
+            continue
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            continue
+        if not payload:
+            continue
+        try:
+            txt = payload.decode(part.get_content_charset() or "utf-8", "ignore")
+        except Exception:
+            txt = payload.decode("utf-8", "ignore")
+        chunks.append(txt)
+    txt = "\n".join(chunks)
+    if "<" in txt and ">" in txt:
+        txt = _re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", txt,
+                      flags=_re.I | _re.S)
+        txt = _re.sub(r"<br\s*/?>|</p>|</tr>|</div>", "\n", txt, flags=_re.I)
+        txt = _re.sub(r"<[^>]+>", " ", txt)
+        txt = _re.sub(r"&nbsp;?", " ", txt)
+        txt = _re.sub(r"&amp;", "&", txt)
+    return _re.sub(r"[ \t]+", " ", txt)
+
+
+def mail_parse_payment(subject, body):
+    """Binance পেমেন্ট-রিসিভ মেইল থেকে (amount, sender, time_ms)।
+
+    মেল না হলে None। এই ফাংশনটি নেটওয়ার্ক ছোঁয় না — টেস্ট করা সহজ।
+    """
+    subj = str(subject or "").lower()
+    txt = str(body or "")
+    low = txt.lower()
+    if "binance" not in subj and "binance" not in low:
+        return None
+    if not ("payment receive" in subj or "incoming transfer" in low
+            or "you received" in low or "payment receive" in low):
+        return None
+    amt = None
+    for _pat in (r"amount\s*:?\s*([0-9][0-9,]*\.?[0-9]*)\s*usdt",
+                 r"([0-9][0-9,]*\.?[0-9]*)\s*usdt"):
+        _m = _re.search(_pat, low)
+        if _m:
+            try:
+                amt = float(_m.group(1).replace(",", ""))
+            except Exception:
+                amt = None
+            if amt and amt > 0:
+                break
+    if not amt or amt <= 0:
+        return None
+    sender = ""
+    _m2 = _re.search(r"from\s*:?\s*([^\n]{2,60})", txt, _re.I)
+    if _m2:
+        sender = _re.sub(r"<[^>]*>", " ", _m2.group(1))
+        sender = _re.sub(r"\s+", " ", sender).strip(" :|-")
+        sender = _re.split(r"(?i)amount|time\s*:|to\s*:|reference", sender)[0].strip(" :|-")
+    ts_ms = 0
+    _m3 = _re.search(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})", txt)
+    if _m3:
+        try:
+            import calendar as _cal
+            ts_ms = int(_cal.timegm(tuple(int(x) for x in _m3.groups())
+                                    + (0, 0, 0))) * 1000
+        except Exception:
+            ts_ms = 0
+    return {"amount": amt, "sender": sender[:60], "ts_ms": ts_ms}
+
+
+def _mail_fetch_payments(limit=15):
+    """IMAP থেকে নতুন Binance পেমেন্ট মেইল — [(message_id, payment), ...]।"""
+    cfg = mail_cfg()
+    if not cfg["on"]:
+        return [], "মেইল সেট করা নেই"
+    import imaplib
+    import email as _email
+    try:
+        try:
+            imap = imaplib.IMAP4_SSL(cfg["host"], cfg["port"], timeout=25)
+        except TypeError:
+            imap = imaplib.IMAP4_SSL(cfg["host"], cfg["port"])
+    except Exception as e:
+        return [], f"IMAP সংযোগ ব্যর্থ: {str(e)[:90]}"
+    out = []
+    try:
+        imap.login(cfg["user"], cfg["pass"])
+        imap.select(cfg["folder"], readonly=True)
+        ids = []
+        for crit in ("UNSEEN", "ALL"):
+            try:
+                typ, data = imap.search(None, crit)
+            except Exception:
+                continue
+            if typ == "OK" and data and data[0]:
+                ids = data[0].split()
+                if ids:
+                    break
+        for num in ids[-int(limit):]:
+            try:
+                typ, data = imap.fetch(num, "(RFC822)")
+            except Exception:
+                continue
+            if typ != "OK" or not data:
+                continue
+            raw = None
+            for chunk in data:
+                if isinstance(chunk, tuple) and len(chunk) > 1:
+                    raw = chunk[1]
+                    break
+            if not raw:
+                continue
+            try:
+                msg = _email.message_from_bytes(raw)
+            except Exception:
+                continue
+            mid = str(msg.get("Message-ID") or num).strip()[:120]
+            pay = mail_parse_payment(msg.get("Subject") or "", _mail_body_text(msg))
+            if pay:
+                out.append((mid, pay))
+    except Exception as e:
+        return [], f"IMAP পড়া ব্যর্থ: {str(e)[:90]}"
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+    return out, ""
+
+
+def _mail_name_ok(dep_name, sender):
+    """ডিপোজিটে দেওয়া নাম আর ইমেইলের From — একই মানুষ কি না।"""
+    a = str(dep_name or "").strip().casefold()
+    b = str(sender or "").strip().casefold()
+    if not a or not b:
+        return False
+    if a == b or a in b or b in a:
+        return True
+    _ta = {w for w in a.replace(".", " ").split() if len(w) > 2}
+    _tb = {w for w in b.replace(".", " ").split() if len(w) > 2}
+    return bool(_ta and _tb and (_ta & _tb))
+
+
+def _mail_time_ok(o, ts_ms, early_min=1440, late_min=10):
+    """ইমেইলের নিজের সময় যুক্তিসঙ্গত কি না (আগে পাঠানো টাকাও মিলবে)।
+
+    ইউজার আগে টাকা পাঠিয়ে পরে ডিপোজিট দিতে পারে — তাই মেইল ২৪ ঘণ্টা
+    পুরোনো হলেও চলবে। ডুপ্লিকেট আটকায় ইমেইলের Message-ID, সময় নয়।
+    ভবিষ্যতের (ভুল) সময় থাকলে বাদ।
+    """
+    try:
+        ct = _dep_created_ms(o) or 0
+    except Exception:
+        ct = 0
+    try:
+        ts = int(ts_ms or 0)
+    except Exception:
+        ts = 0
+    if not ts:
+        return True                      # সময় না পেলে নাম+অঙ্কেই চলবে
+    now_ms = int(_time.time() * 1000)
+    if ts > now_ms + late_min * 60 * 1000:
+        return False
+    if ct and ts < ct - early_min * 60 * 1000:
+        return False                     # ডিপোজিটের অনেক আগের পেমেন্ট
+    return True
+
+
+def _dep_mail_find_for(o):
+    """একটা নাম-ডিপোজিটের জন্য মেইলে খোঁজা — (amount, "", when_ms, err)।
+
+    TxID নেই (মালিকের নির্দেশ) — ডুপ্লিকেট আটকায় ইমেইলের Message-ID আর
+    ইমেইলের নিজের সময়।
+    """
+    try:
+        name = str((o.get("payer_name") if hasattr(o, "get") else o["payer_name"]) or "").strip()
+        want = float((o.get("amount") if hasattr(o, "get") else o["amount"]) or 0)
+    except Exception:
+        return 0.0, "", 0, "ডিপোজিটের তথ্য পড়া যায়নি"
+    if not name:
+        return 0.0, "", 0, "Binance নাম দেওয়া নেই"
+    pays, err = _mail_fetch_payments()
+    if err:
+        return 0.0, "", 0, str(err)[:160]
+    seen = _mail_seen_get()
+    for mid, pay in pays:
+        if mid in seen:
+            continue
+        if not _mail_name_ok(name, pay.get("sender")):
+            continue
+        try:
+            amt = float(pay.get("amount") or 0)
+        except Exception:
+            continue
+        if want > 0 and abs(amt - want) > max(0.0000001, want * 0.0005):
+            continue
+        if not _mail_time_ok(o, pay.get("ts_ms")):
+            continue
+        return amt, "", int(pay.get("ts_ms") or 0), ""
+    return 0.0, "", 0, "🔎 মেইলে এখনো মেলেনি"
+
+
+def _mail_pick_deposit(pay, pendings, max_age_min=0):
+    """এই পেমেন্টের সাথে কোন পেন্ডিং ডিপোজিট মেলে — (ডিপোজিট বা None)।"""
+    amt = float(pay.get("amount") or 0)
+    sender = str(pay.get("sender") or "").strip().casefold()
+    if amt <= 0:
+        return None
+    now_ms = int(_time.time() * 1000)
+    hits = []
+    for o in pendings or []:
+        try:
+            a = float(o["amount"] or 0)
+        except Exception:
+            continue
+        if a <= 0:
+            continue
+        if abs(a - amt) > max(0.0000001, a * 0.0005):
+            continue
+        if not _mail_time_ok(o, pay.get("ts_ms")):
+            continue
+        # নাম দেওয়া থাকলে নাম *অবশ্যই* মিলতে হবে — শুধু অঙ্ক মিললেই ক্রেডিট
+        # করলে একই অঙ্কের অন্য কারো পেমেন্টে ভুল টাকা ঢুকে যেত।
+        _dn = str((o.get("payer_name") if hasattr(o, "get") else "") or "").strip()
+        if _dn and not _mail_name_ok(_dn, pay.get("sender")):
+            continue
+        ct = 0
+        try:
+            ct = _dep_created_ms(o) or 0
+        except Exception:
+            ct = 0
+        hits.append((ct, o))
+    if not hits:
+        return None
+    # নাম মিললে সেটাই আগে (একই অঙ্কের একাধিক পেন্ডিং থাকলে ভুল ক্রেডিট এড়ায়)
+    if sender:
+        for _ct, o in sorted(hits, key=lambda x: x[0]):
+            nm = str((o.get("payer_name") if hasattr(o, "get") else "") or "").strip()
+            if nm and _mail_name_ok(nm, pay.get("sender")):
+                return o
+    if len(hits) == 1:          # একটাই মিল → নিশ্চিন্তে
+        return hits[0][1]
+    return None                  # একাধিক, নামও মেলেনি → অ্যাডমিন দেখবেন
+
+
+async def _dep_mail_once(bot):
+    """একবার মেইল পড়ে পেন্ডিং ডিপোজিটে টাকা যোগ করে — (credited_count)।"""
+    cfg = mail_cfg()
+    if not cfg["on"]:
+        return 0
+    if _DEP_MAIL.get("busy"):
+        return 0
+    _DEP_MAIL["busy"] = True
+    done = 0
+    try:
+        pays, err = await asyncio.to_thread(_mail_fetch_payments)
+        _DEP_MAIL.update({"at": _time.time(), "ok": not err,
+                          "err": err or "", "n": len(pays)})
+        if err or not pays:
+            return 0
+        seen = _mail_seen_get()
+        for mid, pay in pays:
+            if mid in seen:
+                continue
+            try:
+                pend = await asyncio.to_thread(dep_pending, 60)
+            except Exception:
+                pend = []
+            o = _mail_pick_deposit(pay, pend)
+            if not o:
+                continue            # ম্যাচ হয়নি → পরের চেকে আবার (মেইল নষ্ট হয় না)
+            oid = int(o["id"])
+            # TxID বন্ধ (মালিকের নির্দেশ) — ডুপ্লিকেট আটকায় ইমেইলের
+            # Message-ID (`_mail_seen_add`) আর ইমেইলের নিজের সময়।
+            try:
+                _m = await asyncio.to_thread(dep_method, int(o["method_id"] or 0))
+            except Exception:
+                _m = None
+            try:
+                await _dep_auto_credit(_DepCtx(bot), int(o["user_id"]),
+                                       _m or {}, float(pay.get("amount") or 0),
+                                       "", oid)
+            except Exception as _ce:
+                log.warning(f"[DEP-MAIL] #{oid} ক্রেডিট বার্তা ব্যর্থ: {_ce}")
+            _mail_seen_add(mid)
+            done += 1
+            log.info(f"[DEP-MAIL] #{oid} অটো ক্রেডিট {pay.get('amount')}$ "
+                     f"(মেইল, sender={pay.get('sender')})")
+    except Exception as e:
+        _DEP_MAIL["err"] = str(e)[:120]
+        log.debug(f"[DEP-MAIL] {str(e)[:150]}")
+    finally:
+        _DEP_MAIL["busy"] = False
+    return done
+
+
+async def job_dep_mail_watch(ctx):
+    """প্রতি ৬০ সেকেন্ডে Binance ইমেইল চেক (সেট করা থাকলে)।"""
+    try:
+        await _dep_mail_once(ctx.bot)
+    except Exception as e:
+        log.debug(f"[DEP-MAIL] job: {str(e)[:120]}")
+
+
+async def cmd_mail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """মালিক-কমান্ড: /mail — স্ট্যাটাস · /mail on|off · /mail set host port user pass · /mail test"""
+    u = update.effective_user
+    if not u:
+        return
+    if int(u.id) != int(ADMIN_ID) and not await asyncio.to_thread(is_admin, u.id):
+        return
+    args = list(ctx.args or [])
+    act = (args[0] or "").lower() if args else ""
+    cfg = mail_cfg()
+    if act == "on":
+        set_setting("dep_mail_on", "1")
+        await update.message.reply_text("📧 মেইল অটো-ডিপোজিট *চালু* ✅", parse_mode="Markdown")
+        return
+    if act == "off":
+        set_setting("dep_mail_on", "0")
+        await update.message.reply_text("📧 মেইল অটো-ডিপোজিট *বন্ধ* ❌", parse_mode="Markdown")
+        return
+    if act == "set":
+        # সেটআপ এখন ওয়েব প্যানেলে — বটে শুধু চেক/স্ট্যাটাস (মালিকের নির্দেশ)
+        await update.message.reply_text(
+            "⚙️ মেইল সেটআপ এখন *ওয়েব প্যানেল* থেকে:\n"
+            "Admin Panel → ✉️ *Mail Auto-Deposit* → ইমেইল + App Password → সেভ → "
+            "🔎 সংযোগ টেস্ট।\n\nবটে শুধু: `/mail` (স্ট্যাটাস) · `/mail test` (চেক)।",
+            parse_mode="Markdown")
+        return
+    if act == "test":
+        pays, err = await asyncio.to_thread(_mail_fetch_payments)
+        lines = ["📧 *মেইল টেস্ট*", "━━━━━━━━━━━━━━"]
+        if err:
+            lines.append(f"❌ `{_md_esc(err)}`")
+        else:
+            lines.append(f"✅ সংযোগ ঠিক · Binance পেমেন্ট মেইল পাওয়া গেছে: *{len(pays)}*")
+            for _mid, _p in pays[:4]:
+                lines.append(f"• `{float(_p['amount']):g} USDT` · {_md_esc(_p['sender'] or '—')}")
+        if cfg["on"]:
+            lines.append("")
+            lines.append("অটো-চেক: চালু ✅ (প্রতি ৬০ সেকেন্ড)")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+    lines = ["📧 *মেইল অটো-ডিপোজিট*", "━━━━━━━━━━━━━━",
+             f"• স্ট্যাটাস: {'চালু ✅' if cfg['on'] else 'বন্ধ ❌ (সেট করা নেই)'}",
+             f"• হোস্ট: `{_md_esc(cfg['host'])}:{cfg['port']}`",
+             f"• ইউজার: `{_md_esc(cfg['user'] or '—')}`",
+             f"• পাসওয়ার্ড: {'সেট ✅' if cfg['pass'] else 'নেই ❌'}"]
+    if _DEP_MAIL.get("at"):
+        _age = int(_time.time() - float(_DEP_MAIL["at"]))
+        lines.append(f"• শেষ চেক: {_age}s আগে · {_DEP_MAIL.get('n', 0)} মেইল")
+        if _DEP_MAIL.get("err"):
+            lines.append(f"• শেষ এরর: `{_md_esc(str(_DEP_MAIL['err'])[:120])}`")
+    lines += ["", "⚙️ সেটআপ: ওয়েব প্যানেল → ✉️ Mail Auto-Deposit",
+              "`/mail` — স্ট্যাটাস · `/mail test` — সংযোগ চেক",
+              "`/mail on` · `/mail off` — চালু/বন্ধ"]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def _dep_watch_loop(bot):
@@ -12002,6 +12494,32 @@ async def _dep_recheck(q, ctx, oid):
     if not m:
         await q.answer("মেথড পাওয়া যায়নি", show_alert=True)
         return
+    # 📧 মেইল-মোড: 🔁 চেক চাপলে Binance API নয় — মেইল পড়ে দেখাই যথেষ্ট
+    try:
+        if await asyncio.to_thread(lambda: mail_cfg()["on"]):
+            try:
+                await q.answer("🔎 চেক করা হচ্ছে…")
+            except Exception:
+                pass
+            try:
+                await _dep_mail_once(getattr(ctx, "bot", None))
+            except Exception:
+                pass
+            _o2 = await asyncio.to_thread(dep_row, oid)
+            if _o2 and str(_o2["status"]) != "pending":
+                try:
+                    await q.answer("✅ টাকা যোগ হয়েছে!", show_alert=True)
+                except Exception:
+                    pass
+            else:
+                try:
+                    await q.answer("⏳ মেইলে এখনো মেলেনি — মিললেই নিজে থেকে যোগ হবে",
+                                   show_alert=True)
+                except Exception:
+                    pass
+            return
+    except Exception:
+        pass
     _prov = dep_method_provider(m)
     if _prov == "binance":
         # ব্যক্তিগত Binance Key-তে Pay হিস্ট্রি পড়া যায় না → ফান্ডিং ব্যালেন্স দেখি
@@ -12184,7 +12702,7 @@ def spot_usdt_balance():
     if not _ok:
         return None
     off = _binance_server_offset()
-    for base in _binance_bases():
+    for base in _binance_bases()[:1]:
         qs = urllib.parse.urlencode(sorted({
             "timestamp": int((_time.time() + off) * 1000),
             "recvWindow": 20000}.items()))
@@ -12201,7 +12719,7 @@ def spot_usdt_balance():
                 _bn_gate_hit(f"{_sj.get('code')} {_sj.get('msg') or ''}")
             except Exception:
                 pass
-            continue
+            break
         except Exception:
             continue
         tot = 0.0
@@ -12299,12 +12817,12 @@ async def _dep_bal_block():
     _ban = float(_BN_GATE.get("ban_until") or 0) - _time.time()
     if _ban > 0:
         _bm = int(_ban // 60) + 1
-        lines.append(f"⛔ Binance IP ব্যান — আরও {_bm} মিনিট; ততক্ষণ নতুন কল হবে না "
-                     "(উপরে শেষ দেখা ব্যালেন্স দেখানো হচ্ছে)")
+        lines.append(f"⏸ Binance সাময়িক বিরতি — আরও {_bm} মিনিট; "
+                     "ততক্ষণ নতুন কল হবে না (উপরে শেষ দেখা ব্যালেন্স)")
     try:
         _wd = str(get_setting("dep_fund_watch") or "1").strip().lower()
         _on = _wd not in ("0", "off", "false", "no", "")
-        lines.append(f"🔄 ফান্ডিং অটো-ক্রেডিট: {'চালু ✅ (ডিফল্ট)' if _on else 'বন্ধ ❌'}")
+        lines.append("🔄 অটো-ক্রেডিট: শুধু Order ID মিললেই (ব্যালেন্স দেখে নয়)")
         # কত টাকা এখনো "অপেক্ষমাণ" — অর্ডার এলেই অটো ✅ হবে
         if fbal is not None and base is not None:
             _pool = round(float(fbal) - float(base), 6)
@@ -12667,6 +13185,23 @@ async def dep_callback(update, ctx):
             await _dep_uid_finish(_shim, ctx, uid, _mm, _amt, _nm, _en_n2)
             return
 
+        if d == "dep:useoid":
+            ctx.user_data["state"] = "dep_uid_oid"
+            _en_o = False
+            try:
+                _en_o = (await asyncio.to_thread(get_lang, uid)) == "en"
+            except Exception:
+                _en_o = False
+            await q.message.reply_text(
+                ("🧾 *Enter the Binance Order ID*\n\n"
+                 "Binance Pay → History → open the payment → copy *Order ID*.\n\n"
+                 "/cancel — cancel" if _en_o else
+                 "🧾 *Binance Order ID দিন*\n\n"
+                 "Binance Pay → History → পেমেন্টে চাপ → *Order ID* কপি করে পাঠান।\n\n"
+                 "/cancel — বাতিল"),
+                parse_mode="Markdown")
+            return
+
         if d == "dep:chname":
             ctx.user_data["state"] = "dep_uid_name"
             _en_c = False
@@ -12701,6 +13236,53 @@ async def dep_callback(update, ctx):
                 _m = {"id": int(_o["method_id"] or 0),
                       "name": str(_o["method_name"] or ""),
                       "kind": str(_o["kind"] or "uid")}
+            # 📧 মেইল-মোড: নাম দেওয়ার সাথে সাথেই মেইল চেক — অপেক্ষা নয়
+            _mail_mode = False
+            try:
+                _mail_mode = await asyncio.to_thread(lambda: mail_cfg()["on"])
+            except Exception:
+                _mail_mode = False
+            if _mail_mode:
+                try:
+                    await q.answer("🔎 চেক করা হচ্ছে…")
+                except Exception:
+                    pass
+                try:
+                    await _dep_mail_once(ctx.bot)
+                except Exception:
+                    pass
+                _o2 = await asyncio.to_thread(dep_row, _oid)
+                if _o2 and str(_o2["status"]) != "pending":
+                    try:
+                        await q.answer("✅ টাকা যোগ হয়েছে!")
+                    except Exception:
+                        pass
+                    return
+                _lb = False
+                try:
+                    _lb = (await asyncio.to_thread(get_lang, uid)) == "en"
+                except Exception:
+                    _lb = False
+                try:
+                    await ctx.bot.send_message(
+                        uid,
+                        (f"🔎 *Checking your payment…*\n\n"
+                         f"🧾 `#{dep_no(_oid)}` · 💵 `{float(_o['amount'] or 0):g}$`\n"
+                         f"👤 `{_md_esc(str(_o.get('payer_name') or ''))}`\n\n"
+                         "The bot reads the Binance email and adds the balance the "
+                         "moment the name, amount and email time match.\n"
+                         "☝️ Nothing else to do — you'll get a message here."
+                         if _lb else
+                         f"🔎 *আপনার পেমেন্ট যাচাই করা হচ্ছে…*\n\n"
+                         f"🧾 `#{dep_no(_oid)}` · 💵 `{float(_o['amount'] or 0):g}$`\n"
+                         f"👤 `{_md_esc(str(_o.get('payer_name') or ''))}`\n\n"
+                         "বট Binance-এর মেইল পড়ে দেখছে — নাম, অঙ্ক আর মেইলের সময় "
+                         "মিললেই ব্যালেন্স সাথে সাথে যোগ হবে।\n"
+                         "☝️ আপনাকে আর কিছু করতে হবে না, এখানেই জানিয়ে দেওয়া হবে।"),
+                        parse_mode="Markdown")
+                except Exception:
+                    pass
+                return
             _got = await asyncio.to_thread(dep_name_find_for, _o)
             if not (_got and _got[1]):
                 # Order ID দিয়ে চেষ্টা (নাম দেওয়া না থাকলেও কাজ করবে)
@@ -12960,14 +13542,22 @@ async def _dep_uid_finish(update, ctx, uid, m, amt, name, en=False):
     oid = await asyncio.to_thread(dep_new, uid, m, amt, "", _note, "pending",
                                   "binance", "", name)
     _got = None
+    _mail_mode = False
+    try:
+        _mail_mode = await asyncio.to_thread(lambda: mail_cfg()["on"])
+    except Exception:
+        _mail_mode = False
     try:
         _o_new = await asyncio.to_thread(dep_row, oid)
         if _o_new:
-            _got = await asyncio.to_thread(dep_name_find_for, _o_new)
+            _got = await asyncio.to_thread(
+                _dep_mail_find_for if _mail_mode else dep_name_find_for, _o_new)
     except Exception as _ge:
         log.debug(f"[DEP-NAME] সাথে সাথে চেক ব্যর্থ: {_ge}")
-    if _got and _got[1]:
-        await _dep_auto_credit(ctx, uid, m, _got[0] or amt, _got[1], oid)
+    if _got and (_got[1] or (_mail_mode and _got[0])):
+        # TxID বন্ধ — মেইল-মোডে খালি টেক্সট দিয়ে ক্রেডিট (ডুপ্লিকেট আটকায় মেইলের সময়)
+        await _dep_auto_credit(ctx, uid, m, _got[0] or amt,
+                               ("" if _mail_mode else _got[1]), oid)
         return oid
     await update.message.reply_text(
         (f"⏳ *Checking your payment...*\n\n"
@@ -12976,14 +13566,14 @@ async def _dep_uid_finish(update, ctx, uid, m, amt, name, en=False):
          "💵 *After paying the dollars, tap 🔁 Check after 1 minute* — balance is "
          "added instantly.\n"
          "⚡ The bot also checks every minute automatically.\n"
-         "⏱ After 5 minutes auto-check stops — the admin will approve manually."
+         "⏳ No time limit — the bot matches the email's own time."
          if en else
          f"⏳ *আপনার পেমেন্ট যাচাই করা হচ্ছে...*\n\n"
          f"🧾 `#{dep_no(oid)}` · 💵 `{amt:g}$`\n"
          f"🔤 নাম: `{_md_esc(name)}`\n\n"
          "💵 *ডলার পেমেন্ট করে ১ মিনিট পর 🔁 চেক চাপুন* — সাথে সাথে ব্যালেন্স যোগ হবে।\n"
          "⚡ বট নিজেও প্রতি মিনিটে চেক করছে, টাকা এলে অটো যোগ হবে।\n"
-         "⏱ ৫ মিনিট পার হলে অটো হবে না — অ্যাডমিন দেখে অনুমোদন করবেন।"),
+         "⏳ কোনো সময়সীমা নেই — ইমেইলের নিজের সময় দেখে মিলিয়ে নেওয়া হয়।"),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🔁 Check" if en else "🔁 চেক",
@@ -13369,24 +13959,48 @@ async def dep_input(update, ctx, st):
             return True
         ctx.user_data["dep_uid_amt"] = amt
         ctx.user_data["dep_mid"] = int(m["id"] or 0)
-        ctx.user_data["state"] = "dep_uid_oid"
+        # ── আগের "নাম সেভ" সিস্টেম: সেভ করা নাম থাকলে সেটাই ব্যবহার হবে ──
+        _nm0 = ""
+        try:
+            _nm0 = await asyncio.to_thread(dep_name_get, uid)
+        except Exception:
+            _nm0 = ""
+        if _nm0:
+            ctx.user_data.pop("state", None)
+            await update.message.reply_text(
+                (f"💵 *Amount:* `{amt:g}$`\n"
+                 f"🔤 *Saved name:* `{_md_esc(_nm0)}`\n\n"
+                 "📲 Send the money with Binance Pay using *this same nickname*.\n"
+                 "✅ Then tap *I've paid — check* — the bot matches the payment "
+                 "and adds the balance automatically.\n\n"
+                 "💡 You only give the nickname once; next time it is reused."
+                 if _en else
+                 f"💵 *পরিমাণ:* `{amt:g}$`\n"
+                 f"🔤 *সেভ করা নাম:* `{_md_esc(_nm0)}`\n\n"
+                 "📲 এই *একই nickname* দিয়ে Binance Pay-তে টাকা পাঠান।\n"
+                 "✅ তারপর *টাকা পাঠিয়েছি — চেক* চাপুন — বট মিলিয়ে ব্যালেন্স "
+                 "যোগ করে দেবে।\n\n"
+                 "💡 নাম একবার দিলেই হবে — পরেরবার নিজেই ব্যবহার হবে।"),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ টাকা পাঠিয়েছি — চেক" if not _en
+                                          else "✅ I've paid — check",
+                                          callback_data="dep:nameok")],
+                    [InlineKeyboardButton("✏️ নতুন নাম" if not _en else "✏️ New name",
+                                          callback_data="dep:chname"),
+                     InlineKeyboardButton("🧾 Order ID" if not _en else "🧾 Order ID",
+                                          callback_data="dep:useoid")]]))
+            return True
+        # নাম সেভ নেই → আগের মতোই নাম চাই
+        ctx.user_data["state"] = "dep_uid_name"
         await update.message.reply_text(
-            (f"💵 *Amount:* `{amt:g}$`\n\n"
-             "🧾 *Enter the Binance Order ID*\n\n"
-             "Binance app → Pay → History → tap the payment → copy *Order ID* "
-             "(or Transaction ID) and send it here.\n\n"
-             "🎯 With this Order ID the bot matches your payment 100% and adds the "
-             "balance automatically — no name needed.\n"
-             "🔒 One Order ID works only once.\n\n"
-             "/cancel — cancel" if _en else
-             f"💵 *পরিমাণ:* `{amt:g}$`\n\n"
-             "🧾 *Binance Order ID দিন*\n\n"
-             "Binance App → Pay → History → পেমেন্টে চাপ দিন → *Order ID* "
-             "(বা Transaction ID) কপি করে এখানে পাঠান।\n\n"
-             "🎯 এই Order ID দিয়েই বট আপনার পেমেন্ট ১০০% মিলিয়ে ব্যালেন্স "
-             "যোগ করে দেবে — নাম লাগবে না।\n"
-             "🔒 এক Order ID দিয়ে একবারই হবে।\n\n"
-             "/cancel — বাতিল"),
+            ("🔤 *Enter your Binance Nickname*\n\n"
+             "Binance app → Profile → Nickname — type it *exactly*.\n"
+             "It is saved once and reused next time.\n\n/cancel — cancel"
+             if _en else
+             "🔤 *আপনার Binance Nickname দিন*\n\n"
+             "Binance App → Profile → Nickname — পুরো নামটা *হুবহু* লিখুন।\n"
+             "একবার দিলেই সেভ থাকবে, পরেরবার নিজেই ব্যবহার হবে।\n\n/cancel — বাতিল"),
             parse_mode="Markdown")
         return True
 
@@ -31876,7 +32490,12 @@ async def job_fb_sheet_sync(ctx):
 
 
 async def job_dep_name_watch(ctx):
-    """পেন্ডিং নাম-ডিপোজিট — Binance Pay-এ নাম + পরিমাণ মিললেই অটো ক্রেডিট।"""
+    """পেন্ডিং নাম-ডিপোজিট — মেইল-মোডে কাজ `job_dep_mail_watch` করে (০ API কল)।"""
+    try:
+        if await asyncio.to_thread(lambda: mail_cfg()["on"]):
+            return
+    except Exception:
+        pass
     try:
         pend = await asyncio.to_thread(_dep_pending_named, 30)
         if not pend:
@@ -34069,6 +34688,8 @@ def main():
             application.job_queue.run_repeating(
                 job_dep_name_watch, interval=60, first=30, name="dep_name_watch")
             application.job_queue.run_repeating(
+                job_dep_mail_watch, interval=60, first=20, name="dep_mail_watch")
+            application.job_queue.run_repeating(
                 job_fb_password_rotate, interval=60, first=45, name="fb_pw_rotate")
             application.job_queue.run_repeating(
                 job_fb_export, interval=60, first=75, name="fb_export")
@@ -34272,6 +34893,7 @@ def main():
 
     app.add_handler(CommandHandler("start",       _gate(cmd_start)))
     app.add_handler(CommandHandler("depchk",      cmd_depchk))
+    app.add_handler(CommandHandler("mail",        cmd_mail))
     app.add_handler(CommandHandler("setproxy",    cmd_setproxy))
     app.add_handler(CommandHandler("depfund",     cmd_depfund))
     app.add_handler(CommandHandler("perf",        cmd_perf))
@@ -34305,7 +34927,7 @@ def main():
     app.add_handler(CallbackQueryHandler(dep_callback, pattern=r"^(dep:|depa:|depok:|depno:|depname:|adm_dep$)"))
     app.add_handler(CallbackQueryHandler(moneyreq_callback, pattern=r"^mreq:(ok|no):\d+$"))
     app.add_handler(CallbackQueryHandler(on_resetall_cb, pattern=r"^resetall_(yes|no)$"))
-    app.add_handler(CallbackQueryHandler(fb_callback, pattern=r"^(fbt_list|fbtn:\d+|fbr:\d+|fbs:\d+|fbd:\d+|fbc:\d+|fbt_cancel|adm_fb|fbx:\d+|fbnt:\d+|fbvid:\d+|fbvideo:\d+|fbvurl:\d+|fbvup:\d+|fbvdel:\d+)$"))
+    app.add_handler(CallbackQueryHandler(fb_callback, pattern=r"^(fbt_list|fbspwid:\d+|fbtn:\d+|fbr:\d+|fbs:\d+|fbd:\d+|fbc:\d+|fbt_cancel|adm_fb|fbx:\d+|fbnt:\d+|fbvid:\d+|fbvideo:\d+|fbvurl:\d+|fbvup:\d+|fbvdel:\d+)$"))
     app.add_handler(CallbackQueryHandler(ig_callback, pattern=r"^(igt_list|igtn:\d+|igtr:\d+|igts:\d+|igc:\d+|igt_cancel|igu:\d+|igd:\d+|adm_ig|igx:\d+|ignt:\d+|igvid:\d+|igvideo:\d+|igvurl:\d+|igvup:\d+|igvdel:\d+)$"))
     app.add_handler(CallbackQueryHandler(on_callback))
     # ~filters.VIA_BOT → inline-bot দিয়ে পাঠানো message ignore করো

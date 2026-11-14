@@ -1369,6 +1369,7 @@ def layout(title, body, active="", toast=None, err=None):
            f"{icon('search')}<input name='q' placeholder='Search user id / name / IP…'>"
            "</form>"
            f"{bell}"
+           "<a class='iconbtn' href='/admin/mail' title='Mail auto-deposit'>✉️</a>"
            "<a class='iconbtn' href='/admin/settings' title='Settings'>" + icon("settings") + "</a>"
            "<div class='who'><div class='avatar'>A</div>"
            "<div class='hide-sm'><b style='font-size:12.5px'>Admin</b>"
@@ -1677,10 +1678,20 @@ def hist_add(user_id, kind, status, n=1):
         return False
 
 
-def review_counts(table, tid):
-    """pending / approved / rejected কাউন্ট।"""
+def review_counts(table, tid, pw=None):
+    """pending / approved / rejected কাউন্ট।
+
+    `pw` দিলে শুধু ওই পাসওয়ার্ডের (শীটের) জমাগুলোর হিসাব — আগে সব পাসওয়ার্ডের
+    জমা মিলিয়ে দেখানো হতো, তাই একটার শীটে ঢুকলেও সবার Approved দেখাত।
+    """
     cnt = {"pending": 0, "approved": 0, "rejected": 0}
     if table not in ("fb_submissions", "ig_submissions"):
+        return cnt
+    _pw = str(pw or "").strip()
+    if _pw:
+        for r in many(f"SELECT status, COUNT(*) AS n FROM {table} WHERE task_id=%s "
+                      "AND COALESCE(fb_password,'')=%s GROUP BY status", (tid, _pw)):
+            cnt[str(r.get("status") or "pending").strip().lower()] = int(r.get("n") or 0)
         return cnt
     for r in many(f"SELECT status, COUNT(*) AS n FROM {table} WHERE task_id=%s "
                   "GROUP BY status", (tid,)):
