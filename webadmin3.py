@@ -4,6 +4,7 @@
 /admin/fbtask/<id> (এডিট + জমা তথ্য), CSV export, সাবমিশন মুছে ফেলা।
 """
 import json
+import os
 import time
 
 from urllib.parse import quote as _q
@@ -776,6 +777,8 @@ def fbtask_passwords(tid):
             if _v:
                 _bu = _v
                 break
+        if not _bu:            # বট এখনো সেটিংসে ইউজারনেম লেখেনি → env থেকে নাও
+            _bu = str(os.environ.get("BOT_USERNAME") or "").strip().lstrip("@")
     except Exception:
         _bu = ""
     trs, seen = [], set()
@@ -797,11 +800,13 @@ def fbtask_passwords(tid):
             badge(str(int(r.get("pend") or 0)), "mut"),
             badge(str(int(r.get("appr") or 0)), "ok"),
             badge(str(int(r.get("rej") or 0)), "err"),
-            (f"<a class='btn ok sm' target='_blank' "
-             f"href='https://t.me/{esc(_bu)}?start=fbpw_{int(g2['id'])}'>"
-             "🆔 এই পাস দিয়ে আইডি নিন</a>" if _bu else
-             f"<a class='btn ok sm' href='/admin/fbtask/{tid}/pw/{int(g2['id'])}'>"
-             "🆔 এই পাস দিয়ে আইডি নিন</a>"),
+            (f"<form method='post' style='display:flex;gap:4px;align-items:center' "
+             f"action='/admin/do/fbtask/{tid}/pw/{int(g2['id'])}/give'>"
+             "<input name='who' placeholder='@নাম বা ID' required "
+             "style='width:96px;padding:4px 6px;font-size:12px'>"
+             "<button class='btn ok sm' type='submit' "
+             "title='এই নামের ইউজার টাস্ক শুরু করলে সরাসরি এই পাসওয়ার্ডই পাবে'>"
+             "🆔 এই পাস দিয়ে আইডি নিন</button></form>"),
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/subs?pw={_q(_pw)}'>📄 শীট</a>",
             f"<a class='btn gray sm' href='/admin/fbtask/{tid}/passwords/{int(g2['id'])}/edit'>✏️ Edit</a>",
             "<form method='post' action='/admin/do/fbtask/%d/pwgroup/%d/delete' "
@@ -951,6 +956,63 @@ def fbtask_password_delete(tid):
     return redirect(f"/admin/fbtask/{tid}/passwords?ok=" + _q(f"{n} টি সিট ডিলিট হয়েছে"))
 
 
+@wadm.route("/admin/do/fbtask/<int:tid>/pw/<int:gid>/give", methods=["POST"])
+def fbtask_pw_give(tid, gid):
+    """নাম/আইডি দিলে ওই ইউজার টাস্ক শুরু করলে সরাসরি এই পাসওয়ার্ডই পাবে।
+
+    আলাদা করে বটে যাওয়ার লিংক নেই — শুধু ইউজারের জন্য শীটটা লক হয়।
+    """
+    g = guard()
+    if g:
+        return g
+    _init()
+    t = one("SELECT * FROM fb_tasks WHERE id=%s", (tid,))
+    grp = one("SELECT * FROM fb_pw_groups WHERE id=%s AND task_id=%s", (gid, tid))
+    if not t or not grp:
+        return redirect(f"/admin/fbtask/{tid}/passwords?err=" + _q("টাস্ক বা পাসওয়ার্ড নেই"))
+    who = (request.form.get("who") or "").strip()
+    if not who:
+        return redirect(f"/admin/fbtask/{tid}/passwords?err=" + _q("নাম বা ID দিন"))
+    u = None
+    try:
+        if who.lstrip("-").isdigit():
+            u = one("SELECT user_id, username, full_name FROM users WHERE user_id=%s",
+                    (int(who),))
+        if not u:
+            _w = who.lstrip("@").strip()
+            u = one("SELECT user_id, username, full_name FROM users "
+                    "WHERE LOWER(username)=LOWER(%s) LIMIT 1", (_w,))
+        if not u:
+            _w = who.lstrip("@").strip()
+            u = one("SELECT user_id, username, full_name FROM users "
+                    "WHERE LOWER(full_name)=LOWER(%s) LIMIT 1", (_w,))
+        if not u:
+            u = one("SELECT user_id, username, full_name FROM users "
+                    "WHERE full_name ILIKE %s ORDER BY user_id DESC LIMIT 1",
+                    ("%" + who.lstrip("@") + "%",))
+    except Exception as e:
+        return redirect(f"/admin/fbtask/{tid}/passwords?err=" + _q("খোঁজা যায়নি: %s" % str(e)[:40]))
+    if not u:
+        return redirect(f"/admin/fbtask/{tid}/passwords?err="
+                        + _q("ইউজার পাওয়া যায়নি: %s" % who))
+    _uid = int(u["user_id"])
+    _key = f"fb_sheet_u{_uid}"
+    try:
+        _x("INSERT INTO settings (key,value) VALUES (%s,%s) "
+           "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (_key, str(int(gid))))
+    except Exception as e:
+        return redirect(f"/admin/fbtask/{tid}/passwords?err="
+                        + _q("সেভ হয়নি: %s" % str(e)[:40]))
+    try:                      # বটের settings cache সাথে সাথে পরিষ্কার
+        _fire_settings_changed([_key])
+    except Exception:
+        pass
+    _nm = ("@" + str(u.get("username") or "")) if u.get("username") else str(u.get("full_name") or _uid)
+    log_admin("fb_pw_give", f"task={tid} gid={gid} pw={grp.get('password')} → {_uid}")
+    return redirect(f"/admin/fbtask/{tid}/passwords?ok=" +
+                    _q(f"{_nm} — এখন টাস্ক শুরু করলে পাসওয়ার্ড «{grp.get('password')}» পাবে"))
+
+
 @wadm.route("/admin/do/fbtask/<int:tid>/pw/<int:gid>/seat", methods=["POST"])
 def fbtask_pw_seat(tid, gid):
     """এই পাসওয়ার্ডে আরও সিট যোগ — সিট ভরে গেলে নতুন ইউজার আবার এই পাসওয়ার্ড পাবে।"""
@@ -1080,7 +1142,9 @@ def fbtask_pw_view(tid, gid):
         + table(["Date", "User", "Acc#", "Facebook UID", "Status", "জমা তথ্য"], trs,
                 "এখনো কেউ এই পাসওয়ার্ডে আইডি জমা দেয়নি")
         + f"<div class='mut' style='font-size:12px;margin-top:6px'>সর্বশেষ ৩০টি — "
-          f"<a href='/admin/fbtask/{tid}/subs?pw={_q(_pw)}'>সব দেখুন / ✅ ❌ করুন</a></div></div>")
+          f"<a href='/admin/fbtask/{tid}/subs?pw={_q(_pw)}'>সব দেখুন / ✅ ❌ করুন</a>"
+          f" · <a href='/admin/fbtask/{tid}/pw/{gid}/export.xlsx'>⬇️ শুধু এই পাসের ডাউনলোড</a>"
+          "</div></div>")
     return page(f"পাসওয়ার্ড — {t.get('name') or 'FB'}", body, "fbtasks",
                 toast=request.args.get("ok"), err=request.args.get("err"))
 
@@ -1380,6 +1444,39 @@ def _fb_export_table(t):
 def _fb_file_base(t, tid):
     return "".join(ch if ch.isalnum() or ch in "-_" else "_"
                    for ch in str(t.get("name") or tid))[:40]
+
+
+@wadm.route("/admin/fbtask/<int:tid>/pw/<int:gid>/export.xlsx", methods=["GET"])
+def fbtask_pw_export_xlsx(tid, gid):
+    """শুধু ওই পাসওয়ার্ডের জমা — আলাদা ফাইল (বাকি শীটের কিছু থাকে না)।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    t = one("SELECT * FROM fb_tasks WHERE id=%s", (tid,))
+    g2 = one("SELECT * FROM fb_pw_groups WHERE id=%s AND task_id=%s", (gid, tid))
+    if not t or not g2:
+        return page("Not found", "<div class='card'>পাসওয়ার্ড নেই</div>", "fbtasks",
+                    status=404)
+    _pw = str(g2.get("password") or "")
+    try:
+        _raw = json.loads(t.get("sheet_columns") or "[]")
+    except Exception:
+        _raw = []
+    cols = _fb_norm_cols(t, _raw)
+    subs = many(
+        "SELECT s.*, COALESCE(u.username,'') AS username FROM fb_submissions s "
+        "LEFT JOIN users u ON u.user_id=s.user_id WHERE s.task_id=%s "
+        "AND COALESCE(s.fb_password,'')=%s ORDER BY s.id ASC", (int(tid), _pw))
+    header, rows = export_table(cols, subs, t, "fb")
+    _safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in _pw)[:20] or "sheet"
+    data = xlsx_bytes(header, rows,
+                      f"{str(t.get('name') or 'FB')[:20]} · {_pw}"[:30])
+    return Response(
+        data,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition":
+                 f"attachment; filename=fb_{_fb_file_base(t, tid)}_{_safe}.xlsx"})
 
 
 @wadm.route("/admin/fbtask/<int:tid>/export.xlsx", methods=["GET"])
