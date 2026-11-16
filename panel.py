@@ -484,13 +484,26 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = "", ua: str = ""):
                         "WHERE device_hash=%s AND user_id<>%s", (coarse, uid))
                     _rc = cur.fetchone()
                     if int((_rc or {}).get("n") or 0) >= 1:
-                        cur.execute(
-                            "INSERT INTO security_alerts (kind, user_id, related_uid, ip, country, "
-                            "device_hash, detail, status, created_at) "
-                            "VALUES ('same_phone',%s,0,%s,'',%s,%s,'new',%s)",
-                            (uid, ip, coarse,
-                             "একই ফোন-প্রোফাইল (ভিন্ন ব্রাউজার/IP) — ম্যানুয়ালি দেখুন",
-                             str(int(time.time()))))
+                        # 🔁 একই ইউজারের জন্য ২৪ ঘণ্টায় একবারই অ্যালার্ট (স্প্যাম নয়)
+                        _cut24 = str(int(time.time()) - 86400)
+                        try:
+                            cur.execute(
+                                "SELECT COUNT(*) AS n FROM security_alerts "
+                                "WHERE kind='same_phone' AND user_id=%s "
+                                "AND created_at ~ '^[0-9]+$' AND created_at > %s",
+                                (uid, _cut24))
+                            _ex = cur.fetchone()
+                            _dup = int((_ex or {}).get("n") or 0)
+                        except Exception:
+                            _dup = 0
+                        if not _dup:
+                            cur.execute(
+                                "INSERT INTO security_alerts (kind, user_id, related_uid, ip, country, "
+                                "device_hash, detail, status, created_at) "
+                                "VALUES ('same_phone',%s,0,%s,'',%s,%s,'new',%s)",
+                                (uid, ip, coarse,
+                                 "একই ফোন-প্রোফাইল (ভিন্ন ব্রাউজার/IP) — ম্যানুয়ালি দেখুন",
+                                 str(int(time.time()))))
                 except Exception:
                     pass
             # ── ফলব্যাক: একই IP + একই ফোন প্রোফাইল = একই ফোন ──

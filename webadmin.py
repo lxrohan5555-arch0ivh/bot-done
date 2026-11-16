@@ -2290,6 +2290,14 @@ def users():
         return g
     q = (request.args.get("q") or "").strip()
     if q:
+        # 🔎 শুধু সংখ্যা (Telegram ID) দিলে সোজা ওই ইউজারের প্রোফাইল — ১০০%
+        if q.isdigit():
+            try:
+                _u = user_row(int(q))
+            except Exception:
+                _u = None
+            if _u:
+                return redirect(f"/admin/user/{int(q)}")
         like = f"%{q.lower()}%"
         return users_page("Users", "users",
                           "WHERE CAST(user_id AS TEXT) LIKE %s OR LOWER(COALESCE(username,'')) LIKE %s "
@@ -2385,6 +2393,19 @@ def user_detail(uid):
                   "ORDER BY id DESC LIMIT 12", (uid,))
     verif = many("SELECT status, method, attempts, created_at, verified_at, ip, country "
                  "FROM verifications WHERE user_id=%s", (uid,))
+    try:
+        deps = many("SELECT id, amount, method_name, kind, status, created_at FROM deposits "
+                    "WHERE user_id=%s ORDER BY id DESC LIMIT 30", (uid,))
+    except Exception:
+        deps = []
+    try:
+        orders = many("SELECT id, product_name, price, status, created_at FROM shop_orders "
+                      "WHERE user_id=%s ORDER BY id DESC LIMIT 30", (uid,))
+    except Exception:
+        orders = []
+    dep_total = sum(float(r["amount"] or 0) for r in deps if str(r["status"]) == "approved")
+    shop_total = sum(float(r["price"] or 0) for r in orders
+                     if str(r["status"]) != "refunded")
     refs = scal("SELECT COUNT(*) FROM users WHERE referred_by=%s", (uid,))
     earned = sum(float(r["price"] or 0) for r in cat) + sum(float(r["price"] or 0) for r in tg) \
         + sum(float(r["amount"] or 0) for r in bio)
@@ -2484,6 +2505,26 @@ def user_detail(uid):
         + "<div class='card' style='margin-top:14px'><h3>" + icon("task")
         + f" টাস্ক হিস্ট্রি <span class='mut' style='font-weight:400'>({len(tasks_rows)})</span></h3>"
         + table(["Task", "Reward", "Time"], tasks_rows) + "</div>"
+        # 💰 ডিপোজিট + 🛍 কেনাকাটা — এক নজরে
+        + "<div class='grid g2' style='margin-top:14px'>"
+        + "<div class='card'><h3>" + icon("money")
+        + f" ডিপোজিট <span class='mut' style='font-weight:400'>({len(deps)})</span></h3>"
+        + f"<p class='mut' style='margin:0 0 8px;font-size:12px'>মোট অনুমোদিত: <b>{money(dep_total)}</b></p>"
+        + table(["ID", "Amount", "Method", "Status", "Date"],
+                [[f"#{int(r['id'])}", money(r["amount"]),
+                  esc(r["method_name"] or r.get("kind") or "-"),
+                  badge(str(r["status"]), "ok" if str(r["status"]) == "approved"
+                        else "err" if str(r["status"]) == "rejected" else "warn"),
+                  esc(str(r["created_at"] or "")[:19])] for r in deps]) + "</div>"
+        + "<div class='card'><h3>" + icon("shop")
+        + f" কেনাকাটা <span class='mut' style='font-weight:400'>({len(orders)})</span></h3>"
+        + f"<p class='mut' style='margin:0 0 8px;font-size:12px'>মোট খরচ: <b>{money(shop_total)}</b></p>"
+        + table(["ID", "Product", "Price", "Status", "Date"],
+                [[f"#{int(r['id'])}", esc(r["product_name"] or "-"), money(r["price"]),
+                  badge(str(r["status"]), "ok" if str(r["status"]) in ("delivered",)
+                        else "err" if str(r["status"]) == "refunded" else "warn"),
+                  esc(str(r["created_at"] or "")[:19])] for r in orders]) + "</div>"
+        + "</div>"
         + "<div class='grid g2' style='margin-top:14px'>"
         + "<div class='card'><h3>" + icon("wallet") + " Withdrawals</h3>"
         + table(["ID", "Amount", "Status", "Date", "Wallet"],
