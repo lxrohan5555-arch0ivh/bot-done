@@ -439,6 +439,20 @@ def shop_home():
 
     # ক্যাটাগরি তৈরি + ক্রেন্সি
     cur = esc(_cur())
+    # 📦 প্যাকের তালিকা — এখান থেকেই নাম বদলানো / ডিলিট করা যাবে
+    plan_rows = []
+    for pl in _plans():
+        _cc = cat_map.get(int(pl["category_id"] or 0)) or {}
+        plan_rows.append([
+            esc(str(_cc.get("emoji") or "🛍") + " " + str(_cc.get("name") or "—")),
+            f"<b>{esc(_plan_txt(pl))}</b>",
+            _btn("✏️ এডিট", f"/admin/shop/plan/{int(pl['id'])}/edit", "btn gray sm")
+            + "<form method='post' action='/admin/shop/plan/%d/delete' "
+              "style='display:inline;margin-left:6px' "
+              "onsubmit=\"return confirm('প্যাকটা ডিলিট হবে? পণ্যগুলো প্যাক ছাড়া হয়ে থাকবে।')\">"
+              "<button class='gray sm' type='submit'>🗑 ডিলিট</button></form>" % int(pl["id"]),
+        ])
+
     tools = (
         "<div class='card'><b>➕ নতুন ক্যাটাগরি</b>"
         "<form method='post' action='/admin/shop/cat/add' class='row' style='gap:8px;margin-top:8px'>"
@@ -461,6 +475,11 @@ def shop_home():
         "<div class='mut' style='font-size:12px;margin-top:6px'>ইউজার ক্যাটাগরিতে চাপলে "
         "আগে এই প্যাকগুলো দেখবে (কোন প্যাক নিবেন?) — প্যাক বেছে নিলে তার ভিতরের পণ্য।</div>"
         "</div>"
+        + "<div class='card'><b>📦 প্যাক (এডিট / ডিলিট)</b>"
+        + table(["ক্যাটাগরি", "প্যাক", ""], plan_rows,
+                "কোনো প্যাক নেই — উপরে যোগ করুন")
+        + "<div class='mut' style='font-size:12px;margin-top:6px'>"
+          "প্যাকের নাম বদলাতে ✏️, বাদ দিতে 🗑 চাপুন।</div></div>"
         "<div class='card'><b>👀 ইউজার যা দেখবে</b>"
         + _user_preview(cats, prods)
         + "</div>"

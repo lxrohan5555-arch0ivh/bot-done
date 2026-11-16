@@ -523,7 +523,7 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = "", ua: str = ""):
                 _kind_ip = _ip_type(ip, False)
             except Exception:
                 _kind_ip = ""
-            if ip and _kind_ip != "wifi":
+            if ip and _kind_ip == "mobile":
                 return None
             if ip:
                 cur.execute(
@@ -535,7 +535,7 @@ def _limit_check(uid: int, ip: str, hashes, coarse: str = "", ua: str = ""):
                     "AND user_id<>%s", (ip, ip, uid))
                 r4 = cur.fetchone()
                 n_ip = max(int((r3 or {}).get("n") or 0), int((r4 or {}).get("n") or 0))
-                if n_ip >= max(2, ilim):
+                if n_ip >= max(1, ilim):
                     try:
                         ip_block_on = (str(_setting(cur, "sec_ip_block", "off")).strip().lower() == "on")
                     except Exception:
@@ -860,7 +860,8 @@ def _page_countdown(token: str, seconds: int) -> str:
     var m={device:'এই ফোনে ইতিমধ্যে একটি অ্যাকাউন্ট আছে। এক ফোনে একটির বেশি অ্যাকাউন্ট চলবে না।',
            ip:'এই ইন্টারনেট (IP) দিয়ে ইতিমধ্যে ২টি অ্যাকাউন্ট খোলা হয়েছে। Wi-Fi বন্ধ করে মোবাইল ডেটা দিয়ে চেষ্টা করুন।',
            rate:'অনেকবার চেষ্টা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।',
-           vpn:'VPN/Proxy ব্যবহার করা যাচ্ছে না। VPN বন্ধ করে আবার verify করুন।'};
+           vpn:'VPN/Proxy ব্যবহার করা যাচ্ছে না। VPN বন্ধ করে আবার verify করুন।',
+           fp:'ব্রাউজার ঠিকভাবে শনাক্ত করা যায়নি। অন্য ব্রাউজার (Chrome) দিয়ে লিংকটা খুলে আবার চেষ্টা করুন।'};
     title.textContent='Verification Blocked';
     title.className='warn';
     sub.textContent=m[err]||'Something went wrong. Please reopen the link.';
@@ -1030,6 +1031,14 @@ def verify_done(token):
         _fire_verify(uid)
         return jsonify({"ok": True, "already": True})
     # ── ১ ফোন = ১ অ্যাকাউন্ট, এক IP-তে ২ — ভাঙলে verify হবে না ──
+    # 🖐 ফিঙ্গারপ্রিন্ট ছাড়া verify হবে না — নাহলে ব্রাউজারে JS বন্ধ করে
+    #    এক ফোন থেকেই যত ইচ্ছা অ্যাকাউন্ট খোলা যেত (এক-ফোন নিয়ম ফাঁকা)।
+    try:
+        _fp_ok = bool(_device_hash(payload))
+    except Exception:
+        _fp_ok = False
+    if not _fp_ok:
+        return jsonify({"ok": False, "error": "fp"}), 403
     _hashes = []
     _coarse = ""
     try:
