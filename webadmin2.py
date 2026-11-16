@@ -675,8 +675,9 @@ def settings():
             "points_on", "points_block", "reset_on_update", "sec_device_strict",
             "pt_max", "pt_start", "pt_approve", "pt_reject", "pt_dup",
             "task_notify_mode", "task_notify_channel", "task_notify_daily_max",
-            "min_withdraw", "wd_fee", "commission_pct", "shop_ref_pct", "bsc_wallet",
-            "support_owner", "support_bot", "task_promo_text", "ch_btn_text", "ch_btn_url"]
+            "min_withdraw", "wd_fee", "wd_rate", "commission_pct", "shop_ref_pct", "bsc_wallet",
+            "support_owner", "support_bot", "task_promo_text", "ch_btn_text", "ch_btn_url",
+            "shop_closed_bn", "shop_closed_en", "dep_closed_bn", "dep_closed_en"]
     vals = settings_all(keys)
     body = (
         f"<div class='grid g2'>"
@@ -710,15 +711,18 @@ def settings():
         f"<option value='off' {'selected' if vals.get('sec_device_strict') == 'off' else ''}>বন্ধ</option>"
         "</select>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>চালু থাকলে মোবাইল ডেটা/ওয়াইফাই বদলে IP পাল্টালেও একই ফোনে দ্বিতীয় অ্যাকাউন্ট verify হবে না।</p></div>"
-        "<div class='form'><label>IP limit — একই IP-তে সর্বোচ্চ অ্যাকাউন্ট (শুধু সাধারণ/Wi-Fi IP-তে)</label>"
+        "<div class='form'><label>IP limit — একই IP-তে সর্বোচ্চ অ্যাকাউন্ট (1 = এক ইন্টারনেটে এক অ্যাকাউন্ট)</label>"
         f"<input name='sec_ip_limit' type='number' min='1' value='{esc(vals['sec_ip_limit'] or 1)}'></div>"
-        "<p class='mut' style='font-size:11px;margin:6px 0 0'>মোবাইল ডেটা (CGNAT), VPN বা অজানা IP-তে "
-        "এই সীমা লাগে না — শুধু প্যানেলে IP ও ধরন দেখায়।</p>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>১ দিলে একই ইন্টারনেটে দ্বিতীয় "
+        "অ্যাকাউন্ট verify করতে পারবে না। মোবাইল ডেটার শেয়ার্ড IP (CGNAT) বাদে সব IP-তে "
+        "এই সীমা কাজ করে — IP ব্লক চালু থাকলে ভাঙলে ব্যানও হবে।</p>"
         "<div class='form'><label>IP দিয়ে ব্লক</label><select name='sec_ip_block'>"
         f"<option value='off' {'selected' if (vals.get('sec_ip_block') or 'off') != 'on' else ''}>বন্ধ (ডিফল্ট — শুধু অ্যালার্ট)</option>"
-        f"<option value='on' {'selected' if (vals.get('sec_ip_block') or 'off') == 'on' else ''}>চালু (শুধু Wi-Fi IP-তে verify আটকাবে)</option>"
+        f"<option value='on' {'selected' if (vals.get('sec_ip_block') or 'off') == 'on' else ''}>চালু (verify আটকাবে + ব্যান হবে)</option>"
         "</select>"
-        "<p class='mut' style='font-size:11px;margin:6px 0 0'>মোবাইল ইন্টারনেটে (CGNAT) এক IP-তে শত শত ইউজার থাকে — তাই ডিফল্টে IP কাউকে আটকায় না, শুধু অ্যালার্ট দেয়।</p></div>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>চালু থাকলে একই IP-তে দ্বিতীয় "
+        "অ্যাকাউন্ট verify হবে না, আর verify-এর পরে ধরা পড়লে অ্যাকাউন্ট ব্যান হবে। "
+        "মোবাইল ডেটার শেয়ার্ড IP (CGNAT) বাদে সব IP-তে কাজ করে।</p></div>"
         "<div class='form'><label>IP data retention (দিন) — কত দিন IP ইতিহাস রাখবে</label>"
         f"<input name='sec_ip_retention_days' type='number' min='1' value='{esc(vals['sec_ip_retention_days'] or 90)}'></div>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>৯০ দিন মানে: ইউজারের কোন IP-তে কখন "
@@ -755,6 +759,24 @@ def settings():
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>ব্যালান্স/পয়েন্ট মোছা হয় না — শুধু verify আবার করতে হয়। "
         "⚠️ নোটিশ কখনো অটো যায় না: বট /resetall (বা বিল্ড আপডেটের মেসেজে বাটন) চাপলে তখনই সবাইকে যায়, এক বিল্ডে একবার।</p></div>"
         "<button type='submit' style='margin-top:10px'>Save System</button></form></div>"
+        "<div class='card'><h3>✍️ বন্ধের সময় ইউজারকে যা দেখাবে</h3>"
+        "<form method='post' action='/admin/shop/closedmsg'>"
+        "<p class='mut' style='font-size:12px;margin:0 0 8px'>দোকান/ডিপোজিট বন্ধ থাকলে "
+        "ইউজার ঠিক এই লেখাটাই দেখবে। খালি রাখলে ডিফল্ট লেখা যাবে।</p>"
+        "<div class='form'><label>🔒 দোকান বন্ধ (বাংলা)</label>"
+        f"<textarea name='shop_closed_bn' rows='4' style='width:100%'>"
+        f"{esc(vals.get('shop_closed_bn') or '')}</textarea></div>"
+        "<div class='form'><label>🔒 Shop closed (English)</label>"
+        f"<textarea name='shop_closed_en' rows='3' style='width:100%'>"
+        f"{esc(vals.get('shop_closed_en') or '')}</textarea></div>"
+        "<div class='form'><label>💳 ডিপোজিট বন্ধ (বাংলা)</label>"
+        f"<textarea name='dep_closed_bn' rows='3' style='width:100%'>"
+        f"{esc(vals.get('dep_closed_bn') or '')}</textarea></div>"
+        "<div class='form'><label>💳 Deposit closed (English)</label>"
+        f"<textarea name='dep_closed_en' rows='3' style='width:100%'>"
+        f"{esc(vals.get('dep_closed_en') or '')}</textarea></div>"
+        "<button type='submit' style='margin-top:10px'>💾 বন্ধের বার্তা সেভ</button>"
+        "</form></div>"
         "<div class='card'><h3>" + icon("user") + " Support</h3>"
         "<form method='post' action='/admin/do/settings'>"
         "<div class='form'><label>Support owner username (ব্যক্তিগত)</label>"
@@ -793,6 +815,10 @@ def settings():
         "<div class='form'><label>Withdraw fee ($)</label>"
         f"<input name='wd_fee' type='number' step='0.0001' min='0' "
         f"value='{esc(vals.get('wd_fee') or '0.01')}'></div>"
+        "<div class='form'><label>💳 Withdraw রেট — ১ ডলার = কত ৳ "
+        "(ডিপোজিট ব্যালেন্স থেকে উইথড্র করলে এই রেটে ভাঙা হবে)</label>"
+        f"<input name='wd_rate' type='number' step='0.01' min='1' "
+        f"value='{esc(vals.get('wd_rate') or '130')}'></div>"
         "<div class='form'><label>Refer commission (%) — টাস্ক</label>"
         f"<input name='commission_pct' type='number' step='0.1' min='0' max='100' "
         f"value='{esc(vals.get('commission_pct') or '10')}'></div>"
@@ -1045,7 +1071,7 @@ def settings_save():
         settings_set("task_notify_daily_max", v)
         saved.append("task_notify_daily_max")
     # ── Withdraw / পেমেন্ট / Support (বটের অ্যাডমিন প্যানেলেও আছে) ──
-    for k in ("min_withdraw", "wd_fee", "commission_pct", "shop_ref_pct"):
+    for k in ("min_withdraw", "wd_fee", "wd_rate", "commission_pct", "shop_ref_pct"):
         v = (request.form.get(k) or "").strip().replace(",", ".").replace("$", "")
         try:
             if v != "" and float(v) >= 0:

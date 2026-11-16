@@ -224,10 +224,24 @@ def shop_mailcode_save():
     import json as _json
     _rows = []
     _raw = (form.get("mailcode_links_text") or "").replace("\r", "")
-    for _line in _raw.split("\n"):
-        _line = _line.strip()
-        if not _line:
-            continue
+    _lines = [_l.strip() for _l in _raw.split("\n") if _l.strip()]
+    # "প্রতি লাইনে নাম | লিংক" — আবার কেউ নাম এক লাইনে, লিংক পরের লাইনে
+    # লিখলে সেটাও ধরা হয় (নাহলে বাটন কম দেখাত)।
+    _merged = []
+    _i = 0
+    while _i < len(_lines):
+        _l = _lines[_i]
+        if "|" in _l:
+            _nm0, _u0 = _l.split("|", 1)
+            if not _u0.strip().lower().startswith(("http://", "https://")):
+                _nxt = _lines[_i + 1] if _i + 1 < len(_lines) else ""
+                if _nxt.lower().startswith(("http://", "https://")):
+                    _merged.append(_nm0.strip() + " | " + _nxt)
+                    _i += 2
+                    continue
+        _merged.append(_l)
+        _i += 1
+    for _line in _merged:
         if "|" in _line:
             _nm, _u = _line.split("|", 1)
         else:
@@ -312,8 +326,16 @@ def shop_home():
         "SELECT p.*, (SELECT COUNT(*) FROM shop_stock s WHERE s.product_id=p.id "
         "AND COALESCE(s.sold,0)=0) AS stock FROM shop_products p "
         "ORDER BY p.category_id, p.sort_order, p.id")
-    pend = one("SELECT COUNT(*) AS n FROM shop_orders WHERE status='pending'") or {}
-    sold = one("SELECT COUNT(*) AS n FROM shop_orders WHERE status='delivered'") or {}
+    _since = ""
+    try:
+        _r_since = one("SELECT value FROM settings WHERE key='stats_since'") or {}
+        _since = str(_r_since.get("value") or "").strip()
+    except Exception:
+        _since = ""
+    _sw = (" AND created_at>=%s" if _since else "")
+    _sa = ((_since,) if _since else ())
+    pend = one("SELECT COUNT(*) AS n FROM shop_orders WHERE status='pending'" + _sw, _sa) or {}
+    sold = one("SELECT COUNT(*) AS n FROM shop_orders WHERE status='delivered'" + _sw, _sa) or {}
     total_stock = sum(int((p or {}).get("stock") or 0) for p in prods)
     cat_map = {int(c["id"]): c for c in cats}
 
@@ -425,14 +447,16 @@ def shop_home():
         "<form method='post' action='/admin/shop/mailcode'>",
         "<div class='field'><label>অপশন</label>"
         "<select name='mailcode_on'>" + _sel + "</select></div>",
-        "<div class='field'><label>🔗 নাম | লিংক (প্রতি লাইনে একটা)</label>",
+        "<div class='field'><label>🔗 নাম | লিংক (প্রতি লাইনে একটা) — "
+        f"এখন সেভ আছে {num(len(_m_rows))}টি</label>",
         "<textarea name='mailcode_links_text' rows='6' style='width:100%' "
         "placeholder='dongvanfb OTP | https://example.com/otp&#10;"
         "CODE YAMIN | https://example.com/yamin&#10;"
         "MailGen | https://mailgen.shop/'>" + _txt_val + "</textarea>",
         "<div class='mut' style='font-size:11px;margin-top:4px'>",
-        "যেমন: <b>MailGen | https://mailgen.shop/</b> — বটে বাটনের নাম হবে “MailGen”। ",
-        "নাম না দিলে লিংকের সাইটের নাম বসবে।</div></div>",
+        "⬆️ উপরের ধূসর লেখা শুধু <b>উদাহরণ</b> — টাইপ না করলে সেভ হবে না। ",
+        "নিজের লাইন লিখুন, যেমন: <b>MailGen | https://mailgen.shop/</b> — বটে বাটনের নাম হবে "
+        "“MailGen”। নাম না দিলে লিংকের সাইটের নাম বসবে।</div></div>",
         "<button class='ok sm' type='submit'>💾 সেভ করুন</button>",
         "</form></div>",
     ])
@@ -476,13 +500,11 @@ def shop_home():
         "আগে এই প্যাকগুলো দেখবে (কোন প্যাক নিবেন?) — প্যাক বেছে নিলে তার ভিতরের পণ্য।</div>"
         "</div>"
         + "<div class='card'><b>📦 প্যাক (এডিট / ডিলিট)</b>"
-        + table(["ক্যাটাগরি", "প্যাক", ""], plan_rows,
-                "কোনো প্যাক নেই — উপরে যোগ করুন")
+        + _group_details(plan_rows, 0, ["ক্যাটাগরি", "প্যাক", ""],
+                         "কোনো প্যাক নেই — উপরে যোগ করুন")
         + "<div class='mut' style='font-size:12px;margin-top:6px'>"
           "প্যাকের নাম বদলাতে ✏️, বাদ দিতে 🗑 চাপুন।</div></div>"
-        "<div class='card'><b>👀 ইউজার যা দেখবে</b>"
-        + _user_preview(cats, prods)
-        + "</div>"
+        "<div class='card'>" + _user_preview(cats, prods) + "</div>"
         "<div class='card'><b>💱 মুদ্রা</b>"
         "<form method='post' action='/admin/shop/currency' class='row' style='gap:8px;margin-top:8px'>"
         f"<input name='currency' value='{cur}' placeholder='$' style='max-width:120px'>"
@@ -535,8 +557,9 @@ def shop_home():
         + "</div>"
         + "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
           "<b>📦 পণ্য</b>" + _btn("➕ নতুন পণ্য", "/admin/shop/new", "btn ok sm")
-        + "</div>" + table(["পণ্য", "ক্যাটাগরি", "দাম", "ডেলিভারি", "স্টক", "স্ট্যাটাস", ""],
-                           prod_rows, "কোনো পণ্য নেই")
+        + "</div>" + _group_details(
+            prod_rows, 1, ["পণ্য", "ক্যাটাগরি", "দাম", "ডেলিভারি", "স্টক", "স্ট্যাটাস", ""],
+            "কোনো পণ্য নেই")
         + "</div>"
     )
     return page("Shop / দোকান", body, "shop")
@@ -835,11 +858,29 @@ def _plan_counts(pl, prods):
     return n, st
 
 
+def _group_details(rows, cat_idx, head_cols, empty_txt):
+    """একই ক্যাটাগরির রো-গুলো আলাদা ভাঁজ করা (details) টেবিলে — লম্বা লিস্ট ছোট হয়।"""
+    if not rows:
+        return f"<div class='mut' style='font-size:12px'>{empty_txt}</div>"
+    groups = {}
+    for r in rows:
+        groups.setdefault(str(r[cat_idx] or "—"), []).append(r)
+    out = []
+    for name, items in groups.items():
+        out.append(
+            "<details style='margin:6px 0;border:1px solid #2a3550;"
+            "border-radius:10px;padding:8px 10px'>"
+            f"<summary style='cursor:pointer;font-weight:600'>{name} "
+            f"<span class='mut' style='font-size:12px'>· {len(items)}টি</span></summary>"
+            + table(head_cols, items, "")
+            + "</details>")
+    return "".join(out)
+
+
 def _user_preview(cats, prods):
     """ইউজার বটে কোনো ক্যাটাগরিতে চাপলে ঠিক কী দেখবে — অ্যাডমিন প্যানেলে প্রিভিউ।"""
     plans = _plans()
-    out = ["<div style='margin-top:14px'><b>👀 ইউজার চাপলে যা দেখবে</b>"
-           "<div class='mut' style='font-size:12px'>প্রতিটি ক্যাটাগরি ও তার বাটন/পণ্য</div>"]
+    out = ["<div style='margin-top:10px'>"]
     if not cats:
         out.append("<div class='mut' style='font-size:12px'>কোনো ক্যাটাগরি নেই।</div></div>")
         return "".join(out)
@@ -936,6 +977,12 @@ def _form(p=None):
     act = int(p.get("is_active") or (1 if not p else 0))
     pid = int(p.get("id") or 0)
     stock = _stock_n(pid) if pid else 0
+    # 🛍 পণ্যভিত্তিক রেফার কমিশন — খালি/০ মানে Settings-এর মান
+    try:
+        _rpv = float(p.get("ref_pct"))
+        _rp = "" if _rpv <= 0 else f"{_rpv:g}"
+    except Exception:
+        _rp = ""
     return (
         "<div class='card'><form method='post'>"
         "<div class='field'><label>পণ্যের নাম</label>"
@@ -948,6 +995,12 @@ def _form(p=None):
         "“➕ নতুন প্যাক” থেকে। প্যাক না বাছলে পণ্যটা ক্যাটাগরিতে সবার আগে দেখাবে।</p></div>"
         "<div class='field'><label>দাম (ব্যালেন্স থেকে কাটা হবে)</label>"
         f"<input name='price' value='{price}' placeholder='0.78' required></div>"
+        "<div class='field'><label>🛍 রেফার কমিশন (%) — না দিলে Settings-এর %</label>"
+        f"<input name='ref_pct' value='{_rp}' placeholder='খালি = Settings-এর %, 0 = কমিশন নেই'>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>এই পণ্যের জন্য আলাদা % চাইলে "
+        "লিখুন (যেমন 25)। খালি রাখলে Settings → শপ রেফার কমিশন % চলবে। "
+        "<b>0</b> লিখলে এই পণ্যে রেফারার কিছুই পাবে না।</p></div>"
+
         "<div class='field'><label>ডেলিভারি ধরন</label>"
         f"<select name='deliver_type'>"
         f"<option value='auto'{' selected' if typ == 'auto' else ''}>🤖 অটো — txt/লাইন/Sheet স্টক থেকে বট দেবে</option>"
@@ -988,8 +1041,15 @@ def _save(pid=0):
         typ = "auto"
     desc = (request.form.get("description") or "").strip()[:2000]
     active = 1 if request.form.get("is_active") else 0
-    # পণ্যভিত্তিক রেফার কমিশন বন্ধ — সবসময় Settings-এর % ব্যবহার হয়
-    ref_pct = -1.0
+    # 🛍 প্রতি পণ্যের কমিশন: খালি = Settings-এর %, 0 = এই পণ্যে কমিশন নেই
+    try:
+        _rp_v = (request.form.get("ref_pct") or "").strip().replace("%", "")
+        ref_pct = float(_rp_v) if _rp_v else -1.0
+        if ref_pct < 0:
+            ref_pct = -1.0
+        ref_pct = min(90.0, ref_pct)
+    except Exception:
+        ref_pct = -1.0
     _flds = [x.strip()[:24] for x in str(request.form.get("fields") or "").replace(",", "\n")
              .replace("|", "\n").replace(";", "\n").splitlines() if x.strip()][:8]
     fields = "|".join(_flds)

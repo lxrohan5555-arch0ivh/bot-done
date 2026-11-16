@@ -103,12 +103,19 @@ def deposits_home():
     _init()
     st = (request.args.get("st") or "").strip()
     methods = many("SELECT * FROM deposit_methods ORDER BY sort_order, id")
+    # 🔄 "হিসাব ০ থেকে শুরু" — এর আগের ডিপোজিট KPI-তে গোনা হয় না
+    try:
+        _since = str((settings_all(["stats_since"]) or {}).get("stats_since") or "").strip()
+    except Exception:
+        _since = ""
     pend = many("SELECT * FROM deposits WHERE status='pending' ORDER BY id LIMIT 100")
+    _sw = (" AND created_at>=%s" if _since else "")
+    _sa = ((_since,) if _since else ())
     agg = one("SELECT COALESCE(SUM(amount),0) AS s, COUNT(*) AS n FROM deposits "
-              "WHERE status='approved'") or {}
+              "WHERE status='approved'" + _sw, _sa) or {}
     today = one("SELECT COALESCE(SUM(amount),0) AS s FROM deposits "
-                "WHERE status='approved' AND created_at LIKE %s",
-                (time.strftime("%Y-%m-%d") + "%",)) or {}
+                "WHERE status='approved' AND created_at LIKE %s" + _sw,
+                (time.strftime("%Y-%m-%d") + "%",) + _sa) or {}
     sql = "SELECT * FROM deposits WHERE COALESCE(admin_hidden,0)=0"
     args = []
     if st:
@@ -131,7 +138,16 @@ def deposits_home():
             + _kpi("মোট অনুমোদিত", esc(_fmt((agg or {}).get("s"))))
             + _kpi("মোট ডিপোজিট", num((agg or {}).get("n")))
             + _kpi("মেথড", num(len(methods)))
-            + "</div>")
+            + "</div>"
+            + ("<div class='card'><div class='row' style='justify-content:space-between;"
+               "align-items:center;gap:8px'><div><b>🔄 হিসাব ০ থেকে শুরু</b>"
+               "<div class='mut' style='font-size:12px'>উপরের হিসাব ও ইউজারের নম্বর "
+               "(#1, #2 …) এখন থেকে নতুন করে গোনা হবে — পুরোনো ডেটা মুছবে না।</div></div>"
+               "<form method='post' action='/admin/deposits/stats-reset' "
+               "onsubmit=\"return confirm('হিসাব এখন থেকে ০ থেকে শুরু হবে — ঠিক আছে?')\">"
+               f"<button class='gray sm' type='submit'>🔄 রিসেট"
+               + (f" (শুরু: {esc(_since[:16])})" if _since else "")
+               + "</button></form></div></div>"))
 
     mrows = []
     for m in methods:
@@ -252,6 +268,24 @@ def deposits_home():
     )
     return page("Deposits / ডিপোজিট", body, "deposits",
                 toast=request.args.get("ok") or None, err=request.args.get("err") or None)
+
+
+@wadm.route("/admin/deposits/stats-reset", methods=["POST"])
+def deposits_stats_reset():
+    g = guard()
+    if g:
+        return g
+    _init()
+    try:
+        # ⚠️ ডিপোজিট/অর্ডারের created_at বাংলাদেশ সময়ে সেভ হয় — সেই সময়েই রিসেট
+        import datetime as _dt
+        import pytz as _pytz
+        settings_set("stats_since",
+                     _dt.datetime.now(_pytz.timezone("Asia/Dhaka"))
+                     .strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        pass
+    return redirect("/admin/deposits?ok=হিসাব ০ থেকে শুরু হয়েছে")
 
 
 # ───────────────────────── মেথড ফর্ম ─────────────────────────
@@ -432,9 +466,10 @@ def deposit_approve(did):
             pass
         return redirect("/admin/deposits?err=এটি আগেই প্রসেস হয়েছে")
     amt = float(d["amount"] or 0)
-    _x("UPDATE users SET balance=balance+%s, dep_balance=COALESCE(dep_balance,0)+%s, "
+    # 💳 ডিপোজিটের টাকা ডিপোজিট ওয়ালেটে (৳) — earn ব্যালেন্স আলাদা থাকে
+    _x("UPDATE users SET dep_balance=COALESCE(dep_balance,0)+%s, "
        "dep_total=COALESCE(dep_total,0)+%s WHERE user_id=%s",
-       (amt, amt, amt, int(d["user_id"] or 0)))
+       (amt, amt, int(d["user_id"] or 0)))
     try:
         import bot as _bcache
         _bcache._invalidate_user_cache(int(d["user_id"] or 0))   # বটের ক্যাশে পুরোনো ব্যালেন্স না থাকে
