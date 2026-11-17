@@ -1398,9 +1398,10 @@ def admin_smm():
             "smm_url": (form.get("smm_url") or "https://bdsmmpanel.com/api/v2").strip()[:300],
             "smm_key": (form.get("smm_key") or "").strip()[:200],
             "smm_usd_bdt": (form.get("smm_usd_bdt") or "130").strip()[:12],
-            "smm_markup": (form.get("smm_markup") or "20").strip()[:12],
             "smm_tiers": (form.get("smm_tiers") or "").strip()[:4000],
-            "smm_cur": "usd" if (form.get("smm_cur") or "bdt").strip().lower() == "usd" else "bdt",
+            "smm_cur": ("usd" if (form.get("smm_cur") or "auto").strip().lower() == "usd"
+                        else ("bdt" if (form.get("smm_cur") or "").strip().lower() == "bdt"
+                              else "auto")),
             "smm_min_bal": (form.get("smm_min_bal") or "5").strip()[:12],
             "smm_on": "on" if (form.get("smm_on") or "") in ("on", "1", "yes") else "off",
         }
@@ -1408,10 +1409,6 @@ def admin_smm():
             float(vals["smm_usd_bdt"])
         except Exception:
             vals["smm_usd_bdt"] = "130"
-        try:
-            float(vals["smm_markup"])
-        except Exception:
-            vals["smm_markup"] = "20"
         try:                       # ধাপ-তালিকা পরিষ্কার করে সেভ (ভুল লাইন বাদ পড়ে)
             import bot as _bt
             _tiers = _bt.smm_tiers_parse(vals["smm_tiers"])
@@ -1436,6 +1433,7 @@ def admin_smm():
         cfg = {"url": "https://bdsmmpanel.com/api/v2", "key": "", "usd": 130,
                "markup": 20, "cur": "bdt", "on": False}
     bal_txt, bal_err, n_svc = "—", "", 0
+    _bal_cur = ""
     _last_bal, _last_at = "—", "—"
     try:
         _r_lb = one("SELECT value FROM settings WHERE key='smm_bal_last'") or {}
@@ -1457,7 +1455,7 @@ def admin_smm():
             import bot as _bs6
             _res = _bs6.smm_check_balance(None)
             if _res:
-                bal_txt = f"{_res.get('balance')} {_res.get('currency')}"
+                bal_txt = _bs6.smm_bal_text(_res.get("balance"), _res.get("currency"))
                 _last_bal, _last_at = bal_txt, __import__("time").strftime("%Y-%m-%d %H:%M")
     except Exception as _ce:
         bal_err = str(_ce)[:150]
@@ -1465,7 +1463,11 @@ def admin_smm():
         try:
             import bot as _bs3
             _b, _cur = _bs3.smm_panel_balance()
-            bal_txt = f"{_b} {_cur}"
+            _bal_cur = str(_cur or "")
+            try:
+                bal_txt = _bs3.smm_bal_text(_b, _cur)
+            except Exception:
+                bal_txt = f"{_b} {_cur}"
         except Exception as e:
             bal_err = str(e)[:160]
         try:
@@ -1497,6 +1499,11 @@ def admin_smm():
         + f"<tr><th>সার্ভিস সংখ্যা</th><td>{num(n_svc)}</td></tr>"
         + "</tbody></table></div>"
         + "<a class='btn gray sm' href='/admin/smm?chk=1'>🔄 এখনই ব্যালেন্স চেক করুন</a>"
+        + (("<div class='note warn'>ℹ️ প্যানেল ব্যালেন্স ডলারে দেখাচ্ছে। "
+            "আপনার ওয়েবসাইটে ৳ দেখায় — তাই নিচের <b>প্যানেলের দাম কোন মুদ্রায়</b> "
+            "অংশে <b>ডলার ($)</b> বেছে নিন, আর USD→৳ রেট (এখন "
+            f"{esc(str(cfg.get('usd')))}৳) মিলিয়ে নিন; নাহলে দাম অনেক কম দেখাবে।</div>")
+           if _bal_cur.upper() == "USD" and (cfg.get("cur_eff") or "") != "usd" else "")
         + (f"<div class='note warn'>⚠️ {esc(bal_err)}</div>" if bal_err else "")
         + "</div>"
         "<div class='card'><h3>⚙️ সেটিংস</h3>"
@@ -1507,10 +1514,12 @@ def admin_smm():
         f"<input name='smm_key' value='{esc(cfg.get('key') or '')}' placeholder='আপনার API key'></div>"
         "<div class='field'><label>প্যানেলের দাম কোন মুদ্রায়?</label>"
         "<select name='smm_cur'>"
-        + ("<option value='bdt'" + (" selected" if (cfg.get("cur") or "bdt") != "usd" else "")
-           + ">৳ টাকা (bdsmmpanel-এর মতো)</option>")
-        + ("<option value='usd'" + (" selected" if (cfg.get("cur") or "bdt") == "usd" else "")
-           + ">ডলার ($)</option>")
+        + ("<option value='auto'" + (" selected" if (cfg.get("cur") or "auto") not in ("usd", "bdt") else "")
+           + ">🔄 অটো — প্যানেল যা বলে (সবচেয়ে নিরাপদ)</option>")
+        + ("<option value='bdt'" + (" selected" if (cfg.get("cur") or "auto") == "bdt" else "")
+           + ">৳ টাকা (রেট আগেই ৳-তে)</option>")
+        + ("<option value='usd'" + (" selected" if (cfg.get("cur") or "auto") == "usd" else "")
+           + ">ডলার ($) — USD→৳ রেট দিয়ে গুণ হবে</option>")
         + "</select></div>"
         "<div class='field'><label>USD → ৳ রেট <span class='mut'>(শুধু ডলার হলে)</span></label>"
         f"<input name='smm_usd_bdt' value='{esc(str(cfg.get('usd')))}' placeholder='130'></div>"
@@ -1519,9 +1528,6 @@ def admin_smm():
         "<code>1-3 = 100</code>; লাইন যোগ/বাদ দিয়ে এডিট করুন)</span></label>"
         f"<textarea name='smm_tiers' rows='9' style='width:100%' "
         f"placeholder='1-3 = 100&#10;4-6 = 50'>{esc(_tiers_txt)}</textarea></div>"
-        "<div class='field'><label>ডিফল্ট লাভের % "
-        "<span class='mut'>(ধাপ-তালিকা খালি/ভুল হলে এটাই ব্যবহার হবে)</span></label>"
-        f"<input name='smm_markup' value='{esc(str(cfg.get('markup')))}' placeholder='20'></div>"
         + "<div class='field'><label>কম-ব্যালেন্স সীমা <span class='mut'>(এর নিচে নামলে টেলিগ্রামে অ্যালার্ট)</span></label>"
         + f"<input name='smm_min_bal' value='{esc(str(_minb))}' placeholder='5'></div>"
         "<div class='field'><label><input type='checkbox' name='smm_on' value='on'"

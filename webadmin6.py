@@ -147,7 +147,8 @@ def deposits_home():
                "onsubmit=\"return confirm('হিসাব এখন থেকে ০ থেকে শুরু হবে — ঠিক আছে?')\">"
                f"<button class='gray sm' type='submit'>🔄 রিসেট"
                + (f" (শুরু: {esc(_since[:16])})" if _since else "")
-               + "</button></form></div></div>"))
+               + "</button></form></div></div>")
+            )
 
     mrows = []
     for m in methods:
@@ -306,7 +307,7 @@ def _form(m=None):
         f"<option value='qr'{' selected' if kind == 'qr' else ''}>🇧🇩 Bangla QR পেমেন্ট (QR স্ক্যান)</option>"
         f"</select>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>🆔 UID: ইউজার কত ডলার "
-        "পাঠিয়েছে + নাম দিলে বট Binance-এর মেইল পড়ে সাথে সাথে ব্যালেন্স যোগ করে; "
+        "পাঠিয়েছে + নাম দিলে বট পেমেন্ট দেখে সাথে সাথে ব্যালেন্স যোগ করে; "
         "না পেলে পেন্ডিং আসে — আপনি ✅/❌ করবেন।</p></div>"
         "<div class='field'><label>USDT BEP-20 অ্যাড্রেস / Binance Pay ID</label>"
         f"<input name='address' value='{esc(m.get('address') or '')}' placeholder='0x… অথবা Binance UID'></div>"

@@ -161,7 +161,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-17b84"
+BUILD_TAG       = "uid-auto-2026-11-17b91"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -698,9 +698,9 @@ _EN_FAST = {
     # ── ডিপোজিট ──
     "💳 *ডিপোজিট*": "💳 *Deposit*",
     "নিচের যেকোনো একটি মেথড বেছে নিন।": "Choose one of the methods below.",
-    "⚡ *অটো* — পরিমাণ দিন, Binance থেকে টাকা পাঠান — বট মেইল দেখে ব্যালেন্স যোগ করবে।":
-        "⚡ *Auto* — give the amount and send from Binance; the bot reads the "
-        "instantly after verification.",
+    "⚡ *অটো* — পরিমাণ দিন, Binance থেকে টাকা পাঠান — বট পেমেন্ট দেখে নিজেই ব্যালেন্স যোগ করে দেবে।":
+        "⚡ *Auto* — give the amount and send from Binance; the bot sees the "
+        "payment and adds the balance.",
     "✍️ *ম্যানুয়াল* — আপনি পেমেন্ট করে TxID/স্ক্রিনশট দিলে অ্যাডমিন ✅ করবেন।":
         "✍️ *Manual* — pay and send the TxID/screenshot; the admin will approve it.",
     "এখনো কোনো মেথড সেট করা হয়নি।": "No deposit method is set up yet.",
@@ -4337,8 +4337,77 @@ def taka_txt(amt, sym=True):
     return (s2 + " ৳") if sym else s2
 
 
+def _usd_txt(v):
+    """ডলারের ছোট অঙ্কও পুরো দেখাও — 0.0053 → `0.0053$`।"""
+    try:
+        n = float(v or 0)
+    except Exception:
+        n = 0.0
+    if n >= 1:
+        s = f"{n:,.2f}"
+    elif n >= 0.01:
+        s = f"{n:.4f}"
+    else:
+        s = f"{n:.6f}"
+    s = s.rstrip("0").rstrip(".")
+    return (s or "0") + "$"
+
+
+DEP_TAKA_MIGRATE_LIMIT = 100.0   # এর বড় অঙ্ক = আসল ৳ ডিপোজিট, হাত দেওয়া হয় না
+
+
+def dep_bal_taka_auto_migrate():
+    """পুরোনো ডলার-যুগের ডিপোজিট ব্যালেন্স নিজে থেকেই ৳-তে বদলে দাও (একবার)।
+
+    বট চালু হলেই চলে; `dep_bal_taka_migrated` সেট থাকলে আর কিছুই করে না।
+    শুধু ছোট অঙ্ক (< 100) বদলানো হয় — নতুন করে ৳-তে জমা পড়া বড় টাকা ভুলে
+    গুণ হয়ে যাবে না। Returns (count, rate)।
+    """
+    try:
+        if (get_setting("dep_bal_taka_migrated") or "").strip():
+            return 0, 0.0
+    except Exception:
+        pass
+    try:
+        _rate = float(dep_rate())
+    except Exception:
+        _rate = 125.0
+    if _rate <= 0:
+        _rate = 125.0
+    n = 0
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT user_id, COALESCE(dep_balance,0) AS d FROM users "
+                "WHERE COALESCE(dep_balance,0) > 0 AND COALESCE(dep_balance,0) < %s",
+                (DEP_TAKA_MIGRATE_LIMIT,)).fetchall()
+            for r in rows or []:
+                try:
+                    _uid = int(r["user_id"])
+                    _d = float(r["d"] or 0)
+                except Exception:
+                    continue
+                _new = round(_d * _rate, 2)
+                c.execute(
+                    "UPDATE users SET dep_balance=%s, "
+                    "dep_total=GREATEST(COALESCE(dep_total,0), %s) WHERE user_id=%s",
+                    (_new, _new, _uid))
+                n += 1
+    except Exception as e:
+        log.warning(f"[DEP-MIGRATE] ব্যর্থ: {str(e)[:120]}")
+        return 0, _rate
+    try:
+        set_setting("dep_bal_taka_migrated", _time.strftime("%Y-%m-%d %H:%M"))
+        set_setting("dep_bal_migrate_rate", str(_rate))
+    except Exception:
+        pass
+    if n:
+        log.info(f"[DEP-MIGRATE] {n} জনের পুরোনো ডিপোজিট ব্যালেন্স ৳-তে ({_rate:g}৳ = 1$)")
+    return n, _rate
+
+
 def safe_ded_dep(uid, amt):
-    """💳 ডিপোজিট ওয়ালেট (টাকা) থেকে কাটো — যথেষ্ট না হলে False।"""
+    """💳 ডিপোজেট ওয়ালেট (টাকা) থেকে কাটো — যথেষ্ট না হলে False।"""
     try:
         amt = float(amt or 0)
     except Exception:
@@ -6781,7 +6850,7 @@ def dep_no(oid):
 
 
 def _shop_money(v):
-    """দাম/ব্যালেন্স — ছোট অঙ্কও পুরো দেখাবে (0.0001 → `0.0001`, 0 নয়)।"""
+    """দাম/ব্যালেন্স — ৳ এর পাশে ডলারও (রেট অনুযায়ী): `125 ৳ · 1$`।"""
     try:
         n = float(v or 0)
     except Exception:
@@ -6790,7 +6859,16 @@ def _shop_money(v):
         s = _amt(n)
     except Exception:
         s = f"{n:.8f}".rstrip("0").rstrip(".")
-    return f"{s or '0'} {_shop_cur()}"
+    _cur = _shop_cur()
+    out = f"{s or '0'} {_cur}"
+    if _cur == "৳" and n > 0:
+        try:
+            _r = dep_rate()
+            if _r > 0:
+                out += " · " + _usd_txt(n / _r)
+        except Exception:
+            pass
+    return out
 
 
 def _shop_ddl():
@@ -7936,8 +8014,18 @@ async def show_shop(update, ctx=None):
         kb = _shop_cats_kb(cats, other=bool(prods_other), en=_en)
     if await asyncio.to_thread(smm_on):
         try:
-            kb = InlineKeyboardMarkup(list(kb.inline_keyboard) + [[InlineKeyboardButton(
-                _bi("🌐 SMM প্যানেল", "🌐 SMM Panel", _en), callback_data="smm")]])
+            _rows = [list(_r) for _r in kb.inline_keyboard]
+            _sbtn = InlineKeyboardButton(
+                _bi("🌐 SMM প্যানেল", "🌐 SMM Panel", _en), callback_data="smm")
+            _done = False
+            for _r in _rows:            # 🎫 মেইল কোড বাটনের পাশে বসাই
+                if _r and "🎫" in str(getattr(_r[0], "text", "") or ""):
+                    _r.append(_sbtn)
+                    _done = True
+                    break
+            if not _done:
+                _rows.append([_sbtn])
+            kb = InlineKeyboardMarkup(_rows)
         except Exception:
             pass
     msg = update.effective_message
@@ -8708,7 +8796,7 @@ async def _shop_buy_core(ctx, q, pid, count, note=""):
     if total > 0 and not await asyncio.to_thread(shop_hold_place, uid, total):
         for sid, _c in lines:
             await asyncio.to_thread(shop_release_stock, sid)
-        # 💳 ডিপোজিট ব্যালেন্স কম — earn থেকে কনভার্ট করতে বলি
+        # 💳 ডিপোজিট ব্যালেন্স কম — ডিপোজিট করতে বলি (কনভার্ট আর নেই)
         _earn = 0.0
         try:
             _earn = float(await asyncio.to_thread(get_bal, uid) or 0)
@@ -8726,24 +8814,26 @@ async def _shop_buy_core(ctx, q, pid, count, note=""):
             pass
         _msg = (
             ("💳 *আপনার ডিপোজিট ব্যালেন্স যথেষ্ট নয়*\n\n"
-             f"🛍 দাম: `{taka_txt(total)}`\n"
-             f"💳 ডিপোজিট ব্যালেন্স: `{taka_txt(_dep)}`\n"
-             f"🪙 Earn ব্যালেন্স (USD): `{_earn:g}$`\n\n"
-             "👉 আপনার আয়ের টাকা দিয়ে কিনতে চাইলে আগে *Earn → ডিপোজিট* কনভার্ট করুন।\n"
-             "🔄 ডিপোজিট → *Convert Earn → ডিপোজিট ব্যালেন্স* চাপুন।")
+             f"🛍 দাম: `{_shop_money(total)}`\n"
+             f"💳 ডিপোজিট ব্যালেন্স: `{taka_txt(_dep)}` "
+             f"(≈ {_usd_txt(_dep / dep_rate())})\n"
+             f"🪙 Earn ব্যালেন্স: `{_earn:g}$`\n\n"
+             "👉 আরও টাকা ডিপোজিট করুন, তারপর আবার কিনুন।\n"
+             "💬 অন্য কোনো সিস্টেম বা পেমেন্ট অপশন দিয়ে ডিপোজিট করতে চাইলে "
+             "সাপোর্ট/অ্যাডমিনকে মেসেজ করুন — @gmail4gg")
             if not _en else
             ("💳 *Your deposit balance is not enough*\n\n"
-             f"🛍 Price: `{taka_txt(total)}`\n"
+             f"🛍 Price: `{_shop_money(total)}`\n"
              f"💳 Deposit balance: `{taka_txt(_dep)}`\n"
-             f"🪙 Earn balance (USD): `{_earn:g}$`\n\n"
-             "👉 Convert your earn money to the deposit balance first.\n"
-             "🔄 Open Deposit → *Convert Earn → Deposit balance*."))
+             f"🪙 Earn balance: `{_earn:g}$`\n\n"
+             "👉 Please deposit more and try again.\n"
+             "💬 Want to deposit with another system or payment option? "
+             "Message support/admin — @gmail4gg"))
         _kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(_bi("🔄 Convert ব্যালেন্স",
-                                      "🔄 Convert Balance", _en),
-                                  callback_data="dep:conv")],
             [InlineKeyboardButton(_bi("💳 ডিপোজিট", "💳 Deposit", _en),
-                                  callback_data="dep:home")]])
+                                  callback_data="dep:home"),
+             InlineKeyboardButton(_bi("🛍 পণ্য কিনুন", "🛍 Buy Products", _en),
+                                  callback_data="shop:list")]])
         try:
             await q.edit_message_text(_msg, parse_mode="Markdown", reply_markup=_kb)
         except Exception:
@@ -13336,6 +13426,32 @@ def _mail_fetch_payments_once(limit=40, imap=None):
                 ids = data[0].split()
                 if ids:
                     break
+        # 🔎 ইনবক্সে কিছু না মিললে অন্য ফোল্ডারও দেখি — Binance-এর মেইল
+        #    অনেক সময় label-এ চলে যায় বা ইনবক্স থেকে সরে যায় (Gmail)।
+        if not ids:
+            for _f in ("[Gmail]/All Mail", "[Gmail]/Binance", "Binance",
+                       "[Google Mail]/All Mail", "[Gmail]/Spam"):
+                try:
+                    _t2, _d2 = imap.select(_f, readonly=True)
+                except Exception:
+                    continue
+                if _t2 != "OK":
+                    continue
+                try:
+                    _diag["folder"] = _f
+                except Exception:
+                    pass
+                for crit in _crits:
+                    try:
+                        _t3, _d3 = imap.search(None, crit)
+                    except Exception:
+                        continue
+                    if _t3 == "OK" and _d3 and _d3[0]:
+                        ids = _d3[0].split()
+                        if ids:
+                            break
+                if ids:
+                    break
         for num in ids[-int(limit):]:
             # ১) শুধু হেডার নামানো হয় (হালকা) — প্রেরক/Subject না মিললে
             #    পুরো মেইল নামানোই হয় না (Gmail ধীর/ব্লক হয় না)
@@ -13398,7 +13514,20 @@ def _mail_fetch_payments_once(limit=40, imap=None):
     except Exception as e:
         return [], f"IMAP পড়া ব্যর্থ: {str(e)[:90]}"
     finally:
+        if _diag.get("folder"):          # অন্য ফোল্ডার দেখেছিলাম → আগের ফোল্ডারে ফিরি (IDLE ভাঙে না)
+            try:
+                imap.select(cfg["folder"], readonly=True)
+            except Exception:
+                pass
         _DEP_MAIL["diag"] = _diag
+        try:
+            _MAIL_STAT["scan"] = {"all": int(_diag.get("all") or 0),
+                                  "from_ok": int(_diag.get("from_ok") or 0),
+                                  "parsed": int(_diag.get("parsed") or 0),
+                                  "folder": str(_diag.get("folder") or ""),
+                                  "at": _time.time()}
+        except Exception:
+            pass
         if not _shared:          # শেয়ার করা কানেকশন কখনো বন্ধ করা হয় না
             try:
                 imap.logout()
@@ -13973,12 +14102,55 @@ async def cmd_mail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return f"{d // 60} মিনিট আগে"
         return f"{d // 3600} ঘণ্টা আগে"
 
+    def _scan_line(ms):
+        """শেষ স্ক্যানে কত মেইল দেখা হলো — সমস্যা ধরার জন্য।"""
+        sc = (ms.get("scan") or {})
+        try:
+            _n, _f, _p = (int(sc.get("all") or 0), int(sc.get("from_ok") or 0),
+                          int(sc.get("parsed") or 0))
+        except Exception:
+            _n = _f = _p = 0
+        if not sc:
+            return "• 📬 *স্ক্যান:* এখনো হয়নি"
+        _ln = f"• 📬 *স্ক্যান (৪ দিন):* মেইল `{_n}` · প্রেরক মিলেছে `{_f}` · পেমেন্ট `{_p}`"
+        if sc.get("folder"):
+            _ln += f" · 📂 `{_md_esc(str(sc.get('folder'))[:28])}`"
+        return _ln
+
+    def _scan_hint(ms):
+        """কিছু না পেলে কী করতে হবে — ছোট hint (স্ক্যান হওয়ার পরেই)।"""
+        sc = (ms.get("scan") or {})
+        if not sc:
+            return ""
+        try:
+            _n, _f = int(sc.get("all") or 0), int(sc.get("from_ok") or 0)
+        except Exception:
+            return ""
+        _diag = (_DEP_MAIL.get("diag") or {})
+        _smp = list(_diag.get("samples") or [])
+        if _n == 0:
+            return ("⚠️ ৪ দিনে কোনো মেইল পাওয়া যায়নি (All Mail/লেবেলও দেখা হয়েছে)। "
+                    "পেমেন্টের মেইল অন্য অ্যাকাউন্টে এলে বা ৪ দিনের পুরোনো হলে ধরা পড়বে না।")
+        if _f == 0:
+            _s = _smp[-1] if _smp else {}
+            _fr = str(_s.get("from") or "")[:60]
+            _sj = str(_s.get("subj") or "")[:50]
+            _tail = (f"\n🔍 শেষ মেইল: `{_md_esc(_fr)}` — {_md_esc(_sj)}" if _fr else "")
+            return ("⚠️ মেইল পাওয়া যাচ্ছে, কিন্তু প্রেরক ঠিকানা মিলছে না। "
+                    "প্যানেল → ✉️ Mail Auto-Deposit-এ 'From' খালি করুন বা ঠিকানা ঠিক করুন।" + _tail)
+        return ""
+
     _ms = dict(_MAIL_STAT or {})
     _conn = "✅ যুক্ত আছে" if _ms.get("connected") else "❌ যুক্ত নেই"
     if _ms.get("connected"):
         _conn += f" ({_ago_m(_ms.get('conn_at'))} থেকে)"
-    _idle = ("🟢 চলছে (নতুন মেইলের অপেক্ষা)" if _ms.get("idle")
-             else f"⚪ নেই — মোড: {_md_esc(str(_ms.get('mode') or '—'))}")
+    if _ms.get("idle"):
+        _idle = "🟢 চলছে (নতুন মেইলের অপেক্ষা)"
+    elif str(_ms.get("mode") or "") == "IDLE":
+        # IDLE-এর দুই দফার মাঝে scan/refresh চলে — তখনও সব ঠিক থাকে
+        _idle = "🟡 বিরতিতে — এই মুহূর্তে scan চলছে (কয়েক সেকেন্ডেই আবার অপেক্ষায় বসবে)"
+    else:
+        _idle = f"⚪ নেই — মোড: {_md_esc(str(_ms.get('mode') or '—'))}"
     lines = ["📧 *মেইল অটো-ডিপোজিট*", "━━━━━━━━━━━━━━",
              f"• স্ট্যাটাস: {'চালু ✅' if cfg['on'] else 'বন্ধ ❌ (সেট করা নেই)'}",
              f"• 🔌 *Connection:* {_conn}",
@@ -13986,6 +14158,7 @@ async def cmd_mail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
              f"• 📨 *Last Email:* {_ago_m(_ms.get('last_email_at'))}",
              f"• 🔎 *Last Deposit Checked:* {_ago_m(_ms.get('last_check_at'))}",
              f"• 🔢 *Emails Processed:* {int(_ms.get('processed') or 0)}",
+             _scan_line(_ms), _scan_hint(_ms),
              f"• ♻️ *Reconnect:* {int(_ms.get('reconnects') or 0)} বার",
              f"• 🖥 হোস্ট: `{_md_esc(cfg['host'])}:{cfg['port']}`",
              f"• 👤 ইউজার: `{_md_esc(cfg['user'] or '—')}`",
@@ -14190,9 +14363,6 @@ def _dep_kb(methods, en=False):
             nm += " ⚡" if _k in ("auto", "uid") else " ✍️"
         btns.append(InlineKeyboardButton(nm[:40], callback_data=f"dep:m:{int(m['id'])}"))
     rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
-    rows.append([InlineKeyboardButton(_bi("🔄 Convert ব্যালেন্স",
-                                          "🔄 Convert Balance", en),
-                                      callback_data="dep:conv")])
     rows.append([InlineKeyboardButton(_bi("🧾 আমার ডিপোজিট হিস্ট্রি", "🧾 My Deposit History", en),
                                       callback_data="dep:my")])
     rows.append([InlineKeyboardButton(_bi("🛍 পণ্য কিনুন", "🛍 Buy Products", en),
@@ -14277,27 +14447,33 @@ async def show_deposit(update, ctx=None):
     except Exception:
         pass
     _bal_line = (
-        (f"💳 *Deposit balance:* `{taka_txt(_dep_u)}`\n"
+        (f"💳 *Deposit balance:* `{taka_txt(_dep_u)}` "
+         f"(≈ {_usd_txt(_dep_u / dep_rate())})\n"
          f"🪙 *Earn balance:* `{_earn_u:g}$`\n"
          f"📊 Rate: 1$ = `{dep_rate():g}` ৳\n"
          "━━━━━━━━━━━━━━\n")
         if _en else
-        (f"💳 *ডিপোজিট ব্যালেন্স:* `{taka_txt(_dep_u)}`\n"
+        (f"💳 *ডিপোজিট ব্যালেন্স:* `{taka_txt(_dep_u)}` "
+         f"(≈ {_usd_txt(_dep_u / dep_rate())})\n"
          f"🪙 *Earn ব্যালেন্স:* `{_earn_u:g}$`\n"
          f"📊 রেট: 1$ = `{dep_rate():g}` ৳\n"
          "━━━━━━━━━━━━━━\n"))
     if _en:
         txt = ("💳 *Deposit*\n" + _bal_line +
                "Choose any method below.\n\n"
-               "⚡ *Auto* — give the amount and send from Binance; the bot reads "
-               "the e-mail and adds the balance automatically.\n"
-               "✍️ *Manual* — you pay and submit TxID/screenshot; admin approves.")
+               "⚡ *Auto* — give the amount and send from Binance; the bot sees "
+               "the payment and adds the balance automatically.\n"
+               "✍️ *Manual* — you pay and submit TxID/screenshot; admin approves.\n\n"
+               "💬 Want to deposit with another system or payment option? "
+               "Message support/admin — @gmail4gg")
     else:
         txt = ("💳 *ডিপোজিট*\n" + _bal_line +
                "নিচের যেকোনো একটি মেথড বেছে নিন।\n\n"
-               "⚡ *অটো* — পরিমাণ দিন, Binance থেকে টাকা পাঠান — বট মেইল দেখে "
+               "⚡ *অটো* — পরিমাণ দিন, Binance থেকে টাকা পাঠান — বট পেমেন্ট দেখে "
                "নিজেই ব্যালেন্স যোগ করে দেবে।\n"
-               "✍️ *ম্যানুয়াল* — আপনি পেমেন্ট করে TxID/স্ক্রিনশট দিলে অ্যাডমিন ✅ করবেন।")
+               "✍️ *ম্যানুয়াল* — আপনি পেমেন্ট করে TxID/স্ক্রিনশট দিলে অ্যাডমিন ✅ করবেন।\n\n"
+               "💬 অন্য কোনো সিস্টেম বা পেমেন্ট অপশন দিয়ে ডিপোজিট করতে চাইলে "
+               "সাপোর্ট/অ্যাডমিনকে মেসেজ করুন — @gmail4gg")
     if not methods:
         txt = ("💳 *Deposit*\n\nNo method has been set up yet.\nTell the admin."
                if _en else
@@ -15149,48 +15325,6 @@ async def dep_callback(update, ctx):
     try:
         if d in ("dep:list", "dep:back"):
             return await show_deposit(update, ctx)
-        if d == "dep:conv":
-            try:
-                _en = await _shop_is_en(uid)
-            except Exception:
-                _en = False
-            _earn = 0.0
-            try:
-                _earn = float(await asyncio.to_thread(get_bal, uid) or 0)
-            except Exception:
-                _earn = 0.0
-            _dep = 0.0
-            try:
-                _dep = float(await asyncio.to_thread(get_dep_balance, uid) or 0)
-            except Exception:
-                _dep = 0.0
-            _rate = dep_rate()
-            ctx.user_data["state"] = "dep_conv_amt"
-            _txt = (
-                ("🔄 *Convert Earn → ডিপোজিট ব্যালেন্স*\n\n"
-                 f"🪙 Earn ব্যালেন্স: `{_earn:g}$`\n"
-                 f"💳 ডিপোজিট ব্যালেন্স: `{taka_txt(_dep)}`\n"
-                 f"📊 রেট: 1$ = `{_rate:g}` ৳\n\n"
-                 "কত ডলার কনভার্ট করবেন? (শুধু সংখ্যা, যেমন `1`)\n\n"
-                 "/cancel — বাতিল")
-                if not _en else
-                ("🔄 *Convert Earn → Deposit balance*\n\n"
-                 f"🪙 Earn balance: `{_earn:g}$`\n"
-                 f"💳 Deposit balance: `{taka_txt(_dep)}`\n"
-                 f"📊 Rate: 1$ = `{_rate:g}` ৳\n\n"
-                 "Enter the amount (USD) to convert from Earn → Deposit balance :\n"
-                 "Numbers only (e.g. `1`).\n\n/cancel — cancel"))
-            _kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(_bi("🔙 ডিপোজিট", "🔙 Deposit", _en),
-                                     callback_data="dep:home")]])
-            try:
-                await q.edit_message_text(_txt, parse_mode="Markdown", reply_markup=_kb)
-            except Exception:
-                try:
-                    await q.message.reply_text(_txt, parse_mode="Markdown", reply_markup=_kb)
-                except Exception:
-                    pass
-            return
         if d == "dep:my":
             return await _dep_show_my(q)
         if d.startswith("dep:m:"):
@@ -16044,7 +16178,9 @@ async def dep_input(update, ctx, st):
 
     mid = int(ctx.user_data.get("dep_mid") or 0)
     m = await asyncio.to_thread(dep_method, mid) if mid else None
-    if not m:
+    # ⚠️ মেথড লাগে শুধু এই কয়টা ধাপে — আগে সব ধাপেই চেক হতো, ফলে
+    #    কনভার্ট/QR-এর অঙ্ক লিখলে ভুল করে "মেথড পাওয়া যায়নি" আসত।
+    if not m and str(st) in ("dep_tx", "dep_amt", "dep_note", "dep_uid_amt"):
         ctx.user_data.pop("state", None)
         await update.message.reply_text("❌ ডিপোজিট মেথড পাওয়া যায়নি — আবার শুরু করুন।")
         return True
@@ -16227,107 +16363,6 @@ async def dep_input(update, ctx, st):
                     pass
         except Exception:
             pass
-        return True
-
-    if st == "dep_conv_amt":
-        try:
-            _usd = float(txt.replace(",", ".").replace("$", "").strip())
-        except Exception:
-            await update.message.reply_text(
-                "❌ শুধু সংখ্যা লিখুন (যেমন 1)।" if not _en
-                else "❌ Numbers only (e.g. 1).")
-            return True
-        if _usd <= 0:
-            await update.message.reply_text(
-                "❌ পরিমাণ ০ এর বেশি হতে হবে।" if not _en
-                else "❌ Amount must be more than 0.")
-            return True
-        _earn = 0.0
-        try:
-            _earn = float(await asyncio.to_thread(get_bal, uid) or 0)
-        except Exception:
-            _earn = 0.0
-        if _usd > _earn + 1e-9:
-            await update.message.reply_text(
-                (f"❌ আপনার Earn ব্যালেন্সে মাত্র `{_earn:g}$` আছে।" if not _en
-                 else f"❌ You only have `{_earn:g}$` in your earn balance."),
-                parse_mode="Markdown")
-            return True
-        _ok = False
-        try:
-            _ok = await asyncio.to_thread(safe_ded_bal, uid, _usd)
-        except Exception:
-            _ok = False
-        if not _ok:
-            await update.message.reply_text(
-                "❌ কনভার্ট হয়নি — আবার চেষ্টা করুন।" if not _en
-                else "❌ Conversion failed — please try again.")
-            return True
-        _taka = usd_to_taka(_usd)
-        _added = False
-        try:
-            with _c() as _c3:
-                _cur3 = _c3.execute(
-                    "UPDATE users SET dep_balance=COALESCE(dep_balance,0)+%s, "
-                    "dep_total=COALESCE(dep_total,0)+%s WHERE user_id=%s",
-                    (_taka, _taka, uid))
-                _added = bool(_cur3.rowcount)
-        except Exception:
-            _added = False
-        if not _added:
-            # ফেরত দাও — টাকা হারাবে না
-            try:
-                add_bal(uid, _usd)
-            except Exception:
-                pass
-            await update.message.reply_text(
-                "❌ কনভার্ট হয়নি — টাকা ফেরত দেওয়া হয়েছে।" if not _en
-                else "❌ Conversion failed — your money was returned.")
-            return True
-        try:
-            _invalidate_user_cache(uid)
-            _mark_dirty()
-        except Exception:
-            pass
-        ctx.user_data.pop("state", None)
-        _dep2 = 0.0
-        try:
-            _dep2 = float(await asyncio.to_thread(get_dep_balance, uid) or 0)
-        except Exception:
-            _dep2 = 0.0
-        _earn2 = 0.0
-        try:
-            _earn2 = float(await asyncio.to_thread(get_bal, uid) or 0)
-        except Exception:
-            _earn2 = 0.0
-        try:
-            await notify_full_admins(
-                ctx.bot,
-                f"🔄 *Earn → ডিপোজিট কনভার্ট*\n\n"
-                f"👤 `{uid}`\n🪙 `{_usd:g}$` → 💳 `{taka_txt(_taka)}` "
-                f"(রেট `{dep_rate():g}`)")
-        except Exception:
-            pass
-        await update.message.reply_text(
-            (("✅ *কনভার্ট সম্পন্ন!*\n\n"
-              f"🪙 Earn থেকে কাটা: `{_usd:g}$`\n"
-              f"💳 ডিপোজিট ব্যালেন্সে যোগ: `{taka_txt(_taka)}`\n"
-              f"📊 রেট: 1$ = `{dep_rate():g}` ৳\n\n"
-              f"💳 এখন ডিপোজিট ব্যালেন্স: `{taka_txt(_dep2)}`\n"
-              f"🪙 Earn ব্যালেন্স: `{_earn2:g}$`")
-             if not _en else
-             ("✅ *Converted!*\n\n"
-              f"🪙 Deducted from earn: `{_usd:g}$`\n"
-              f"💳 Added to deposit balance: `{taka_txt(_taka)}`\n"
-              f"📊 Rate: 1$ = `{dep_rate():g}` ৳\n\n"
-              f"💳 Deposit balance: `{taka_txt(_dep2)}`\n"
-              f"🪙 Earn balance: `{_earn2:g}$`")),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(_bi("🛍 পণ্য কিনুন", "🛍 Buy products", _en),
-                                      callback_data="shop:list")],
-                [InlineKeyboardButton(_bi("💳 ডিপোজিট", "💳 Deposit", _en),
-                                      callback_data="dep:home")]]))
         return True
 
     if st == "dep_uid":
@@ -26778,7 +26813,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── 💳 Deposit ইনপুট (ইউজার TxID/পরিমাণ + অ্যাডমিন মেথড তৈরি) ──
     if st and str(st).startswith(("dep_tx", "dep_amt", "dep_note", "dep_uid", "dep_proof",
-                                  "dep_conv_amt",
                                   "qr_amt", "qr_proof",
                                   "depa_new", "depa_min", "depa_qr", "depa_api")):
         try:
@@ -36946,6 +36980,18 @@ def main():
                 await asyncio.to_thread(_perf_indexes)        # hot-path ইনডেক্স
                 await asyncio.to_thread(_backfill_devices)    # পুরোনো হ্যাশ → devices
                 await asyncio.to_thread(_dep_backfill)        # পুরোনো ডিপোজিট-হিসাব
+                _mg_n, _mg_r = await asyncio.to_thread(dep_bal_taka_auto_migrate)
+                if _mg_n:
+                    try:
+                        await application.bot.send_message(
+                            ADMIN_ID,
+                            "💱 *পুরোনো ডিপোজিট ব্যালেন্স অটো রূপান্তর*\n\n"
+                            f"👥 `{_mg_n}` জনের ব্যালেন্স ৳-তে বদলানো হলো "
+                            f"(রেট `{_mg_r:g}`৳ = ১$)।\n"
+                            "এখন থেকে সব জায়গায় ডিপোজিট ব্যালেন্স ৳ হিসেবে দেখাবে।",
+                            parse_mode="Markdown")
+                    except Exception:
+                        pass
                 log.info("🔥 [WARMUP] DB pool + caches প্রস্তুত")
             except Exception as _we:
                 log.warning(f"[WARMUP] ব্যর্থ: {_we}")
@@ -37432,8 +37478,8 @@ def main():
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
     app.add_handler(CallbackQueryHandler(cleanup_callback, pattern=r"^cleanup_(junk|logs7|logs30|close)$"))
     app.add_handler(CallbackQueryHandler(sec_callback, pattern=r"^sec_(unban|ignore)_\d+$"))
-    app.add_handler(CallbackQueryHandler(shop_callback, pattern=r"^(shop:|shopa:|shopao:|shopar:|mail:|adm_shop$)"))
-    app.add_handler(CallbackQueryHandler(dep_callback, pattern=r"^(dep:|depa:|depadm:|depok:|depno:|depname:|adm_dep$)"))
+    app.add_handler(CallbackQueryHandler(shop_callback, pattern=r"^(shop:|shopa:|shopao:|shopar:|mail:|adm_shop$|smm)"))
+    app.add_handler(CallbackQueryHandler(dep_callback, pattern=r"^(dep:|depa:|depadm:|depok:|depno:|depname:|depchk|depdiag|adm_dep$)"))
     app.add_handler(CallbackQueryHandler(moneyreq_callback, pattern=r"^mreq:(ok|no):\d+$"))
     app.add_handler(CallbackQueryHandler(on_resetall_cb, pattern=r"^resetall_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(fb_callback, pattern=r"^(fbt_list|fbspwid:\d+|fbtn:\d+|fbr:\d+|fbs:\d+|fbd:\d+|fbc:\d+|fbt_cancel|adm_fb|fbx:\d+|fbnt:\d+|fbvid:\d+|fbvideo:\d+|fbvurl:\d+|fbvup:\d+|fbvdel:\d+)$"))
@@ -37474,13 +37520,20 @@ def smm_cfg():
             return float(d)
     return {
         "url": (get_setting("smm_url") or SMM_DEF_URL).strip(),
-        "key": (get_setting("smm_key") or "").strip(),
+        "key": re.sub(r"\s+", "", (get_setting("smm_key") or "")
+                      .strip().strip("'\"")),
         "usd": _f("smm_usd_bdt", 130) or 130.0,
         "markup": _f("smm_markup", 20),
         # প্যানেলের দাম কোন মুদ্রায়: "bdt" (৳, যেমন bdsmmpanel দেখায়) বা "usd" ($)
-        "cur": (get_setting("smm_cur") or "bdt").strip().lower(),
+        "cur": (get_setting("smm_cur") or "auto").strip().lower(),
         "on": (get_setting("smm_on") or "off") == "on",
         "tiers": get_setting("smm_tiers") or SMM_TIERS_DEF,
+        # "auto" হলে প্যানেল নিজে যে মুদ্রা বলছে সেটাই ধরা হয় (USD/৳)
+        "cur_eff": "usd" if (
+            (get_setting("smm_cur") or "auto").strip().lower() == "usd"
+            or ((get_setting("smm_cur") or "auto").strip().lower() == "auto"
+                and str(get_setting("smm_bal_cur") or "").strip().upper() == "USD")
+        ) else "bdt",
     }
 
 
@@ -37505,8 +37558,22 @@ def _smm_api(params, timeout=25):
         cfg["url"], data=body,
         headers={"User-Agent": "Mozilla/5.0 (compatible; TaskEarnBot)",
                  "Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read().decode("utf-8", "replace").strip()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace").strip()
+    except urllib.error.HTTPError as e:
+        _code = int(getattr(e, "code", 0) or 0)
+        if _code in (401, 403):
+            raise RuntimeError(
+                "API Key ভুল বা মেয়াদ শেষ (401) — প্যানেলের Account/API পেজ থেকে "
+                "নতুন key কপি করে 'API Key' ঘরে আবার বসান, তারপর সেভ করুন")
+        if _code == 429:
+            raise RuntimeError("প্যানেল অনেক রিকোয়েস্ট আটকাচ্ছে (429) — ১-২ মিনিট পরে আবার চেষ্টা করুন")
+        if _code >= 500:
+            raise RuntimeError(f"প্যানেলের সার্ভারে সমস্যা (HTTP {_code}) — একটু পরে আবার চেষ্টা করুন")
+        raise RuntimeError(f"প্যানেল HTTP {_code} দিল — API URL ও Key ঠিক আছে কি না দেখুন")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"প্যানেলের সাথে যোগাযোগ হচ্ছে না — ইন্টারনেট/URL দেখুন ({str(getattr(e, 'reason', e))[:80]})")
     try:
         js = _json.loads(raw)
     except Exception:
@@ -37522,6 +37589,29 @@ def smm_panel_balance():
     if isinstance(js, dict):
         return str(js.get("balance", "")), str(js.get("currency", "USD"))
     return "", "USD"
+
+
+def smm_bal_to_taka(bal, cur=""):
+    """প্যানেলের ব্যালেন্স ৳-তে — ডলার হলে USD→৳ রেট দিয়ে গুণ।"""
+    try:
+        b = float(str(bal or 0).replace(",", "").strip() or 0)
+    except Exception:
+        b = 0.0
+    if str(cur or "").strip().upper() in ("USD", "$"):
+        try:
+            b *= float(smm_cfg().get("usd") or 130)
+        except Exception:
+            pass
+    return b
+
+
+def smm_bal_text(bal, cur=""):
+    """দেখানোর লেখা — যেমন '0.0099724 USD ≈ ৳1.24'।"""
+    _b = smm_bal_to_taka(bal, cur)
+    _c = str(cur or "").strip()
+    if _c.upper() in ("USD", "$"):
+        return f"{bal} {_c or 'USD'} ≈ ৳{_b:,.2f}"
+    return f"{bal} {_c}".strip()
 
 
 def smm_services(force=False):
@@ -37632,7 +37722,7 @@ def smm_price(rate, qty):
     """
     cfg = smm_cfg()
     base = (float(rate) / 1000.0) * int(qty)
-    if cfg.get("cur") == "usd":
+    if cfg.get("cur_eff") == "usd":
         base *= float(cfg["usd"])
     try:
         _pct = smm_markup_pct(base)
@@ -37683,11 +37773,13 @@ def smm_check_balance(notify_bot=None, force=False):
         b = 0.0
     try:
         set_setting("smm_bal_last", f"{bal}")
+        set_setting("smm_bal_taka", f"{_b_taka:.4f}")
         set_setting("smm_bal_cur", cur or "")
         set_setting("smm_bal_at", now())
     except Exception:
         pass
-    low = b < _smm_min_bal()
+    _b_taka = smm_bal_to_taka(b, cur)
+    low = _b_taka < _smm_min_bal()
     alerted = False
     if low and notify_bot is not None:
         try:
@@ -37697,8 +37789,8 @@ def smm_check_balance(notify_bot=None, force=False):
         _gap = 600 if force else 21600        # সাধারণত ৬ ঘণ্টায় একবার, অর্ডার আটকালে ১০ মিনিটে একবার
         if _time.time() - last > _gap:
             msg = (f"⚠️ *SMM প্যানেলের ব্যালেন্স কম!*\n\n"
-                   f"💳 আছে: *{bal} {cur}*\n"
-                   f"🔻 সীমা: {_smm_min_bal():g}\n\n"
+                   f"💳 আছে: *{smm_bal_text(bal, cur)}*\n"
+                   f"🔻 সীমা: ৳{_smm_min_bal():g}\n\n"
                    f"প্যানেলে টাকা যোগ করুন, নাহলে ইউজারের অর্ডার ফেল হবে।")
             for aid in _smm_admin_ids():
                 try:
@@ -37711,7 +37803,8 @@ def smm_check_balance(notify_bot=None, force=False):
                     set_setting("smm_bal_alert_at", str(_time.time()))
                 except Exception:
                     pass
-    return {"balance": bal, "currency": cur, "low": low, "alerted": alerted}
+    return {"balance": bal, "currency": cur, "taka": _b_taka,
+            "low": low, "alerted": alerted}
 
 
 async def job_smm_balance(context):
