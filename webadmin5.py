@@ -385,47 +385,8 @@ def shop_home():
            "⬜ দোকান বন্ধেও ডিপোজিট চালু (বদলাতে চাপুন)")
         + "</div></div>")
 
-    # ── বন্ধের সময় ইউজারকে যা দেখাবে (নিজের লেখা) ──
-    try:
-        import bot as _bs3
-        # খালি থাকলে বটের নিজের লেখাটাই বাক্সে দেখা যাবে — নতুন করে লিখতে হবে না
-        _mbn = esc(_bs3.closed_msg_custom("shop_closed_bn")
-                   or _bs3.closed_msg_default("shop_closed_bn"))
-        _men = esc(_bs3.closed_msg_custom("shop_closed_en")
-                   or _bs3.closed_msg_default("shop_closed_en"))
-        _dbn = esc(_bs3.closed_msg_custom("dep_closed_bn")
-                   or _bs3.closed_msg_default("dep_closed_bn"))
-        _den = esc(_bs3.closed_msg_custom("dep_closed_en")
-                   or _bs3.closed_msg_default("dep_closed_en"))
-    except Exception:
-        _mbn = _men = _dbn = _den = ""
-    msg_card = (
-        "<div class='card'><b>✍️ বন্ধের সময় ইউজারকে যা দেখাবে</b>"
-        "<div class='mut' style='font-size:12px;margin:6px 0'>"
-        "বাক্সে এখন বটের নিজের লেখাই আছে — নতুন করে লিখতে হবে না। "
-        "যেটুকু বদলাতে চান শুধু সেটুকু বদলে সেভ করুন।</div>"
-        "<form method='post' action='/admin/shop/closedmsg'>"
-        "<div class='field'><label>🛍 দোকান বন্ধ — বাংলা</label>"
-        f"<textarea name='shop_closed_bn' rows='3' style='width:100%' "
-        f"placeholder='🔒 দোকান এখন বন্ধ — অ্যাডমিন চালু করলে আবার কেনাকাটা করতে পারবেন।'>{_mbn}</textarea></div>"
-        "<div class='field'><label>🛍 Shop closed — English</label>"
-        f"<textarea name='shop_closed_en' rows='2' style='width:100%' "
-        f"placeholder='🔒 Shop is closed right now.'>{_men}</textarea></div>"
-        "<div class='field'><label>💳 ডিপোজিট বন্ধ — বাংলা</label>"
-        f"<textarea name='dep_closed_bn' rows='3' style='width:100%' "
-        f"placeholder='🔒 ডিপোজিট এখন বন্ধ — দোকান বন্ধ থাকায় ডিপোজিটও বন্ধ আছে।'>{_dbn}</textarea></div>"
-        "<div class='field'><label>💳 Deposit closed — English</label>"
-        f"<textarea name='dep_closed_en' rows='2' style='width:100%' "
-        f"placeholder='🔒 Deposit is closed right now.'>{_den}</textarea></div>"
-        "<div class='row' style='gap:8px;margin-top:8px'>"
-        "<button class='ok sm' type='submit'>💾 বার্তা সেভ করুন</button>"
-        "<button class='gray sm' type='submit' formaction='/admin/shop/closedmsg' "
-        "name='reset' value='1' "
-        "onclick=\"return confirm('সব বাক্স বটের নিজের লেখায় ফিরে যাবে?')\">"
-        "↩️ ডিফল্টে ফিরে যান</button></div>"
-        "<div class='mut' style='font-size:11px;margin-top:6px'>"
-        "সব লেখা সাধারণ টেক্সট হিসেবে যাবে — ইমোজি চলবে, *বোল্ড* মার্কডাউন চলবে না।</div>"
-        "</form></div>")
+    # ✍️ বন্ধের বার্তা এখন Settings পেজে — এখানে আর রাখা হয় না
+    msg_card = ""
 
     # ── 🎫 মেইল কোড সেটিংস (শুধু নাম + লিংক) ──
     try:
@@ -891,15 +852,11 @@ def _user_preview(cats, prods):
         prods_n = sum(1 for p in prods if int(p["category_id"] or 0) == cid)
         chips = " · ".join(f"[{esc(_plan_txt(pl, _pk))}]" for pl in mine) or "—"
         if mine:
-            # প্ল্যান থাকলে *সব* ক্যাটাগরিতেই আগে বাটন, তারপর সেই প্যাকের পণ্য
-            line = (f"প্যাক বাটন: {chips} → তারপর সেই প্যাকের পণ্য "
-                    f"({num(prods_n)}টি পণ্য)")
+            line = f"{num(prods_n)}টি পণ্য · {num(len(mine))}টি প্যাক"
         elif _pk in ("days", "mb"):
-            line = (f"এখনো প্যাক যোগ হয়নি — উপরের ফর্মে যোগ করুন, "
-                    f"তাহলে ইউজার বাটন দেখবে (পণ্য {num(prods_n)}টি)")
+            line = f"{num(prods_n)}টি পণ্য · প্যাক যোগ করুন"
         else:
-            line = (f"প্যাক নেই → সরাসরি পণ্য লিস্ট ({num(prods_n)}টি) · "
-                    "প্যাক চাইলে উপরে ধরন বেছে যোগ করুন")
+            line = f"{num(prods_n)}টি পণ্য"
         out.append(
             f"<div class='row' style='gap:6px;margin-top:6px;align-items:center'>"
             f"<a href='/admin/shop/cat/{cid}' style='text-decoration:none'>"
@@ -983,6 +940,11 @@ def _form(p=None):
         _rp = "" if _rpv <= 0 else f"{_rpv:g}"
     except Exception:
         _rp = ""
+    try:
+        _minq = max(1, int(float(p.get("min_qty") or 1)))
+    except Exception:
+        _minq = 1
+    _ask = esc(str(p.get("ask_fields") or "").replace("|", chr(10)))
     return (
         "<div class='card'><form method='post'>"
         "<div class='field'><label>পণ্যের নাম</label>"
@@ -1011,6 +973,13 @@ def _form(p=None):
         f"<textarea name='fields' rows='4' placeholder='Number\nUsername\nPassword'>{esc(str(p.get('fields') or '').replace('|', chr(10)))}</textarea>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>স্টকের প্রতিটি লাইনে যতগুলো অংশ "
         "(ট্যাব / | / কমা / স্পেস দিয়ে আলাদা), ঠিক ততগুলো নাম দিন। খালি রাখলে কপি করা লাইনই যাবে।</p></div>"
+        "<div class='field'><label>🔢 মিনিমাম কত পিস কিনতে হবে</label>"
+        f"<input name='min_qty' type='number' min='1' step='1' value='{_minq}' placeholder='1'>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>ইউজার এর কম পিস কিনতে পারবে না। খালি/১ = কোনো বাধা নেই।</p></div>"
+        "<div class='field'><label>❓ কেনার সময় ইউজারকে যা জিজ্ঞেস করবেন (প্রতি লাইনে একটি, সর্বোচ্চ ২টা)</label>"
+        f"<textarea name='ask_fields' rows='2' placeholder='তোমার Gmail ঠিকানা দাও'>{_ask}</textarea>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>টাস্কের মতো — ইউজার উত্তর না দিলে কেনা সম্পন্ন হবে না। "
+        "খালি রাখলে কিছু জিজ্ঞেস করা হবে না।</p></div>"
         "<div class='field'><label>বর্ণনা (ঐচ্ছিক)</label>"
         f"<textarea name='description' rows='3' placeholder='যেমন: ১০০% Fresh, Instant Delivery'>{desc}</textarea></div>"
         f"<label class='chk'><input type='checkbox' name='is_active' value='1'"
@@ -1053,20 +1022,31 @@ def _save(pid=0):
     _flds = [x.strip()[:24] for x in str(request.form.get("fields") or "").replace(",", "\n")
              .replace("|", "\n").replace(";", "\n").splitlines() if x.strip()][:8]
     fields = "|".join(_flds)
+    # 🔢 মিনিমাম পিস + ❓ কেনার সময়ের প্রশ্ন (সর্বোচ্চ ২টা)
+    try:
+        min_qty = max(1, int(float(str(request.form.get("min_qty") or "1").strip() or 1)))
+    except Exception:
+        min_qty = 1
+    _asks = [x.strip()[:90] for x in str(request.form.get("ask_fields") or "")
+             .replace("|", "\n").replace(";", "\n").splitlines() if x.strip()][:2]
+    ask_fields = "|".join(_asks)
     try:
         plan_id = int(request.form.get("plan_id") or 0)
     except Exception:
         plan_id = 0
     if pid:
         _x("UPDATE shop_products SET category_id=%s, name=%s, description=%s, price=%s, "
-           "deliver_type=%s, ref_pct=%s, fields=%s, plan_id=%s, is_active=%s WHERE id=%s",
-           (cid, name, desc, price, typ, ref_pct, fields, plan_id, active, pid))
+           "deliver_type=%s, ref_pct=%s, fields=%s, plan_id=%s, is_active=%s, "
+           "min_qty=%s, ask_fields=%s WHERE id=%s",
+           (cid, name, desc, price, typ, ref_pct, fields, plan_id, active,
+            min_qty, ask_fields, pid))
         return pid
     nxt = (one("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shop_products") or {}).get("n") or 1
     r = one("INSERT INTO shop_products (category_id, name, description, price, deliver_type, "
-            "ref_pct, fields, plan_id, is_active, sort_order, created_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (cid, name, desc, price, typ, ref_pct, fields, plan_id, active, int(nxt), _now()))
+            "ref_pct, fields, plan_id, is_active, min_qty, ask_fields, sort_order, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (cid, name, desc, price, typ, ref_pct, fields, plan_id, active,
+             min_qty, ask_fields, int(nxt), _now()))
     return int((r or {}).get("id") or 0)
 
 
@@ -1334,6 +1314,14 @@ def shop_order_view(oid):
                 return redirect(f"/admin/shop/order/{oid}?err=কনটেন্ট লিখুন")
             _x("UPDATE shop_orders SET status='delivered', content=%s, delivered_at=%s WHERE id=%s",
                (content[:3900], _now(), oid))
+            # 🔒 Hold থাকলে এখনই স্থায়ীভাবে কাটা (একবারই — লেজার protected)
+            try:
+                import bot as _bc
+                _ha = float(o["hold_amt"] or 0) if "hold_amt" in o.keys() else 0.0
+                if _ha > 0:
+                    _bc.shop_hold_consume(int(o["user_id"]), _ha, int(oid))
+            except Exception:
+                pass
             queue_user_msg(int(o["user_id"]),
                            f"✅ আপনার অর্ডার #{oid} ডেলিভারি হয়েছে\n\n"
                            f"🛍 {o['product_name']}\n\n{content}\n\n"
@@ -1341,8 +1329,18 @@ def shop_order_view(oid):
             log_admin("shop_deliver", oid, f"uid={o['user_id']}")
             return redirect(f"/admin/shop/order/{oid}?ok=ডেলিভারি পাঠানো হয়েছে (বট ১ মিনিটে পৌঁছে দেবে)")
         if act == "refund":
-            _x("UPDATE users SET balance=balance+%s WHERE user_id=%s",
-               (float(o["price"] or 0), int(o["user_id"])))
+            # 🔒 Hold থাকলে সেটাই ৳ ওয়ালেটে ফেরত; পুরোনো (Hold-বিহীন) অর্ডার হলে আগের নিয়মে Earn-এ
+            _ha2 = float(o["hold_amt"] or 0) if "hold_amt" in o.keys() else 0.0
+            _done = False
+            if _ha2 > 0:
+                try:
+                    import bot as _bc2
+                    _done = bool(_bc2.shop_hold_release(int(o["user_id"]), _ha2, int(oid)))
+                except Exception:
+                    _done = False
+            if not _done:
+                _x("UPDATE users SET balance=balance+%s WHERE user_id=%s",
+                   (float(o["price"] or 0), int(o["user_id"])))
             try:
                 import bot as _bcache
                 _bcache._invalidate_user_cache(int(o["user_id"]))   # ক্যাশে রিফ্রেশ
@@ -1383,4 +1381,152 @@ def shop_order_view(oid):
         + "<a class='btn gray' href='/admin/shop/orders'>🔙 অর্ডার তালিকা</a>"
     )
     return page(f"অর্ডার #{oid}", body, "shop",
+                toast=request.args.get("ok") or None, err=request.args.get("err") or None)
+
+
+# ═════════════════ 🌐 SMM প্যানেল (bdsmmpanel API v2) ═════════════════
+@wadm.route("/admin/smm", methods=["GET", "POST"])
+def admin_smm():
+    """SMM প্যানেল: API Key, USD→৳ রেট, লাভের %, চালু/বন্ধ + প্যানেল ব্যালেন্স।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    if request.method == "POST":
+        form = request.form
+        vals = {
+            "smm_url": (form.get("smm_url") or "https://bdsmmpanel.com/api/v2").strip()[:300],
+            "smm_key": (form.get("smm_key") or "").strip()[:200],
+            "smm_usd_bdt": (form.get("smm_usd_bdt") or "130").strip()[:12],
+            "smm_markup": (form.get("smm_markup") or "20").strip()[:12],
+            "smm_tiers": (form.get("smm_tiers") or "").strip()[:4000],
+            "smm_cur": "usd" if (form.get("smm_cur") or "bdt").strip().lower() == "usd" else "bdt",
+            "smm_min_bal": (form.get("smm_min_bal") or "5").strip()[:12],
+            "smm_on": "on" if (form.get("smm_on") or "") in ("on", "1", "yes") else "off",
+        }
+        try:
+            float(vals["smm_usd_bdt"])
+        except Exception:
+            vals["smm_usd_bdt"] = "130"
+        try:
+            float(vals["smm_markup"])
+        except Exception:
+            vals["smm_markup"] = "20"
+        try:                       # ধাপ-তালিকা পরিষ্কার করে সেভ (ভুল লাইন বাদ পড়ে)
+            import bot as _bt
+            _tiers = _bt.smm_tiers_parse(vals["smm_tiers"])
+            vals["smm_tiers"] = _bt.smm_tiers_str(_tiers) if _tiers else _bt.SMM_TIERS_DEF
+        except Exception:
+            vals["smm_tiers"] = ""
+        try:
+            import bot as _bs
+            for k, v in vals.items():
+                _bs.set_setting(k, v)
+        except Exception:
+            for k, v in vals.items():
+                _x("INSERT INTO settings (key,value) VALUES (%s,%s) "
+                   "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k, v))
+        log_admin("smm_save", 0, "saved")
+        return redirect("/admin/smm?ok=" + _q("🌐 SMM সেটিংস সেভ হয়েছে"))
+
+    try:
+        import bot as _bs2
+        cfg = _bs2.smm_cfg()
+    except Exception:
+        cfg = {"url": "https://bdsmmpanel.com/api/v2", "key": "", "usd": 130,
+               "markup": 20, "cur": "bdt", "on": False}
+    bal_txt, bal_err, n_svc = "—", "", 0
+    _last_bal, _last_at = "—", "—"
+    try:
+        _r_lb = one("SELECT value FROM settings WHERE key='smm_bal_last'") or {}
+        _r_la = one("SELECT value FROM settings WHERE key='smm_bal_at'") or {}
+        _r_lc = one("SELECT value FROM settings WHERE key='smm_bal_cur'") or {}
+        if str(_r_lb.get("value") or "").strip():
+            _last_bal = str(_r_lb.get("value")) + " " + str(_r_lc.get("value") or "")
+        _last_at = str(_r_la.get("value") or "—")
+    except Exception:
+        pass
+    _minb = 5.0
+    try:
+        import bot as _bs5
+        _minb = _bs5._smm_min_bal()
+    except Exception:
+        pass
+    try:
+        if request.args.get("chk") and cfg.get("key"):
+            import bot as _bs6
+            _res = _bs6.smm_check_balance(None)
+            if _res:
+                bal_txt = f"{_res.get('balance')} {_res.get('currency')}"
+                _last_bal, _last_at = bal_txt, __import__("time").strftime("%Y-%m-%d %H:%M")
+    except Exception as _ce:
+        bal_err = str(_ce)[:150]
+    if cfg.get("key"):
+        try:
+            import bot as _bs3
+            _b, _cur = _bs3.smm_panel_balance()
+            bal_txt = f"{_b} {_cur}"
+        except Exception as e:
+            bal_err = str(e)[:160]
+        try:
+            import bot as _bs4
+            n_svc = len(_bs4.smm_services())
+        except Exception:
+            n_svc = 0
+    _on = bool(cfg.get("on"))
+    _tiers_txt = ""
+    try:
+        import bot as _bt2
+        _tiers_txt = "\n".join(f"{lo:g}-{hi:g} = {pct:g}"
+                               for lo, hi, pct in _bt2.smm_tiers())
+    except Exception:
+        _tiers_txt = "1-3 = 100\n4-6 = 50\n7-10 = 40\n10-50 = 30\n50-80 = 40\n80-100 = 30\n100-120 = 25\n120-150 = 20"
+    body = (
+        "<div class='card'><h3>" + icon("globe") + " 🌐 SMM প্যানেল</h3>"
+        "<div class='mut' style='font-size:12px;margin-bottom:10px'>"
+        "bdsmmpanel-এর API v2 দিয়ে ইউজার বট থেকেই সার্ভিস কিনবে। "
+        "দাম = প্যানেলের rate × পরিমাণ, তারপর অর্ডারের অঙ্ক অনুযায়ী নিচের তালিকা থেকে "
+        "লাভের % যোগ হয় (যেমন ২৳ অর্ডারে ১০০% → দ্বিগুণ দাম)।</div>"
+        + ("<div class='note ok'>✅ SMM চালু — ইউজার দোকানে '🌐 SMM প্যানেল' বাটন দেখছে।</div>"
+           if _on else
+           "<div class='note warn'>⏸ SMM বন্ধ — বাটন ইউজার দেখছে না।</div>")
+        + "<div class='tbl-wrap' style='margin:10px 0'><table><tbody>"
+        + f"<tr><th>প্যানেলে আপনার ব্যালেন্স</th><td><b>{esc(_last_bal)}</b></td></tr>"
+        + f"<tr><th>সর্বশেষ চেক</th><td>{esc(_last_at)}</td></tr>"
+        + f"<tr><th>কম-ব্যালেন্স সীমা</th><td>{esc(str(_minb))} (নিচে নামলে অ্যাডমিনকে অ্যালার্ট)</td></tr>"
+        + f"<tr><th>সার্ভিস সংখ্যা</th><td>{num(n_svc)}</td></tr>"
+        + "</tbody></table></div>"
+        + "<a class='btn gray sm' href='/admin/smm?chk=1'>🔄 এখনই ব্যালেন্স চেক করুন</a>"
+        + (f"<div class='note warn'>⚠️ {esc(bal_err)}</div>" if bal_err else "")
+        + "</div>"
+        "<div class='card'><h3>⚙️ সেটিংস</h3>"
+        "<form method='post'>"
+        "<div class='field'><label>API URL</label>"
+        f"<input name='smm_url' value='{esc(cfg.get('url') or '')}'></div>"
+        "<div class='field'><label>API Key <span class='mut'>(প্যানেলের Account পেজ থেকে)</span></label>"
+        f"<input name='smm_key' value='{esc(cfg.get('key') or '')}' placeholder='আপনার API key'></div>"
+        "<div class='field'><label>প্যানেলের দাম কোন মুদ্রায়?</label>"
+        "<select name='smm_cur'>"
+        + ("<option value='bdt'" + (" selected" if (cfg.get("cur") or "bdt") != "usd" else "")
+           + ">৳ টাকা (bdsmmpanel-এর মতো)</option>")
+        + ("<option value='usd'" + (" selected" if (cfg.get("cur") or "bdt") == "usd" else "")
+           + ">ডলার ($)</option>")
+        + "</select></div>"
+        "<div class='field'><label>USD → ৳ রেট <span class='mut'>(শুধু ডলার হলে)</span></label>"
+        f"<input name='smm_usd_bdt' value='{esc(str(cfg.get('usd')))}' placeholder='130'></div>"
+        "<div class='field'><label>ধাপ অনুযায়ী লাভের % "
+        "<span class='mut'>(কোন অঙ্কে কত % লাভ — প্রতি লাইনে একটা, যেমন "
+        "<code>1-3 = 100</code>; লাইন যোগ/বাদ দিয়ে এডিট করুন)</span></label>"
+        f"<textarea name='smm_tiers' rows='9' style='width:100%' "
+        f"placeholder='1-3 = 100&#10;4-6 = 50'>{esc(_tiers_txt)}</textarea></div>"
+        "<div class='field'><label>ডিফল্ট লাভের % "
+        "<span class='mut'>(ধাপ-তালিকা খালি/ভুল হলে এটাই ব্যবহার হবে)</span></label>"
+        f"<input name='smm_markup' value='{esc(str(cfg.get('markup')))}' placeholder='20'></div>"
+        + "<div class='field'><label>কম-ব্যালেন্স সীমা <span class='mut'>(এর নিচে নামলে টেলিগ্রামে অ্যালার্ট)</span></label>"
+        + f"<input name='smm_min_bal' value='{esc(str(_minb))}' placeholder='5'></div>"
+        "<div class='field'><label><input type='checkbox' name='smm_on' value='on'"
+        + (" checked" if _on else "") + "> SMM প্যানেল চালু</label></div>"
+        "<button class='ok' type='submit'>💾 সেভ করুন</button></form></div>"
+    )
+    return page("SMM প্যানেল", body, "smm",
                 toast=request.args.get("ok") or None, err=request.args.get("err") or None)

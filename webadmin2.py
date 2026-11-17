@@ -916,6 +916,11 @@ def mail_setup():
         "<p class='mut' style='font-size:12px;line-height:1.7'>"
         "Binance টাকা পেলেই মেইল পাঠায় — বট সেই মেইল পড়ে টাকা যোগ করে। "
         "এতে Binance API একটাও ডাকা হয় না, তাই <b>IP ব্যান/রেট-লিমিট হবে না</b>।"
+        "</p>"
+        "<p class='mut' style='font-size:12px;line-height:1.7'>"
+        "⚠️ মেইলের <b>সাবজেক্টে</b> কী লেখা আছে সেটা দেখা হয় না — শুধু নিচের "
+        "<b>প্রেরকের ঠিকানা</b> থেকে আসা এবং <b>“টাকা এসেছে / incoming transfer”</b> "
+        "ধরনের মেইল হলেই টাকা যোগ হয়। টাকা পাঠানো বা উত্তোলনের মেইল কখনো গোনা হয় না।"
         "</p></div>"
     )
     _card = (
@@ -944,19 +949,51 @@ def mail_setup():
         f"<input name='mail_win_min' "
         f"value='{esc(v.get('mail_win_min') or '3')}' inputmode='numeric'></div>"
         "<div class='form'><label>অটো-চেক</label><select name='dep_mail_on'>"
-        f"<option value='1' {'selected' if _on else ''}>চালু (প্রতি ৬০ সেকেন্ডে মেইল পড়বে)</option>"
+        f"<option value='1' {'selected' if _on else ''}>চালু (IDLE — নতুন মেইল সাথে সাথে, একই কানেকশন)</option>"
         f"<option value='0' {'selected' if not _on else ''}>বন্ধ</option>"
         "</select></div>"
         "<button type='submit'>💾 সেভ করুন</button></form></div>"
     )
+    # 📬 নতুন Persistent IMAP + IDLE engine-এর অবস্থা
+    _ms = {}
+    try:
+        import bot as _b2
+        _ms = dict(getattr(_b2, "_MAIL_STAT", {}) or {})
+    except Exception:
+        _ms = {}
+
+    def _ago(ts):
+        try:
+            ts = float(ts or 0)
+        except Exception:
+            ts = 0.0
+        if ts <= 0:
+            return "এখনো হয়নি"
+        d = int(time.time() - ts)
+        if d < 60:
+            return f"{d}s আগে"
+        if d < 3600:
+            return f"{d // 60} মিনিট আগে"
+        return f"{d // 3600} ঘণ্টা আগে"
+
+    _conn_txt = ("✅ যুক্ত আছে" if _ms.get("connected") else "❌ যুক্ত নেই")
+    if _ms.get("connected"):
+        _conn_txt += f" ({_ago(_ms.get('conn_at'))} থেকে)"
+    _idle_txt = ("🟢 IDLE চলছে (নতুন মেইলের অপেক্ষা)" if _ms.get("idle")
+                 else f"⚪ IDLE নেই — মোড: {esc(str(_ms.get('mode') or '—'))}")
     _status = (
         "<div class='card'><h3>অবস্থা</h3>"
         f"<p>• সেটআপ: {'✅ ঠিক আছে' if (_has and _on) else ('⚠️ নাম/পাসওয়ার্ড নেই' if not _has else '⏸ বন্ধ আছে')}</p>"
+        f"<p>• <b>Connection Status:</b> {_conn_txt}</p>"
+        f"<p>• <b>IMAP IDLE:</b> {_idle_txt}</p>"
+        f"<p>• <b>Last Email Received:</b> {_ago(_ms.get('last_email_at'))}</p>"
+        f"<p>• <b>Last Deposit Checked:</b> {_ago(_ms.get('last_check_at') or _st.get('at'))}</p>"
+        f"<p>• <b>Total Emails Processed:</b> {int(_ms.get('processed') or 0)}</p>"
+        f"<p>• <b>Reconnect:</b> {int(_ms.get('reconnects') or 0)} বার"
+        + (f" · শেষ এরর: <span class='mono'>{esc(str(_ms.get('err'))[:140])}</span>"
+           if _ms.get("err") else "") + "</p>"
         + (f"<p>• শেষ চেক: {int(time.time() - float(_st.get('at') or 0))}s আগে · "
-           f"{int(_st.get('n') or 0)} টি Binance মেইল</p>" if _st.get("at") else
-           "<p>• শেষ চেক: এখনো হয়নি</p>")
-        + (f"<p>• শেষ এরর: <span class='mono'>{esc(str(_st.get('err'))[:160])}</span></p>"
-           if _st.get("err") else "")
+           f"{int(_st.get('n') or 0)} টি Binance মেইল</p>" if _st.get("at") else "")
         + "<form method='post' action='/admin/do/mail/test' style='margin-top:8px'>"
         "<button class='btn gray' type='submit'>🔎 সংযোগ টেস্ট করুন</button></form>"
         "<p class='mut' style='font-size:11px;margin-top:8px'>"

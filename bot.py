@@ -161,7 +161,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-14b60"
+BUILD_TAG       = "uid-auto-2026-11-17b84"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -368,7 +368,7 @@ MSGS = {
         'pf_rejected': "❌ Rejected:",
         'pf_earned': "💵 Total earned:",
         'pf_withdrawn': "📤 Withdrawn:",
-        'pf_available': "✅ Available:",
+        'pf_available': "✅ Available (Earn):",
         'pf_on_hold': "🔒 On hold:",
         'balance_title': "💰 *BALANCE*",
         'balance_greet': "✅ *আসসালামু আলাইকুম ভাই/আপু*",
@@ -469,7 +469,7 @@ MSGS = {
         'pf_rejected': "❌ Rejected:",
         'pf_earned': "💵 Total earned:",
         'pf_withdrawn': "📤 Withdrawn:",
-        'pf_available': "✅ Available:",
+        'pf_available': "✅ Available (Earn):",
         'pf_on_hold': "🔒 On hold:",
         'balance_title': "💰 *BALANCE*",
         'balance_greet': "✅ *Hello! Welcome back.*",
@@ -1972,6 +1972,7 @@ class _SafeDDL:
 # "column ... does not exist" এরর আসে।
 _USERS_COLUMN_SQL = (
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS verified INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS hold_balance REAL DEFAULT 0",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_at TEXT DEFAULT ''",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS reg_ip TEXT DEFAULT ''",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_ip TEXT DEFAULT ''",
@@ -3276,6 +3277,28 @@ async def _vrf_after_web_verify(uid, bot=None):
 
 
 
+def _seed_req_channels_once():
+    """ডিফল্ট চ্যানেল তিনটা শুধু *প্রথমবারই* বসায়।
+
+    মালিক প্যানেল থেকে সব চ্যানেল মুছে দিলে রিস্টার্টে আর ফিরে আসে না।
+    """
+    try:
+        with _c() as c:
+            _sd = c.execute("SELECT value FROM settings WHERE key='req_ch_seeded'").fetchone()
+            _r = c.execute("SELECT COUNT(*) AS n FROM required_channels").fetchone()
+            _n = int((_r or {}).get("n") or 0)
+            if _n == 0 and not _sd:
+                for ch in REQUIRED_CHANNELS:
+                    c.execute("INSERT INTO required_channels (ch_id, ch_link, ch_name) "
+                              "VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                              (ch["id"], ch["link"], ch["name"]))
+            if not _sd:
+                c.execute("INSERT INTO settings (key,value) VALUES ('req_ch_seeded','1') "
+                          "ON CONFLICT (key) DO UPDATE SET value='1'")
+    except Exception as _e:
+        log.debug(f"[CH-SEED] {_e}")
+
+
 def init_db():
     with _c() as c:
         # soft মোড: এক statement fail করলেও বাকি টেবিল/কলাম তৈরি চলবে
@@ -3718,14 +3741,7 @@ def init_db():
                 "ON CONFLICT (key) DO NOTHING",
                 (key, bn, en)
             )
-        # ── Default required channels ─────────────────────────────
-        existing = _count(c.execute("SELECT COUNT(*) FROM required_channels").fetchone())
-        if existing == 0:
-            for ch in REQUIRED_CHANNELS:
-                c.execute(
-                    "INSERT INTO required_channels (ch_id, ch_link, ch_name) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
-                    (ch["id"], ch["link"], ch["name"])
-                )
+        # ── Default required channels ডিফল্ট সিডিং নিচে আলাদা ফাংশনে ──
         # gmail/withdraw channel ids
         if not c.execute("SELECT value FROM settings WHERE key='gmail_ch_id'").fetchone():
             c.execute("INSERT INTO settings (key,value) VALUES ('gmail_ch_id',%s) ON CONFLICT DO NOTHING", (str(GMAIL_CH_ID),))
@@ -3821,6 +3837,7 @@ def init_db():
         except Exception as _dce:
             log.warning(f"[DEP] 5min migration ব্যর্থ: {_dce}")
         log.info("✅ PostgreSQL schema ready.")
+    _seed_req_channels_once()
 
 
 def now(): return datetime.now(pytz.timezone("Asia/Dhaka")).strftime("%Y-%m-%d %H:%M")
@@ -4337,6 +4354,138 @@ def safe_ded_dep(uid, amt):
     return True
 
 
+def get_hold_balance(uid):
+    """🕒 Hold-এ আটকে থাকা টাকা (৳) — ডেলিভারির পর স্থায়ীভাবে কাটা হবে।"""
+    try:
+        with _c() as c:
+            r = c.execute("SELECT COALESCE(hold_balance,0) AS h FROM users WHERE user_id=%s",
+                          (uid,)).fetchone()
+        return round(float((r or {}).get("h") or 0), 4)
+    except Exception:
+        return 0.0
+
+
+def _hold_tx_add(oid, uid, amount, kind):
+    """একটা অর্ডারের জন্য একবারই hold/release/consume — ডুপ্লিকেট আটকায়।"""
+    try:
+        with _c() as c:
+            c.execute("INSERT INTO shop_hold_tx (order_id, user_id, amount, kind, created_at) "
+                      "VALUES (%s,%s,%s,%s,%s)", (int(oid), int(uid), float(amount or 0),
+                                                  str(kind), now()))
+        return True
+    except Exception:
+        return False          # unique (order_id, kind) → আগেই হয়েছে
+
+
+def shop_hold_place(uid, amt, oid=0):
+    """৳ ওয়ালেট থেকে Hold-এ নাও (কাটা নয়) — যথেষ্ট না হলে False।"""
+    try:
+        amt = round(float(amt or 0), 4)
+    except Exception:
+        amt = 0.0
+    if amt <= 0:
+        return True
+    if oid and not _hold_tx_add(oid, uid, amt, "hold"):
+        return True                     # এই অর্ডারের hold আগেই হয়েছে
+    with _c() as c:
+        cur = c.execute(
+            "UPDATE users SET dep_balance=COALESCE(dep_balance,0)-%s, "
+            "hold_balance=COALESCE(hold_balance,0)+%s "
+            "WHERE user_id=%s AND COALESCE(dep_balance,0) >= %s", (amt, amt, uid, amt))
+        if cur.rowcount == 0:
+            try:
+                c.execute("DELETE FROM shop_hold_tx WHERE order_id=%s AND kind='hold' "
+                          "AND user_id=%s", (int(oid or 0), int(uid)))
+            except Exception:
+                pass
+            return False
+    _invalidate_user_cache(uid)
+    _mark_dirty()
+    return True
+
+
+def shop_hold_release(uid, amt, oid=0):
+    """Hold থেকে টাকা আবার ৳ ওয়ালেটে ফেরত — একবারই।"""
+    try:
+        amt = round(float(amt or 0), 4)
+    except Exception:
+        amt = 0.0
+    if amt <= 0:
+        return True
+    if oid and not _hold_tx_add(oid, uid, amt, "release"):
+        return True                     # আগেই ফেরত গেছে
+    with _c() as c:
+        cur = c.execute(
+            "UPDATE users SET hold_balance=COALESCE(hold_balance,0)-%s, "
+            "dep_balance=COALESCE(dep_balance,0)+%s "
+            "WHERE user_id=%s AND COALESCE(hold_balance,0) >= %s", (amt, amt, uid, amt))
+        if cur.rowcount == 0:
+            try:
+                c.execute("DELETE FROM shop_hold_tx WHERE order_id=%s AND kind='release' "
+                          "AND user_id=%s", (int(oid or 0), int(uid)))
+            except Exception:
+                pass
+            return False
+    _invalidate_user_cache(uid)
+    _mark_dirty()
+    return True
+
+
+def shop_hold_consume(uid, amt, oid=0):
+    """ডেলিভারি সম্পন্ন — Hold টাকা স্থায়ীভাবে কেটে নাও। একবারই।"""
+    try:
+        amt = round(float(amt or 0), 4)
+    except Exception:
+        amt = 0.0
+    if amt <= 0:
+        return True
+    if oid and not _hold_tx_add(oid, uid, amt, "consume"):
+        return True                     # আগেই কাটা হয়েছে
+    with _c() as c:
+        cur = c.execute(
+            "UPDATE users SET hold_balance=COALESCE(hold_balance,0)-%s "
+            "WHERE user_id=%s AND COALESCE(hold_balance,0) >= %s", (amt, uid, amt))
+        if cur.rowcount == 0:
+            try:
+                c.execute("DELETE FROM shop_hold_tx WHERE order_id=%s AND kind='consume' "
+                          "AND user_id=%s", (int(oid or 0), int(uid)))
+            except Exception:
+                pass
+            return False
+    _invalidate_user_cache(uid)
+    _mark_dirty()
+    return True
+
+
+def shop_order_hold_set(oid, amt, state, add_tx=False):
+    try:
+        with _c() as c:
+            row = c.execute("SELECT user_id, hold_amt, hold_state FROM shop_orders WHERE id=%s",
+                            (int(oid),)).fetchone()
+            if not row:
+                return
+            _u = int(row.get("user_id") or 0)
+            _old = str(row.get("hold_state") or "")
+            if state == "held":
+                c.execute("UPDATE shop_orders SET hold_amt=%s, hold_state='held' WHERE id=%s",
+                          (round(float(amt or 0), 4), int(oid)))
+            elif state == "consumed":
+                if _old == "held":
+                    c.execute("UPDATE shop_orders SET hold_state='consumed' WHERE id=%s",
+                              (int(oid),))
+            elif state == "released":
+                if _old == "held":
+                    c.execute("UPDATE shop_orders SET hold_state='released' WHERE id=%s",
+                              (int(oid),))
+        if state == "held":
+            try:
+                _hold_tx_add(int(oid), int(row.get("user_id") or 0), amt, "hold")
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning(f"[SHOP-HOLD] #{oid} স্টেট সেভ ব্যর্থ: {e}")
+
+
 def wd_rate():
     """Withdraw-র রেট — ১ USDT = কত ৳ (Settings → wd_rate, ডিফল্ট ১৩০)।"""
     try:
@@ -4346,7 +4495,7 @@ def wd_rate():
     return r if r > 0 else 130.0
 
 
-def wd_split(uid, amt):
+def wd_split(uid, amt, src="earn"):
     """(earn_used$, dep_taka_used, cut$, rate) — withdraw-এ টাকা কোথা থেকে যাবে।
 
     ১) আগে earn ($) থেকে, ২) বাকিটা ডিপোজিট ওয়ালেট (৳) থেকে রেটে ভাগ করে,
@@ -4367,25 +4516,98 @@ def wd_split(uid, amt):
         dep_tk = 0.0
     if amt <= 0:
         return 0.0, 0.0, 0.0, rate
-    e_used = round(min(amt, max(earn, 0)), 4)
-    rest_usd = round(amt - e_used, 4)
-    d_tk = round(min(dep_tk, rest_usd * rate), 2) if rest_usd > 0 else 0.0
-    d_usd = round(d_tk / rate, 4) if rate > 0 else 0.0
-    cut = round(d_usd * DEP_WD_CUT_PCT, 4)
-    return e_used, d_tk, cut, rate
+    if str(src) == "dep":
+        # 💳 পুরোটাই ডিপোজিট ওয়ালেট (টাকা) থেকে — রেটে ভাঙা, ১৫% কাটা
+        d_tk = round(min(max(dep_tk, 0), amt * rate), 2)
+        d_usd = round(d_tk / rate, 4) if rate > 0 else 0.0
+        return 0.0, d_tk, round(d_usd * DEP_WD_CUT_PCT, 4), rate
+    # 🪙 Earn ($) থেকে — শুধু normal withdraw ফি, কোনো ১৫% নেই
+    return round(min(amt, max(earn, 0)), 4), 0.0, 0.0, rate
 
 
-def wd_available(uid):
-    """Withdraw করা যাবে মোট কত $ (earn + ডিপোজিট টাকা রেটে ভাঙা)।"""
+def wd_available(uid, src="earn"):
+    """ওই ওয়ালেট থেকে কত $ তোলা যাবে।"""
+    try:
+        if str(src) == "dep":
+            dep_tk = float(get_dep_balance(uid) or 0)
+            return round(max(dep_tk, 0) / wd_rate(), 4)
+        return round(max(float(get_bal(uid) or 0), 0), 4)
+    except Exception:
+        return 0.0
+
+
+def wd_src_text(uid, lang, fee, min_w, kb_cls=None):
+    """Withdraw — কোন ওয়ালেটের টাকা তুলবে বেছে নেওয়ার স্ক্রিন (bn/en)।"""
     try:
         earn = float(get_bal(uid) or 0)
     except Exception:
         earn = 0.0
     try:
-        dep_tk = float(get_dep_balance(uid) or 0)
+        dep = float(get_dep_balance(uid) or 0)
     except Exception:
-        dep_tk = 0.0
-    return round(max(earn, 0) + (dep_tk / wd_rate()), 4)
+        dep = 0.0
+    rate = wd_rate()
+    dep_usd = round(dep / rate, 4) if rate > 0 else 0.0
+    if lang == 'en':
+        txt = (
+            "💸 *WITHDRAW — choose your wallet*\n\n"
+            f"🪙 *Earn balance:* `{earn:g}$` (≈ ${earn:g})\n\n"
+            f"💳 *Deposit balance:* `{taka_txt(dep)}` (≈ ${dep_usd:g})\n"
+            f"   • 15% cut on the deposit part + withdraw fee `${fee:g}`.\n\n"
+            f"⚠️ Minimum withdrawal: `{min_w}$`\n"
+            "Which wallet do you want to withdraw from?"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🪙 From Earn", callback_data="wd_src_earn")],
+            [InlineKeyboardButton("💳 From Deposit", callback_data="wd_src_dep")],
+        ])
+    else:
+        txt = (
+            "💸 *WITHDRAW — কোন ওয়ালেট থেকে নেবেন?*\n\n"
+            f"🪙 *Earn ব্যালেন্স:* `{earn:g}$` (≈ ${earn:g})\n\n"
+            f"💳 *ডিপোজিট ব্যালেন্স:* `{taka_txt(dep)}` (≈ ${dep_usd:g})\n"
+            f"   • ডিপোজিটের অংশে ১৫% কাটা হবে + withdraw ফি `${fee:g}`।\n\n"
+            f"⚠️ মিনিমাম withdraw: `{min_w}$`\n"
+            "কোন ওয়ালেটের টাকা withdraw করবেন?"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🪙 Earn থেকে", callback_data="wd_src_earn")],
+            [InlineKeyboardButton("💳 ডিপোজিট থেকে", callback_data="wd_src_dep")],
+        ])
+    return txt, kb
+
+
+def wd_amt_prompt_text(uid, lang, fee, min_w, src):
+    """কত ডলার — কোন ওয়ালেট, কত আছে সাথে দেখায়।"""
+    rate = wd_rate()
+    src = "dep" if str(src) == "dep" else "earn"
+    try:
+        earn = float(get_bal(uid) or 0)
+    except Exception:
+        earn = 0.0
+    try:
+        dep = float(get_dep_balance(uid) or 0)
+    except Exception:
+        dep = 0.0
+    avail = round((dep / rate) if src == "dep" else earn, 4)
+    if lang == 'en':
+        head = ("💳 *From: Deposit balance*" if src == "dep"
+                else "🪙 *From: Earn balance*")
+        extra = ("\n_15% cut will be taken from the deposit part._"
+                 if src == "dep" else "")
+        return (f"{head}\n"
+                f"💰 Available: `${avail:g}`\n"
+                f"⚠️ Minimum: `{min_w}$`\n"
+                f"📉 Withdraw fee: `${fee:g}`{extra}\n\n"
+                "💵 How much do you want to withdraw? (numbers only, e.g. `1`)")
+    head = ("💳 *কোথা থেকে: ডিপোজিট ব্যালেন্স*" if src == "dep"
+            else "🪙 *কোথা থেকে: Earn ব্যালেন্স*")
+    extra = ("\n_ডিপোজিটের অংশে ১৫% কাটা হবে।_" if src == "dep" else "")
+    return (f"{head}\n"
+            f"💰 আছে: `${avail:g}`\n"
+            f"⚠️ মিনিমাম: `{min_w}$`\n"
+            f"📉 withdraw ফি: `${fee:g}`{extra}\n\n"
+            "💵 কত ডলার নিতে চান? (শুধু সংখ্যা, যেমন `1`)")
 
 
 def wd_dep_split(uid, amt):
@@ -5237,6 +5459,59 @@ def _norm_ch_id(v):
     return x
 
 
+_CH_LINK_RE = _re.compile(r"^https?://[A-Za-z0-9.\-]+\.[A-Za-z]{2,}(/.*)?$")
+
+
+def _ch_public_link(ch_id, ch_link=""):
+    """চ্যানেলের পাবলিক লিংক — বাটনে বসালে Telegram কখনো ভুল বলে না।
+
+    অ্যাডমিন শুধু `@name` বা `t.me/name` দিলেও ঠিক `https://t.me/name` হয় —
+    আগে `https://@name` হয়ে যেত, তাই বাটন বানাতেই বট ক্র্যাশ করত।
+    না পেলে খালি স্ট্রিং (তখন বাটনটাই বাদ যায়, ক্র্যাশ নয়)।
+    """
+    _raw = str(ch_link or "").strip()
+    _cid = _norm_ch_id(ch_id) if ch_id is not None else ""
+    _x = _raw
+    for _p in ("https://", "http://"):
+        if _x.lower().startswith(_p):
+            _x = _x[len(_p):]
+    _x = _x.strip().strip("/")
+    if _x.lower().startswith("@"):
+        _x = "t.me/" + _x[1:]
+    if _x.lower().startswith("t.me/") or _x.lower().startswith("telegram.me/"):
+        _u = "https://" + _x
+    elif _x and "." in _x and " " not in _x and not _x.lower().startswith(("t.me", "telegram")):
+        _u = "https://" + _x          # অন্য সাইটের লিংক (যেমন youtube) — যেমন আছে
+    else:
+        _u = ""
+    if _CH_LINK_RE.match(_u):
+        return _u
+    # লিংক কাজের না → ch_id থেকেই বানাই
+    if _cid.startswith("@"):
+        _u = "https://t.me/" + _cid[1:]
+        return _u if _CH_LINK_RE.match(_u) else ""
+    if _cid.lstrip("-").isdigit():
+        _d = _cid.lstrip("-")
+        if _d.startswith("100") and len(_d) > 5:
+            _u = "https://t.me/c/" + _d[3:]
+            return _u if _CH_LINK_RE.match(_u) else ""
+    return ""
+
+
+def button_safe_url(u):
+    """Telegram-এ পাঠানোর আগে লিংক যাচাই — ভুল হলে None (বাটন বাদ)।"""
+    _u = str(u or "").strip()
+    return _u if _CH_LINK_RE.match(_u) else None
+
+
+def _ch_btn(ch_name, ch_id="", ch_link=""):
+    """চ্যানেলের জয়েন-বাটন — লিংক ভুল হলে None ফেরে (ক্র্যাশ নয়)।"""
+    _u = button_safe_url(_ch_public_link(ch_id, ch_link))
+    if not _u:
+        return None
+    return InlineKeyboardButton(str(ch_name or ch_id or "Channel"), url=_u)
+
+
 def _req_ch_dedupe():
     """একবারের মাইগ্রেশন — পুরোনো ভুল ফরম্যাট ঠিক + ডুপ্লিকেট এক + unique index।
 
@@ -5269,6 +5544,19 @@ def _req_ch_dedupe():
                                   (_new, _rid))
     except Exception as e:
         log.warning(f"[CH-DEDUPE] ch_id ঠিক করা যায়নি: {e}")
+    # ১খ) ভুল লিংক (যেমন `https://@name`) ঠিক করা
+    try:
+        with _c() as c:
+            rows = c.execute("SELECT id, ch_id, ch_link FROM required_channels").fetchall()
+        for r in rows or []:
+            _good = _ch_public_link(r["ch_id"], r["ch_link"])
+            if _good != str(r["ch_link"] or ""):
+                with _c() as c:
+                    c.execute("UPDATE required_channels SET ch_link=%s WHERE id=%s",
+                              (_good, int(r["id"])))
+    except Exception as e:
+        log.debug(f"[CH-DEDUPE] লিংক ঠিক করা যায়নি: {e}")
+
     # ২) এখন একই ch_id একাধিক থাকলে সবচেয়ে পুরোনোটা রাখো
     try:
         with _c() as c:
@@ -5302,9 +5590,8 @@ def add_req_channel(ch_id, ch_link, ch_name):
     cid = _norm_ch_id(ch_id)
     if not cid:
         return
-    link = (ch_link or "").strip() or f"https://t.me/{cid.lstrip('@')}"
-    if link and not link.lower().startswith(("http://", "https://")):
-        link = "https://" + link.lstrip("/")
+    link = _ch_public_link(cid, ch_link) or (
+        f"https://t.me/{cid.lstrip('@')}" if cid.startswith("@") else "")
     name = (ch_name or "").strip() or cid
     with _c() as c:
         r = c.execute("SELECT id FROM required_channels WHERE lower(ch_id)=lower(%s) "
@@ -6508,6 +6795,24 @@ def _shop_money(v):
 
 def _shop_ddl():
     with _c() as c:
+        try:
+            c.execute("""CREATE TABLE IF NOT EXISTS smm_orders (
+                id           BIGSERIAL PRIMARY KEY,
+                user_id      BIGINT DEFAULT 0,
+                service_id   BIGINT DEFAULT 0,
+                service_name TEXT DEFAULT '',
+                link         TEXT DEFAULT '',
+                qty          INTEGER DEFAULT 0,
+                price        REAL DEFAULT 0,
+                charge_usd   TEXT DEFAULT '',
+                api_id       TEXT DEFAULT '',
+                status       TEXT DEFAULT 'new',
+                created_at   TEXT DEFAULT '',
+                updated_at   TEXT DEFAULT ''
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS smm_orders_user ON smm_orders (user_id, id)")
+        except Exception as _se:
+            log.warning(f"[SMM] DDL ব্যর্থ: {_se}")
         for _q in (
             """CREATE TABLE IF NOT EXISTS shop_categories (
                 id         BIGSERIAL PRIMARY KEY,
@@ -6564,6 +6869,20 @@ def _shop_ddl():
             "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS deliver_type TEXT DEFAULT 'auto'",
             "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS ref_pct REAL DEFAULT -1",
             "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS fields TEXT DEFAULT ''",
+            "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS min_qty INTEGER DEFAULT 1",
+            "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS ask_fields TEXT DEFAULT ''",
+            "ALTER TABLE shop_orders ADD COLUMN IF NOT EXISTS buyer_note TEXT DEFAULT ''",
+            "ALTER TABLE shop_orders ADD COLUMN IF NOT EXISTS hold_amt REAL DEFAULT 0",
+            "ALTER TABLE shop_orders ADD COLUMN IF NOT EXISTS hold_state TEXT DEFAULT ''",
+            """CREATE TABLE IF NOT EXISTS shop_hold_tx (
+                id         BIGSERIAL PRIMARY KEY,
+                order_id   BIGINT NOT NULL,
+                user_id    BIGINT DEFAULT 0,
+                amount     REAL DEFAULT 0,
+                kind       TEXT NOT NULL,
+                created_at TEXT DEFAULT ''
+            )""",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_shop_hold_tx ON shop_hold_tx (order_id, kind)",
             "ALTER TABLE shop_categories ADD COLUMN IF NOT EXISTS plan_kind TEXT DEFAULT ''",
             "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS plan_id BIGINT DEFAULT 0",
         ):
@@ -6830,6 +7149,35 @@ def shop_product_set_fields(pid, text):
     return parts[:_SHOP_FIELD_MAX]
 
 
+_SHOP_ASK_MAX = 2
+
+
+def shop_product_min_qty(p):
+    """এই পণ্যে সর্বনিম্ন কত পিস কিনতে হবে (ডিফল্ট ১)।"""
+    try:
+        keys = p.keys() if hasattr(p, "keys") else []
+        if "min_qty" not in keys:
+            return 1
+        return max(1, int(float(p["min_qty"] or 1)))
+    except Exception:
+        return 1
+
+
+def shop_product_ask(p):
+    """কেনার সময় ইউজারকে যে প্রশ্নগুলো করা হবে (সর্বোচ্চ ২টা)।"""
+    try:
+        keys = p.keys() if hasattr(p, "keys") else []
+        if "ask_fields" not in keys:
+            return []
+        raw = str(p["ask_fields"] or "").strip()
+    except Exception:
+        return []
+    if not raw:
+        return []
+    out = [x.strip()[:90] for x in re.split(r"[\n|;]+", raw) if x.strip()]
+    return out[:_SHOP_ASK_MAX]
+
+
 def _shop_split_item(line):
     """স্টকের এক লাইনকে ফিল্ডে ভাগ করে — ট্যাব / | / , / ২+ স্পেস / স্পেস।"""
     sline = str(line or "").strip()
@@ -7066,16 +7414,16 @@ def shop_release_stock(sid):
         pass
 
 
-def shop_order_new(uid, p, content, status, price=None):
+def shop_order_new(uid, p, content, status, price=None, note=""):
     """price না দিলে পণ্যের একক দাম, দিলে ওটাই (কয়েকটা কিনলে মোট দাম)।"""
     amt = float(p["price"] or 0) if price is None else float(price or 0)
     oid = 0
     with _c() as c:
         cur = c.execute(
             "INSERT INTO shop_orders (user_id, product_id, product_name, price, status, "
-            "content, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            "content, buyer_note, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (int(uid), int(p["id"]), str(p["name"] or "")[:120], amt,
-             status, content or "", now()))
+             status, content or "", str(note or "")[:1500], now()))
         r = cur.fetchone()
         if r and r.get("id"):
             oid = int(r["id"])
@@ -7586,6 +7934,12 @@ async def show_shop(update, ctx=None):
             [InlineKeyboardButton(_bi("🔙 ফিরে যান", "🔙 Back", _en), callback_data="shop:back")]])
     else:
         kb = _shop_cats_kb(cats, other=bool(prods_other), en=_en)
+    if await asyncio.to_thread(smm_on):
+        try:
+            kb = InlineKeyboardMarkup(list(kb.inline_keyboard) + [[InlineKeyboardButton(
+                _bi("🌐 SMM প্যানেল", "🌐 SMM Panel", _en), callback_data="smm")]])
+        except Exception:
+            pass
     msg = update.effective_message
     if update.callback_query:
         try:
@@ -7751,6 +8105,18 @@ async def _shop_show_confirm(q, pid, qty=1):
                                       "❌ This product is not available right now.", _en))
         return
     qty = max(1, int(qty or 1))
+    _min_q = shop_product_min_qty(p)
+    if qty < _min_q:
+        _mmsg = _bi(f"⚠️ এই পণ্যে মিনিমাম *{_min_q} পিস* কিনতে হবে।",
+                    f"⚠️ Minimum *{_min_q} pcs* for this product.", _en)
+        try:
+            await q.edit_message_text(_mmsg, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(_bi("🔢 পরিমাণ বদলান", "🔢 Change quantity", _en),
+                                         callback_data=f"shop:b:{int(p['id'])}")]]))
+        except Exception:
+            pass
+        return
     bal = await asyncio.to_thread(get_bal, uid)
     price = float(p["price"] or 0)
     total = price * qty
@@ -7762,8 +8128,13 @@ async def _shop_show_confirm(q, pid, qty=1):
            f"🔢 {_bi('পরিমাণ', 'Quantity', _en)}: `{qty}` {_pc}\n"
            f"💵 {_bi('এক পিসের দাম', 'Price per piece', _en)}: *{_shop_money(price)}*\n"
            f"🧮 {_bi('মোট', 'Total', _en)}: *{_shop_money(total)}*\n"
+           f"🕒 {_bi('টাকা Hold থাকবে — পণ্য পাওয়ার পর কাটা হবে', 'Amount will be held — charged after delivery', _en)}\n"
            f"💰 {_bi('আপনার ব্যালেন্স', 'Your balance', _en)}: `{_shop_money(bal)}`\n"
-           f"➡️ {_bi('কেনার পরে থাকবে', 'Balance after purchase', _en)}: `{_shop_money(after)}`\n\n")
+           f"➡️ {_bi('কেনার পরে থাকবে', 'Balance after purchase', _en)}: `{_shop_money(after)}`\n")
+    if shop_product_min_qty(p) > 1:
+        txt += _bi(f"📌 মিনিমাম: `{shop_product_min_qty(p)}` পিস\n",
+                   f"📌 Minimum: `{shop_product_min_qty(p)}` pcs\n", _en)
+    txt += "\n"
     if after < 0:
         txt += _bi("❌ *ব্যালেন্স যথেষ্ট নয়।* আগে ডিপোজিট করুন।",
                    "❌ *Not enough balance.* Please deposit first.", _en)
@@ -7867,7 +8238,7 @@ async def post_withdraw_channel(bot, text, with_btn=False):
 async def shop_notify_channel(bot, oid, uid, p, qty, total):
     """🛍 কেনাকাটা → উইথড্র চ্যানেলে নোটিশ।"""
     try:
-        nm = await _ch_user_label(uid)
+        nm = _mask_uname(await _ch_user_label(uid))   # 👤 নাম ** ** করে দেখাও
         _q = max(1, int(qty or 1))
         # 🛍 প্যাকের নামও সাথে — "শুধু V" নয়, পুরো "ভিএন — 3 DAY" যায়
         _name = _shop_full_name(p or {})
@@ -7876,7 +8247,7 @@ async def shop_notify_channel(bot, oid, uid, p, qty, total):
                f"👤 Buyer: {nm}\n"
                f"🆔 Order ID: #{shop_no(oid)}\n"
                f"🛒 Amount: {_q} pcs\n"
-               f"💎 Total Paid: ${_amt(float(total or 0))}\n"
+               f"💎 Total Paid: {_shop_money(total)}\n"
                f"✅ Transaction Successful")
         await post_withdraw_channel(bot, txt, with_btn=True)
     except Exception as e:
@@ -7898,7 +8269,7 @@ async def dep_notify_channel(bot, oid, uid, m, amount, txid):
                + (f"🧾 TrxID: {_ch_mask_tx(txid)}\n"
                   if str(txid or "").strip()
                   and not str(txid).startswith("FUND") else "")
-               + f"💰 Amount: ${_amt(float(amount or 0))}\n"
+               + f"💰 Amount: {taka_txt(amount)}\n"
                f"✅ Funded Successfully")
         await post_withdraw_channel(bot, txt, with_btn=True)
     except Exception as e:
@@ -8164,13 +8535,15 @@ def shop_stale_orders(minutes=30, skip_reminded=True):
     return out
 
 
-async def _shop_pending_order(ctx, uid, p, qty, total, full_name=""):
+async def _shop_pending_order(ctx, uid, p, qty, total, full_name="", note=""):
     """ম্যানুয়াল/স্টক-শেষ অর্ডার তৈরি + অ্যাডমিনকে নোটিফাই। অর্ডার আইডি দেয়।"""
     qty = int(qty or 1)
     pp = dict(p)
     if qty > 1:                       # অর্ডার/অ্যাডমিন দুই জায়গায়ই পরিমাণ দেখা যাবে
         pp["name"] = f"{str(p['name'] or '')[:110]} × {qty}"
-    oid = await asyncio.to_thread(shop_order_new, uid, pp, "", "pending", total)
+    oid = await asyncio.to_thread(shop_order_new, uid, pp, "", "pending", total, note)
+    # 🕒 টাকা Hold-এ রাখা হলো (কাটা হয়নি) — ডেলিভারির পর কাটা হবে
+    await asyncio.to_thread(shop_order_hold_set, oid, total, "held")
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ ডেলিভারি দিন", callback_data=f"shopao:{oid}"),
         InlineKeyboardButton("💸 রিফান্ড", callback_data=f"shopar:{oid}"),
@@ -8193,6 +8566,12 @@ async def _shop_pending_order(ctx, uid, p, qty, total, full_name=""):
     _lines.append(f"🛍 পণ্য: {_md_esc(str(p['name'] or ''))}")
     if _desc_t:
         _lines.append(f"📝 বিস্তারিত: {_md_esc(_desc_t[:400])}")
+    if note:
+        _lines.append("")
+        _lines.append("📋 *ইউজারের উত্তর:*")
+        for _ln in str(note).splitlines():
+            if _ln.strip():
+                _lines.append(_md_esc(_ln.strip()[:120]))
     _lines += [
         f"🔢 পরিমাণ: `{int(qty)}` পিস",
         f"💵 এক পিস: `{_one_t}` · মোট: `{_shop_money(total)}`",
@@ -8219,7 +8598,7 @@ async def _shop_pending_order(ctx, uid, p, qty, total, full_name=""):
     return oid
 
 
-async def _shop_buy_core(ctx, q, pid, count):
+async def _shop_buy_core(ctx, q, pid, count, note=""):
     """নির্বাচিত সংখ্যক আইটেম কেনা + ইউনিক ডেলিভারি। সফল হলে True।"""
     uid = q.from_user.id
     _en = await _shop_is_en(uid)
@@ -8232,20 +8611,29 @@ async def _shop_buy_core(ctx, q, pid, count):
         return False
     typ = _shop_type(p)
     price = float(p["price"] or 0)
+    _min_q = shop_product_min_qty(p)
     count = max(1, min(int(count or 1), 20))
-    bal = await asyncio.to_thread(get_bal, uid)
+    if count < _min_q:
+        await q.answer(_bi(f"মিনিমাম {_min_q} পিস কিনতে হবে",
+                           f"Minimum {_min_q} pcs", _en), show_alert=True)
+        return False
+    # 🛍 শপের দাম ৳-এ — তাই ডিপোজিট (৳) ওয়ালেটই আসল ব্যালেন্স
+    bal = await asyncio.to_thread(get_dep_balance, uid)
     total = price * count
     if total > bal:
-        await q.answer(_bi("ব্যালেন্স যথেষ্ট নয়", "Not enough balance", _en), show_alert=True)
+        await q.answer(_bi("ডিপোজিট (৳) ব্যালেন্স যথেষ্ট নয়",
+                           "Not enough deposit balance", _en), show_alert=True)
         return False
     full_name = getattr(q.from_user, "full_name", "") or ""
 
     # ── ম্যানুয়াল: টাকা কাটিয়ে পেন্ডিং অর্ডার ──
     if typ == "manual":
-        if total > 0 and not await asyncio.to_thread(safe_ded_bal, uid, total):
-            await q.answer(_bi("ব্যালেন্স যথেষ্ট নয়", "Not enough balance", _en), show_alert=True)
+        # 🕒 পুরো টাকা Hold হবে — এখনই স্থায়ীভাবে কাটা যাবে না
+        if total > 0 and not await asyncio.to_thread(shop_hold_place, uid, total):
+            await q.answer(_bi("ডিপোজিট (৳) ব্যালেন্স যথেষ্ট নয়",
+                               "Not enough deposit balance", _en), show_alert=True)
             return False
-        oid = await _shop_pending_order(ctx, uid, p, count, total, full_name)
+        oid = await _shop_pending_order(ctx, uid, p, count, total, full_name, note)
         try:
             await q.edit_message_text(
                 f"⏳ *{_bi('অর্ডার গ্রহণ করা হয়েছে', 'Order received', _en)}*\n\n"
@@ -8253,6 +8641,8 @@ async def _shop_buy_core(ctx, q, pid, count):
                 f"🛍 {_bi('পণ্য', 'Product', _en)}: {_md_esc(_shop_full_name(p))}\n"
                 f"🔢 {_bi('পরিমাণ', 'Quantity', _en)}: `{count}` {_bi('পিস', 'pcs', _en)}\n"
                 f"💵 {_bi('মোট', 'Total', _en)}: `{_shop_money(total)}`\n\n"
+                + _bi(f"🕒 `{_shop_money(total)}` এখন Hold-এ আছে — পণ্য পাওয়ার পর কাটা হবে।\n\n",
+                      f"🕒 `{_shop_money(total)}` is on hold — charged after delivery.\n\n", _en)
                 + _bi("অ্যাডমিন খুব শীঘ্রই আপনার প্রোডাক্ট পাঠিয়ে দেবেন।",
                       "The admin will send your product very soon.", _en),
                 parse_mode="Markdown",
@@ -8275,10 +8665,11 @@ async def _shop_buy_core(ctx, q, pid, count):
             await asyncio.to_thread(shop_release_stock, sid)
         avail = await asyncio.to_thread(shop_stock_count, pid)
         if typ == "hybrid" and not lines:
-            if total > 0 and not await asyncio.to_thread(safe_ded_bal, uid, total):
-                await q.answer(_bi("ব্যালেন্স যথেষ্ট নয়", "Not enough balance", _en), show_alert=True)
+            if total > 0 and not await asyncio.to_thread(shop_hold_place, uid, total):
+                await q.answer(_bi("ডিপোজিট (৳) ব্যালেন্স যথেষ্ট নয়",
+                                   "Not enough deposit balance", _en), show_alert=True)
                 return False
-            oid = await _shop_pending_order(ctx, uid, p, count, total, full_name)
+            oid = await _shop_pending_order(ctx, uid, p, count, total, full_name, note)
             try:
                 await q.edit_message_text(
                     f"⏳ *{_bi('স্টক শেষ — অর্ডার গ্রহণ করা হয়েছে', 'Out of stock — order received', _en)}*\n\n"
@@ -8286,6 +8677,8 @@ async def _shop_buy_core(ctx, q, pid, count):
                     f"🛍 {_bi('পণ্য', 'Product', _en)}: {_md_esc(_shop_full_name(p))}\n"
                     f"🔢 {_bi('পরিমাণ', 'Quantity', _en)}: `{count}` {_bi('পিস', 'pcs', _en)}\n"
                     f"💵 {_bi('মোট', 'Total', _en)}: `{_shop_money(total)}`\n\n"
+                    + _bi(f"🕒 `{_shop_money(total)}` এখন Hold-এ আছে — পণ্য পাওয়ার পর কাটা হবে।\n\n",
+                          f"🕒 `{_shop_money(total)}` is on hold — charged after delivery.\n\n", _en)
                     + _bi("অ্যাডমিন নিজে ডেলিভারি দেবেন।",
                           "The admin will deliver it personally.", _en),
                     parse_mode="Markdown",
@@ -8312,7 +8705,7 @@ async def _shop_buy_core(ctx, q, pid, count):
             pass
         return False
 
-    if total > 0 and not await asyncio.to_thread(safe_ded_dep, uid, total):
+    if total > 0 and not await asyncio.to_thread(shop_hold_place, uid, total):
         for sid, _c in lines:
             await asyncio.to_thread(shop_release_stock, sid)
         # 💳 ডিপোজিট ব্যালেন্স কম — earn থেকে কনভার্ট করতে বলি
@@ -8362,7 +8755,12 @@ async def _shop_buy_core(ctx, q, pid, count):
 
     content = "\n".join((f"{i}. {c}" if count > 1 else c)
                         for i, (_sid, c) in enumerate(lines, 1))
-    oid = await asyncio.to_thread(shop_order_new, uid, p, content, "delivered", total)
+    oid = await asyncio.to_thread(shop_order_new, uid, p, content, "delivered", total, note)
+    # 🕒 ডেলিভারি সফল → Hold টাকা স্থায়ীভাবে কাটা
+    await asyncio.to_thread(shop_order_hold_set, oid, total, "held")
+    if total > 0 and not await asyncio.to_thread(shop_hold_consume, uid, total, oid):
+        log.warning(f"[SHOP-HOLD] #{oid} consume ব্যর্থ uid={uid} amt={total}")
+    await asyncio.to_thread(shop_order_hold_set, oid, total, "consumed")
     try:
         await q.answer(_bi("✅ অর্ডার হয়েছে", "✅ Order placed"))
     except Exception:
@@ -8386,7 +8784,10 @@ async def _shop_buy_core(ctx, q, pid, count):
             f"🔢 পরিমাণ: `{count}` পিস\n"
             f"💵 মোট: `{_shop_money(total)}`\n"
             f"👤 ইউজার: `{uid}`\n"
-            f"📦 বাকি স্টক: `{await asyncio.to_thread(shop_stock_count, pid)}`")
+            f"📦 বাকি স্টক: `{await asyncio.to_thread(shop_stock_count, pid)}`"
+            + (("\n\n📋 *ইউজারের উত্তর:*\n"
+                + "\n".join(_md_esc(x.strip()[:120]) for x in str(note).splitlines() if x.strip()))
+               if note else ""))
     except Exception:
         pass
     await shop_notify_channel(ctx.bot, oid, uid, p, count, total)
@@ -8404,9 +8805,10 @@ async def _shop_do_buy(q, ctx, pid):
         return
     typ = _shop_type(p)
     price = float(p["price"] or 0)
-    bal = await asyncio.to_thread(get_bal, uid)
+    bal = await asyncio.to_thread(get_dep_balance, uid)
     if price > bal:
-        await q.answer(_bi("ব্যালেন্স যথেষ্ট নয়", "Not enough balance", _en), show_alert=True)
+        await q.answer(_bi("ডিপোজিট (৳) ব্যালেন্স যথেষ্ট নয়",
+                           "Not enough deposit balance", _en), show_alert=True)
         return
     stock = 0 if typ == "manual" else await asyncio.to_thread(shop_stock_count, pid)
     if typ == "hybrid" and stock <= 0:
@@ -8433,9 +8835,15 @@ async def _shop_do_buy(q, ctx, pid):
     if maxn == 1:                       # একটাই সম্ভব — সরাসরি নিশ্চিতকরণ
         return await _shop_show_confirm(q, pid, 1)
 
+    _mn = shop_product_min_qty(p)
+    if _mn > maxn:
+        await q.answer(_bi(f"এই পণ্যে মিনিমাম {_mn} পিস — আপনার ব্যালেন্স/স্টক যথেষ্ট নয়",
+                           f"Minimum {_mn} pcs — you don't have enough balance/stock", _en),
+                       show_alert=True)
+        return
     rows, row = [], []
-    for k in (1, 2, 3, 5):
-        if k <= maxn:
+    for k in (_mn, _mn + 1, _mn + 2, _mn + 4):
+        if k <= maxn and k not in (0,):
             row.append(InlineKeyboardButton(f"{k}", callback_data=f"shop:q:{int(p['id'])}:{k}"))
             if len(row) == 4:
                 rows.append(row); row = []
@@ -8453,6 +8861,9 @@ async def _shop_do_buy(q, ctx, pid):
            f"💵 {_bi('একটার দাম', 'Price per piece', _en)}: *{_shop_money(price)}*\n")
     if typ != "manual":
         txt += f"📦 {'Stock' if _en else 'স্টক'}: `{stock}`\n"
+    if shop_product_min_qty(p) > 1:
+        txt += _bi(f"📌 মিনিমাম: `{shop_product_min_qty(p)}` পিস\n",
+                   f"📌 Minimum: `{shop_product_min_qty(p)}` pcs\n", _en)
     txt += (f"💰 {_bi('আপনার ব্যালেন্স', 'Your balance', _en)}: `{_shop_money(bal)}`\n"
             + _bi(f"➡️ সর্বোচ্চ `{maxn}` টা নিতে পারবেন।\n\nসংখ্যা বেছে নিন 👇",
                   f"➡️ You can buy up to `{maxn}`.\n\nChoose the quantity 👇", _en))
@@ -8486,6 +8897,49 @@ async def shop_qty_input(update, ctx, st):
 
     q = _Q()
     await _shop_show_confirm(q, pid, cnt)
+    return True
+
+
+async def shop_ask_input(update, ctx, st):
+    """কেনার আগে প্রশ্নের উত্তর নেওয়া — `shop_ask:<pid>:<qty>:<idx>`।"""
+    uid = update.effective_user.id if getattr(update, "effective_user", None) else 0
+    _en = await _shop_is_en(uid)
+    txt = (update.message.text or "").strip()
+    if not txt:
+        await update.message.reply_text(_bi("❌ উত্তরটি লিখে পাঠান।",
+                                            "❌ Please type your answer.", _en))
+        return True
+    try:
+        _a, _p, _q, _i = str(st).split(":")
+        pid, qty, idx = int(_p), int(_q), int(_i)
+    except Exception:
+        ctx.user_data.pop("state", None)
+        return True
+    p = await asyncio.to_thread(shop_product, pid)
+    asks = shop_product_ask(p) if p else []
+    ans = ctx.user_data.setdefault("shop_ask_ans", [])
+    _lbl = asks[idx] if idx < len(asks) else "উত্তর"
+    ans.append(f"{_lbl}: {txt[:300]}")
+    nxt = idx + 1
+    if nxt < len(asks):
+        ctx.user_data["state"] = f"shop_ask:{pid}:{qty}:{nxt}"
+        await update.message.reply_text(
+            f"❓ *{_md_esc(asks[nxt])}*\n\n"
+            + _bi("উত্তরটি লিখে পাঠান।", "Please type your answer.", _en)
+            + "\n\n/cancel — " + _bi("বাতিল", "Cancel", _en),
+            parse_mode="Markdown")
+        return True
+    note = "\n".join(ans)
+    ctx.user_data.pop("state", None)
+    ctx.user_data.pop("shop_ask_ans", None)
+
+    class _Q:
+        from_user = update.effective_user
+        message = update.message
+        answer = _QtyNoop()
+        edit_message_text = _QtyEdit(update.message)
+
+    await _shop_buy_core(ctx, _Q(), pid, qty, note)
     return True
 
 
@@ -8569,7 +9023,13 @@ async def _shop_show_order(q, oid):
            f"🛍 {_bi('পণ্য', 'Product', _en)}: <b>{html.escape(str(o['product_name'] or ''))}</b>\n"
            f"💵 {_bi('মূল্য', 'Price', _en)}: <b>{html.escape(_shop_money(o['price']))}</b>\n"
            f"📅 {_bi('তারিখ', 'Date', _en)}: <code>{html.escape(str(o['created_at'] or '')[:16])}</code>\n"
-           f"⚙️ {_bi('স্ট্যাটাস', 'Status', _en)}: {html.escape(st_txt)}\n\n"
+           f"⚙️ {_bi('স্ট্যাটাস', 'Status', _en)}: {html.escape(st_txt)}\n"
+           + ((f"🕒 {_bi('Hold করা টাকা', 'Amount on hold', _en)}: "
+               f"<b>{html.escape(_shop_money(o['hold_amt']))}</b> — "
+               + _bi("ডেলিভারির পর কাটা হবে।", "will be charged after delivery.", _en) + "\n")
+              if str(o.get("hold_state") or "") == "held" and float(o.get("hold_amt") or 0) > 0
+              else "")
+           + "\n"
            f"📦 <b>{_bi('ডেলিভারি', 'Delivery', _en)}:</b>\n{_body}\n\n"
            + _bi("⚠️ এই তথ্য কারও সাথে শেয়ার করবেন না।",
                  "⚠️ Do not share this information with anyone.", _en))
@@ -8591,6 +9051,10 @@ async def shop_callback(update, ctx):
         await q.answer()
     except Exception:
         pass
+
+    # ── 🌐 SMM প্যানেল ──
+    if d == "smm" or d.startswith("smm:"):
+        return await smm_callback(update, ctx)
 
     # ── অ্যাডমিন সাইড ──
     if d == "adm_shop" or d.startswith("shopa:") or d.startswith("shopaon:") \
@@ -8640,7 +9104,21 @@ async def shop_callback(update, ctx):
         if d.startswith("shop:y:"):
             _sp = d.split(":")
             _qty = int(_sp[3]) if len(_sp) > 3 else 1
-            return await _shop_buy_core(ctx, q, int(_sp[2]), _qty)
+            _pid_y = int(_sp[2])
+            _p_y = await asyncio.to_thread(shop_product, _pid_y)
+            _asks = shop_product_ask(_p_y) if _p_y else []
+            if _asks:
+                # ❓ টাস্কের মতো — আগে ইউজারের কাছে প্রশ্ন, তারপর কেনা
+                ctx.user_data["shop_ask_ans"] = []
+                ctx.user_data["state"] = f"shop_ask:{_pid_y}:{_qty}:0"
+                _en_y = await _shop_is_en(uid)
+                await q.edit_message_text(
+                    f"❓ *{_md_esc(_asks[0])}*\n\n"
+                    + _bi("উত্তরটি লিখে পাঠান।", "Please type your answer.", _en_y)
+                    + "\n\n/cancel — " + _bi("বাতিল", "Cancel", _en_y),
+                    parse_mode="Markdown")
+                return
+            return await _shop_buy_core(ctx, q, _pid_y, _qty)
         if d.startswith("shop:q:"):
             _sp = d.split(":")
             return await _shop_show_confirm(q, int(_sp[2]), int(_sp[3]))
@@ -8978,7 +9456,18 @@ async def _shop_admin_cb(q, ctx, d):
                     parse_mode="Markdown")
                 return
             price = float(o["price"] or 0)
-            await asyncio.to_thread(add_bal, int(o["user_id"]), price)
+            _rh = float(o["hold_amt"] or 0)
+            if _rh > 0:
+                # 🕒 Hold-এ থাকা টাকা ৳ ওয়ালেটে ফেরত (একবারই)
+                _okr = await asyncio.to_thread(shop_hold_release, int(o["user_id"]),
+                                               _rh, oid)
+                await asyncio.to_thread(shop_order_hold_set, oid, _rh, "released")
+                if not _okr:
+                    await q.answer("⚠️ Hold পাওয়া যায়নি — আগেই ফেরত/কাটা হয়েছে",
+                                   show_alert=True)
+            else:
+                # পুরোনো (আগের সিস্টেমের) অর্ডার — আগের মতোই Earn-এ ফেরত
+                await asyncio.to_thread(add_bal, int(o["user_id"]), price)
             await asyncio.to_thread(shop_order_set, oid, "refunded")
             try:
                 await ctx.bot.send_message(
@@ -9163,6 +9652,13 @@ async def shop_admin_input(update, ctx, st):
             await update.message.reply_text(f"❌ ইউজারকে পাঠানো যায়নি: {e}")
             return True
         await asyncio.to_thread(shop_order_set, oid, "delivered", txt)
+        # 🕒 ডেলিভারি সম্পন্ন → Hold টাকা স্থায়ীভাবে কাটা (একবারই)
+        _hold_amt = float(o["hold_amt"] or 0)
+        if _hold_amt > 0:
+            if await asyncio.to_thread(shop_hold_consume, int(o["user_id"]), _hold_amt, oid):
+                await asyncio.to_thread(shop_order_hold_set, oid, _hold_amt, "consumed")
+            else:
+                log.warning(f"[SHOP-HOLD] #{oid} consume ব্যর্থ (uid={o['user_id']})")
         _qm = re.search(r"×\s*(\d+)\s*$", str(o["product_name"] or ""))
         await shop_notify_channel(ctx.bot, oid, int(o["user_id"]), p,
                                   int(_qm.group(1)) if _qm else 1, float(o["price"] or 0))
@@ -12126,6 +12622,23 @@ async def _dep_watch_once(bot):
 #  rate limit, API permission — কিছুই আর দরকার নেই।
 # ══════════════════════════════════════════════════════════════════
 _DEP_MAIL = {"at": 0.0, "ok": False, "err": "", "n": 0, "busy": False}
+
+# ── 📬 Gmail IMAP IDLE + Persistent Connection ────────────────────────
+# একবার login → কানেকশন খোলা থাকে → নতুন মেইল এলে IDLE-ই খবর দেয়।
+# IDLE না চললে ২৫ সেকেন্ডের normal poll (fallback), কানেকশন একই থাকে।
+_MAIL_STAT = {
+    "connected": False,     # এখন IMAP এ যুক্ত?
+    "idle": False,          # এখন IDLE-এ বসে আছে?
+    "conn_at": 0.0,         # কখন যুক্ত হলো
+    "idle_since": 0.0,
+    "last_email_at": 0.0,   # শেষ নতুন মেইল কখন ধরা পড়ল
+    "last_check_at": 0.0,   # শেষ বার ইনবক্স পড়া হলো
+    "processed": 0,         # মোট কত পেমেন্ট মেইল প্রসেস হলো (এই রান-এ)
+    "reconnects": 0,
+    "err": "",
+    "mode": "—",            # IDLE / Polling
+}
+_MAILW = {"conn": None, "lock": None, "task": None}
 _DEP_MAIL_SEEN_KEY = "dep_mail_seen"
 # শুধু এই ঠিকানা থেকে আসা মেইল পড়া হয় (ওয়েব প্যানেল থেকে বদলানো যায়)
 _DEP_MAIL_FROM_DEF = "do-not-reply@ses.binance.com"
@@ -12201,6 +12714,48 @@ def _mail_seen_add(mid):
         pass
 
 
+_MAIL_UNM_KEY = "dep_mail_unm_seen"
+
+
+def _mail_unm_seen():
+    try:
+        raw = str(get_setting(_MAIL_UNM_KEY) or "")
+    except Exception:
+        raw = ""
+    return set(x for x in raw.split("|") if x)
+
+
+def _mail_unm_add(mid):
+    try:
+        cur = _mail_unm_seen()
+        cur.add(str(mid)[:120])
+        set_setting(_MAIL_UNM_KEY, "|".join(list(cur)[-300:]))
+    except Exception:
+        pass
+
+
+async def _dep_mail_unmatched_notify(bot, mid, pay):
+    """মেইলে টাকা এসেছে কিন্তু কোনো পেন্ডিং ডিপোজিটের সাথে মেলেনি → অ্যাডমিনকে জানাও।"""
+    mid = str(mid or "")
+    if not mid or mid in _mail_unm_seen():
+        return
+    try:
+        _amt = float(pay.get("amount") or 0)
+    except Exception:
+        _amt = 0.0
+    try:
+        await notify_full_admins(
+            bot,
+            f"📧 *নতুন পেমেন্ট মেইল — কোনো ডিপোজিটে মেলেনি*\n\n"
+            f"💵 `{_amt:g}$` ≈ `{usd_to_taka(_amt):g}৳`\n"
+            f"👤 পাঠানো: `{_md_esc(str(pay.get('sender') or '—'))}`\n\n"
+            f"ইউজার ডিপোজিট করেনি বা অঙ্ক/সময় মেলেনি। ম্যানুয়ালি দেখুন।")
+        _mail_unm_add(mid)
+        log.info(f"[DEP-MAIL] অমিল পেমেন্টের নোটিফিকেশন পাঠানো ({_amt}$)")
+    except Exception as e:
+        log.debug(f"[DEP-MAIL] অমিল নোটিফিকেশন ব্যর্থ: {e}")
+
+
 def _mail_body_text(msg):
     """মেইলের সব টেক্সট (HTML হলে ট্যাগ বাদ) এক স্ট্রিং-এ।"""
     chunks = []
@@ -12243,25 +12798,92 @@ def _mail_from_ok(from_hdr, want=None):
     want = str(want or "").strip().lower()
     if not want:
         return True                      # ফাঁকা = সব মেইল (মালিকের পছন্দ)
-    _h = str(from_hdr or "").lower().replace(" ", "")
+    _raw = str(from_hdr or "")
+    _h = _raw.lower().replace(" ", "")
     if str(want).lower() in _h:
         return True
+    # ⚠️ শুধু দেখতে "Binance" লেখা আছে কিনা তা নয় — আসল ইমেইল ঠিকানাটাই
+    #    বের করে ডোমেইন মিলিয়ে দেখা হয়। নাহলে "Binance <x@random.com>"
+    #    ধরনের ফেক মেইলও পেমেন্ট হিসেবে গোনা হয়ে যেত।
+    def _addr(v):
+        _v = str(v or "")
+        _m = _re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", _v)
+        return _m.group(0).lower() if _m else ""
+
+    _a_from = _addr(_raw)
+    _a_want = _addr(want) or str(want).strip().lower()
+    if not _a_from:
+        return False
+    if _a_from == _a_want:
+        return True
     # Binance একাধিক ঠিকানা থেকে পাঠায় (ses / no-reply / notification) —
-    # শুধু "binance" থাকলেই গ্রহণ, তবু Subject/বডি যাচাই আলাদাই হয়।
-    if "binance" in str(want).lower() and "binance" in _h:
+    # কনফিগে binance ঠিকানা থাকলে binance.com ডোমেইনের যেকোনো ঠিকানা চলবে।
+    _d_want = _a_want.split("@")[-1]
+    _d_from = _a_from.split("@")[-1]
+    if "binance" in _d_want and (_d_from == "binance.com" or _d_from.endswith(".binance.com")):
         return True
     return False
 
 
+# ⚠️ Binance-এর আসল "রিসিভ" মেইলে সাবজেক্টে Binance শব্দও থাকে না, আবার
+# বডিতে লেখা থাকে শুধু "You received an incoming transfer"। তাই সিদ্ধান্ত
+# হয় প্রেরক ঠিকানা (`_mail_from_ok`) + বডি "রিসিভ" কি না — সাবজেক্টের
+# নির্দিষ্ট লেখা নয়। শুধু স্পষ্ট প্রোমো/কোড/সিকিউরিটি মেইল আগেই বাদ যায়।
+_MAIL_SKIP_WORDS = (
+    "verification code", "verify your", "log in to", "login code", "security code",
+    "password", "announcement", "promotion", "newsletter", "price alert",
+    "referral", "listing", "you sent", "sent successfully", "successful withdrawal",
+    "withdrawal successful", "you've withdrawn", "order filled", "order cancelled",
+    "deposit address", "api key",
+)
+
+# শুধু "টাকা এসেছে" বোঝানো বাক্য — এগুলো থাকলেই পেমেন্ট
+_MAIL_IN_WORDS = (
+    "incoming transfer", "received a payment", "you received", "you've received",
+    "you have received", "payment received", "received an incoming",
+    "incoming payment", "received your transfer", "পেমেন্ট পেয়েছেন",
+)
+
+# টাকা পাঠানো/উত্তোলনের মেইল — ভুল করে ডিপোজিট গোনা যাবে না
+_MAIL_OUT_WORDS = (
+    "you sent", "you've sent", "you have sent", "sent a transfer", "sent a payment",
+    "successfully sent", "has been sent", "withdrawal successful",
+    "successful withdrawal", "you've withdrawn", "has been withdrawn",
+)
+
+
+def _mail_flat(txt):
+    """HTML/এনটিটি সরিয়ে ছোট হাতের এক লাইনের টেক্সট।"""
+    t = str(txt or "")
+    if "<" in t and ">" in t:
+        t = _re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", t, flags=_re.I | _re.S)
+        t = _re.sub(r"<[^>]+>", " ", t)
+    t = (t.replace("&nbsp;", " ").replace("&amp;", "&")
+         .replace("&#39;", "'").replace("&quot;", '"'))
+    return _re.sub(r"\s+", " ", t).strip().lower()
+
+
 def _mail_subject_ok(subject):
-    """Subject দেখেই বোঝা যায় এটা Binance-এর পেমেন্ট মেইল কি না।"""
-    subj = str(subject or "").lower()
-    if "binance" not in subj:
+    """এই মেইলটা কি রিসিভ-পেমেন্ট ধরনের?
+
+    প্রেরক ঠিকানা আগেই যাচাই হয়েছে। এখানে শুধু স্পষ্ট প্রোমো/কোড/সিকিউরিটি
+    মেইল বাদ দেওয়া হয় — সাবজেক্টে পেমেন্টের শব্দ না থাকলেও চলবে, কারণ
+    আসল মেইলে সেটা নাও থাকতে পারে (বডি দেখে সিদ্ধান্ত হবে)।
+    """
+    s = _mail_flat(subject)
+    if any(w in s for w in _MAIL_SKIP_WORDS):
         return False
-    return bool("payment receive" in subj or "you received" in subj
-                or "received a payment" in subj or "incoming transfer" in subj
-                or ("payment" in subj and ("receiv" in subj or "transfer" in subj))
-                or ("binance" in subj and "receiv" in subj))
+    if any(w in s for w in _MAIL_OUT_WORDS):
+        return False
+    return True
+
+
+def _mail_recv_ok(subject, body=""):
+    """মেইলটা কি *টাকা এসেছে* (রিসিভ) — পাঠানো/উত্তোলন নয়?"""
+    t = _mail_flat(str(subject or "") + " " + str(body or ""))
+    if any(w in t for w in _MAIL_OUT_WORDS):
+        return False
+    return any(w in t for w in _MAIL_IN_WORDS)
 
 
 def _diag_sample(diag, frm, subj, why):
@@ -12353,12 +12975,13 @@ def mail_parse_payment(subject, body):
     মেল না হলে None। এই ফাংশনটি নেটওয়ার্ক ছোঁয় না — টেস্ট করা সহজ।
     """
     txt = str(body or "")
-    low = txt.lower()
-    # ⚠️ Subject না মিললে কোনোভাবেই পেমেন্ট নয় (প্রোমো/নিউজ মেইল বাদ)
-    if not _mail_subject_ok(subject):
+    low = _mail_flat(txt)
+    # ⚠️ প্রেরক ঠিকানা ইতিমধ্যেই যাচাই — এখন দেখি এটা *টাকা এসেছে*
+    # ধরনের মেইল কি না (পাঠানো/উত্তোলন/প্রোমো হলে বাদ)
+    if not _mail_recv_ok(subject, txt):
         return None
     amt = None
-    for _pat in (r"amount\s*:?\s*([0-9][0-9,]*\.?[0-9]*)\s*usdt",
+    for _pat in (r"amount\s*:?\s*[^0-9\n]{0,25}([0-9][0-9,]*\.?[0-9]*)\s*usdt",
                  r"([0-9][0-9,]*\.?[0-9]*)\s*usdt"):
         _m = _re.search(_pat, low)
         if _m:
@@ -12401,7 +13024,7 @@ def _mail_fetch_payments(limit=40):
     _last = ""
     for _lim in (limit, max(12, int(limit) // 2), 10):
         try:
-            _items, _err = _mail_fetch_payments_once(_lim)
+            _items, _err = _mailw_fetch(_lim)
         except Exception as _e:
             _items, _err = [], str(_e)[:90]
         if not _err:
@@ -12419,7 +13042,256 @@ def _mail_fetch_payments(limit=40):
     return [], _last
 
 
-def _mail_fetch_payments_once(limit=40):
+# ── 📬 Persistent IMAP + IDLE engine ─────────────────────────────────
+def _mailw_lock():
+    """একটাই IMAP কানেকশন — সবাই একসাথে ব্যবহার করে, তাই lock লাগে।"""
+    import threading
+    if _MAILW.get("lock") is None:
+        _MAILW["lock"] = threading.RLock()
+    return _MAILW["lock"]
+
+
+def _mailw_close_locked():
+    """কানেকশন বন্ধ (lock ধরা অবস্থায়)।"""
+    c = _MAILW.get("conn")
+    _MAILW["conn"] = None
+    _MAIL_STAT["connected"] = False
+    _MAIL_STAT["idle"] = False
+    if c is not None:
+        try:
+            c.logout()
+        except Exception:
+            pass
+
+
+def _mailw_connect_locked():
+    """চালু কানেকশন থাকলে সেটাই ফেরত; না থাকলে নতুন login (একবারই)।"""
+    cfg = mail_cfg()
+    if not (cfg.get("user") and cfg.get("pass")):
+        return None, "ইমেইল / App Password সেট করা নেই"
+    import imaplib
+    c = _MAILW.get("conn")
+    if c is not None:
+        try:
+            c.sock.settimeout(25)
+            typ, _ = c.noop()
+            if typ == "OK":
+                _MAIL_STAT["connected"] = True
+                return c, ""
+        except Exception:
+            pass
+        _mailw_close_locked()
+    try:
+        try:
+            imap = imaplib.IMAP4_SSL(cfg["host"], cfg["port"], timeout=25)
+        except TypeError:
+            imap = imaplib.IMAP4_SSL(cfg["host"], cfg["port"])
+        imap.login(cfg["user"], cfg["pass"])
+        imap.select(cfg["folder"], readonly=True)
+        _MAILW["conn"] = imap
+        _MAIL_STAT.update(connected=True, conn_at=_time.time(), err="")
+        log.info("[MAIL-IDLE] IMAP এ যুক্ত — কানেকশন খোলা থাকবে")
+        return imap, ""
+    except Exception as e:
+        _MAIL_STAT.update(connected=False, err=str(e)[:120])
+        return None, f"IMAP সংযোগ ব্যর্থ: {str(e)[:90]}"
+
+
+def _mailw_fetch(limit=40):
+    """শেয়ার করা কানেকশন দিয়েই মেইল পড়া — নতুন login নয়।"""
+    with _mailw_lock():
+        conn, err = _mailw_connect_locked()
+        if not conn:
+            return [], err
+        try:
+            _items, _err = _mail_fetch_payments_once(limit, imap=conn)
+            if not _err:
+                _MAIL_STAT["last_check_at"] = _time.time()
+            return _items, _err
+        except Exception as e:
+            _MAIL_STAT["err"] = str(e)[:120]
+            return [], f"IMAP পড়া ব্যর্থ: {str(e)[:90]}"
+
+
+def _mail_lease_mine():
+    """একাধিক worker চললেও একটাই IMAP engine চালাবে (DB lease, ৬০s)।"""
+    import os as _os
+    pid = _os.getpid()
+    now = _time.time()
+    try:
+        with _c() as c:
+            r = c.execute("SELECT value FROM settings "
+                          "WHERE key='mail_engine_lease'").fetchone()
+        raw = str((r or {}).get("value") or "") if r else ""
+    except Exception:
+        raw = ""
+    try:
+        _op, _ot = raw.split("|")
+        opid, ots = int(_op), float(_ot)
+    except Exception:
+        opid, ots = 0, 0.0
+    if opid and opid != pid and (now - ots) < 60:
+        return False
+    try:
+        set_setting("mail_engine_lease", f"{pid}|{int(now)}")
+    except Exception:
+        pass
+    return True
+
+
+def _mail_idle_refresh():
+    """IDLE কত সেকেন্ড পরপর refresh হবে (ডিফল্ট ২৪০s, কমপক্ষে ৬০)।"""
+    try:
+        v = int(get_setting("mail_idle_refresh") or 240)
+    except Exception:
+        v = 240
+    return max(60, min(v, 1740))
+
+
+def _mailw_idle_wait(timeout=240):
+    """IDLE-এ বসে অপেক্ষা — নতুন মেইল এলে 'new', সময় শেষে 'timeout'।
+
+    রিটার্ন: 'new' | 'timeout' | 'noidle' | 'error'
+    """
+    import socket
+    with _mailw_lock():
+        conn, _err = _mailw_connect_locked()
+        if conn is None:
+            return "error"
+        caps = getattr(conn, "capabilities", ()) or ()
+        try:
+            has_idle = b"IDLE" in caps or "IDLE" in str(caps).upper()
+        except Exception:
+            has_idle = False
+        if not has_idle:
+            _MAIL_STAT["idle"] = False
+            _MAIL_STAT["mode"] = "Polling"
+            return "noidle"
+        tag = None
+        try:
+            tag = conn._new_tag()
+            conn.sock.settimeout(20)
+            conn.send(tag + b" IDLE\r\n")
+            _ok = False
+            for _ in range(4):
+                line = conn.readline()
+                if not line:
+                    break
+                if line.startswith(b"+"):
+                    _ok = True
+                    break
+            if not _ok:
+                raise IOError("IDLE চালু হয়নি")
+            _MAIL_STAT["idle"] = True
+            _MAIL_STAT["idle_since"] = _time.time()
+            _MAIL_STAT["mode"] = "IDLE"
+            _MAIL_STAT["connected"] = True
+            conn.sock.settimeout(float(timeout))
+            res = "timeout"
+            try:
+                while True:
+                    line = conn.readline()
+                    if not line:
+                        res = "error"
+                        break
+                    if b"EXISTS" in line or b"RECENT" in line:
+                        res = "new"
+                        break
+            except (socket.timeout, TimeoutError):
+                res = "timeout"
+            except Exception:
+                res = "error"
+            finally:
+                _MAIL_STAT["idle"] = False
+                try:
+                    conn.sock.settimeout(20)
+                    conn.send(b"DONE\r\n")
+                    for _ in range(6):
+                        line = conn.readline()
+                        if not line or (tag and line.startswith(tag)):
+                            break
+                except Exception:
+                    # DONE-এর জবাব পড়তে না পারলেও নতুন মেইলটা হারায় না
+                    if res == "error":
+                        _mailw_close_locked()
+            return res
+        except Exception as e:
+            _MAIL_STAT["idle"] = False
+            _MAIL_STAT["err"] = str(e)[:120]
+            _mailw_close_locked()
+            return "error"
+
+
+async def mail_engine_loop(bot):
+    """IDLE-ভিত্তিক মেইল engine — বট চালু থাকলে সবসময় চলবে।"""
+    _MAILW["task"] = asyncio.current_task()
+    backoff = 5
+    log.info("[MAIL-IDLE] মেইল engine চালু")
+    while True:
+        try:
+            cfg = mail_cfg()
+            if not (cfg["on"] and cfg.get("user") and cfg.get("pass")):
+                _MAIL_STAT.update(mode="বন্ধ", connected=False, idle=False)
+                await asyncio.sleep(15)
+                continue
+            # 🔒 একাধিক worker → একটাই মেইল engine চালাবে
+            if not await asyncio.to_thread(_mail_lease_mine):
+                _MAIL_STAT.update(mode="অন্য worker চলছে", idle=False)
+                await asyncio.sleep(20)
+                continue
+            st = await asyncio.to_thread(_mailw_idle_wait, _mail_idle_refresh())
+            if st == "new":
+                _MAIL_STAT["last_email_at"] = _time.time()
+                n = await _dep_mail_once(bot)
+                _MAIL_STAT["processed"] += int(n or 0)
+                _MAIL_STAT["last_check_at"] = _time.time()
+                backoff = 5
+                continue
+            if st == "timeout":
+                # IDLE refresh — মাঝে মাঝে একবার safety scan (নতুন মেইল মিস না হয়)
+                await _dep_mail_once(bot)
+                _MAIL_STAT["last_check_at"] = _time.time()
+                continue
+            if st == "noidle":
+                # সার্ভারে IDLE নেই → ২৫ সেকেন্ডের normal check, কানেকশন একই
+                _MAIL_STAT["mode"] = "Polling"
+                await _dep_mail_once(bot)
+                _MAIL_STAT["last_check_at"] = _time.time()
+                gap = 25
+                try:
+                    gap = max(10, int(get_setting("mail_poll_sec") or 25))
+                except Exception:
+                    gap = 25
+                await asyncio.sleep(gap)
+                backoff = 5
+                continue
+            # ── error → auto reconnect (backoff সহ) ──
+            _MAIL_STAT["reconnects"] += 1
+            _MAIL_STAT["mode"] = "Reconnect…"
+            await asyncio.sleep(backoff)
+            backoff = min(int(backoff * 2), 60)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            _MAIL_STAT["err"] = str(e)[:120]
+            await asyncio.sleep(10)
+
+
+def mail_engine_start(bot):
+    """engine task তৈরি (আগেই চলছে থাকলে নতুন করে নয়)।"""
+    try:
+        t = _MAILW.get("task")
+        if t is not None and not t.done():
+            return t
+    except Exception:
+        pass
+    task = asyncio.create_task(mail_engine_loop(bot))
+    _background_tasks.add(task)
+    task.add_done_callback(_bg_task_done)
+    return task
+
+
+def _mail_fetch_payments_once(limit=40, imap=None):
     """IMAP থেকে নতুন Binance পেমেন্ট মেইল — [(message_id, payment), ...]।"""
     cfg = mail_cfg()
     # ⚠️ অটো-চেক সুইচ বন্ধ থাকলেও ইমেইল + App Password সেট থাকলে মেইল পড়া হবে
@@ -12427,19 +13299,25 @@ def _mail_fetch_payments_once(limit=40):
         return [], "মেইল সেট করা নেই"
     import imaplib
     import email as _email
-    try:
+    _shared = imap is not None
+    if _shared:
+        if imap is None:
+            return [], "কানেকশন নেই"
+    else:
         try:
-            imap = imaplib.IMAP4_SSL(cfg["host"], cfg["port"], timeout=25)
-        except TypeError:
-            imap = imaplib.IMAP4_SSL(cfg["host"], cfg["port"])
-    except Exception as e:
-        return [], f"IMAP সংযোগ ব্যর্থ: {str(e)[:90]}"
+            try:
+                imap = imaplib.IMAP4_SSL(cfg["host"], cfg["port"], timeout=25)
+            except TypeError:
+                imap = imaplib.IMAP4_SSL(cfg["host"], cfg["port"])
+        except Exception as e:
+            return [], f"IMAP সংযোগ ব্যর্থ: {str(e)[:90]}"
     out = []
     _want = cfg.get("from") or ""
     _diag = {"all": 0, "from_ok": 0, "parsed": 0, "samples": []}
     try:
-        imap.login(cfg["user"], cfg["pass"])
-        imap.select(cfg["folder"], readonly=True)
+        if not _shared:
+            imap.login(cfg["user"], cfg["pass"])
+            imap.select(cfg["folder"], readonly=True)
         # ⚠️ আগে UNSEEN আগে দেখা হত — ইউজার মেইল একবার খুলে ফেললেই
         #    (পড়া হয়ে গেলেই) সেই পেমেন্ট আর কখনো ধরা পড়ত না। এখন
         #    পড়া/না-পড়া সব মেইলই দেখা হয়, শুধু শেষ কয়েক দিনের।
@@ -12521,10 +13399,11 @@ def _mail_fetch_payments_once(limit=40):
         return [], f"IMAP পড়া ব্যর্থ: {str(e)[:90]}"
     finally:
         _DEP_MAIL["diag"] = _diag
-        try:
-            imap.logout()
-        except Exception:
-            pass
+        if not _shared:          # শেয়ার করা কানেকশন কখনো বন্ধ করা হয় না
+            try:
+                imap.logout()
+            except Exception:
+                pass
     return out, ""
 
 
@@ -12549,6 +13428,14 @@ def _mail_name_ok(dep_name, sender):
     return bool(_ta and _tb and (_ta & _tb))
 
 
+_MAIL_MASKED_RE = _re.compile(r"^(?:user[-_ ]?[0-9a-f]{4,}|binance\s*user.*|user\d*)$", _re.I)
+
+
+def _mail_name_masked(sender):
+    """Binance নাম লুকালে `User-ae595c5f` এভাবে পাঠায় — তখন নাম মেলানোই যায় না।"""
+    return bool(_MAIL_MASKED_RE.match(str(sender or "").strip()))
+
+
 def _mail_time_ok(o, ts_ms, early_min=None, late_min=None):
     """মেইলের নিজের সময় কি চেক-উইন্ডোর ভেতরে (ডিফল্ট ±৬০ মিনিট)।
 
@@ -12571,11 +13458,22 @@ def _mail_time_ok(o, ts_ms, early_min=None, late_min=None):
     if not ts:
         return True                      # সময় না পেলে নাম+অঙ্কেই চলবে
     now_ms = int(_time.time() * 1000)
-    if ts > now_ms + late_min * 60 * 1000:
-        return False
-    if ct and ts < ct - early_min * 60 * 1000:
-        return False                     # ডিপোজিটের অনেক আগের পেমেন্ট
-    return True
+    # ⚠️ Binance মেইলের ভিতরের সময় সবসময় UTC নয় — অনেক সময় ব্যবহারকারীর
+    #    নিজের সময় (ঢাকা, +৬ ঘণ্টা) লেখা থাকে। তাই UTC ধরে মিললেও, ৬ ঘণ্টা
+    #    আগে/পরে ধরে একবার দেখে নেওয়া হয় — নাহলে টাকা কখনোই যোগ হতো না।
+    _cands = [ts]
+    for _off in (6 * 3600 * 1000, -6 * 3600 * 1000):
+        try:
+            _cands.append(ts + _off)
+        except Exception:
+            pass
+    for _ts in _cands:
+        if _ts > now_ms + late_min * 60 * 1000:
+            continue
+        if ct and _ts < ct - early_min * 60 * 1000:
+            continue                     # ডিপোজিটের অনেক আগের পেমেন্ট
+        return True
+    return False
 
 
 def _dep_mail_find_for(o):
@@ -12605,7 +13503,16 @@ def _dep_mail_find_for(o):
             if _pk1 and _pk1 in seen:      # একই পেমেন্ট আগেই গোনা হয়েছে
                 continue
             if not _mail_name_ok(name, pay.get("sender")):
-                continue
+                # নাম লুকানো (User-ae595c5f) হলে নাম মেলানো অসম্ভব — তখন
+                # অঙ্ক + সময় মিললেই গ্রহণ, তবে শুধু একটাই পেন্ডিং থাকলে।
+                _masked_ok = False
+                if _mail_name_masked(pay.get("sender")):
+                    try:
+                        _masked_ok = _dep_same_pending_count(o) <= 1
+                    except Exception:
+                        _masked_ok = False
+                if not _masked_ok:
+                    continue
             try:
                 amt = float(pay.get("amount") or 0)
             except Exception:
@@ -12927,6 +13834,7 @@ async def _dep_mail_once(bot):
     _DEP_MAIL["busy"] = True
     done = 0
     try:
+        _MAIL_STAT["last_check_at"] = _time.time()
         pays, err = await asyncio.to_thread(_mail_fetch_payments)
         _DEP_MAIL.update({"at": _time.time(), "ok": not err,
                           "err": err or "", "n": len(pays)})
@@ -12942,7 +13850,11 @@ async def _dep_mail_once(bot):
                 pend = []
             o = _mail_pick_deposit(pay, pend)
             if not o:
-                continue            # ম্যাচ হয়নি → পরের চেকে আবার (মেইল নষ্ট হয় না)
+                try:                # 💡 ম্যাচ হয়নি → অ্যাডমিনকে জানাই (একবারই)
+                    await _dep_mail_unmatched_notify(bot, mid, pay)
+                except Exception:
+                    pass
+                continue            # পরের চেকে আবার চেষ্টা হবে (মেইল নষ্ট হয় না)
             oid = int(o["id"])
             # TxID বন্ধ (মালিকের নির্দেশ) — ডুপ্লিকেট আটকায় ইমেইলের
             # Message-ID (`_mail_seen_add`) আর ইমেইলের নিজের সময়।
@@ -12990,11 +13902,18 @@ async def _dep_mail_once(bot):
 
 
 async def job_dep_mail_watch(ctx):
-    """প্রতি ৬০ সেকেন্ডে Binance ইমেইল চেক (সেট করা থাকলে)।"""
+    """Watchdog — IDLE engine চলছে কি না দেখে, বন্ধ হলে আবার চালু করে।
+
+    ⚠️ পুরোনো ২৫ সেকেন্ডের polling job আর নেই; মেইল চেক করে
+    `mail_engine_loop` (IDLE), আর IDLE না চললে engine-ই ২৫s polling করে।
+    """
     try:
-        await _dep_mail_once(ctx.bot)
+        t = _MAILW.get("task")
+        if t is None or t.done():
+            mail_engine_start(ctx.bot)
+            log.info("[MAIL-IDLE] engine বন্ধ ছিল — আবার চালু হলো")
     except Exception as e:
-        log.debug(f"[DEP-MAIL] job: {str(e)[:120]}")
+        log.debug(f"[DEP-MAIL] watchdog: {str(e)[:120]}")
 
 
 async def cmd_mail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -13037,19 +13956,43 @@ async def cmd_mail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                              f"👤 {_md_esc(_p.get('sender') or 'নাম পাওয়া যায়নি')}")
         if cfg["on"]:
             lines.append("")
-            lines.append("অটো-চেক: চালু ✅ (প্রতি ৬০ সেকেন্ড)")
+            lines.append("অটো-চেক: চালু ✅ (IDLE — নতুন মেইল সাথে সাথে)")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
+    def _ago_m(ts):
+        try:
+            ts = float(ts or 0)
+        except Exception:
+            ts = 0.0
+        if ts <= 0:
+            return "এখনো হয়নি"
+        d = int(_time.time() - ts)
+        if d < 60:
+            return f"{d}s আগে"
+        if d < 3600:
+            return f"{d // 60} মিনিট আগে"
+        return f"{d // 3600} ঘণ্টা আগে"
+
+    _ms = dict(_MAIL_STAT or {})
+    _conn = "✅ যুক্ত আছে" if _ms.get("connected") else "❌ যুক্ত নেই"
+    if _ms.get("connected"):
+        _conn += f" ({_ago_m(_ms.get('conn_at'))} থেকে)"
+    _idle = ("🟢 চলছে (নতুন মেইলের অপেক্ষা)" if _ms.get("idle")
+             else f"⚪ নেই — মোড: {_md_esc(str(_ms.get('mode') or '—'))}")
     lines = ["📧 *মেইল অটো-ডিপোজিট*", "━━━━━━━━━━━━━━",
              f"• স্ট্যাটাস: {'চালু ✅' if cfg['on'] else 'বন্ধ ❌ (সেট করা নেই)'}",
-             f"• হোস্ট: `{_md_esc(cfg['host'])}:{cfg['port']}`",
-             f"• ইউজার: `{_md_esc(cfg['user'] or '—')}`",
-             f"• পাসওয়ার্ড: {'সেট ✅' if cfg['pass'] else 'নেই ❌'}"]
-    if _DEP_MAIL.get("at"):
-        _age = int(_time.time() - float(_DEP_MAIL["at"]))
-        lines.append(f"• শেষ চেক: {_age}s আগে · {_DEP_MAIL.get('n', 0)} মেইল")
-        if _DEP_MAIL.get("err"):
-            lines.append(f"• শেষ এরর: `{_md_esc(str(_DEP_MAIL['err'])[:120])}`")
+             f"• 🔌 *Connection:* {_conn}",
+             f"• 📡 *IMAP IDLE:* {_idle}",
+             f"• 📨 *Last Email:* {_ago_m(_ms.get('last_email_at'))}",
+             f"• 🔎 *Last Deposit Checked:* {_ago_m(_ms.get('last_check_at'))}",
+             f"• 🔢 *Emails Processed:* {int(_ms.get('processed') or 0)}",
+             f"• ♻️ *Reconnect:* {int(_ms.get('reconnects') or 0)} বার",
+             f"• 🖥 হোস্ট: `{_md_esc(cfg['host'])}:{cfg['port']}`",
+             f"• 👤 ইউজার: `{_md_esc(cfg['user'] or '—')}`",
+             f"• 🔑 পাসওয়ার্ড: {'সেট ✅' if cfg['pass'] else 'নেই ❌'}"]
+    _err = str(_ms.get("err") or (_DEP_MAIL.get("err") or ""))[:120]
+    if _err:
+        lines.append(f"• ⚠️ শেষ এরর: `{_md_esc(_err)}`")
     lines += ["", "⚙️ সেটআপ: ওয়েব প্যানেল → ✉️ Mail Auto-Deposit",
               "`/mail` — স্ট্যাটাস · `/mail test` — সংযোগ চেক",
               "`/mail on` · `/mail off` — চালু/বন্ধ"]
@@ -14050,6 +14993,9 @@ async def cmd_depchk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _dep_auto_credit(ctx, uid, m, amount, txid, oid, pay_key="", pay_ts=0):
+    # কেউ সোজা bot পাঠালেও কাজ করবে (ইউজার/অ্যাডমিন নোটিফিকেশন ঠিক যাবে)
+    if not hasattr(ctx, "bot"):
+        ctx = _DepCtx(ctx)
     """অটো ডিপোজিট সফল — ব্যালেন্স যোগ + ইউজার ও অ্যাডমিনকে জানাও।
 
     pay_key / pay_ts — মেইলের পেমেন্টের নিজস্ব চিহ্ন ও সময়। একই পেমেন্ট
@@ -14145,8 +15091,8 @@ async def _dep_auto_credit(ctx, uid, m, amount, txid, oid, pay_key="", pay_ts=0)
                                 int(pay_ts or 0))
     except Exception:
         pass
-    try:
-        bal = await asyncio.to_thread(get_bal, uid)
+    try:      # ডিপোজিটের টাকা ৳ ওয়ালেটে যায় — সেটাই দেখাই
+        bal = await asyncio.to_thread(get_dep_balance, uid)
     except Exception:
         bal = 0
     try:
@@ -14154,9 +15100,9 @@ async def _dep_auto_credit(ctx, uid, m, amount, txid, oid, pay_key="", pay_ts=0)
             uid,
             (f"✅ <b>ডিপোজিট সফল!</b>\n\n"
              f"💵 পরিমাণ: <b>{amount:g}$</b>\n"
-             f"🏷 মেথড: {html.escape(str(m['name'] or ''))}\n"
+             f"🏷 মেথড: {html.escape(str((m or {}).get('name') or 'Binance'))}\n"
              f"🔗 TxID: <code>{html.escape('Binance Pay (অটো)' if str(txid).upper().startswith('FUND') else txid)}</code>\n"
-             f"💰 নতুন ব্যালেন্স: <b>{bal:g}$</b>\n\n"
+             f"💰 নতুন ৳ ব্যালেন্স: <b>{bal:g}৳</b>\n\n"
              f"🧾 ডিপোজিট নম্বর: <code>#{dep_no(oid)}</code>"),
             parse_mode="HTML")
     except Exception as e:
@@ -14166,7 +15112,7 @@ async def _dep_auto_credit(ctx, uid, m, amount, txid, oid, pay_key="", pay_ts=0)
             ctx.bot,
             f"💳 *অটো ডিপোজিট*\n\n"
             f"🆔 `#{dep_no(oid)}` · 👤 `{uid}`\n"
-            f"💵 `{amount:g}$` — {_md_esc(m['name'] or '')}\n"
+            f"💵 `{amount:g}$` — {_md_esc((m or {}).get('name') or 'Binance')}\n"
             f"🔗 `{txid}`")
     except Exception:
         pass
@@ -14225,8 +15171,8 @@ async def dep_callback(update, ctx):
                  f"🪙 Earn ব্যালেন্স: `{_earn:g}$`\n"
                  f"💳 ডিপোজিট ব্যালেন্স: `{taka_txt(_dep)}`\n"
                  f"📊 রেট: 1$ = `{_rate:g}` ৳\n\n"
-                 "Enter the amount (USD) to convert from Earn → ডিপোজিট ব্যালেন্স :\n"
-                 "শুধু সংখ্যা লিখুন (যেমন `1`)।\n\n/cancel — বাতিল")
+                 "কত ডলার কনভার্ট করবেন? (শুধু সংখ্যা, যেমন `1`)\n\n"
+                 "/cancel — বাতিল")
                 if not _en else
                 ("🔄 *Convert Earn → Deposit balance*\n\n"
                  f"🪙 Earn balance: `{_earn:g}$`\n"
@@ -14851,6 +15797,13 @@ async def _dep_uid_finish(update, ctx, uid, m, amt, name, en=False):
                     _mail_gap = max(10, int(get_setting("mail_poll_sec") or 25))
                 except Exception:
                     _mail_gap = 25
+                # ⏱ উইন্ডো ছোট হলে মেইল দেখার ফাঁকও ছোট হবে — নাহলে দেরিতে
+                #    আসা মেইল পুরো উইন্ডোতেই ধরা পড়ে না।
+                try:
+                    _left_w = max(3, int((_end_ms - _time.time() * 1000) / 1000))
+                    _mail_gap = min(_mail_gap, _left_w)
+                except Exception:
+                    pass
                 _next_mail = _time.time() + _mail_gap
                 try:
                     await _dep_mail_once(ctx.bot)
@@ -16408,7 +17361,11 @@ def invalidate_ch_cache(uid: int):
 async def join_prompt(update: Update, uid=None):
     lang_uid = uid or (update.effective_user.id if update.effective_user else 0)
     channels = await asyncio.to_thread(get_req_channels)
-    btns = [[InlineKeyboardButton(f"👉 {ch['ch_name']}", url=ch["ch_link"])] for ch in channels]
+    btns = []
+    for ch in channels:
+        _b = _ch_btn(f"👉 {ch['ch_name']}", ch.get("ch_id"), ch.get("ch_link"))
+        if _b:
+            btns.append([_b])
     _jp_lang = await asyncio.to_thread(get_lang, lang_uid)
     _jp_btn_lbl = "✅ জয়েন করেছি — চেক করুন" if _jp_lang == 'bn' else "✅ I've Joined — Check Now"
     btns.append([InlineKeyboardButton(_jp_btn_lbl, callback_data="check_join")])
@@ -16453,7 +17410,11 @@ async def _send_join_prompt_bot(bot, uid, lang="bn"):
         channels = []
     if not channels:
         return False
-    btns = [[InlineKeyboardButton(f"👉 {ch['ch_name']}", url=ch["ch_link"])] for ch in channels]
+    btns = []
+    for ch in channels:
+        _b = _ch_btn(f"👉 {ch['ch_name']}", ch.get("ch_id"), ch.get("ch_link"))
+        if _b:
+            btns.append([_b])
     btns.append([InlineKeyboardButton(
         "✅ জয়েন করেছি — চেক করুন" if lang != "en" else "✅ I've Joined — Check Now",
         callback_data="check_join")])
@@ -17245,7 +18206,7 @@ async def show_profile(update, ctx):
     _dep_bal = float(st.get("dep_bal") or 0)
     # সবসময় দেখাও (ডিপোজিট না থাকলে $0.00)
     _dep_line = (f"💰 *{'Deposit balance' if _lang == 'en' else 'ডিপোজিট ব্যালেন্স'}:* "
-                 f"`${_dep_bal:.2f}`\n")
+                 f"`{taka_txt(_dep_bal)}`\n")
     _name = _md_esc(user.full_name or user.username or "—")
     if user.username and user.full_name:
         _name += f" (@{_md_esc(user.username)})"
@@ -19830,15 +20791,13 @@ async def receive_wd_addr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for k in ("state", "wd_addr", "wd_amt"):
             ctx.user_data.pop(k, None)
         return
-    bal, fee, min_w = await asyncio.gather(
-        asyncio.to_thread(wd_available, uid),
+    fee, min_w = await asyncio.gather(
         asyncio.to_thread(get_wd_fee),
         asyncio.to_thread(get_min_withdraw),
     )
-    await update.message.reply_text(
-        T(uid, 'wd_enter_amt', bal=bal, fee=fee, min_w=min_w),
-        parse_mode="Markdown", reply_markup=cancel_kb(uid)
-    )
+    _txt_w, _kb_w = await asyncio.to_thread(wd_src_text, uid, lang, fee, min_w)
+    ctx.user_data["state"] = "wd_src"
+    await update.message.reply_text(_txt_w, parse_mode="Markdown", reply_markup=_kb_w)
 
 def save_wallet_if_changed(uid, address):
     """saved_wallet সেভ করো; আগের ঠিকানা থেকে সত্যিই বদল হলে wallet_updated_at স্ট্যাম্প দাও।
@@ -19923,14 +20882,21 @@ async def receive_wd_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                    else f"❌ *মিনিমাম উইথড্র:* `{min_w}$ USDT`")
         await update.message.reply_text(min_msg, parse_mode="Markdown", reply_markup=cancel_kb(uid))
         return
-    # 💳 earn ($) + ডিপোজিট টাকা (রেটে ভাঙা) — দুটো মিলিয়েই withdraw হয়
-    bal = await asyncio.to_thread(wd_available, uid)
-    if amt > bal:
-        await update.message.reply_text(
-            T(uid, 'wd_no_bal', bal=bal, amt=amt), parse_mode="Markdown",
-            reply_markup=cancel_kb(uid))
+    # 💳/🪙 ইউজার যে ওয়ালেট বেছেছে সেটার টাকা দিয়েই withdraw হবে
+    _src = "dep" if ctx.user_data.get("wd_src") == "dep" else "earn"
+    bal = await asyncio.to_thread(wd_available, uid, _src)
+    if amt > bal + 1e-9:
+        _avail_msg = (
+            (f"❌ *Not enough in your deposit balance!*\n\n"
+             f"💳 Available: `${bal:g}`\n💸 Requested: `${amt:g}`")
+            if lang == 'en' else
+            (f"❌ *ডিপোজিট ব্যালেন্সে যথেষ্ট টাকা নেই!*\n\n"
+             f"💳 আছে: `${bal:g}`\n💸 চাইছেন: `${amt:g}`"))
+        await update.message.reply_text(_avail_msg, parse_mode="Markdown",
+                                        reply_markup=cancel_kb(uid))
         return
-    _eused, _dused, _dcut, _wrate = await asyncio.to_thread(wd_split, uid, amt)
+    _eused, _dused, _dcut, _wrate = await asyncio.to_thread(
+        wd_split, uid, amt, _src)
     net_amt = round(amt - fee - _dcut, 4)
     if net_amt <= 0:
         err = (f"❌ *Amount too low.* After fee `${fee}`, nothing remains."
@@ -19953,11 +20919,12 @@ async def show_wd_confirmation(msg, ctx, uid):
         asyncio.to_thread(get_wd_fee),
         asyncio.to_thread(get_lang, uid),
     )
-    _eu, _du, _cut, _wrate = await asyncio.to_thread(wd_split, uid, amt)
+    _wsrc = "dep" if ctx.user_data.get("wd_src") == "dep" else "earn"
+    _eu, _du, _cut, _wrate = await asyncio.to_thread(wd_split, uid, amt, _wsrc)
     net_amt = round(amt - fee - _cut, 4)
-    _cut_en = (f"🏦 *Deposit part:* `{_du:g} ৳` (1$ = {_wrate:g} ৳)\n"
+    _cut_en = (f"🏦 *Cut from deposit:* `{taka_txt(_du)}`\n"
                f"🏦 *Deposit cut (15%):* `${_cut:.4f}`\n" if _cut else "")
-    _cut_bn = (f"🏦 *ডিপোজিট থেকে:* `{_du:g} ৳` (1$ = {_wrate:g} ৳)\n"
+    _cut_bn = (f"🏦 *ডিপোজিট থেকে কাটা:* `{taka_txt(_du)}`\n"
                f"🏦 *ডিপোজিটের অংশে ১৫% কাটা:* `${_cut:.4f}`\n" if _cut else "")
     masked  = addr   # ইউজার নিজের wallet সব জায়গায় ফুল দেখবে
     if lang == 'en':
@@ -20025,9 +20992,11 @@ async def do_wd_submit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         asyncio.to_thread(get_wd_fee),
         asyncio.to_thread(get_lang, uid),
     )
-    # ── ডিপোজিটের টাকার অংশে ১৫% কাটা (ইনকামের টাকায় নয়) ──
+    # ── ইউজার যে ওয়ালেট বেছেেছে (Earn / ডিপোজিট) সেটার টাকা কাটা ──
     await asyncio.to_thread(_ensure_dep_cols)
-    _earn_used, dep_used, dep_cut, _wrate2 = await asyncio.to_thread(wd_split, uid, amt)
+    _src2 = "dep" if ctx.user_data.get("wd_src") == "dep" else "earn"
+    _earn_used, dep_used, dep_cut, _wrate2 = await asyncio.to_thread(
+        wd_split, uid, amt, _src2)
     net_amt = round(amt - fee - dep_cut, 4)
     _cut_en = (f"🏦 *Deposit cut (15%):* `${dep_cut:.4f}`\n" if dep_cut else "")
     _cut_bn = (f"🏦 *ডিপোজিট থেকে ১৫% কাটা:* `${dep_cut:.4f}`\n" if dep_cut else "")
@@ -22685,16 +23654,30 @@ async def _on_callback_inner(update, ctx, q, uid, d):
         ); return
 
     if d == "wd_edit_amt":
-        ctx.user_data["state"] = "wd_amt"
-        fee, min_w, bal = await asyncio.gather(
+        _lang_e, fee, min_w = await asyncio.gather(
+            asyncio.to_thread(get_lang, uid),
             asyncio.to_thread(get_wd_fee),
             asyncio.to_thread(get_min_withdraw),
-            asyncio.to_thread(wd_available, uid),
         )
-        await q.message.reply_text(
-            T(uid, 'wd_enter_amt', bal=bal, fee=fee, min_w=min_w),
-            parse_mode="Markdown", reply_markup=cancel_kb(uid)
-        ); return
+        _src_e = "dep" if ctx.user_data.get("wd_src") == "dep" else "earn"
+        ctx.user_data["state"] = "wd_amt"
+        _txt_e = await asyncio.to_thread(wd_amt_prompt_text, uid, _lang_e, fee, min_w, _src_e)
+        await q.message.reply_text(_txt_e, parse_mode="Markdown",
+                                   reply_markup=cancel_kb(uid)); return
+
+    if d in ("wd_src_earn", "wd_src_dep", "wd_src"):
+        _src_c = "dep" if str(d).endswith("dep") else ("earn" if str(d).endswith("earn")
+                                                     else ("dep" if ctx.user_data.get("wd_src") == "dep" else "earn"))
+        ctx.user_data["wd_src"] = _src_c
+        ctx.user_data["state"] = "wd_amt"
+        _lang_c, fee, min_w = await asyncio.gather(
+            asyncio.to_thread(get_lang, uid),
+            asyncio.to_thread(get_wd_fee),
+            asyncio.to_thread(get_min_withdraw),
+        )
+        _txt_c = await asyncio.to_thread(wd_amt_prompt_text, uid, _lang_c, fee, min_w, _src_c)
+        await q.message.reply_text(_txt_c, parse_mode="Markdown",
+                                   reply_markup=cancel_kb(uid)); return
 
     if d == "wd_use_saved_wallet":
         _sw = ctx.user_data.pop("_saved_w_cache", None)
@@ -22710,15 +23693,15 @@ async def _on_callback_inner(update, ctx, q, uid, d):
                 T(uid, 'wd_enter_addr'), parse_mode="Markdown", reply_markup=cancel_kb(uid))
             ctx.user_data["state"] = "wd_addr"; return
         ctx.user_data["wd_addr"] = _sw
-        ctx.user_data["state"]   = "wd_amt"
-        bal, fee, min_w = await asyncio.gather(
-            asyncio.to_thread(wd_available, uid),
+        _lang_s, fee, min_w = await asyncio.gather(
+            asyncio.to_thread(get_lang, uid),
             asyncio.to_thread(get_wd_fee),
             asyncio.to_thread(get_min_withdraw),
         )
-        await q.message.reply_text(
-            T(uid, 'wd_enter_amt', bal=bal, fee=fee, min_w=min_w),
-            parse_mode="Markdown", reply_markup=cancel_kb(uid)); return
+        _txt_s, _kb_s = await asyncio.to_thread(wd_src_text, uid, _lang_s, fee, min_w)
+        ctx.user_data["state"] = "wd_src"
+        await q.message.reply_text(_txt_s, parse_mode="Markdown",
+                                   reply_markup=_kb_s); return
 
     if d == "wd_enter_new_addr":
         ctx.user_data.pop("_saved_w_cache", None)
@@ -25795,6 +26778,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── 💳 Deposit ইনপুট (ইউজার TxID/পরিমাণ + অ্যাডমিন মেথড তৈরি) ──
     if st and str(st).startswith(("dep_tx", "dep_amt", "dep_note", "dep_uid", "dep_proof",
+                                  "dep_conv_amt",
                                   "qr_amt", "qr_proof",
                                   "depa_new", "depa_min", "depa_qr", "depa_api")):
         try:
@@ -25813,7 +26797,22 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as _mce:
             log.warning(f"[MAILCODE] input ব্যর্থ: {_mce}")
 
+    # ── 🌐 SMM: লিংক / পরিমাণ ইনপুট ──
+    if st and str(st).startswith("smm_"):
+        try:
+            if await smm_input(update, ctx, str(st)):
+                return
+        except Exception as _sme:
+            log.warning(f"[SMM] input ব্যর্থ: {_sme}")
+
     # ── 🛒 Shop: ইউজারের "কয়টা নিবেন" ইনপুট ──
+    if st and str(st).startswith("shop_ask:"):
+        try:
+            if await shop_ask_input(update, ctx, str(st)):
+                return
+        except Exception as _sae:
+            log.warning(f"[SHOP] ask input ব্যর্থ: {_sae}")
+
     if st and str(st).startswith("shop_qty:"):
         try:
             if await shop_qty_input(update, ctx, str(st)):
@@ -30881,12 +31880,17 @@ def _auto_configure():
         # Required channels: শুধু DB একদম খালি থাকলে default seed করো
         # (admin panel থেকে করা পরিবর্তন যাতে code re-run এ মুছে না যায়)
         ch_count = _count(c.execute("SELECT COUNT(*) FROM required_channels").fetchone())
-        if ch_count == 0:
+        _ch_seeded2 = c.execute(
+            "SELECT value FROM settings WHERE key='req_ch_seeded'").fetchone()
+        if ch_count == 0 and not _ch_seeded2:
             for ch in REQUIRED_CHANNELS:
                 c.execute(
                     "INSERT INTO required_channels (ch_id, ch_link, ch_name) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
                     (ch["id"], ch["link"], ch["name"])
                 )
+        if not _ch_seeded2:
+            c.execute("INSERT INTO settings (key,value) VALUES ('req_ch_seeded','1') "
+                      "ON CONFLICT (key) DO UPDATE SET value='1'")
 
     # ── Step 2: সব settings JSON এ backup রাখো ──────────────────────
     try:
@@ -30917,6 +31921,9 @@ def _auto_configure():
             with _c() as c:
                 user_count = _count(c.execute("SELECT COUNT(*) FROM users").fetchone())
                 ch_count_now = _count(c.execute("SELECT COUNT(*) FROM required_channels").fetchone())
+                # মালিক চ্যানেলগুলো নিজে মুছে দিলে ব্যাকআপ থেকে আর ফিরিয়ে আনা যাবে না
+                _seed_flag_now = c.execute(
+                    "SELECT value FROM settings WHERE key='req_ch_seeded'").fetchone()
             if user_count == 0 and saved.get("settings"):
                 with _c() as c:
                     # settings restore করো
@@ -30927,7 +31934,7 @@ def _auto_configure():
                             (key, val)
                         )
                     # required_channels restore করো — admin পরিবর্তন করা channels ফিরিয়ে আনো
-                    if ch_count_now == 0 and saved.get("required_channels"):
+                    if ch_count_now == 0 and not _seed_flag_now and saved.get("required_channels"):
                         for ch in saved["required_channels"]:
                             c.execute(
                                 "INSERT INTO required_channels (ch_id, ch_link, ch_name) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
@@ -31507,7 +32514,6 @@ async def job_auto_withdraw(context):
                         f"<blockquote>👤 <b>User Name:</b> {_esc(_uname_clean or 'Unknown')}</blockquote>\n"
                         f"<blockquote>💰 <b>Amount:</b> ${net_amt:.4f} USDT</blockquote>\n"
                         f"<blockquote>👛 <b>Withdraw:</b> 💎 BEP20 (USDT)</blockquote>\n"
-                        f"<blockquote>📍 <b>Wallet:</b> <code>{_esc(masked)}</code></blockquote>\n"
                         f"<blockquote>🕐 <b>Date:</b> {_pay_date}</blockquote>\n"
                         f"<blockquote>🔗 <b>TxHash:</b> <code>{_esc(tx_hash)}</code></blockquote>\n\n"
                         f"💎 <i>Auto payment • Task Earn Bot</i>"
@@ -31535,7 +32541,6 @@ async def job_auto_withdraw(context):
                             f"👤 User Name: {_uname_clean or 'Unknown'}\n"
                             f"💰 Amount: ${net_amt:.4f} USDT\n"
                             f"👛 Withdraw: BEP20 (USDT)\n"
-                            f"📍 Wallet: {masked}\n"
                             f"🕐 Date: {_pay_date}\n"
                             f"🔗 TxHash: {tx_hash}\n\n"
                             f"BSCScan: {bscscan_url}"
@@ -36157,6 +37162,11 @@ def main():
             _vrf_sig_task.add_done_callback(_bg_task_done)
         except Exception as _ve:
             log.warning(f"[VRF] signal watcher চালু হয়নি: {_ve}")
+        # 📬 মেইল IDLE engine — job_queue না থাকলেও চালু হবে
+        try:
+            mail_engine_start(application.bot)
+        except Exception as _me:
+            log.warning(f"[MAIL-IDLE] engine চালু হয়নি: {_me}")
         # Fallback dirty-check: ৬০ সেকেন্ড পরপর (immediate scheduling ব্যর্থ হলে)
         if application.job_queue is not None:
             application.job_queue.run_repeating(
@@ -36175,8 +37185,9 @@ def main():
                 job_fb_sheet_sync, interval=300, first=120, name="fb_sheet_sync")
             application.job_queue.run_repeating(
                 job_dep_name_watch, interval=60, first=30, name="dep_name_watch")
+            # 📬 মেইল engine ইতিমধ্যে চালু — এটা শুধু watchdog (বন্ধ হলে আবার চালু)
             application.job_queue.run_repeating(
-                job_dep_mail_watch, interval=25, first=10, name="dep_mail_watch")
+                job_dep_mail_watch, interval=60, first=20, name="dep_mail_watch")
             application.job_queue.run_repeating(
                 job_fb_password_rotate, interval=60, first=45, name="fb_pw_rotate")
             application.job_queue.run_repeating(
@@ -36191,6 +37202,8 @@ def main():
                 job_task_notify_queue, interval=15, first=8, name="task_notify_queue")
             application.job_queue.run_repeating(
                 job_history_sync, interval=1800, first=120, name="history_sync")
+            application.job_queue.run_repeating(
+                job_smm_balance, interval=1800, first=90, name="smm_balance")
             application.job_queue.run_repeating(
                 job_clean_stuck_states,
                 interval=1800,
@@ -36443,6 +37456,964 @@ def main():
     app.add_error_handler(_smart_error_handler)
     log.info("✅ Task Earn Bot started!")
     app.run_polling(drop_pending_updates=True)
+
+# ═════════════════ 🌐 SMM প্যানেল (bdsmmpanel API v2) ═════════════════
+# অ্যাডমিন শুধু API Key দিলেই ইউজার বট থেকেই SMM সার্ভিস কিনতে পারবে।
+# দাম: প্যানেলের rate (প্রতি ১০০০ ইউনিট, USD) → ৳ (USD রেট × markup %)।
+SMM_DEF_URL = "https://bdsmmpanel.com/api/v2"
+_SMM_CACHE = {"ts": 0.0, "svc": []}
+_SMM_PAGE = 8
+
+
+def smm_cfg():
+    """সেটিংস থেকে SMM কনফিগ — URL/Key/USD রেট/মার্কআপ/চালু-বন্ধ।"""
+    def _f(k, d):
+        try:
+            return float(get_setting(k) or d)
+        except Exception:
+            return float(d)
+    return {
+        "url": (get_setting("smm_url") or SMM_DEF_URL).strip(),
+        "key": (get_setting("smm_key") or "").strip(),
+        "usd": _f("smm_usd_bdt", 130) or 130.0,
+        "markup": _f("smm_markup", 20),
+        # প্যানেলের দাম কোন মুদ্রায়: "bdt" (৳, যেমন bdsmmpanel দেখায়) বা "usd" ($)
+        "cur": (get_setting("smm_cur") or "bdt").strip().lower(),
+        "on": (get_setting("smm_on") or "off") == "on",
+        "tiers": get_setting("smm_tiers") or SMM_TIERS_DEF,
+    }
+
+
+def smm_on():
+    """SMM বাটন দেখাবে কি না — Key সেট থাকলে এবং অ্যাডমিন চালু করলে।"""
+    try:
+        c = smm_cfg()
+        return bool(c["on"] and c["key"])
+    except Exception:
+        return False
+
+
+def _smm_api(params, timeout=25):
+    """প্যানেলে POST করে JSON ফেরত দেয়। error থাকলে exception।"""
+    cfg = smm_cfg()
+    if not cfg["key"]:
+        raise RuntimeError("API Key সেট করা হয়নি")
+    data = {"key": cfg["key"]}
+    data.update({k: v for k, v in params.items() if v is not None})
+    body = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(
+        cfg["url"], data=body,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; TaskEarnBot)",
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read().decode("utf-8", "replace").strip()
+    try:
+        js = _json.loads(raw)
+    except Exception:
+        raise RuntimeError("প্যানেলের উত্তর বোঝা যায়নি")
+    if isinstance(js, dict) and js.get("error"):
+        raise RuntimeError(str(js["error"])[:180])
+    return js
+
+
+def smm_panel_balance():
+    """প্যানেল অ্যাকাউন্টে আপনার নিজের ব্যালেন্স (যেটা দিয়ে অর্ডার যায়)।"""
+    js = _smm_api({"action": "balance"})
+    if isinstance(js, dict):
+        return str(js.get("balance", "")), str(js.get("currency", "USD"))
+    return "", "USD"
+
+
+def smm_services(force=False):
+    """সার্ভিস লিস্ট (১০ মিনিট ক্যাশ)।"""
+    if not force and _SMM_CACHE["svc"] and (_time.time() - _SMM_CACHE["ts"] < 600):
+        return _SMM_CACHE["svc"]
+    js = _smm_api({"action": "services"}, timeout=40)
+    out = []
+    if isinstance(js, list):
+        for s in js:
+            try:
+                out.append({
+                    "id": int(s.get("service")),
+                    "name": str(s.get("name") or "").strip(),
+                    "cat": str(s.get("category") or "অন্যান্য").strip(),
+                    "rate": float(s.get("rate") or 0),
+                    "min": int(float(s.get("min") or 1)),
+                    "max": int(float(s.get("max") or 0)),
+                    "type": str(s.get("type") or "Default"),
+                })
+            except Exception:
+                continue
+    _SMM_CACHE.update({"ts": _time.time(), "svc": out})
+    return out
+
+
+# ধাপ অনুযায়ী লাভের % — "কত ৳ হলে কত %" (অ্যাডমিন প্যানেল থেকে এডিট/যোগ করা যায়)
+SMM_TIERS_DEF = "1-3:100|4-6:50|7-10:40|10-50:30|50-80:40|80-100:30|100-120:25|120-150:20"
+
+
+def smm_tiers_parse(text):
+    """'1-3:100|4-6:50' বা প্রতিটা লাইনে '1-3 = 100' → [(lo, hi, pct), ...]"""
+    out = []
+    for part in re.split(r"[|\n;]+", str(text or "")):
+        p = (part.replace("=", ":").replace("—", "-").replace("–", "-")
+             .replace("%", "").strip())
+        if not p:
+            continue
+        if ":" in p:
+            rng, _, pc = p.partition(":")
+        else:
+            bits = p.replace("-", " - ").split()
+            if len(bits) < 3:
+                continue
+            rng, pc = "".join(bits[:-1]), bits[-1]
+        mm = re.match(r"^(\d+(?:\.\d+)?)\s*(?:-|to|থেকে)\s*(\d+(?:\.\d+)?)$",
+                      rng.strip().replace(" ", ""), re.I)
+        if not mm:
+            continue
+        try:
+            lo, hi, pct = float(mm.group(1)), float(mm.group(2)), float(pc.strip())
+        except Exception:
+            continue
+        if hi < lo:
+            lo, hi = hi, lo
+        if pct < 0:
+            pct = 0.0
+        out.append((lo, hi, pct))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def smm_tiers_str(tiers):
+    return "|".join(f"{lo:g}-{hi:g}:{pct:g}" for lo, hi, pct in tiers)
+
+
+def smm_tiers():
+    """কার্যকর ধাপ-তালিকা (সেটিংস খালি/ভুল হলে ডিফল্ট)।"""
+    try:
+        raw = get_setting("smm_tiers") or SMM_TIERS_DEF
+    except Exception:
+        raw = SMM_TIERS_DEF
+    ts = smm_tiers_parse(raw)
+    return ts or smm_tiers_parse(SMM_TIERS_DEF)
+
+
+def smm_markup_pct(base):
+    """এই অঙ্কের (৳) জন্য প্রযোজ্য লাভের %।"""
+    try:
+        base = float(base)
+    except Exception:
+        base = 0.0
+    ts = smm_tiers()
+    for lo, hi, pct in ts:
+        if lo <= base <= hi:
+            return pct
+    if not ts:
+        try:
+            return float(smm_cfg().get("markup") or 0)
+        except Exception:
+            return 0.0
+    if base < ts[0][0]:            # সবচেয়ে ছোট ধাপের নিচে → প্রথম ধাপ
+        return ts[0][2]
+    if base > ts[-1][1]:           # সবচেয়ে বড় ধাপের উপরে → শেষ ধাপ
+        return ts[-1][2]
+    best = ts[-1][2]               # ফাঁক থাকলে নিচের সবচেয়ে কাছের ধাপ
+    for lo, _hi, pct in ts:
+        if base >= lo:
+            best = pct
+    return best
+
+
+def smm_price(rate, qty):
+    """প্যানেল rate (প্রতি ১০০০) → ইউজারের ৳ দাম (markup সহ)।
+
+    প্যানেলের দাম আগেই ৳ হলে (bdsmmpanel-এর মতো) শুধু markup যোগ হয়;
+    ডলারে হলে USD→৳ রেট দিয়ে গুণ করা হয়।
+    """
+    cfg = smm_cfg()
+    base = (float(rate) / 1000.0) * int(qty)
+    if cfg.get("cur") == "usd":
+        base *= float(cfg["usd"])
+    try:
+        _pct = smm_markup_pct(base)
+    except Exception:
+        _pct = float(cfg["markup"])
+    return round(base * (1.0 + _pct / 100.0), 2)
+
+
+def _smm_min_bal():
+    try:
+        return float(get_setting("smm_min_bal") or 5)
+    except Exception:
+        return 5.0
+
+
+def _smm_admin_ids():
+    ids = set()
+    try:
+        if ADMIN_ID:
+            ids.add(int(ADMIN_ID))
+    except Exception:
+        pass
+    try:
+        with _c() as c:
+            for r in (c.execute("SELECT user_id FROM admins").fetchall() or []):
+                try:
+                    ids.add(int(r["user_id"]))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return list(ids)
+
+
+def smm_check_balance(notify_bot=None, force=False):
+    """প্যানেলের ব্যালেন্স দেখা + কম হলে অ্যাডমিনকে সতর্ক করা (৬ ঘণ্টায় একবার)।
+
+    (ফেরত) dict: balance/currency/low/alerted — বা None (প্যানেলের সাথে যোগাযোগ ব্যর্থ)।
+    """
+    try:
+        bal, cur = smm_panel_balance()
+    except Exception as e:
+        log.warning(f"[SMM] ব্যালেন্স আনা যায়নি: {e}")
+        return None
+    try:
+        b = float(str(bal or 0).replace(",", "").strip())
+    except Exception:
+        b = 0.0
+    try:
+        set_setting("smm_bal_last", f"{bal}")
+        set_setting("smm_bal_cur", cur or "")
+        set_setting("smm_bal_at", now())
+    except Exception:
+        pass
+    low = b < _smm_min_bal()
+    alerted = False
+    if low and notify_bot is not None:
+        try:
+            last = float(get_setting("smm_bal_alert_at") or 0)
+        except Exception:
+            last = 0.0
+        _gap = 600 if force else 21600        # সাধারণত ৬ ঘণ্টায় একবার, অর্ডার আটকালে ১০ মিনিটে একবার
+        if _time.time() - last > _gap:
+            msg = (f"⚠️ *SMM প্যানেলের ব্যালেন্স কম!*\n\n"
+                   f"💳 আছে: *{bal} {cur}*\n"
+                   f"🔻 সীমা: {_smm_min_bal():g}\n\n"
+                   f"প্যানেলে টাকা যোগ করুন, নাহলে ইউজারের অর্ডার ফেল হবে।")
+            for aid in _smm_admin_ids():
+                try:
+                    notify_bot.send_message(aid, msg, parse_mode="Markdown")
+                    alerted = True
+                except Exception:
+                    pass
+            if alerted:
+                try:
+                    set_setting("smm_bal_alert_at", str(_time.time()))
+                except Exception:
+                    pass
+    return {"balance": bal, "currency": cur, "low": low, "alerted": alerted}
+
+
+async def job_smm_balance(context):
+    """প্রতি ৩০ মিনিটে প্যানেলের ব্যালেন্স চেক।"""
+    try:
+        if not get_setting("smm_key"):
+            return
+        await asyncio.to_thread(smm_check_balance, context.bot)
+    except Exception as e:
+        log.warning(f"[SMM] ব্যালেন্স জব ব্যর্থ: {e}")
+
+
+def smm_panel_cost(serv_or_rate, qty):
+    """প্যানেলে অর্ডারটার আসল খরচ (প্যানেলের মুদ্রায়) — rate/১০০০ × পরিমাণ।"""
+    try:
+        rate = serv_or_rate["rate"] if isinstance(serv_or_rate, dict) else serv_or_rate
+        return float(rate) / 1000.0 * float(qty)
+    except Exception:
+        return 0.0
+
+
+def smm_panel_balance_num():
+    """(ব্যালেন্স সংখ্যা, মুদ্রা) — না পেলে (None, "")।"""
+    try:
+        bal, cur = smm_panel_balance()
+    except Exception:
+        return None, ""
+    try:
+        return float(str(bal).replace(",", "").strip()), cur
+    except Exception:
+        return None, ""
+
+
+def smm_can_afford(serv, qty):
+    """প্যানেলের ব্যালেন্স এই অর্ডারের জন্য যথেষ্ট কি না।
+
+    (ফেরত) True = যথেষ্ট / বোঝা গেল না, False = টাকা কম।
+    """
+    cost = smm_panel_cost(serv, qty)
+    if cost <= 0:
+        return True
+    bal, _cur = smm_panel_balance_num()
+    if bal is None:
+        return True          # ব্যালেন্স পড়া গেল না — অর্ডার আটকাব না
+    return bal >= cost
+
+
+def _smm_need_comments(serv):
+    """কমেন্ট টাইপ সার্ভিসে ইউজারকে কমেন্ট লিখতে হবে।"""
+    t = str((serv or {}).get("type") or "").lower()
+    return ("comment" in t) or t.startswith("mention")
+
+
+def smm_dep_deduct(uid, amt):
+    """৳ ওয়ালেট থেকে atomic কাটা — টাকা কম থাকলে False।"""
+    amt = round(float(amt), 4)
+    if amt <= 0:
+        return True
+    with _c() as c:
+        r = c.execute("UPDATE users SET dep_balance=dep_balance-%s "
+                      "WHERE user_id=%s AND dep_balance>=%s RETURNING dep_balance",
+                      (amt, uid, amt)).fetchone()
+    try:
+        _invalidate_user_cache(uid)
+    except Exception:
+        pass
+    return bool(r)
+
+
+def smm_dep_refund(uid, amt):
+    amt = round(float(amt), 4)
+    if amt <= 0:
+        return
+    with _c() as c:
+        c.execute("UPDATE users SET dep_balance=dep_balance+%s WHERE user_id=%s", (amt, uid))
+    try:
+        _invalidate_user_cache(uid)
+    except Exception:
+        pass
+
+
+def smm_order_new(uid, sid, sname, link, qty, price):
+    with _c() as c:
+        r = c.execute(
+            "INSERT INTO smm_orders(user_id,service_id,service_name,link,qty,price,status,created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,'new',%s) RETURNING id",
+            (uid, int(sid), str(sname)[:200], str(link)[:500], int(qty),
+             round(float(price), 4), now())).fetchone()
+    return int(r["id"])
+
+
+def smm_order_set(oid, api_id=None, status=None, charge=None):
+    sets, args = [], []
+    if api_id is not None:
+        sets.append("api_id=%s"); args.append(str(api_id)[:40])
+    if status is not None:
+        sets.append("status=%s"); args.append(str(status)[:60])
+    if charge is not None:
+        sets.append("charge_usd=%s"); args.append(str(charge)[:40])
+    if not sets:
+        return
+    sets.append("updated_at=%s"); args.append(now())
+    with _c() as c:
+        c.execute(f"UPDATE smm_orders SET {', '.join(sets)} WHERE id=%s", tuple(args) + (int(oid),))
+
+
+def smm_order_get(oid):
+    with _c() as c:
+        return c.execute("SELECT * FROM smm_orders WHERE id=%s", (int(oid),)).fetchone()
+
+
+def smm_orders_user(uid, limit=10):
+    with _c() as c:
+        return c.execute("SELECT * FROM smm_orders WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+                         (uid, int(limit))).fetchall() or []
+
+
+def smm_order_status_sync(oid):
+    """প্যানেল থেকে এক অর্ডারের স্ট্যাটাস এনে DB-তে লিখে।"""
+    o = smm_order_get(oid)
+    if not o or not (o["api_id"] or "").strip():
+        return o
+    try:
+        js = _smm_api({"action": "status", "order": str(o["api_id"])})
+        if isinstance(js, dict):
+            st = str(js.get("status") or "")
+            ch = str(js.get("charge") or "")
+            if st:
+                smm_order_set(oid, status=st, charge=ch or None)
+            return smm_order_get(oid)
+    except Exception as e:
+        log.warning(f"[SMM] #{oid} স্ট্যাটাস আনা যায়নি: {e}")
+    return o
+
+
+_SMM_DONE = ("completed", "complete", "canceled", "cancelled", "partial", "refunded")
+
+
+def smm_orders_sync_user(uid, limit=10):
+    """একসাথে (multiple orders status) ইউজারের সব অর্ডারের স্ট্যাটাস আনা।"""
+    rows = smm_orders_user(uid, limit)
+    ids = [str(o["api_id"]).strip() for o in rows
+           if str(o["api_id"] or "").strip()
+           and str(o["status"] or "").lower() not in _SMM_DONE]
+    if not ids:
+        return rows
+    try:
+        js = _smm_api({"action": "status", "orders": ",".join(ids[:100])}, timeout=30)
+    except Exception as e:
+        log.warning(f"[SMM] bulk status ব্যর্থ: {e}")
+        return rows
+    if isinstance(js, dict):
+        for o in rows:
+            aid = str(o["api_id"] or "").strip()
+            if not aid or aid not in js:
+                continue
+            info = js.get(aid) or {}
+            if not isinstance(info, dict) or info.get("error"):
+                continue
+            st = str(info.get("status") or "")
+            if st:
+                smm_order_set(int(o["id"]), status=st, charge=str(info.get("charge") or "") or None)
+    return smm_orders_user(uid, limit)
+
+
+def smm_cancel_order(oid):
+    """প্যানেলে ক্যানসেল রিকোয়েস্ট। (True, msg) ফেরত দেয়।"""
+    o = smm_order_get(oid)
+    if not o or not str(o["api_id"] or "").strip():
+        return False, "অর্ডার আইডি নেই"
+    try:
+        js = _smm_api({"action": "cancel", "orders": str(o["api_id"])})
+    except Exception as e:
+        return False, str(e)[:150]
+    msg = ""
+    if isinstance(js, dict):
+        msg = str(js.get("success") or js.get("message") or "")
+        if isinstance(js.get(str(o["api_id"])), dict):
+            msg = str(js.get(str(o["api_id"])).get("error") or msg)
+    smm_order_set(oid, status="Cancel requested")
+    return True, msg or "ক্যানসেল রিকোয়েস্ট পাঠানো হয়েছে"
+
+
+def smm_refill_order(oid):
+    """প্যানেলে রিফিল রিকোয়েস্ট। (True, msg) ফেরত দেয়।"""
+    o = smm_order_get(oid)
+    if not o or not str(o["api_id"] or "").strip():
+        return False, "অর্ডার আইডি নেই"
+    try:
+        js = _smm_api({"action": "refill", "orders": str(o["api_id"])})
+    except Exception as e:
+        return False, str(e)[:150]
+    msg = ""
+    if isinstance(js, dict):
+        msg = str(js.get("success") or js.get("message") or "")
+    return True, msg or "রিফিল রিকোয়েস্ট পাঠানো হয়েছে"
+
+
+def _smm_cats(svcs):
+    """সার্ভিসগুলোকে ক্যাটাগরি অনুযায়ী গ্রুপ করা।"""
+    out = {}
+    for s in svcs:
+        out.setdefault(s["cat"], []).append(s)
+    return dict(sorted(out.items(), key=lambda kv: kv[0].lower()))
+
+
+async def show_smm(q, ctx, page=0):
+    """🌐 SMM প্যানেল — ক্যাটাগরি লিস্ট।"""
+    uid = q.from_user.id if getattr(q, "from_user", None) else 0
+    _en = await _shop_is_en(uid)
+    if not await asyncio.to_thread(smm_on):
+        try:
+            await q.answer(_bi("SMM প্যানেল এখন বন্ধ", "SMM panel is off", _en), show_alert=True)
+        except Exception:
+            pass
+        return
+    try:
+        svcs = await asyncio.to_thread(smm_services)
+    except Exception as e:
+        return await q.edit_message_text(
+            _bi(f"⚠️ SMM প্যানেলের সাথে যোগাযোগ হচ্ছে না।\n\n`{str(e)[:120]}`",
+                f"⚠️ Cannot reach the SMM panel.\n\n`{str(e)[:120]}`", _en),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(_bi("🔄 আবার চেষ্টা", "🔄 Retry", _en), callback_data="smm:home")],
+                [InlineKeyboardButton(_bi("🔙 দোকান", "🔙 Shop", _en), callback_data="shop:list")]]))
+    cats = await asyncio.to_thread(_smm_cats, svcs)
+    if not cats:
+        return await q.edit_message_text(
+            _bi("🌐 *SMM প্যানেল*\n\nএখন কোনো সার্ভিস নেই।",
+                "🌐 *SMM Panel*\n\nNo service available now.", _en),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(_bi("🔄 রিফ্রেশ", "🔄 Refresh", _en), callback_data="smm:r")],
+                [InlineKeyboardButton(_bi("🔙 দোকান", "🔙 Shop", _en), callback_data="shop:list")]]))
+    names = list(cats.keys())
+    per, pages = 8, max(1, (len(names) + 7) // 8)
+    page = max(0, min(int(page or 0), pages - 1))
+    rows = []
+    for nm in names[page * per:(page + 1) * per]:
+        rows.append([InlineKeyboardButton(f"{nm} ({len(cats[nm])})",
+                                          callback_data=f"smm:c:{names.index(nm)}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"smm:home:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="smm:noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"smm:home:{page+1}"))
+    if len(nav) > 1:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(_bi("🧾 আমার SMM অর্ডার", "🧾 My SMM orders", _en),
+                                      callback_data="smm:my")])
+    rows.append([InlineKeyboardButton(_bi("🔄 রিফ্রেশ", "🔄 Refresh", _en), callback_data="smm:r"),
+                 InlineKeyboardButton(_bi("🔙 দোকান", "🔙 Shop", _en), callback_data="shop:list")])
+    txt = _bi("🌐 *SMM প্যানেল*\n\nক্যাটাগরি বেছে নিন — এর ভিতরে সব সার্ভিস ও দাম।\n"
+              "💵 পেমেন্ট ৳ ওয়ালেট থেকে কাটা হবে।",
+              "🌐 *SMM Panel*\n\nPick a category — all services and prices inside.\n"
+              "💵 Payment is deducted from your ৳ wallet.", _en)
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def show_smm_cat(q, ctx, idx, page=0):
+    uid = q.from_user.id if getattr(q, "from_user", None) else 0
+    _en = await _shop_is_en(uid)
+    try:
+        svcs = await asyncio.to_thread(smm_services)
+        cats = await asyncio.to_thread(_smm_cats, svcs)
+        names = list(cats.keys())
+        nm = names[int(idx)]
+        items = cats[nm]
+    except Exception:
+        return await show_smm(q, ctx, 0)
+    per, pages = 6, max(1, (len(items) + 5) // 6)
+    page = max(0, min(int(page or 0), pages - 1))
+    rows = []
+    for s in items[page * per:(page + 1) * per]:
+        p1000 = await asyncio.to_thread(smm_price, s["rate"], 1000)
+        rows.append([InlineKeyboardButton(f"{s['name'][:38]} — {p1000:g}৳/1000",
+                                          callback_data=f"smm:s:{s['id']}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"smm:c:{idx}:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="smm:noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"smm:c:{idx}:{page+1}"))
+    if len(nav) > 1:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(_bi("🔙 ক্যাটাগরি", "🔙 Categories", _en), callback_data="smm:home")])
+    await q.edit_message_text(
+        _bi(f"🌐 *{_md_esc(nm)}*\n\nসার্ভিস বেছে নিন (দাম প্রতি ১০০০-এ):",
+            f"🌐 *{_md_esc(nm)}*\n\nPick a service (price per 1000):", _en),
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def show_smm_service(q, ctx, sid):
+    uid = q.from_user.id if getattr(q, "from_user", None) else 0
+    _en = await _shop_is_en(uid)
+    svcs = await asyncio.to_thread(smm_services)
+    s = next((x for x in svcs if x["id"] == int(sid)), None)
+    if not s:
+        try:
+            await q.answer(_bi("সার্ভিসটি পাওয়া যায়নি", "Service not found", _en), show_alert=True)
+        except Exception:
+            pass
+        return
+    p1000 = await asyncio.to_thread(smm_price, s["rate"], 1000)
+    pmin = await asyncio.to_thread(smm_price, s["rate"], s["min"])
+    txt = _bi(
+        f"🌐 *{_md_esc(s['name'])}*\n\n"
+        f"📁 ক্যাটাগরি: {_md_esc(s['cat'])}\n"
+        f"💵 দাম: *{p1000:g}৳* / ১০০০\n"
+        f"🔢 সর্বনিম্ন: {s['min']:,} — সর্বোচ্চ: {s['max']:,}\n"
+        f"➡️ সর্বনিম্ন অর্ডারে খরচ: ~{pmin:g}৳\n"
+        + ("💬 এই সার্ভিসে কমেন্ট লিখতে হবে।\n" if _smm_need_comments(s) else "")
+        + f"\nকিনতে চাইলে নিচের বাটন চাপুন।",
+        f"🌐 *{_md_esc(s['name'])}*\n\n"
+        f"📁 Category: {_md_esc(s['cat'])}\n"
+        f"💵 Price: *{p1000:g}৳* / 1000\n"
+        f"🔢 Min: {s['min']:,} — Max: {s['max']:,}\n"
+        f"➡️ Minimum order cost: ~{pmin:g}৳\n\nPress the button to order.", _en)
+    await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton(_bi("🛒 অর্ডার করুন", "🛒 Order now", _en), callback_data=f"smm:b:{s['id']}")],
+        [InlineKeyboardButton(_bi("🔙 পিছনে", "🔙 Back", _en), callback_data="smm:home")]]))
+
+
+async def smm_ask_link(update, ctx, sid):
+    """লিংক নেওয়া — state: smm_link:<sid>"""
+    uid = update.effective_user.id
+    _en = await _shop_is_en(uid)
+    txt = (update.message.text or "").strip()
+    if not (txt.startswith("http://") or txt.startswith("https://") or txt.startswith("@")):
+        await update.message.reply_text(_bi("❌ লিংকটি ঠিক নয়। `https://...` দিয়ে শুরু হতে হবে।",
+                                            "❌ Invalid link. It must start with `https://...`", _en),
+                                        parse_mode="Markdown")
+        return True
+    try:
+        sid = int(str(ctx.user_data.get("state")).split(":")[1])
+    except Exception:
+        ctx.user_data.pop("state", None)
+        return True
+    svcs = await asyncio.to_thread(smm_services)
+    s = next((x for x in svcs if x["id"] == sid), None)
+    if not s:
+        ctx.user_data.pop("state", None)
+        await update.message.reply_text(_bi("সার্ভিসটি পাওয়া যায়নি।", "Service not found.", _en))
+        return True
+    ctx.user_data["smm_link"] = txt
+    ctx.user_data["state"] = f"smm_qty:{sid}"
+    await update.message.reply_text(
+        _bi(f"🔢 *কত ইউনিট নিবেন?*\n\nসর্বনিম্ন {s['min']:,} — সর্বোচ্চ {s['max']:,}\n"
+            f"শুধু সংখ্যাটা লিখে পাঠান।\n\n/cancel — বাতিল",
+            f"🔢 *How many units?*\n\nMin {s['min']:,} — Max {s['max']:,}\n"
+            f"Send only the number.\n\n/cancel — Cancel", _en),
+        parse_mode="Markdown")
+    return True
+
+
+async def _smm_send_confirm(update, ctx, s, qty):
+    """অর্ডার কনফার্ম মেসেজ — লিংক ও (দরকার হলে) কমেন্ট সহ।"""
+    uid = update.effective_user.id
+    _en = await _shop_is_en(uid)
+    price = await asyncio.to_thread(smm_price, s["rate"], qty)
+    dep = await asyncio.to_thread(get_dep_balance, uid)
+    link = ctx.user_data.get("smm_link", "")
+    cmt = ctx.user_data.get("smm_cmt_text", "")
+    ctx.user_data.pop("state", None)
+    extra = ""
+    if cmt:
+        _n = len([x for x in cmt.splitlines() if x.strip()])
+        extra = _bi(f"💬 কমেন্ট: {_n} লাইন\n", f"💬 Comments: {_n} line(s)\n", _en)
+    txt2 = _bi(
+        f"🧾 *অর্ডার কনফার্ম করুন*\n\n"
+        f"🌐 {_md_esc(s['name'])}\n"
+        f"🔗 {_md_esc(link[:80])}\n"
+        f"🔢 {qty:,} ইউনিট\n"
+        f"{extra}"
+        f"💵 খরচ: *{price:g}৳*\n"
+        f"💳 আপনার ৳ ব্যালেন্স: {dep:g}৳\n\n"
+        f"ঠিক থাকলে নিচের বাটন চাপুন।",
+        f"🧾 *Confirm order*\n\n"
+        f"🌐 {_md_esc(s['name'])}\n"
+        f"🔗 {_md_esc(link[:80])}\n"
+        f"🔢 {qty:,} units\n"
+        f"{extra}"
+        f"💵 Cost: *{price:g}৳*\n"
+        f"💳 Your ৳ balance: {dep:g}৳\n\nPress the button to confirm.", _en)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(_bi(f"✅ কনফার্ম — {price:g}৳", f"✅ Confirm — {price:g}৳", _en),
+                              callback_data=f"smm:ok:{s['id']}:{qty}")],
+        [InlineKeyboardButton(_bi("❌ বাতিল", "❌ Cancel", _en), callback_data="smm:home")]])
+    await update.message.reply_text(txt2, parse_mode="Markdown", reply_markup=kb)
+
+
+async def smm_ask_qty(update, ctx, sid):
+    """পরিমাণ নেওয়া — state: smm_qty:<sid>, তারপর কনফার্ম।"""
+    uid = update.effective_user.id
+    _en = await _shop_is_en(uid)
+    txt = (update.message.text or "").strip().replace(",", "")
+    if not txt.isdigit():
+        await update.message.reply_text(_bi("❌ শুধু সংখ্যা লিখুন (যেমন `500`)।",
+                                            "❌ Send only a number (e.g. `500`).", _en))
+        return True
+    qty = int(txt)
+    svcs = await asyncio.to_thread(smm_services)
+    s = next((x for x in svcs if x["id"] == int(sid)), None)
+    if not s:
+        ctx.user_data.pop("state", None)
+        await update.message.reply_text(_bi("সার্ভিসটি পাওয়া যায়নি।", "Service not found.", _en))
+        return True
+    if qty < s["min"] or (s["max"] and qty > s["max"]):
+        await update.message.reply_text(
+            _bi(f"❌ পরিমাণ {s['min']:,} থেকে {s['max']:,} এর মধ্যে হতে হবে।",
+                f"❌ Quantity must be between {s['min']:,} and {s['max']:,}.", _en))
+        return True
+    if _smm_need_comments(s):
+        ctx.user_data["state"] = f"smm_cmt:{s['id']}:{qty}"
+        await update.message.reply_text(
+            _bi("💬 *কমেন্টগুলো পাঠান*\n\nপ্রতি লাইনে একটা করে কমেন্ট লিখুন।\n"
+                f"দরকার: {qty:,} টা কমেন্ট।\n\n/cancel — বাতিল",
+                "💬 *Send the comments*\n\nOne comment per line.\n"
+                f"Needed: {qty:,} comments.\n\n/cancel — Cancel", _en),
+            parse_mode="Markdown")
+        return True
+    await _smm_send_confirm(update, ctx, s, qty)
+    return True
+
+
+async def smm_ask_cmt(update, ctx, st):
+    """কমেন্ট নেওয়া — state: smm_cmt:<sid>:<qty>"""
+    uid = update.effective_user.id
+    _en = await _shop_is_en(uid)
+    txt = (update.message.text or "").strip()
+    try:
+        _a, _sid, _q = str(st).split(":")
+        sid, qty = int(_sid), int(_q)
+    except Exception:
+        ctx.user_data.pop("state", None)
+        return True
+    lines = [x.strip() for x in txt.splitlines() if x.strip()]
+    if not lines:
+        await update.message.reply_text(_bi("❌ কমেন্ট লিখে পাঠান (প্রতি লাইনে একটা)।",
+                                            "❌ Please send the comments (one per line).", _en))
+        return True
+    if len(lines) > qty:
+        lines = lines[:qty]
+    svcs = await asyncio.to_thread(smm_services)
+    s = next((x for x in svcs if x["id"] == sid), None)
+    if not s:
+        ctx.user_data.pop("state", None)
+        await update.message.reply_text(_bi("সার্ভিসটি পাওয়া যায়নি।", "Service not found.", _en))
+        return True
+    ctx.user_data["smm_cmt_text"] = "\n".join(lines)
+    await _smm_send_confirm(update, ctx, s, qty)
+    return True
+
+
+async def smm_place_order(q, ctx, sid, qty):
+    """৳ কাটা → প্যানেলে অর্ডার → রেকর্ড। ব্যর্থ হলে টাকা ফেরত।"""
+    uid = q.from_user.id
+    _en = await _shop_is_en(uid)
+    svcs = await asyncio.to_thread(smm_services)
+    s = next((x for x in svcs if x["id"] == int(sid)), None)
+    if not s:
+        try:
+            await q.answer(_bi("সার্ভিসটি পাওয়া যায়নি", "Service not found", _en), show_alert=True)
+        except Exception:
+            pass
+        return
+    qty = int(qty)
+    if qty < s["min"] or (s["max"] and qty > s["max"]):
+        try:
+            await q.answer(_bi("পরিমাণ সীমার বাইরে", "Quantity out of range", _en), show_alert=True)
+        except Exception:
+            pass
+        return
+    link = ctx.user_data.get("smm_link", "")
+    if not link:
+        try:
+            await q.answer(_bi("লিংক পাওয়া যায়নি — আবার শুরু করুন", "Link missing — start again", _en),
+                           show_alert=True)
+        except Exception:
+            pass
+        return
+    price = await asyncio.to_thread(smm_price, s["rate"], qty)
+    # 🛡️ প্যানেলে আমাদের নিজের টাকা যথেষ্ট আছে? না থাকলে ইউজারের ৳ কাটাই না।
+    _afford = await asyncio.to_thread(smm_can_afford, s, qty)
+    if not _afford:
+        log.warning(f"[SMM] প্যানেল ব্যালেন্স কম — অর্ডার আটকানো হলো (uid={uid}, qty={qty})")
+        try:
+            await asyncio.to_thread(smm_check_balance, getattr(ctx, "bot", None), True)
+        except Exception:
+            pass
+        try:
+            await q.answer(_bi("😔 এই মুহূর্তে অর্ডার নেওয়া যাচ্ছে না — কিছুক্ষণ পরে আবার চেষ্টা করুন। আপনার ৳ কাটা হয়নি।",
+                               "😔 Orders are paused right now — please try again later. No ৳ was charged.", _en),
+                           show_alert=True)
+        except Exception:
+            pass
+        return
+    ok = await asyncio.to_thread(smm_dep_deduct, uid, price)
+    if not ok:
+        try:
+            await q.answer(_bi("💳 ৳ ব্যালেন্স যথেষ্ট নয় — ডিপোজিট করুন",
+                               "💳 Not enough ৳ balance — please deposit", _en), show_alert=True)
+        except Exception:
+            pass
+        return
+    oid = await asyncio.to_thread(smm_order_new, uid, s["id"], s["name"], link, qty, price)
+    try:
+        _params = {"action": "add", "service": str(s["id"]),
+                   "link": link, "quantity": str(qty)}
+        _cmt = (ctx.user_data.get("smm_cmt_text") or "").strip()
+        if _cmt:
+            _params["comments"] = _cmt
+        js = await asyncio.to_thread(_smm_api, _params)
+        api_id = ""
+        if isinstance(js, dict):
+            api_id = str(js.get("order") or js.get("order_id") or "")
+        if not api_id:
+            raise RuntimeError("প্যানেল অর্ডার আইডি দেয়নি")
+        await asyncio.to_thread(smm_order_set, oid, api_id, "Pending", None)
+    except Exception as e:
+        await asyncio.to_thread(smm_dep_refund, uid, price)
+        await asyncio.to_thread(smm_order_set, oid, None, "failed")
+        log.warning(f"[SMM] অর্ডার ব্যর্থ #{oid}: {e}")
+        await q.edit_message_text(
+            _bi(f"❌ *অর্ডার হয়নি*\n\nকারণ: `{str(e)[:150]}`\n\n"
+                f"💸 {price:g}৳ আপনার ৳ ওয়ালেটে ফেরত দেওয়া হয়েছে।",
+                f"❌ *Order failed*\n\nReason: `{str(e)[:150]}`\n\n"
+                f"💸 {price:g}৳ has been refunded to your ৳ wallet.", _en),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(_bi("🔙 SMM প্যানেল", "🔙 SMM Panel", _en), callback_data="smm:home")]]))
+        return
+    ctx.user_data.pop("smm_link", None)
+    ctx.user_data.pop("smm_cmt_text", None)
+    await q.edit_message_text(
+        _bi(f"✅ *অর্ডার সফল*\n\n🌐 {_md_esc(s['name'])}\n"
+            f"🔗 {_md_esc(link[:80])}\n🔢 {qty:,} ইউনিট\n"
+            f"💵 কাটা হয়েছে: {price:g}৳\n🆔 প্যানেল অর্ডার: `{api_id}`\n\n"
+            f"⏳ কাজ শুরু হতে কয়েক মিনিট লাগতে পারে। স্ট্যাটাস দেখতে নিচের বাটন।",
+            f"✅ *Order placed*\n\n🌐 {_md_esc(s['name'])}\n"
+            f"🔗 {_md_esc(link[:80])}\n🔢 {qty:,} units\n"
+            f"💵 Charged: {price:g}৳\n🆔 Panel order: `{api_id}`\n\n"
+            f"⏳ Delivery may take a few minutes. Check status below.", _en),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(_bi("🔄 স্ট্যাটাস দেখুন", "🔄 Check status", _en),
+                                  callback_data=f"smm:v:{oid}")],
+            [InlineKeyboardButton(_bi("🧾 আমার SMM অর্ডার", "🧾 My SMM orders", _en), callback_data="smm:my")],
+            [InlineKeyboardButton(_bi("🔙 SMM প্যানেল", "🔙 SMM Panel", _en), callback_data="smm:home")]]))
+
+
+async def show_smm_my(q):
+    uid = q.from_user.id
+    _en = await _shop_is_en(uid)
+    try:
+        rows_db = await asyncio.to_thread(smm_orders_sync_user, uid, 10)
+    except Exception:
+        rows_db = await asyncio.to_thread(smm_orders_user, uid, 10)
+    if not rows_db:
+        return await q.edit_message_text(
+            _bi("🧾 *আপনার SMM অর্ডার*\n\nএখনো কোনো অর্ডার নেই।",
+                "🧾 *Your SMM orders*\n\nNo order yet.", _en),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(_bi("🔙 SMM প্যানেল", "🔙 SMM Panel", _en), callback_data="smm:home")]]))
+    rows = []
+    for o in rows_db:
+        rows.append([InlineKeyboardButton(
+            f"#{int(o['id'])} {str(o['service_name'])[:20]} — {str(o['status'])[:12]}",
+            callback_data=f"smm:v:{int(o['id'])}")])
+    rows.append([InlineKeyboardButton(_bi("🔄 স্ট্যাটাস রিফ্রেশ", "🔄 Refresh status", _en),
+                                      callback_data="smm:my")])
+    rows.append([InlineKeyboardButton(_bi("🔙 SMM প্যানেল", "🔙 SMM Panel", _en), callback_data="smm:home")])
+    await q.edit_message_text(
+        _bi("🧾 *আপনার SMM অর্ডার*\n\nবিস্তারিত দেখতে একটা অর্ডারে চাপুন।",
+            "🧾 *Your SMM orders*\n\nTap an order for details.", _en),
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def show_smm_order(q, ctx, oid):
+    uid = q.from_user.id
+    _en = await _shop_is_en(uid)
+    o = await asyncio.to_thread(smm_order_status_sync, oid)
+    if not o or int(o["user_id"] or 0) != uid:
+        try:
+            await q.answer(_bi("অর্ডার পাওয়া যায়নি", "Order not found", _en), show_alert=True)
+        except Exception:
+            pass
+        return
+    st = str(o["status"] or "")
+    emoji = "🟡" if st.lower() in ("pending", "in progress", "processing", "new") else \
+            ("🟢" if st.lower() in ("completed", "complete") else
+             ("🔴" if st.lower() in ("canceled", "cancelled", "failed") else "⚪️"))
+    await q.edit_message_text(
+        _bi(f"{emoji} *অর্ডার #{int(o['id'])}*\n\n"
+            f"🌐 {_md_esc(str(o['service_name']))}\n"
+            f"🔗 {_md_esc(str(o['link'])[:80])}\n"
+            f"🔢 {int(o['qty'] or 0):,} ইউনিট\n"
+            f"💵 {float(o['price'] or 0):g}৳\n"
+            f"🆔 প্যানেল: `{_md_esc(str(o['api_id'] or '—'))}`\n"
+            f"📌 স্ট্যাটাস: *{_md_esc(st)}*",
+            f"{emoji} *Order #{int(o['id'])}*\n\n"
+            f"🌐 {_md_esc(str(o['service_name']))}\n"
+            f"🔗 {_md_esc(str(o['link'])[:80])}\n"
+            f"🔢 {int(o['qty'] or 0):,} units\n"
+            f"💵 {float(o['price'] or 0):g}৳\n"
+            f"🆔 Panel: `{_md_esc(str(o['api_id'] or '—'))}`\n"
+            f"📌 Status: *{_md_esc(st)}*", _en),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(_bi("🔄 রিফ্রেশ", "🔄 Refresh", _en), callback_data=f"smm:v:{oid}")]]
+            + ([] if st.lower() in _SMM_DONE or st.lower() == "cancel requested" else
+               [[InlineKeyboardButton(_bi("❌ ক্যানসেল", "❌ Cancel order", _en),
+                                      callback_data=f"smm:x:{oid}")]])
+            + ([[InlineKeyboardButton(_bi("🔁 রিফিল", "🔁 Refill", _en),
+                                      callback_data=f"smm:rf:{oid}")]]
+               if st.lower() in ("completed", "complete", "partial") else [])
+            + [[InlineKeyboardButton(_bi("🧾 সব অর্ডার", "🧾 All orders", _en), callback_data="smm:my"),
+                InlineKeyboardButton(_bi("🔙 SMM", "🔙 SMM", _en), callback_data="smm:home")]]))
+
+
+async def smm_callback(update, ctx):
+    """🌐 SMM প্যানেলের সব বাটন।"""
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    d = q.data or ""
+    uid = q.from_user.id
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    try:
+        if d in ("smm", "smm:home", "smm:r"):
+            if d == "smm:r":
+                await asyncio.to_thread(smm_services, True)
+            return await show_smm(q, ctx, 0)
+        if d.startswith("smm:home:"):
+            return await show_smm(q, ctx, int(d.split(":")[2]))
+        if d == "smm:noop":
+            return
+        if d.startswith("smm:c:"):
+            parts = d.split(":")
+            return await show_smm_cat(q, ctx, int(parts[2]), int(parts[3]) if len(parts) > 3 else 0)
+        if d.startswith("smm:s:"):
+            return await show_smm_service(q, ctx, int(d.split(":")[2]))
+        if d.startswith("smm:b:"):
+            sid = int(d.split(":")[2])
+            ctx.user_data["state"] = f"smm_link:{sid}"
+            _en = await _shop_is_en(uid)
+            await q.edit_message_text(
+                _bi("🔗 *লিংক পাঠান*\n\nযে পেজ/প্রোফাইলে অর্ডার হবে তার লিংক "
+                    "(যেমন `https://instagram.com/username`)।\n\n/cancel — বাতিল",
+                    "🔗 *Send the link*\n\nThe page/profile to boost "
+                    "(e.g. `https://instagram.com/username`).\n\n/cancel — Cancel", _en),
+                parse_mode="Markdown")
+            return
+        if d.startswith("smm:ok:"):
+            parts = d.split(":")
+            return await smm_place_order(q, ctx, int(parts[2]), int(parts[3]))
+        if d == "smm:my":
+            return await show_smm_my(q)
+        if d.startswith("smm:v:"):
+            return await show_smm_order(q, ctx, int(d.split(":")[2]))
+        if d.startswith("smm:x:"):
+            _o = int(d.split(":")[2])
+            _okc, _msgc = await asyncio.to_thread(smm_cancel_order, _o)
+            _en = await _shop_is_en(uid)
+            try:
+                await q.answer(("✅ " if _okc else "⚠️ ") + str(_msgc)[:150], show_alert=True)
+            except Exception:
+                pass
+            return await show_smm_order(q, ctx, _o)
+        if d.startswith("smm:rf:"):
+            _o = int(d.split(":")[2])
+            _okr, _msgr = await asyncio.to_thread(smm_refill_order, _o)
+            try:
+                await q.answer(("✅ " if _okr else "⚠️ ") + str(_msgr)[:150], show_alert=True)
+            except Exception:
+                pass
+            return await show_smm_order(q, ctx, _o)
+    except Exception as e:
+        log.warning(f"[SMM] callback '{d}' ব্যর্থ: {e}")
+        try:
+            await q.answer(_bi("একটু সমস্যা হলো — আবার চেষ্টা করুন",
+                               "Something went wrong — try again", False), show_alert=True)
+        except Exception:
+            pass
+
+
+async def smm_input(update, ctx, st):
+    """SMM-এর টেক্সট ইনপুট (লিংক / পরিমাণ)।"""
+    if str(st).startswith("smm_link:"):
+        return await smm_ask_link(update, ctx, str(st))
+    if str(st).startswith("smm_qty:"):
+        return await smm_ask_qty(update, ctx, str(st))
+    if str(st).startswith("smm_cmt:"):
+        return await smm_ask_cmt(update, ctx, str(st))
+    return False
+
 
 if __name__ == "__main__":
     import time, asyncio as _asyncio

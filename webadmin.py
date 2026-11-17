@@ -1318,6 +1318,7 @@ MENU = [
     ("taskstats", "/admin/task-stats", "Task Statistics", "trend", ""),
     ("history", "/admin/history", "Task History", "task", ""),
     ("shop", "/admin/shop", "Shop / দোকান", "money", ""),
+    ("smm", "/admin/smm", "SMM Panel", "globe", ""),
     ("deposits", "/admin/deposits", "Deposits", "wallet", ""),
     ("earnings", "/admin/earnings", "Earnings", "money", ""),
     ("withdrawals", "/admin/withdrawals", "Withdrawals", "wallet", ""),
