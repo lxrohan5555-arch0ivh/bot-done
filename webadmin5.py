@@ -927,6 +927,14 @@ def _plan_options(sel=0):
 # ───────────────────────── পণ্য ফর্ম ─────────────────────────
 def _form(p=None):
     p = p or {}
+    # 💵 ডলার↔টাকা রেট (Settings → QR রেট)
+    try:
+        _rs0 = one("SELECT value FROM settings WHERE key='qr_rate'")
+        _rate_now = float(str((_rs0 or {}).get("value") or "125").replace(",", "."))
+    except Exception:
+        _rate_now = 125.0
+    if _rate_now <= 0:
+        _rate_now = 125.0
     name = esc(p.get("name") or "")
     desc = esc(p.get("description") or "")
     price = esc(str(p.get("price") or ""))
@@ -956,7 +964,13 @@ def _form(p=None):
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>প্যাক বানাবেন উপরে "
         "“➕ নতুন প্যাক” থেকে। প্যাক না বাছলে পণ্যটা ক্যাটাগরিতে সবার আগে দেখাবে।</p></div>"
         "<div class='field'><label>দাম (ব্যালেন্স থেকে কাটা হবে)</label>"
-        f"<input name='price' value='{price}' placeholder='0.78' required></div>"
+        f"<input name='price' value='{price}' placeholder='25' required>"
+        "<select name='price_cur' style='margin-top:6px'>"
+        "<option value='৳' selected>৳ — টাকায় লিখেছি</option>"
+        "<option value='$'>$ — ডলারে লিখেছি</option></select>"
+        f"<p class='mut' style='font-size:11px;margin:6px 0 0'>ডলারে লিখলে বট নিজেই "
+        f"রেট দিয়ে টাকায় বদলে নেবে (এখন 1$ = {_rate_now:g} ৳)। "
+        "বটে দাম সবসময় ডলার + টাকা দুটোই দেখাবে।</p></div>"
         "<div class='field'><label>🛍 রেফার কমিশন (%) — না দিলে Settings-এর %</label>"
         f"<input name='ref_pct' value='{_rp}' placeholder='খালি = Settings-এর %, 0 = কমিশন নেই'>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>এই পণ্যের জন্য আলাদা % চাইলে "
@@ -1000,6 +1014,16 @@ def _save(pid=0):
         price = float((request.form.get("price") or "0").replace(",", "."))
     except Exception:
         price = 0.0
+    # 💵 দাম ডলারে দিলে অ্যাডমিনের রেটে টাকায় বদলে রাখো
+    if (request.form.get("price_cur") or "").strip().startswith("$"):
+        try:
+            _rs = one("SELECT value FROM settings WHERE key='qr_rate'")
+            _rate = float(str((_rs or {}).get("value") or "125").replace(",", "."))
+        except Exception:
+            _rate = 125.0
+        if _rate <= 0:
+            _rate = 125.0
+        price = round(price * _rate, 2)
     cid = request.form.get("category_id") or 0
     try:
         cid = int(cid)

@@ -161,7 +161,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-17b91"
+BUILD_TAG       = "uid-auto-2026-11-17b96"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -4255,7 +4255,7 @@ def dep_ch_notify(oid, uid, amt, method="", txid=""):
         txt += "🔄 ম্যাচ: ফান্ডিং ব্যালেন্স বেড়েছে\n"
     elif _tx and _tx not in ("-", "—", "–", "0", "N/A", "n/a"):
         txt += f"🧾 TrxID: {_ch_mask_tx(_tx)}\n"
-    txt += (f"💰 Amount: {taka_txt(amt)}\n"
+    txt += (f"💰 Amount: {_shop_money(amt)}\n"
             "✅ Funded Successfully")
     log.info(f"[DEP-CH] ক্রেডিট নোটিশ #{oid} uid={uid} → চ্যানেল")
     return dep_ch_http_send(txt, _dep_ch_kb(oid))
@@ -4345,7 +4345,9 @@ def _usd_txt(v):
         n = 0.0
     if n >= 1:
         s = f"{n:,.2f}"
-    elif n >= 0.01:
+    elif n >= 0.01:          # ০.০১$ থেকে বেশি হলে দুই ঘরই যথেষ্ট (0.48$)
+        s = f"{n:.2f}"
+    elif n >= 0.0001:
         s = f"{n:.4f}"
     else:
         s = f"{n:.6f}"
@@ -4621,7 +4623,7 @@ def wd_src_text(uid, lang, fee, min_w, kb_cls=None):
         txt = (
             "💸 *WITHDRAW — choose your wallet*\n\n"
             f"🪙 *Earn balance:* `{earn:g}$` (≈ ${earn:g})\n\n"
-            f"💳 *Deposit balance:* `{taka_txt(dep)}` (≈ ${dep_usd:g})\n"
+            f"💳 *Deposit balance:* `{_shop_money(dep)}`\n"
             f"   • 15% cut on the deposit part + withdraw fee `${fee:g}`.\n\n"
             f"⚠️ Minimum withdrawal: `{min_w}$`\n"
             "Which wallet do you want to withdraw from?"
@@ -4634,7 +4636,7 @@ def wd_src_text(uid, lang, fee, min_w, kb_cls=None):
         txt = (
             "💸 *WITHDRAW — কোন ওয়ালেট থেকে নেবেন?*\n\n"
             f"🪙 *Earn ব্যালেন্স:* `{earn:g}$` (≈ ${earn:g})\n\n"
-            f"💳 *ডিপোজিট ব্যালেন্স:* `{taka_txt(dep)}` (≈ ${dep_usd:g})\n"
+            f"💳 *ডিপোজিট ব্যালেন্স:* `{_shop_money(dep)}`\n"
             f"   • ডিপোজিটের অংশে ১৫% কাটা হবে + withdraw ফি `${fee:g}`।\n\n"
             f"⚠️ মিনিমাম withdraw: `{min_w}$`\n"
             "কোন ওয়ালেটের টাকা withdraw করবেন?"
@@ -6850,24 +6852,26 @@ def dep_no(oid):
 
 
 def _shop_money(v):
-    """দাম/ব্যালেন্স — ৳ এর পাশে ডলারও (রেট অনুযায়ী): `125 ৳ · 1$`।"""
+    """দাম/ব্যালেন্স — আগে ডলার, পাশে অ্যাডমিনের রেটে টাকা: `$0.2 · 25 ৳`।
+
+    ভিতরে সব অঙ্ক টাকায় থাকে (ডিপোজিট/ডাটাবেস), শুধু দেখানোর সময়
+    ডলার আগে বসে।
+    """
     try:
         n = float(v or 0)
     except Exception:
         n = 0.0
     try:
-        s = _amt(n)
+        _r = float(dep_rate() or 125)
     except Exception:
-        s = f"{n:.8f}".rstrip("0").rstrip(".")
-    _cur = _shop_cur()
-    out = f"{s or '0'} {_cur}"
-    if _cur == "৳" and n > 0:
-        try:
-            _r = dep_rate()
-            if _r > 0:
-                out += " · " + _usd_txt(n / _r)
-        except Exception:
-            pass
+        _r = 125.0
+    if _r <= 0:
+        _r = 125.0
+    out = _usd_txt(n / _r)
+    try:
+        out += " · " + taka_txt(n)
+    except Exception:
+        pass
     return out
 
 
@@ -6889,6 +6893,16 @@ def _shop_ddl():
                 updated_at   TEXT DEFAULT ''
             )""")
             c.execute("CREATE INDEX IF NOT EXISTS smm_orders_user ON smm_orders (user_id, id)")
+            for _al in (
+                "ALTER TABLE smm_orders ADD COLUMN IF NOT EXISTS refunded INTEGER DEFAULT 0",
+                "ALTER TABLE smm_orders ADD COLUMN IF NOT EXISTS refund_at TEXT DEFAULT ''",
+                "ALTER TABLE smm_orders ADD COLUMN IF NOT EXISTS remains INTEGER DEFAULT 0",
+                "ALTER TABLE smm_orders ADD COLUMN IF NOT EXISTS refund_amt REAL DEFAULT 0",
+            ):
+                try:
+                    c.execute(_al)
+                except Exception:
+                    pass
         except Exception as _se:
             log.warning(f"[SMM] DDL ব্যর্থ: {_se}")
         for _q in (
@@ -7665,10 +7679,13 @@ def task_promo_block(lang, owner_e, first=False):
     return ("\n\n" if first else "\n") + "━━━━━━━━━━━━━━━━\n" + _body
 
 
-def _shop_cats_kb(cats, other=False, en=False):
+def _shop_cats_kb(cats, other=False, en=False, meta=None):
     rows, row = [], []
     for ct in cats:
-        lbl = f"{ct['emoji'] or '🛍'} {ct['name'] or ''}".strip()[:38]
+        _n, _pr = (meta or {}).get(int(ct["id"]), (0, 0.0))
+        lbl = f"{ct['emoji'] or '🛍'} {ct['name'] or ''}".strip()[:26]
+        if _n:
+            lbl += f" ({_n}) · {_smm_dual(_pr)}"
         row.append(InlineKeyboardButton(lbl, callback_data=f"shop:c:{int(ct['id'])}"))
         if len(row) == 2:
             rows.append(row)
@@ -7995,14 +8012,44 @@ async def show_shop(update, ctx=None):
     _en = await _shop_is_en(_su)
     cats = await asyncio.to_thread(shop_cats)
     prods_other = await asyncio.to_thread(shop_products, 0)
-    if _en:
-        txt = ("🛍 *Choose a product category*\n\n"
-               "Pick a category below, then pick the product.\n"
-               "💵 Payment will be deducted from your balance.")
-    else:
-        txt = ("🛍 *প্রোডাক্ট ক্যাটাগরি বেছে নিন*\n\n"
-               "নিচের বাটন থেকে ক্যাটাগরি বেছে নিন, তারপর পণ্য।\n"
-               "💵 পেমেন্ট আপনার ব্যালেন্স থেকে কেটে নেওয়া হবে।")
+    # 🧮 প্রতিটি ক্যাটাগরিতে কত পণ্য, শুরুর দাম কত
+    _meta = {}
+    for _ct in cats:
+        try:
+            _ps = await asyncio.to_thread(shop_products, int(_ct["id"]), True)
+        except Exception:
+            _ps = []
+        _pr = [float(x["price"] or 0) for x in _ps]
+        _meta[int(_ct["id"])] = (len(_ps), min(_pr) if _pr else 0.0)
+    _dep_b, _earn_b = 0.0, 0.0
+    if _su:
+        try:
+            _dep_b = float(await asyncio.to_thread(get_dep_balance, _su) or 0)
+        except Exception:
+            _dep_b = 0.0
+        try:
+            _earn_b = float(await asyncio.to_thread(get_bal, _su) or 0)
+        except Exception:
+            _earn_b = 0.0
+    txt = _bi(
+        "🛍 *দোকান*\n"
+        "সব পণ্য এক জায়গায় — ক্যাটাগরি বেছে নিন\n"
+        "━━━━━━━━━━━━━━\n"
+        "👤 *আপনার হিসাব*\n"
+        f"💳 ডিপোজিট ব্যালেন্স: *{_shop_money(_dep_b)}*\n"
+        f"🪙 Earn ব্যালেন্স: *{_usd_txt(_earn_b)}* ≈ {taka_txt(_earn_b * dep_rate())}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📁 *ক্যাটাগরি* ({len(cats)})\n"
+        "প্রতিটি বাটনে পণ্য সংখ্যা ও শুরুর দাম (৳ · $) আছে।",
+        "🛍 *Shop*\n"
+        "Everything in one place — pick a category\n"
+        "━━━━━━━━━━━━━━\n"
+        "👤 *Your account*\n"
+        f"💳 Deposit balance: *{_shop_money(_dep_b)}*\n"
+        f"🪙 Earn balance: *{_usd_txt(_earn_b)}* ≈ {taka_txt(_earn_b * dep_rate())}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📁 *Categories* ({len(cats)})\n"
+        "Each button shows product count and starting price (৳ · $).", _en)
     if not cats and not prods_other:
         txt = (_bi("🛍 *দোকান*\n\nএখনো কোনো পণ্য যোগ করা হয়নি।\nঅ্যাডমিন শীঘ্রই পণ্য যোগ করবেন।",
                    "🛍 *Shop*\n\nNo product has been added yet.\nThe admin will add products soon.", _en))
@@ -8011,7 +8058,7 @@ async def show_shop(update, ctx=None):
              InlineKeyboardButton(_bi("🧾 আমার অর্ডার", "🧾 My Orders", _en), callback_data="shop:my")],
             [InlineKeyboardButton(_bi("🔙 ফিরে যান", "🔙 Back", _en), callback_data="shop:back")]])
     else:
-        kb = _shop_cats_kb(cats, other=bool(prods_other), en=_en)
+        kb = _shop_cats_kb(cats, other=bool(prods_other), en=_en, meta=_meta)
     if await asyncio.to_thread(smm_on):
         try:
             _rows = [list(_r) for _r in kb.inline_keyboard]
@@ -8134,9 +8181,14 @@ async def _shop_show_cat(q, cid, plan_id=None):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(_bi("🔙 ফিরে যান", "🔙 Back", _en), callback_data=_back)]]))
         return
-    txt = (f"*{_md_esc(title)}*\n\n" + _bi(
-        "👇 পণ্য বেছে নিন। বাটনে দাম ও স্টক দেখা যাচ্ছে।",
-        "👇 Choose a product. Price and stock are shown on the buttons.", _en))
+    _pp = [float(x["price"] or 0) for x in prods]
+    txt = (f"*{_md_esc(title)}*\n"
+           "━━━━━━━━━━━━━━\n"
+           + _bi(f"📦 পণ্য: *{len(prods)}* টি\n", f"📦 Products: *{len(prods)}*\n", _en)
+           + (f"💵 {_bi('শুরুর দাম', 'From', _en)}: *{_shop_money(min(_pp))}*\n" if _pp else "")
+           + "━━━━━━━━━━━━━━\n"
+           + _bi("👇 পণ্য বেছে নিন — বাটনে দাম ও স্টক দেখা যাচ্ছে।",
+                 "👇 Choose a product — price and stock are on the buttons.", _en))
     try:
         await q.edit_message_text(txt, parse_mode="Markdown",
                                   reply_markup=_shop_prods_kb(cid, prods, _back, en=_en))
@@ -8357,7 +8409,7 @@ async def dep_notify_channel(bot, oid, uid, m, amount, txid):
                + (f"🧾 TrxID: {_ch_mask_tx(txid)}\n"
                   if str(txid or "").strip()
                   and not str(txid).startswith("FUND") else "")
-               + f"💰 Amount: {taka_txt(amount)}\n"
+               + f"💰 Amount: {_shop_money(amount)}\n"
                f"✅ Funded Successfully")
         await post_withdraw_channel(bot, txt, with_btn=True)
     except Exception as e:
@@ -8815,8 +8867,7 @@ async def _shop_buy_core(ctx, q, pid, count, note=""):
         _msg = (
             ("💳 *আপনার ডিপোজিট ব্যালেন্স যথেষ্ট নয়*\n\n"
              f"🛍 দাম: `{_shop_money(total)}`\n"
-             f"💳 ডিপোজিট ব্যালেন্স: `{taka_txt(_dep)}` "
-             f"(≈ {_usd_txt(_dep / dep_rate())})\n"
+             f"💳 ডিপোজিট ব্যালেন্স: `{_shop_money(_dep)}`\n"
              f"🪙 Earn ব্যালেন্স: `{_earn:g}$`\n\n"
              "👉 আরও টাকা ডিপোজিট করুন, তারপর আবার কিনুন।\n"
              "💬 অন্য কোনো সিস্টেম বা পেমেন্ট অপশন দিয়ে ডিপোজিট করতে চাইলে "
@@ -8824,7 +8875,7 @@ async def _shop_buy_core(ctx, q, pid, count, note=""):
             if not _en else
             ("💳 *Your deposit balance is not enough*\n\n"
              f"🛍 Price: `{_shop_money(total)}`\n"
-             f"💳 Deposit balance: `{taka_txt(_dep)}`\n"
+             f"💳 Deposit balance: `{_shop_money(_dep)}`\n"
              f"🪙 Earn balance: `{_earn:g}$`\n\n"
              "👉 Please deposit more and try again.\n"
              "💬 Want to deposit with another system or payment option? "
@@ -9620,16 +9671,23 @@ async def shop_admin_input(update, ctx, st):
         ctx.user_data["shop_new"] = d
         ctx.user_data["state"] = "shopa_pprice"
         await update.message.reply_text(
-            f"💵 *ধাপ ২/৩ — দাম*\n\n`{_md_esc(txt)}` এর দাম লিখুন "
-            f"(শুধু সংখ্যা, যেমন `0.78`)।\n\n/cancel — বাতিল",
+            f"💵 *ধাপ ২/৩ — দাম*\n\n`{_md_esc(txt)}` এর দাম লিখুন — "
+            f"*টাকায়* (যেমন `25`), অথবা `$5` লিখলে ডলার ধরে নেবে।\n"
+            f"📊 রেট: 1$ = `{dep_rate():g}` ৳ — বট দাম ডলার আগে, পাশে টাকা দেখাবে।\n\n"
+            "/cancel — বাতিল",
             parse_mode="Markdown")
         return True
 
     if st == "shopa_pprice":
+        _usd_in = txt.strip().startswith("$")
         try:
-            price = float(txt.replace(",", ".").replace(_shop_cur(), "").strip())
+            price = float(txt.replace(",", ".").replace(_shop_cur(), "")
+                          .replace("$", "").strip())
+            if _usd_in:                       # `$5` → রেট ধরে টাকায়
+                price = round(price * dep_rate(), 2)
         except Exception:
-            await update.message.reply_text("❌ শুধু সংখ্যা লিখুন (যেমন 0.78)।")
+            await update.message.reply_text(
+                "❌ শুধু সংখ্যা লিখুন (যেমন `25` অথবা `$0.2`)।", parse_mode="Markdown")
             return True
         if price < 0:
             await update.message.reply_text("❌ দাম ঋণাত্মক হতে পারে না।")
@@ -14296,13 +14354,16 @@ def qr_summary(bdt, c=None, lang="bn"):
     _tot_lbl = "Total to pay" if lang == "en" else "মোট দিতে হবে"
     _rate_tail = ("balance is added in taka" if lang == "en"
                   else "ব্যালেন্স টাকায় যোগ হবে")
+    # 💵 আগের মতো আগে ডলার, পাশে অ্যাডমিনের রেটে টাকা
+    _usd_tot = qr_usd(total, c)
     txt = (f"🧾 *Payment Summary* ✨\n"
            f"━━━━━━━━━━━━━━\n"
-           f"💰 *Amount:* `{bdt:g}` BDT\n"
-           f"➕ *Fee:* `{fee:g}` BDT\n"
-           f"🧮 *{_tot_lbl}:* `{total:g}` BDT\n"
+           f"💰 *{'Amount' if lang == 'en' else 'অ্যামাউন্ট'}:* "
+           f"`{_usd_txt(usd)}` · `{bdt:g}` ৳\n"
+           f"➕ *{'Fee' if lang == 'en' else 'ফি'}:* `{fee:g}` ৳\n"
+           f"🧮 *{_tot_lbl}:* `{_usd_txt(_usd_tot)}` · `{total:g}` ৳\n"
            f"💳 *{'Balance to add' if lang == 'en' else 'ব্যালেন্সে যোগ হবে'}:* "
-           f"`{bdt:g}` ৳\n"
+           f"`{_usd_txt(usd)}` · `{bdt:g}` ৳\n"
            f"📊 *{'Rate' if lang == 'en' else 'রেট'}:* 1$ = `{c['rate']:g}` ৳  "
            f"({_rate_tail})\n"
            f"💳 *Method:* QR Payment")
@@ -14423,6 +14484,15 @@ async def show_deposit(update, ctx=None):
                        if str(m["kind"] or "manual") != "auto"]
     except Exception:
         pass
+    # 🚫 Binance-ভিত্তিক মেথড (auto/uid) আর দেখানো হয় না — শুধু QR + ম্যানুয়াল।
+    # কিছু না থাকলে (পুরোনো সেটআপ) সবই দেখাবে, ডিপোজিট আটকে যাবে না।
+    try:
+        _nonbn = [m for m in (methods or [])
+                  if str(m["kind"] or "manual") not in ("auto", "uid")]
+        if _nonbn:
+            methods = _nonbn
+    except Exception:
+        pass
     _du = update.effective_user.id if update.effective_user else 0
     _en = False
     try:
@@ -14447,30 +14517,27 @@ async def show_deposit(update, ctx=None):
     except Exception:
         pass
     _bal_line = (
-        (f"💳 *Deposit balance:* `{taka_txt(_dep_u)}` "
-         f"(≈ {_usd_txt(_dep_u / dep_rate())})\n"
+        (f"💳 *Deposit balance:* `{_shop_money(_dep_u)}`\n"
          f"🪙 *Earn balance:* `{_earn_u:g}$`\n"
          f"📊 Rate: 1$ = `{dep_rate():g}` ৳\n"
          "━━━━━━━━━━━━━━\n")
         if _en else
-        (f"💳 *ডিপোজিট ব্যালেন্স:* `{taka_txt(_dep_u)}` "
-         f"(≈ {_usd_txt(_dep_u / dep_rate())})\n"
+        (f"💳 *ডিপোজিট ব্যালেন্স:* `{_shop_money(_dep_u)}`\n"
          f"🪙 *Earn ব্যালেন্স:* `{_earn_u:g}$`\n"
          f"📊 রেট: 1$ = `{dep_rate():g}` ৳\n"
          "━━━━━━━━━━━━━━\n"))
     if _en:
         txt = ("💳 *Deposit*\n" + _bal_line +
                "Choose any method below.\n\n"
-               "⚡ *Auto* — give the amount and send from Binance; the bot sees "
-               "the payment and adds the balance automatically.\n"
+               "🇧🇩 *QR* — scan the QR and pay; the bot sees the payment and adds "
+               "the balance automatically.\n"
                "✍️ *Manual* — you pay and submit TxID/screenshot; admin approves.\n\n"
                "💬 Want to deposit with another system or payment option? "
                "Message support/admin — @gmail4gg")
     else:
         txt = ("💳 *ডিপোজিট*\n" + _bal_line +
                "নিচের যেকোনো একটি মেথড বেছে নিন।\n\n"
-               "⚡ *অটো* — পরিমাণ দিন, Binance থেকে টাকা পাঠান — বট পেমেন্ট দেখে "
-               "নিজেই ব্যালেন্স যোগ করে দেবে।\n"
+               "🇧🇩 *QR* — QR স্ক্যান করে টাকা পাঠান, বট পেমেন্ট দেখে নিজেই ব্যালেন্স যোগ করে।\n"
                "✍️ *ম্যানুয়াল* — আপনি পেমেন্ট করে TxID/স্ক্রিনশট দিলে অ্যাডমিন ✅ করবেন।\n\n"
                "💬 অন্য কোনো সিস্টেম বা পেমেন্ট অপশন দিয়ে ডিপোজিট করতে চাইলে "
                "সাপোর্ট/অ্যাডমিনকে মেসেজ করুন — @gmail4gg")
@@ -14517,14 +14584,14 @@ async def _dep_qr_amount_card(q, ctx, uid, mid):
     if _en:
         _cap = ("🇧🇩 *Bangla QR Payment*\n"
                 "━━━━━━━━━━━━━━\n"
-                f"💰 *Minimum:* `{_qc['min']:g}` ৳\n\n"
+                f"💰 *Minimum:* `{_shop_money(_qc['min'])}`\n\n"
                 "📝 *Now type the amount:* how many taka do you want to deposit?\n\n"
                 "💡 After the amount you'll get the QR code, the total with fee "
                 "and how many $ you get.")
     else:
         _cap = ("🇧🇩 *Bangla QR Payment*\n"
                 "━━━━━━━━━━━━━━\n"
-                f"💰 *সর্বনিম্ন:* `{_qc['min']:g}` ৳\n\n"
+                f"💰 *সর্বনিম্ন:* `{_shop_money(_qc['min'])}`\n\n"
                 "📝 *এবার অ্যামাউন্ট লিখুন:* কত টাকা ডিপোজিট করবেন?\n\n"
                 "💡 অ্যামাউন্ট দেওয়ার পর *QR কোড* আসবে, সাথে *ফি সহ মোট* "
                 "কত দিতে হবে আর কত $ যোগ হবে দেখাবে।")
@@ -14583,9 +14650,9 @@ async def _dep_method_page(q, mid):
     elif kind == "qr":
         _qc = qr_conf()
         if _en:
-            lines += ["", f"💰 Minimum: `{_qc['min']:g}` ৳"]
+            lines += ["", f"💰 Minimum: `{_shop_money(_qc['min'])}`"]
         else:
-            lines += ["", f"💰 সর্বনিম্ন: `{_qc['min']:g}` ৳"]
+            lines += ["", f"💰 সর্বনিম্ন: `{_shop_money(_qc['min'])}`"]
         if (_qc["note"] or "").strip():
             lines += ["", "📋 " + _qc["note"]]
         lines += ["", "After sending, tap *✅ I have paid*." if _en
@@ -15722,8 +15789,8 @@ async def dep_callback(update, ctx):
             _amtline = ""
             try:
                 if _qb:
-                    _amtline = (f"\n💵 Amount: `{float(_qb):g}` ৳\n" if _en_p
-                                else f"\n💵 অ্যামাউন্ট: `{float(_qb):g}` ৳\n")
+                    _amtline = (f"\n💵 Amount: `{_shop_money(float(_qb))}`\n" if _en_p
+                                else f"\n💵 অ্যামাউন্ট: `{_shop_money(float(_qb))}`\n")
             except Exception:
                 _amtline = ""
             await ctx.bot.send_message(
@@ -16316,23 +16383,26 @@ async def dep_input(update, ctx, st):
             bdt = 0.0
         _qc = await asyncio.to_thread(qr_conf)
         _sum, _total, _usd = qr_summary(bdt, _qc)
-        _note = (f"QR: {bdt:g} BDT + ফি {float(_qc['fee'] or 0):g} = {_total:g} BDT · "
+        _note = (f"QR: ${qr_usd(bdt, _qc):g} ({bdt:g} BDT) + ফি "
+                 f"{float(_qc['fee'] or 0):g} = {_total:g} BDT · "
                  f"শেষ ৪: {last4} · রেট {float(_qc['rate'] or 0):g}")
         ctx.user_data.pop("state", None)
         ctx.user_data.pop("qr_bdt", None)
         ctx.user_data.pop("dep_mid", None)
-        # 💳 এখন QR-এ পাঠানো টাকাই ডিপোজিটে জমা হয় (ডলারে বদলানো হয় না)
-        _credit_tk = round(float(bdt or 0), 2)
-        oid = await asyncio.to_thread(dep_new, uid, m, _credit_tk, "", _note, "pending",
+        # 💵 আগের মতোই QR ডিপোজিট ডলারে জমা হয় (৳ ÷ রেট); অনুমোদন করলে
+        #    ওই ডলারই রেটে টাকা হয়ে ৳ ওয়ালেটে যোগ হয় — পাশে টাকাও দেখানো হয়।
+        _usd_dep = round(qr_usd(bdt, _qc), 6)
+        _paid_txt = f"{_usd_txt(_usd_dep)} · {taka_txt(bdt)}"
+        oid = await asyncio.to_thread(dep_new, uid, m, _usd_dep, "", _note, "pending",
                                       f"qr:{last4}")
         await update.message.reply_text(
             (f"⏳ *Checking your payment...* please wait\n\n"
-             f"🧾 `#{dep_no(oid)}` · 💳 `{taka_txt(bdt)}`\n"
+             f"🧾 `#{dep_no(oid)}` · 💳 `{_paid_txt}`\n"
              f"📱 Last 4 digits: `{last4}`\n\n"
              "✅ Your request has reached me — the admin will verify and add the balance."
              if _en else
              f"⏳ *আপনার পেমেন্ট চেক করা হচ্ছে...* দয়া করে অপেক্ষা করুন\n\n"
-             f"🧾 `#{dep_no(oid)}` · 💳 `{taka_txt(bdt)}`\n"
+             f"🧾 `#{dep_no(oid)}` · 💳 `{_paid_txt}`\n"
              f"📱 নাম্বারের শেষ ৪: `{last4}`\n\n"
              "✅ আপনার রিকোয়েস্ট আমার কাছে এসেছে — অ্যাডমিন যাচাই করে "
              "ব্যালেন্স যোগ করে দিবেন।"),
@@ -16345,7 +16415,7 @@ async def dep_input(update, ctx, st):
                     f"🧾 `#{dep_no(oid)}` · 👤 `{uid}`\n"
                     f"💰 `{bdt:g}` BDT + ফি `{float(_qc['fee'] or 0):g}` = "
                     f"`{_total:g}` BDT\n"
-                    f"💳 যোগ হবে: `{taka_txt(bdt)}` "
+                    f"💳 যোগ হবে: `{_paid_txt}` "
                     f"(রেট `{float(_qc['rate'] or 0):g}`)\n"
                     f"📱 শেষ ৪ ডিজিট: `{last4}`")
             _kb = InlineKeyboardMarkup([[
@@ -18241,7 +18311,7 @@ async def show_profile(update, ctx):
     _dep_bal = float(st.get("dep_bal") or 0)
     # সবসময় দেখাও (ডিপোজিট না থাকলে $0.00)
     _dep_line = (f"💰 *{'Deposit balance' if _lang == 'en' else 'ডিপোজিট ব্যালেন্স'}:* "
-                 f"`{taka_txt(_dep_bal)}`\n")
+                 f"`{_shop_money(_dep_bal)}`\n")
     _name = _md_esc(user.full_name or user.username or "—")
     if user.username and user.full_name:
         _name += f" (@{_md_esc(user.username)})"
@@ -20957,9 +21027,9 @@ async def show_wd_confirmation(msg, ctx, uid):
     _wsrc = "dep" if ctx.user_data.get("wd_src") == "dep" else "earn"
     _eu, _du, _cut, _wrate = await asyncio.to_thread(wd_split, uid, amt, _wsrc)
     net_amt = round(amt - fee - _cut, 4)
-    _cut_en = (f"🏦 *Cut from deposit:* `{taka_txt(_du)}`\n"
+    _cut_en = (f"🏦 *Cut from deposit:* `{_shop_money(_du)}`\n"
                f"🏦 *Deposit cut (15%):* `${_cut:.4f}`\n" if _cut else "")
-    _cut_bn = (f"🏦 *ডিপোজিট থেকে কাটা:* `{taka_txt(_du)}`\n"
+    _cut_bn = (f"🏦 *ডিপোজিট থেকে কাটা:* `{_shop_money(_du)}`\n"
                f"🏦 *ডিপোজিটের অংশে ১৫% কাটা:* `${_cut:.4f}`\n" if _cut else "")
     masked  = addr   # ইউজার নিজের wallet সব জায়গায় ফুল দেখবে
     if lang == 'en':
@@ -37251,6 +37321,8 @@ def main():
             application.job_queue.run_repeating(
                 job_smm_balance, interval=1800, first=90, name="smm_balance")
             application.job_queue.run_repeating(
+                job_smm_refund_sync, interval=600, first=120, name="smm_refund_sync")
+            application.job_queue.run_repeating(
                 job_clean_stuck_states,
                 interval=1800,
                 first=1800,
@@ -37393,6 +37465,7 @@ def main():
                 asyncio.create_task(_run_periodically(job_db_keepalive,      300, first_sec=20)),
                 asyncio.create_task(_run_periodically(job_task_timeout,       30, first_sec=20)),
                 asyncio.create_task(_run_periodically(job_history_sync,     1800, first_sec=120)),
+                asyncio.create_task(_run_periodically(job_smm_refund_sync,    600, first_sec=120)),
                 asyncio.create_task(_run_daily_at(job_bio_task_check,   0, 5, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_post_leaderboard, 0, 0, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_winback,        21, 0, BD_TZ)),
@@ -37631,6 +37704,11 @@ def smm_services(force=False):
                     "min": int(float(s.get("min") or 1)),
                     "max": int(float(s.get("max") or 0)),
                     "type": str(s.get("type") or "Default"),
+                    # প্যানেল অতিরিক্ত তথ্য দিলে রেখে দাও (গতি/রিফিল/কোয়ালিটি)
+                    "extra": {k: s.get(k) for k in
+                              ("start_time", "start", "speed", "refill", "quality",
+                               "dripfeed", "cancel", "description", "desc")
+                              if str(s.get(k) or "").strip()},
                 })
             except Exception:
                 continue
@@ -37807,6 +37885,46 @@ def smm_check_balance(notify_bot=None, force=False):
             "low": low, "alerted": alerted}
 
 
+async def job_smm_refund_sync(context):
+    """প্রতি ১০ মিনিটে: প্যানেল সত্যিই বাতিল করা অর্ডারের টাকা ইউজারকে ফেরত।"""
+    try:
+        if not get_setting("smm_key"):
+            return
+        await asyncio.to_thread(smm_sync_open_orders, 30)
+        _ref = await asyncio.to_thread(smm_refund_new, 20)
+        for _oid, _u, _amt, _snm, _part in _ref:
+            try:
+                _en = (await asyncio.to_thread(get_lang, _u)) == "en"
+            except Exception:
+                _en = False
+            try:
+                await context.bot.send_message(
+                    _u,
+                    _bi(
+                        ("💸 *SMM অর্ডার আংশিক ডেলিভারি*\n\n" if _part else
+                         "💸 *SMM অর্ডার বাতিল হয়েছে*\n\n")
+                        + f"🧾 `#{_oid}` · {_md_esc(str(_snm)[:60])}\n"
+                          f"💵 ফেরত: *{_shop_money(_amt)}*\n\n"
+                        + ("প্যানেল যতটুকু ডেলিভারি দেয়নি ঠিক ততটুকুর টাকা ফেরত "
+                           "দেওয়া হয়েছে।" if _part else
+                           "প্যানেল অর্ডারটা বাতিল করেছে, তাই টাকা আপনার ব্যালেন্সে "
+                           "ফেরত দেওয়া হয়েছে।"),
+                        ("💸 *SMM order partially delivered*\n\n" if _part else
+                         "💸 *SMM order cancelled*\n\n")
+                        + f"🧾 `#{_oid}` · {_md_esc(str(_snm)[:60])}\n"
+                          f"💵 Refunded: *{_shop_money(_amt)}*\n\n"
+                        + ("You were refunded for the part the panel did not deliver."
+                           if _part else
+                           "The panel cancelled this order, so the money is back in "
+                           "your balance."), _en),
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+            await asyncio.to_thread(smm_refund_mark_notified, _oid)
+    except Exception as e:
+        log.warning(f"[SMM] রিফান্ড জব ব্যর্থ: {e}")
+
+
 async def job_smm_balance(context):
     """প্রতি ৩০ মিনিটে প্যানেলের ব্যালেন্স চেক।"""
     try:
@@ -37896,7 +38014,7 @@ def smm_order_new(uid, sid, sname, link, qty, price):
     return int(r["id"])
 
 
-def smm_order_set(oid, api_id=None, status=None, charge=None):
+def smm_order_set(oid, api_id=None, status=None, charge=None, remains=None):
     sets, args = [], []
     if api_id is not None:
         sets.append("api_id=%s"); args.append(str(api_id)[:40])
@@ -37904,6 +38022,12 @@ def smm_order_set(oid, api_id=None, status=None, charge=None):
         sets.append("status=%s"); args.append(str(status)[:60])
     if charge is not None:
         sets.append("charge_usd=%s"); args.append(str(charge)[:40])
+    if remains is not None:
+        try:
+            _rm = int(float(str(remains).replace(",", "").strip() or 0))
+        except Exception:
+            _rm = 0
+        sets.append("remains=%s"); args.append(_rm)
     if not sets:
         return
     sets.append("updated_at=%s"); args.append(now())
@@ -37933,7 +38057,9 @@ def smm_order_status_sync(oid):
             st = str(js.get("status") or "")
             ch = str(js.get("charge") or "")
             if st:
-                smm_order_set(oid, status=st, charge=ch or None)
+                smm_order_set(oid, status=st, charge=ch or None,
+                              remains=js.get("remains"))
+                smm_refund_if_cancelled(oid)
             return smm_order_get(oid)
     except Exception as e:
         log.warning(f"[SMM] #{oid} স্ট্যাটাস আনা যায়নি: {e}")
@@ -37941,6 +38067,173 @@ def smm_order_status_sync(oid):
 
 
 _SMM_DONE = ("completed", "complete", "canceled", "cancelled", "partial", "refunded")
+
+
+# 🚫 প্যানেল যে স্ট্যাটাসে অর্ডারটা সত্যিই বাতিল/ফেরত দিয়েছে বোঝায়
+_SMM_CANCELED = ("canceled", "cancelled", "refunded", "failed")
+
+
+def _smm_refund_amount(o):
+    """ওয়েবসাইটের মতো: প্যানেল যতটা ডেলিভারি দেয়নি ঠিক ততটার টাকা ফেরত।
+
+    • বাতিল/ফেরত/ব্যর্থ → পুরো টাকা
+    • partial বা কিছু বাকি (remains) → (দাম × বাকি ইউনিট ÷ মোট ইউনিট)
+    """
+    try:
+        price = float(o["price"] or 0)
+    except Exception:
+        price = 0.0
+    try:
+        qty = int(o["qty"] or 0)
+    except Exception:
+        qty = 0
+    st = str(o["status"] or "").strip().lower()
+    try:
+        remains = int(float(str(dict(o).get("remains") or 0).replace(",", "").strip() or 0))
+    except Exception:
+        remains = 0
+    if price <= 0:
+        return 0.0
+    if st in _SMM_CANCELED:
+        return round(price, 4)              # পুরো অর্ডার বাতিল → পুরো টাকা
+    if remains > 0 and qty > 0:            # আংশিক → শুধু বাকি অংশের টাকা
+        remains = min(remains, qty)
+        return round(price * remains / qty, 4)
+    return 0.0
+
+
+def smm_refund_if_cancelled(oid):
+    """প্যানেল সত্যিই বাতিল/আংশিক করেছে → ঠিক ততটুকু টাকা ফেরত (একবারই)।
+
+    ⚠️ শুধু "Cancel requested" পাঠালে ফেরত হয় না — প্যানেল থেকে স্ট্যাটাস
+    cancelled/partial/refunded এলে তবেই, কারণ তখনই প্যানেল আমাদের টাকা দেয়।
+    """
+    o = smm_order_get(oid)
+    if not o:
+        return 0.0
+    try:
+        if int(dict(o).get("refunded") or 0):
+            return 0.0
+    except Exception:
+        pass
+    uid = int(o["user_id"] or 0)
+    amt = _smm_refund_amount(o)
+    if amt <= 0 or not uid:
+        return 0.0
+    try:
+        with _c() as c:
+            cur = c.execute(
+                "UPDATE smm_orders SET refunded=1, refund_amt=%s, refund_at=%s, "
+                "updated_at=%s WHERE id=%s AND COALESCE(refunded,0)=0",
+                (amt, now(), now(), int(oid)))
+            if cur.rowcount == 0:
+                return 0.0
+    except Exception as e:
+        log.warning(f"[SMM] #{oid} রিফান্ড ফ্ল্যাগ ব্যর্থ: {e}")
+        return 0.0
+    try:
+        smm_dep_refund(uid, amt)
+    except Exception as e:
+        try:                      # টাকা ফেরত না গেলে ফ্ল্যাগ খুলে দাও — পরে আবার
+            with _c() as c:
+                c.execute("UPDATE smm_orders SET refunded=0 WHERE id=%s", (int(oid),))
+        except Exception:
+            pass
+        log.warning(f"[SMM] #{oid} রিফান্ড ব্যর্থ: {e}")
+        return 0.0
+    log.info(f"[SMM] #{oid} {str(o['status'])[:20]} — {amt:g}৳ ফেরত uid={uid}")
+    return round(amt, 4)
+
+
+def smm_refund_new(limit=20):
+    """বাতিল হওয়া অর্ডারের টাকা ফেরত — আর যাদের এখনো জানানো হয়নি তাদের তালিকা।
+
+    refunded=0 → এখনো ফেরত হয়নি, 1 → ফেরত হয়েছে কিন্তু ইউজারকে জানানো বাকি,
+    2 → জানানো হয়ে গেছে।
+    """
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT id FROM smm_orders WHERE COALESCE(refunded,0) IN (0,1) "
+                "AND (LOWER(COALESCE(status,'')) IN "
+                "('canceled','cancelled','refunded','failed') "
+                "OR COALESCE(remains,0) > 0) "
+                "ORDER BY id LIMIT %s", (int(limit),)).fetchall() or []
+    except Exception as e:
+        log.debug(f"[SMM] রিফান্ড লিস্ট ব্যর্থ: {e}")
+        return []
+    out = []
+    for r in rows:
+        oid = int(r["id"])
+        amt = smm_refund_if_cancelled(oid)
+        o = smm_order_get(oid)
+        if amt <= 0 and o:
+            # আগেই ফেরত হয়ে গেছে (refunded=1) → শুধু মেসেজ দেওয়া বাকি
+            try:
+                if int(dict(o).get("refunded") or 0) == 1:
+                    amt = float(dict(o).get("refund_amt") or 0) \
+                        or float(o["price"] or 0)
+            except Exception:
+                amt = 0.0
+        if amt > 0 and o:
+            try:
+                _part = (str(o["status"] or "").strip().lower() not in _SMM_CANCELED
+                         and int(dict(o).get("remains") or 0) > 0)
+            except Exception:
+                _part = False
+            out.append((oid, int(o["user_id"] or 0), amt,
+                        str(o["service_name"] or ""), _part))
+        else:
+            # ফেরত দেওয়ার মতো টাকা নেই / অর্ডার নেই — আর লুপে রাখা লাগবে না
+            smm_refund_mark_notified(oid)
+    return out
+
+
+def smm_refund_mark_notified(oid):
+    """ইউজারকে মেসেজ দেওয়া হয়েছে — আবার মেসেজ যাবে না।"""
+    try:
+        with _c() as c:
+            c.execute("UPDATE smm_orders SET refunded=2 WHERE id=%s", (int(oid),))
+    except Exception:
+        pass
+
+
+def smm_sync_open_orders(limit=30):
+    """চলমান ও ক্যানসেল-অপেক্ষমাণ সব অর্ডারের স্ট্যাটাস প্যানেল থেকে আপডেট।"""
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT id, api_id FROM smm_orders WHERE COALESCE(api_id,'')<>'' "
+                "AND (LOWER(COALESCE(status,'')) NOT IN "
+                "('completed','complete','canceled','cancelled','partial','refunded') "
+                "OR (COALESCE(refunded,0)=0 AND LOWER(COALESCE(status,'')) IN "
+                "('canceled','cancelled','refunded','failed'))) "
+                "ORDER BY id DESC LIMIT %s", (int(limit),)).fetchall() or []
+    except Exception as e:
+        log.debug(f"[SMM] open-order sync লিস্ট ব্যর্থ: {e}")
+        return
+    ids = [str(r["api_id"]).strip() for r in rows]
+    if not ids:
+        return
+    try:
+        js = _smm_api({"action": "status", "orders": ",".join(ids[:100])}, timeout=30)
+    except Exception as e:
+        log.warning(f"[SMM] অর্ডার sync ব্যর্থ: {e}")
+        return
+    if not isinstance(js, dict):
+        return
+    for r in rows:
+        aid = str(r["api_id"]).strip()
+        info = js.get(aid) or {}
+        if not isinstance(info, dict) or info.get("error"):
+            continue
+        st = str(info.get("status") or "")
+        if not st:
+            continue
+        smm_order_set(int(r["id"]), status=st,
+                      charge=str(info.get("charge") or "") or None,
+                      remains=info.get("remains"))
+        smm_refund_if_cancelled(int(r["id"]))
 
 
 def smm_orders_sync_user(uid, limit=10):
@@ -37966,7 +38259,10 @@ def smm_orders_sync_user(uid, limit=10):
                 continue
             st = str(info.get("status") or "")
             if st:
-                smm_order_set(int(o["id"]), status=st, charge=str(info.get("charge") or "") or None)
+                smm_order_set(int(o["id"]), status=st,
+                              charge=str(info.get("charge") or "") or None,
+                              remains=info.get("remains"))
+                smm_refund_if_cancelled(int(o["id"]))
     return smm_orders_user(uid, limit)
 
 
@@ -38003,6 +38299,84 @@ def smm_refill_order(oid):
     return True, msg or "রিফিল রিকোয়েস্ট পাঠানো হয়েছে"
 
 
+def smm_user_stats(uid):
+    """ইউজারের SMM অর্ডার সংখ্যা ও মোট খরচ (৳)।"""
+    if not uid:
+        return 0, 0.0
+    try:
+        with _c() as c:
+            r = c.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(price),0) AS s FROM smm_orders "
+                "WHERE user_id=%s AND LOWER(COALESCE(status,'')) <> 'failed'",
+                (uid,)).fetchone()
+        return int((r["n"] if r else 0) or 0), float((r["s"] if r else 0) or 0)
+    except Exception:
+        return 0, 0.0
+
+
+def _smm_from_price(items):
+    """এক ক্যাটাগরির সবচেয়ে কম দাম (প্রতি ১০০০)।"""
+    try:
+        vals = [smm_price(s["rate"], 1000) for s in (items or [])[:5]]
+    except Exception:
+        return 0.0
+    return min(vals) if vals else 0.0
+
+
+def _smm_dual(v):
+    """বাটনের জন্য ছোট দুই মুদ্রা — আগে ডলার: `$0.48/60.59৳`।"""
+    try:
+        n = float(v or 0)
+    except Exception:
+        n = 0.0
+    try:
+        r = float(dep_rate() or 125)
+    except Exception:
+        r = 125.0
+    if r <= 0:
+        r = 125.0
+    s = _usd_txt(n / r) + "/"
+    s += f"{n:g}৳" if abs(n) >= 1 else f"{n:.2f}৳"
+    return s
+
+
+# ওয়েবসাইটের "Jump straight to a platform"-এর মতো আলাদা প্ল্যাটফর্ম অপশন
+SMM_PLATS = [
+    ("fb", "📘 Facebook", ("facebook",)),
+    ("ig", "📸 Instagram", ("instagram",)),
+    ("tt", "🎵 TikTok", ("tiktok", "tik tok")),
+    ("yt", "▶️ YouTube", ("youtube",)),
+    ("tg", "✈️ Telegram", ("telegram",)),
+    ("tw", "🐦 Twitter / X", ("twitter",)),
+    ("sp", "🟢 Spotify", ("spotify",)),
+    ("li", "💼 LinkedIn", ("linkedin",)),
+    ("dc", "💬 Discord", ("discord",)),
+    ("tv", "🟣 Twitch", ("twitch",)),
+    ("web", "🌍 Website", ("website", "web traffic", "seo")),
+    ("ot", "🌐 অন্যান্য / Other", ()),
+]
+
+
+def _smm_plat(key):
+    """প্ল্যাটফর্মের লেবেল ও কীওয়ার্ড।"""
+    for k, lab, kws in SMM_PLATS:
+        if k == key:
+            return lab, kws
+    return "", ()
+
+
+def _smm_plat_filter(cats, key):
+    """প্ল্যাটফর্ম অনুযায়ী ক্যাটাগরি ছাঁকা।"""
+    if not key or key not in [p[0] for p in SMM_PLATS]:
+        return dict(cats)
+    if key == "ot":
+        _all = [kw for _c2, _l, ks in SMM_PLATS if ks for kw in ks]
+        return {n: v for n, v in cats.items()
+                if not any(kw in n.lower() for kw in _all)}
+    _lab, kws = _smm_plat(key)
+    return {n: v for n, v in cats.items() if any(kw in n.lower() for kw in kws)}
+
+
 def _smm_cats(svcs):
     """সার্ভিসগুলোকে ক্যাটাগরি অনুযায়ী গ্রুপ করা।"""
     out = {}
@@ -38011,8 +38385,8 @@ def _smm_cats(svcs):
     return dict(sorted(out.items(), key=lambda kv: kv[0].lower()))
 
 
-async def show_smm(q, ctx, page=0):
-    """🌐 SMM প্যানেল — ক্যাটাগরি লিস্ট।"""
+async def show_smm(q, ctx, page=0, plat=""):
+    """🌐 SMM প্যানেল — ড্যাশবোর্ড: হিসাব আলাদা, প্ল্যাটফর্ম, ক্যাটাগরি।"""
     uid = q.from_user.id if getattr(q, "from_user", None) else 0
     _en = await _shop_is_en(uid)
     if not await asyncio.to_thread(smm_on):
@@ -38040,62 +38414,122 @@ async def show_smm(q, ctx, page=0):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(_bi("🔄 রিফ্রেশ", "🔄 Refresh", _en), callback_data="smm:r")],
                 [InlineKeyboardButton(_bi("🔙 দোকান", "🔙 Shop", _en), callback_data="shop:list")]]))
-    names = list(cats.keys())
-    per, pages = 8, max(1, (len(names) + 7) // 8)
+    plat = str(plat or "").strip().lower()
+    if plat not in [p[0] for p in SMM_PLATS]:
+        plat = ""
+    pcats = _smm_plat_filter(cats, plat)
+    if plat and not pcats:
+        plat, pcats = "", cats
+    names = list(pcats.keys())
+    per, pages = 6, max(1, (len(names) + 5) // 6)
     page = max(0, min(int(page or 0), pages - 1))
+    # 💳 আলাদা আলাদা হিসাব — ওয়েবসাইটের ড্যাশবোর্ড কার্ডের মতো
+    dep = await asyncio.to_thread(get_dep_balance, uid)
+    try:
+        earn = float(await asyncio.to_thread(get_bal, uid) or 0) if uid else 0.0
+    except Exception:
+        earn = 0.0
+    _n_ord, _spent = await asyncio.to_thread(smm_user_stats, uid)
     rows = []
+    # ⛔ ওয়েবসাইটের "All" বাটন বটে নেই (ইউজারের অনুরোধ) — শুধু প্ল্যাটফর্মগুলো।
+    #    কোনো প্ল্যাটফর্ম বেছে নেওয়ার পর ফেরার জন্য নিচে ছোট বাটন থাকে।
+    _prow = []
+    for _k, _lab, _kw in SMM_PLATS:
+        if _k == "ot" and _en:
+            _lab = "🌐 Others"          # ইংরেজি ইউজার ইংরেজি দেখবে
+        _prow.append(InlineKeyboardButton(("✅ " if _k == plat else "") + _lab,
+                                          callback_data=(f"smm:p:{_k}" if _k != plat else "smm:home")))
+        if len(_prow) == 2:
+            rows.append(_prow)
+            _prow = []
+    if _prow:
+        rows.append(_prow)
+    if plat:
+        rows.append([InlineKeyboardButton(_bi("🔙 সব ক্যাটাগরি", "🔙 All categories", _en),
+                                          callback_data="smm:home")])
     for nm in names[page * per:(page + 1) * per]:
-        rows.append([InlineKeyboardButton(f"{nm} ({len(cats[nm])})",
-                                          callback_data=f"smm:c:{names.index(nm)}")])
+        _from = await asyncio.to_thread(_smm_from_price, pcats[nm])
+        rows.append([InlineKeyboardButton(f"{nm[:24]} ({len(pcats[nm])}) · {_smm_dual(_from)}",
+                                          callback_data=f"smm:c:{plat}:{names.index(nm)}")])
+    _pfx = f"smm:p:{plat}" if plat else "smm:home"
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("◀️", callback_data=f"smm:home:{page-1}"))
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"{_pfx}:{page-1}"))
     nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="smm:noop"))
     if page < pages - 1:
-        nav.append(InlineKeyboardButton("▶️", callback_data=f"smm:home:{page+1}"))
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"{_pfx}:{page+1}"))
     if len(nav) > 1:
         rows.append(nav)
     rows.append([InlineKeyboardButton(_bi("🧾 আমার SMM অর্ডার", "🧾 My SMM orders", _en),
                                       callback_data="smm:my")])
     rows.append([InlineKeyboardButton(_bi("🔄 রিফ্রেশ", "🔄 Refresh", _en), callback_data="smm:r"),
                  InlineKeyboardButton(_bi("🔙 দোকান", "🔙 Shop", _en), callback_data="shop:list")])
-    txt = _bi("🌐 *SMM প্যানেল*\n\nক্যাটাগরি বেছে নিন — এর ভিতরে সব সার্ভিস ও দাম।\n"
-              "💵 পেমেন্ট ৳ ওয়ালেট থেকে কাটা হবে।",
-              "🌐 *SMM Panel*\n\nPick a category — all services and prices inside.\n"
-              "💵 Payment is deducted from your ৳ wallet.", _en)
+    _plab = _smm_plat(plat)[0] if plat else ""
+    txt = _bi(
+        "🌐 *SMM প্যানেল*\n"
+        "লাইক · ফলোয়ার · ভিউ · সাবস্ক্রাইবার\n"
+        "━━━━━━━━━━━━━━\n"
+        "👤 *আপনার হিসাব*\n"
+        f"💳 ডিপোজিট ব্যালেন্স: *{_shop_money(dep)}*\n"
+        f"💰 Earn ব্যালেন্স: *{_usd_txt(earn)}* ≈ {taka_txt(earn * dep_rate())}\n"
+        f"🧾 অর্ডার: {_n_ord} টি  |  💸 মোট খরচ: {_shop_money(_spent)}\n"
+        "━━━━━━━━━━━━━━\n"
+        "🎯 *প্ল্যাটফর্ম* — শুধু ওই প্ল্যাটফর্মের সার্ভিস দেখতে চাপুন\n"
+        + (f"➡️ এখন দেখছেন: *{_plab}*\n" if _plab else "")
+        + f"\n📁 *ক্যাটাগরি* ({len(names)})\n"
+          "কোনো ক্যাটাগরিতে চাপলে সব সার্ভিস ও দাম ($ · ৳) দেখবেন।",
+        "🌐 *SMM Panel*\n"
+        "Likes · Followers · Views · Subscribers\n"
+        "━━━━━━━━━━━━━━\n"
+        "👤 *Your account*\n"
+        f"💳 Deposit balance: *{_shop_money(dep)}*\n"
+        f"💰 Earn balance: *{_usd_txt(earn)}* ≈ {taka_txt(earn * dep_rate())}\n"
+        f"🧾 Orders: {_n_ord}  |  💸 Total spent: {_shop_money(_spent)}\n"
+        "━━━━━━━━━━━━━━\n"
+        "🎯 *Platform* — tap to see only that platform\n"
+        + (f"➡️ Showing: *{_plab}*\n" if _plab else "")
+        + f"\n📁 *Categories* ({len(names)})\n"
+          "Tap a category to see all services and prices ($ · ৳).", _en)
     await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
 
 
-async def show_smm_cat(q, ctx, idx, page=0):
+async def show_smm_cat(q, ctx, idx, page=0, plat=""):
+    """🌐 এক ক্যাটাগরির সার্ভিস লিস্ট — দাম ৳ ও $ একসাথে।"""
     uid = q.from_user.id if getattr(q, "from_user", None) else 0
     _en = await _shop_is_en(uid)
+    plat = str(plat or "").strip().lower()
+    if plat not in [p[0] for p in SMM_PLATS]:
+        plat = ""
     try:
         svcs = await asyncio.to_thread(smm_services)
         cats = await asyncio.to_thread(_smm_cats, svcs)
-        names = list(cats.keys())
+        pcats = _smm_plat_filter(cats, plat) or cats
+        names = list(pcats.keys())
         nm = names[int(idx)]
-        items = cats[nm]
+        items = pcats[nm]
     except Exception:
-        return await show_smm(q, ctx, 0)
+        return await show_smm(q, ctx, 0, plat)
     per, pages = 6, max(1, (len(items) + 5) // 6)
     page = max(0, min(int(page or 0), pages - 1))
     rows = []
     for s in items[page * per:(page + 1) * per]:
         p1000 = await asyncio.to_thread(smm_price, s["rate"], 1000)
-        rows.append([InlineKeyboardButton(f"{s['name'][:38]} — {p1000:g}৳/1000",
+        rows.append([InlineKeyboardButton(f"{s['name'][:24]} — {_smm_dual(p1000)}/1000",
                                           callback_data=f"smm:s:{s['id']}")])
     nav = []
+    _pfx = f"smm:c:{plat}:{idx}"
     if page > 0:
-        nav.append(InlineKeyboardButton("◀️", callback_data=f"smm:c:{idx}:{page-1}"))
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"{_pfx}:{page-1}"))
     nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="smm:noop"))
     if page < pages - 1:
-        nav.append(InlineKeyboardButton("▶️", callback_data=f"smm:c:{idx}:{page+1}"))
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"{_pfx}:{page+1}"))
     if len(nav) > 1:
         rows.append(nav)
-    rows.append([InlineKeyboardButton(_bi("🔙 ক্যাটাগরি", "🔙 Categories", _en), callback_data="smm:home")])
+    rows.append([InlineKeyboardButton(_bi("🔙 ক্যাটাগরি", "🔙 Categories", _en),
+                                      callback_data=(f"smm:p:{plat}" if plat else "smm:home"))])
     await q.edit_message_text(
-        _bi(f"🌐 *{_md_esc(nm)}*\n\nসার্ভিস বেছে নিন (দাম প্রতি ১০০০-এ):",
-            f"🌐 *{_md_esc(nm)}*\n\nPick a service (price per 1000):", _en),
+        _bi(f"🌐 *{_md_esc(nm)}* ({len(items)})\n\nসার্ভিস বেছে নিন — দাম প্রতি ১০০০-এ ($ · ৳):",
+            f"🌐 *{_md_esc(nm)}* ({len(items)})\n\nPick a service — price per 1000 ($ · ৳):", _en),
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -38112,22 +38546,83 @@ async def show_smm_service(q, ctx, sid):
         return
     p1000 = await asyncio.to_thread(smm_price, s["rate"], 1000)
     pmin = await asyncio.to_thread(smm_price, s["rate"], s["min"])
+    # 📋 প্যানেল বিস্তারিত (গতি/রিফিল/কোয়ালিটি) পাঠালে সেগুলোও দেখাও
+    _ex = s.get("extra") or {}
+    _ex_rows = []
+    for _k, _lab in (("start_time", _bi("শুরু", "Start", _en)),
+                     ("speed", _bi("গতি", "Speed", _en)),
+                     ("refill", _bi("রিফিল", "Refill", _en)),
+                     ("quality", _bi("কোয়ালিটি", "Quality", _en)),
+                     ("dripfeed", _bi("ড্রিপফিড", "Drip-feed", _en)),
+                     ("cancel", _bi("ক্যানসেল", "Cancel", _en))):
+        _v = str(_ex.get(_k) or "").strip()
+        if _v and _v.lower() not in ("0", "no", "false", "none"):
+            _ex_rows.append(f"• {_lab}: {_md_esc(_v[:60])}")
     txt = _bi(
-        f"🌐 *{_md_esc(s['name'])}*\n\n"
+        f"🌐 *{_md_esc(s['name'])}*\n"
+        f"━━━━━━━━━━━━━━\n"
         f"📁 ক্যাটাগরি: {_md_esc(s['cat'])}\n"
-        f"💵 দাম: *{p1000:g}৳* / ১০০০\n"
+        f"🔖 ধরন: {_md_esc(str(s.get('type') or 'Default'))}\n"
+        f"💵 দাম: *{_shop_money(p1000)}* / ১০০০\n"
         f"🔢 সর্বনিম্ন: {s['min']:,} — সর্বোচ্চ: {s['max']:,}\n"
-        f"➡️ সর্বনিম্ন অর্ডারে খরচ: ~{pmin:g}৳\n"
+        f"➡️ সর্বনিম্ন অর্ডারে খরচ: ~{_shop_money(pmin)}\n"
         + ("💬 এই সার্ভিসে কমেন্ট লিখতে হবে।\n" if _smm_need_comments(s) else "")
-        + f"\nকিনতে চাইলে নিচের বাটন চাপুন।",
-        f"🌐 *{_md_esc(s['name'])}*\n\n"
+        + ("\n📋 *বিস্তারিত*\n" + "\n".join(_ex_rows) + "\n" if _ex_rows else "")
+        + "\n⚠️ *পড়ে নিন*\n"
+          "• সার্ভিস ব্যস্ত থাকলে কাজ শুরু হতে একটু দেরি হতে পারে।\n"
+          "• আগের অর্ডার শেষ হওয়ার আগে একই লিংকে দ্বিতীয় অর্ডার দেবেন না।\n"
+          "• কাজ শুরু হলে অর্ডার আর বাতিল করা যায় না।\n\n"
+          "👉 কিনতে চাইলে নিচের বাটন চাপুন — লিংক ও পরিমাণ ধাপে ধাপে নেওয়া হবে।",
+        f"🌐 *{_md_esc(s['name'])}*\n"
+        f"━━━━━━━━━━━━━━\n"
         f"📁 Category: {_md_esc(s['cat'])}\n"
-        f"💵 Price: *{p1000:g}৳* / 1000\n"
+        f"🔖 Type: {_md_esc(str(s.get('type') or 'Default'))}\n"
+        f"💵 Price: *{_shop_money(p1000)}* / 1000\n"
         f"🔢 Min: {s['min']:,} — Max: {s['max']:,}\n"
-        f"➡️ Minimum order cost: ~{pmin:g}৳\n\nPress the button to order.", _en)
+        f"➡️ Minimum order cost: ~{_shop_money(pmin)}\n"
+        + ("\n📋 *Details*\n" + "\n".join(_ex_rows) + "\n" if _ex_rows else "")
+        + "\n⚠️ *Please read before ordering*\n"
+          "• When the service is busy, the start may be delayed.\n"
+          "• Do not place a second order on the same link before this one finishes.\n"
+          "• Once started, an order cannot be cancelled.\n\n"
+          "👉 Tap the button below — link and quantity are asked step by step.", _en)
     await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
         [InlineKeyboardButton(_bi("🛒 অর্ডার করুন", "🛒 Order now", _en), callback_data=f"smm:b:{s['id']}")],
         [InlineKeyboardButton(_bi("🔙 পিছনে", "🔙 Back", _en), callback_data="smm:home")]]))
+
+
+def _smm_qty_kb(s, en=False):
+    """পরিমাণের বাটন — প্রতিটাতে খরচও লেখা, যাতে ইউজার বুঝে বেছে নেয়।"""
+    btns = []
+    for v in _smm_qty_btns(s):
+        try:
+            _p = smm_price(s["rate"], v)
+        except Exception:
+            _p = 0.0
+        btns.append(InlineKeyboardButton(f"{v:,} · {_smm_dual(_p)}",
+                                         callback_data=f"smm:q:{int(s['id'])}:{v}"))
+    return InlineKeyboardMarkup(
+        _pair_rows(btns)
+        + [[InlineKeyboardButton(_bi("✏️ নিজে লিখব", "✏️ Type my own", en),
+                                 callback_data=f"smm:qo:{int(s['id'])}")],
+           [InlineKeyboardButton(_bi("🔙 পিছনে", "🔙 Back", en),
+                                 callback_data=f"smm:s:{int(s['id'])}")]])
+
+
+def _smm_qty_btns(s):
+    """সাধারণ পরিমাণের বাটন — ইউজারকে সংখ্যা লিখতে হয় না।"""
+    try:
+        mn = max(1, int(s["min"] or 1))
+        mx = int(s["max"] or 0)
+    except Exception:
+        mn, mx = 1, 0
+    vals = []
+    for v in (mn, mn * 2, mn * 5, 1000, 5000, 10000, 50000):
+        v = int(v)
+        if v < mn or (mx and v > mx) or v in vals:
+            continue
+        vals.append(v)
+    return vals[:6]
 
 
 async def smm_ask_link(update, ctx, sid):
@@ -38153,12 +38648,17 @@ async def smm_ask_link(update, ctx, sid):
         return True
     ctx.user_data["smm_link"] = txt
     ctx.user_data["state"] = f"smm_qty:{sid}"
+    _qkb = _smm_qty_kb(s, _en)
     await update.message.reply_text(
-        _bi(f"🔢 *কত ইউনিট নিবেন?*\n\nসর্বনিম্ন {s['min']:,} — সর্বোচ্চ {s['max']:,}\n"
-            f"শুধু সংখ্যাটা লিখে পাঠান।\n\n/cancel — বাতিল",
-            f"🔢 *How many units?*\n\nMin {s['min']:,} — Max {s['max']:,}\n"
-            f"Send only the number.\n\n/cancel — Cancel", _en),
-        parse_mode="Markdown")
+        _bi(f"🔢 *কত ইউনিট নিবেন?*\n\n"
+            f"🔹 সর্বনিম্ন {s['min']:,}  |  সর্বোচ্চ {s['max']:,}\n"
+            f"💵 দাম প্রতি ১০০০-এ: {_shop_money(await asyncio.to_thread(smm_price, s['rate'], 1000))}\n\n"
+            f"👉 নিচের বাটনে চাপুন, অথবা সংখ্যাটা লিখে পাঠান।\n\n/cancel — বাতিল",
+            f"🔢 *How many units?*\n\n"
+            f"🔹 Min {s['min']:,}  |  Max {s['max']:,}\n"
+            f"💵 Price per 1000: {_shop_money(await asyncio.to_thread(smm_price, s['rate'], 1000))}\n\n"
+            f"👉 Tap a button below, or type the number.\n\n/cancel — Cancel", _en),
+        parse_mode="Markdown", reply_markup=_qkb)
     return True
 
 
@@ -38181,21 +38681,29 @@ async def _smm_send_confirm(update, ctx, s, qty):
         f"🔗 {_md_esc(link[:80])}\n"
         f"🔢 {qty:,} ইউনিট\n"
         f"{extra}"
-        f"💵 খরচ: *{price:g}৳*\n"
-        f"💳 আপনার ৳ ব্যালেন্স: {dep:g}৳\n\n"
+        f"💵 খরচ: *{_shop_money(price)}*\n"
+        f"💳 আপনার ডিপোজিট ব্যালেন্স: {_shop_money(dep)}\n\n"
         f"ঠিক থাকলে নিচের বাটন চাপুন।",
         f"🧾 *Confirm order*\n\n"
         f"🌐 {_md_esc(s['name'])}\n"
         f"🔗 {_md_esc(link[:80])}\n"
         f"🔢 {qty:,} units\n"
         f"{extra}"
-        f"💵 Cost: *{price:g}৳*\n"
-        f"💳 Your ৳ balance: {dep:g}৳\n\nPress the button to confirm.", _en)
+        f"💵 Cost: *{_shop_money(price)}*\n"
+        f"💳 Your deposit balance: {_shop_money(dep)}\n\nPress the button to confirm.", _en)
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(_bi(f"✅ কনফার্ম — {price:g}৳", f"✅ Confirm — {price:g}৳", _en),
+        [InlineKeyboardButton(_bi(f"✅ কনফার্ম — {_smm_dual(price)}", f"✅ Confirm — {_smm_dual(price)}", _en),
                               callback_data=f"smm:ok:{s['id']}:{qty}")],
         [InlineKeyboardButton(_bi("❌ বাতিল", "❌ Cancel", _en), callback_data="smm:home")]])
-    await update.message.reply_text(txt2, parse_mode="Markdown", reply_markup=kb)
+    _cq = getattr(update, "callback_query", None)
+    if _cq:
+        try:
+            return await _cq.edit_message_text(txt2, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+    _mm = getattr(update, "message", None) or getattr(update, "effective_message", None)
+    if _mm:
+        await _mm.reply_text(txt2, parse_mode="Markdown", reply_markup=kb)
 
 
 async def smm_ask_qty(update, ctx, sid):
@@ -38203,6 +38711,25 @@ async def smm_ask_qty(update, ctx, sid):
     uid = update.effective_user.id
     _en = await _shop_is_en(uid)
     txt = (update.message.text or "").strip().replace(",", "")
+    # ⚠️ এখানে state-এর পুরো লেখা ("smm_qty:3") আসে — শুধু সংখ্যাটা নিতে হবে।
+    # আগে int("smm_qty:3") করতে গিয়ে exception হতো → ধাপ হারিয়ে মেনুতে ফিরে যেত।
+    try:
+        sid = int(str(sid).split(":")[1]) if ":" in str(sid) else int(sid)
+    except Exception:
+        ctx.user_data.pop("state", None)
+        await update.message.reply_text(
+            _bi("🔁 আবার শুরু করুন — /start চেপে শপ → 🌐 SMM প্যানেল খুলুন।",
+                "🔁 Please start again — tap /start, then Shop → 🌐 SMM Panel.", _en))
+        return True
+    # মেনুর কোনো বাটন চাপলে আগের অসম্পূর্ণ ধাপ বাতিল হয়ে মেনুই খুলবে
+    try:
+        _labels = {v for v in (get_all_btns(await asyncio.to_thread(get_lang, uid)) or {}).values()
+                   if isinstance(v, str)}
+    except Exception:
+        _labels = set()
+    if txt in _labels:
+        ctx.user_data.pop("state", None)
+        return False
     if not txt.isdigit():
         await update.message.reply_text(_bi("❌ শুধু সংখ্যা লিখুন (যেমন `500`)।",
                                             "❌ Send only a number (e.g. `500`).", _en))
@@ -38344,11 +38871,11 @@ async def smm_place_order(q, ctx, sid, qty):
     await q.edit_message_text(
         _bi(f"✅ *অর্ডার সফল*\n\n🌐 {_md_esc(s['name'])}\n"
             f"🔗 {_md_esc(link[:80])}\n🔢 {qty:,} ইউনিট\n"
-            f"💵 কাটা হয়েছে: {price:g}৳\n🆔 প্যানেল অর্ডার: `{api_id}`\n\n"
+            f"💵 কাটা হয়েছে: {_shop_money(price)}\n🆔 প্যানেল অর্ডার: `{api_id}`\n\n"
             f"⏳ কাজ শুরু হতে কয়েক মিনিট লাগতে পারে। স্ট্যাটাস দেখতে নিচের বাটন।",
             f"✅ *Order placed*\n\n🌐 {_md_esc(s['name'])}\n"
             f"🔗 {_md_esc(link[:80])}\n🔢 {qty:,} units\n"
-            f"💵 Charged: {price:g}৳\n🆔 Panel order: `{api_id}`\n\n"
+            f"💵 Charged: {_shop_money(price)}\n🆔 Panel order: `{api_id}`\n\n"
             f"⏳ Delivery may take a few minutes. Check status below.", _en),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
@@ -38397,6 +38924,10 @@ async def show_smm_order(q, ctx, oid):
             pass
         return
     st = str(o["status"] or "")
+    try:
+        _rf = int(dict(o).get("refunded") or 0) > 0
+    except Exception:
+        _rf = False
     emoji = "🟡" if st.lower() in ("pending", "in progress", "processing", "new") else \
             ("🟢" if st.lower() in ("completed", "complete") else
              ("🔴" if st.lower() in ("canceled", "cancelled", "failed") else "⚪️"))
@@ -38405,16 +38936,19 @@ async def show_smm_order(q, ctx, oid):
             f"🌐 {_md_esc(str(o['service_name']))}\n"
             f"🔗 {_md_esc(str(o['link'])[:80])}\n"
             f"🔢 {int(o['qty'] or 0):,} ইউনিট\n"
-            f"💵 {float(o['price'] or 0):g}৳\n"
+            f"💵 {_shop_money(float(o['price'] or 0))}\n"
             f"🆔 প্যানেল: `{_md_esc(str(o['api_id'] or '—'))}`\n"
-            f"📌 স্ট্যাটাস: *{_md_esc(st)}*",
+            f"📌 স্ট্যাটাস: *{_md_esc(st)}*"
+            + ("\n💸 অর্ডার বাতিল — টাকা ব্যালেন্সে ফেরত দেওয়া হয়েছে" if _rf else ""),
             f"{emoji} *Order #{int(o['id'])}*\n\n"
             f"🌐 {_md_esc(str(o['service_name']))}\n"
             f"🔗 {_md_esc(str(o['link'])[:80])}\n"
             f"🔢 {int(o['qty'] or 0):,} units\n"
-            f"💵 {float(o['price'] or 0):g}৳\n"
+            f"💵 {_shop_money(float(o['price'] or 0))}\n"
             f"🆔 Panel: `{_md_esc(str(o['api_id'] or '—'))}`\n"
-            f"📌 Status: *{_md_esc(st)}*", _en),
+            f"📌 Status: *{_md_esc(st)}*"
+            + ("\n💸 Order cancelled — money refunded to your balance" if _rf else ""),
+            _en),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton(_bi("🔄 রিফ্রেশ", "🔄 Refresh", _en), callback_data=f"smm:v:{oid}")]]
@@ -38446,11 +38980,21 @@ async def smm_callback(update, ctx):
             return await show_smm(q, ctx, 0)
         if d.startswith("smm:home:"):
             return await show_smm(q, ctx, int(d.split(":")[2]))
+        if d == "smm:p" or d.startswith("smm:p:"):
+            parts = d.split(":")
+            _pk = parts[2] if len(parts) > 2 else ""
+            _pg = int(parts[3]) if len(parts) > 3 and str(parts[3]).isdigit() else 0
+            return await show_smm(q, ctx, _pg, _pk)
         if d == "smm:noop":
             return
         if d.startswith("smm:c:"):
             parts = d.split(":")
-            return await show_smm_cat(q, ctx, int(parts[2]), int(parts[3]) if len(parts) > 3 else 0)
+            _pk = parts[2] if len(parts) > 2 else ""
+            if str(_pk).isdigit():          # পুরোনো ফরম্যাট: smm:c:<idx>[:page]
+                return await show_smm_cat(q, ctx, int(_pk),
+                                          int(parts[3]) if len(parts) > 3 else 0)
+            return await show_smm_cat(q, ctx, int(parts[3]) if len(parts) > 3 else 0,
+                                      int(parts[4]) if len(parts) > 4 else 0, _pk)
         if d.startswith("smm:s:"):
             return await show_smm_service(q, ctx, int(d.split(":")[2]))
         if d.startswith("smm:b:"):
@@ -38464,6 +39008,30 @@ async def smm_callback(update, ctx):
                     "(e.g. `https://instagram.com/username`).\n\n/cancel — Cancel", _en),
                 parse_mode="Markdown")
             return
+        if d.startswith("smm:q:"):
+            parts = d.split(":")                       # smm:q:<sid>:<qty>
+            _sid = int(parts[2])
+            _qty = int(parts[3])
+            _svcs = await asyncio.to_thread(smm_services)
+            _s = next((x for x in _svcs if x["id"] == _sid), None)
+            if not _s:
+                try:
+                    await q.answer(_bi("সার্ভিসটি পাওয়া যায়নি", "Service not found", False),
+                                   show_alert=True)
+                except Exception:
+                    pass
+                return
+            ctx.user_data["state"] = f"smm_qty:{_sid}"
+            return await _smm_send_confirm(update, ctx, _s, _qty)
+        if d.startswith("smm:qo:"):
+            _sid = int(d.split(":")[2])
+            _en2 = await _shop_is_en(uid)
+            ctx.user_data["state"] = f"smm_qty:{_sid}"
+            return await q.edit_message_text(
+                _bi("✏️ *নিজের মতো পরিমাণ লিখুন*\n\nশুধু সংখ্যাটা পাঠান (যেমন `750`)।\n\n/cancel — বাতিল",
+                    "✏️ *Type your own quantity*\n\nSend only the number (e.g. `750`).\n\n/cancel — Cancel",
+                    _en2),
+                parse_mode="Markdown")
         if d.startswith("smm:ok:"):
             parts = d.split(":")
             return await smm_place_order(q, ctx, int(parts[2]), int(parts[3]))
