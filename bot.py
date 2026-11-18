@@ -161,7 +161,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-18b134"
+BUILD_TAG       = "uid-auto-2026-11-18b140"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -8093,6 +8093,7 @@ GETNUM_CH_DEF   = "-1003728636195"
 GN_WAIT_MIN = 20          # নাম্বার কত মিনিট লাইভ
 GN_MAX_SERVICES = 12
 GN_MAX_ITEMS = 60
+GN_MAX_OPEN = 3           # একসাথে কতগুলো নাম্বার চলতে পারে
 GN_SMS_TTL = 3            # OTP লিস্ট ক্যাশ (সেকেন্ড)
 _GN_SMS_CACHE = {"ts": 0.0, "rows": []}
 # সার্ভিসের নাম → সুন্দর লেবেল
@@ -8211,11 +8212,35 @@ def getnum_ch_id():
         return int(GETNUM_CH_DEF)
 
 
+_GN_SVC_CACHE = {"raw": None, "ts": 0.0, "val": []}
+_GN_SVC_TTL = 15.0        # সেকেন্ড — DB পড়া কমানোর জন্য ছোট ক্যাশ
+
+
+def _gn_svcs_copy(svcs):
+    """ক্যাশের লিস্ট কলকারীর হাতে mutate হলেও যেন ক্যাশ নষ্ট না হয়।"""
+    return [{"name": str(sv.get("name") or ""),
+             "items": [{"name": str(it.get("name") or ""),
+                        "range": str(it.get("range") or ""),
+                        "price": it.get("price") or 0}
+                       for it in (sv.get("items") or [])]}
+            for sv in (svcs or [])]
+
+
 def getnum_services():
     """[{'name': '📘 Facebook', 'items': [{'name','range','price'}, …]}, …]"""
+    global _GN_SVC_CACHE
+    _t = _time.time()
+    _c = _GN_SVC_CACHE
+    if _c.get("val") is not None \
+            and (_t - float(_c.get("ts") or 0)) < _GN_SVC_TTL:
+        return _gn_svcs_copy(_c["val"])          # DB পড়া বাদ — ক্যাশ থেকেই
+    try:
+        _raw = str(get_setting("getnum_services") or "[]")
+    except Exception:
+        _raw = "[]"
     out = []
     try:
-        j = _json.loads(str(get_setting("getnum_services") or "[]"))
+        j = _json.loads(_raw)
     except Exception:
         j = []
     if not isinstance(j, list):
@@ -8245,7 +8270,11 @@ def getnum_services():
             out.append({"name": _nm, "items": items})
         if len(out) >= GN_MAX_SERVICES:
             break
-    return out
+    try:
+        _GN_SVC_CACHE = {"raw": _raw, "ts": _t, "val": out}
+    except Exception:
+        pass
+    return _gn_svcs_copy(out)
 
 
 def getnum_all_items():
@@ -8326,6 +8355,90 @@ def _gn_flag(iso):
         return "".join(chr(0x1F1E6 + ord(ch) - 97) for ch in i)
     except Exception:
         return ""
+
+# ডায়ালিং কোড → (ISO, দেশের নাম) — রেঞ্জ থেকে দেশ বের করার জন্য
+_GN_CC = {
+    "1": ("US", "USA"), "7": ("RU", "Russia"), "20": ("EG", "Egypt"),
+    "27": ("ZA", "South Africa"), "30": ("GR", "Greece"), "31": ("NL", "Netherlands"),
+    "32": ("BE", "Belgium"), "33": ("FR", "France"), "34": ("ES", "Spain"),
+    "36": ("HU", "Hungary"), "39": ("IT", "Italy"), "40": ("RO", "Romania"),
+    "41": ("CH", "Switzerland"), "43": ("AT", "Austria"), "44": ("GB", "UK"),
+    "45": ("DK", "Denmark"), "46": ("SE", "Sweden"), "47": ("NO", "Norway"),
+    "48": ("PL", "Poland"), "49": ("DE", "Germany"), "51": ("PE", "Peru"),
+    "52": ("MX", "Mexico"), "53": ("CU", "Cuba"), "54": ("AR", "Argentina"),
+    "55": ("BR", "Brazil"), "56": ("CL", "Chile"), "57": ("CO", "Colombia"),
+    "58": ("VE", "Venezuela"), "60": ("MY", "Malaysia"), "61": ("AU", "Australia"),
+    "62": ("ID", "Indonesia"), "63": ("PH", "Philippines"), "64": ("NZ", "New Zealand"),
+    "65": ("SG", "Singapore"), "66": ("TH", "Thailand"), "81": ("JP", "Japan"),
+    "82": ("KR", "South Korea"), "84": ("VN", "Vietnam"), "86": ("CN", "China"),
+    "90": ("TR", "Turkey"), "91": ("IN", "India"), "92": ("PK", "Pakistan"),
+    "93": ("AF", "Afghanistan"), "94": ("LK", "Sri Lanka"), "95": ("MM", "Myanmar"),
+    "98": ("IR", "Iran"), "212": ("MA", "Morocco"), "213": ("DZ", "Algeria"),
+    "216": ("TN", "Tunisia"), "218": ("LY", "Libya"), "220": ("GM", "Gambia"),
+    "221": ("SN", "Senegal"), "222": ("MR", "Mauritania"), "223": ("ML", "Mali"),
+    "224": ("GN", "Guinea"), "225": ("CI", "Ivory Coast"), "226": ("BF", "Burkina Faso"),
+    "227": ("NE", "Niger"), "228": ("TG", "Togo"), "229": ("BJ", "Benin"),
+    "230": ("MU", "Mauritius"), "231": ("LR", "Liberia"), "232": ("SL", "Sierra Leone"),
+    "233": ("GH", "Ghana"), "234": ("NG", "Nigeria"), "235": ("TD", "Chad"),
+    "236": ("CF", "Central African Rep."), "237": ("CM", "Cameroon"),
+    "238": ("CV", "Cape Verde"), "239": ("ST", "Sao Tome"), "240": ("GQ", "Eq. Guinea"),
+    "241": ("GA", "Gabon"), "242": ("CG", "Congo"), "243": ("CD", "DR Congo"),
+    "244": ("AO", "Angola"), "245": ("GW", "Guinea-Bissau"), "248": ("SC", "Seychelles"),
+    "249": ("SD", "Sudan"), "250": ("RW", "Rwanda"), "251": ("ET", "Ethiopia"),
+    "252": ("SO", "Somalia"), "253": ("DJ", "Djibouti"), "254": ("KE", "Kenya"),
+    "255": ("TZ", "Tanzania"), "256": ("UG", "Uganda"), "257": ("BI", "Burundi"),
+    "258": ("MZ", "Mozambique"), "260": ("ZM", "Zambia"), "261": ("MG", "Madagascar"),
+    "262": ("RE", "Reunion"), "263": ("ZW", "Zimbabwe"), "264": ("NA", "Namibia"),
+    "265": ("MW", "Malawi"), "266": ("LS", "Lesotho"), "267": ("BW", "Botswana"),
+    "268": ("SZ", "Eswatini"), "269": ("KM", "Comoros"), "297": ("AW", "Aruba"),
+    "350": ("GI", "Gibraltar"), "351": ("PT", "Portugal"), "352": ("LU", "Luxembourg"),
+    "353": ("IE", "Ireland"), "354": ("IS", "Iceland"), "355": ("AL", "Albania"),
+    "356": ("MT", "Malta"), "357": ("CY", "Cyprus"), "358": ("FI", "Finland"),
+    "359": ("BG", "Bulgaria"), "370": ("LT", "Lithuania"), "371": ("LV", "Latvia"),
+    "372": ("EE", "Estonia"), "373": ("MD", "Moldova"), "374": ("AM", "Armenia"),
+    "375": ("BY", "Belarus"), "376": ("AD", "Andorra"), "380": ("UA", "Ukraine"),
+    "381": ("RS", "Serbia"), "382": ("ME", "Montenegro"), "383": ("XK", "Kosovo"),
+    "385": ("HR", "Croatia"), "386": ("SI", "Slovenia"), "387": ("BA", "Bosnia"),
+    "389": ("MK", "North Macedonia"), "420": ("CZ", "Czechia"), "421": ("SK", "Slovakia"),
+    "423": ("LI", "Liechtenstein"), "502": ("GT", "Guatemala"), "503": ("SV", "El Salvador"),
+    "504": ("HN", "Honduras"), "505": ("NI", "Nicaragua"), "506": ("CR", "Costa Rica"),
+    "507": ("PA", "Panama"), "509": ("HT", "Haiti"), "591": ("BO", "Bolivia"),
+    "592": ("GY", "Guyana"), "593": ("EC", "Ecuador"), "595": ("PY", "Paraguay"),
+    "597": ("SR", "Suriname"), "598": ("UY", "Uruguay"), "673": ("BN", "Brunei"),
+    "855": ("KH", "Cambodia"), "856": ("LA", "Laos"), "880": ("BD", "Bangladesh"),
+    "960": ("MV", "Maldives"), "961": ("LB", "Lebanon"), "962": ("JO", "Jordan"),
+    "963": ("SY", "Syria"), "964": ("IQ", "Iraq"), "965": ("KW", "Kuwait"),
+    "966": ("SA", "Saudi Arabia"), "967": ("YE", "Yemen"), "968": ("OM", "Oman"),
+    "971": ("AE", "UAE"), "972": ("IL", "Israel"), "973": ("BH", "Bahrain"),
+    "974": ("QA", "Qatar"), "975": ("BT", "Bhutan"), "976": ("MN", "Mongolia"),
+    "977": ("NP", "Nepal"), "992": ("TJ", "Tajikistan"), "993": ("TM", "Turkmenistan"),
+    "994": ("AZ", "Azerbaijan"), "995": ("GE", "Georgia"), "996": ("KG", "Kyrgyzstan"),
+    "998": ("UZ", "Uzbekistan"),
+}
+
+
+def _gn_country_of(rng):
+    """রেঞ্জ → (🇨🇲, 'Cameroon') — ডায়ালিং কোডের সবচেয়ে লম্বা মিল আগে।"""
+    try:
+        d = _re.sub(r"\D", "", str(rng or ""))
+        for n in (3, 2, 1):
+            cc = d[:n]
+            if cc and cc in _GN_CC:
+                iso, nm = _GN_CC[cc]
+                return _gn_flag(iso), nm
+    except Exception:
+        pass
+    return "", ""
+
+
+def _gn_range_label(it):
+    """বাটনের লেবেলের দেশ অংশ — দেশ না পেলে রেঞ্জই দেখাবে (ভুল নাম নয়)।"""
+    _f, _c = _gn_country_of((it or {}).get("range"))
+    if _c:
+        return f"{_f} {_c}".strip(), _c.lower()
+    _r = str((it or {}).get("range") or "").strip()
+    return _r, _gn_rng_key(_r)
+
 
 def _gn_rate_of(it):
     """এই দেশ/রেঞ্জে প্রতি OTP-তে ইউজার যা পাবে (৳)।"""
@@ -8647,16 +8760,68 @@ def gn_order_get(oid):
         return None
 
 
-def gn_open_order(uid):
-    """এই ইউজারের এখনো OTP না আসা নাম্বার (২০ মিনিটের ভিতরে)।"""
+def getnum_feed_rows(limit=15):
+    """প্যানেলের লাইভ OTP ফিডের সর্বশেষ কোডগুলো।"""
+    try:
+        with _c() as c:
+            return c.execute(
+                "SELECT * FROM getnum_feed ORDER BY id DESC LIMIT %s",
+                (int(limit),)).fetchall() or []
+    except Exception:
+        return []
+
+
+def _gn_live_text(en=False):
+    """🚦 Live Traffic — কোন দেশে কোন সার্ভিসে কী কোড এখন আসছে।"""
+    rows = getnum_feed_rows(15)
+    if not rows:
+        return _bi("🚦 *Live Traffic*\n\nএখনো কোনো কোড আসেনি — কিছুক্ষণ পর আবার দেখুন।",
+                   "🚦 *Live Traffic*\n\nNo codes yet — check again in a moment.", en)
+    out = [_bi("🚦 *Live Traffic* — এখন যে কোডগুলো আসছে",
+               "🚦 *Live Traffic* — codes arriving now", en)]
+    for r in rows:
+        _rng = str(r.get("range_val") or "").strip()
+        _cty = str(r.get("country") or "").strip()
+        _svc = str(r.get("service") or "").strip()
+        _msg = str(r.get("msg") or "").strip()
+        _code = ""
+        try:
+            _code = _gn_otp_code(_msg) or ""
+        except Exception:
+            _code = ""
+        if not _code:
+            # কোডে অক্ষরও থাকতে পারে (H29Q+Fsn4Sr) — "code" শব্দের পরের টোকেন
+            _m2 = _re.search(r"(?i)code\D{0,14}(?<![A-Za-z0-9+])([A-Za-z0-9+]{4,16})", _msg)
+            if _m2:
+                _code = _m2.group(1)
+        _f, _cn = _gn_country_of(_rng)
+        _where = f"{_f} {_cn}".strip() or _cty or "—"
+        _t = ((str(r.get("created_at") or "").split() or [""])[-1] or "")[:5]
+        _tail = (f"`{_code}`" + (" — কোড" if not en else " — code")) if _code \
+            else _md_esc(_msg[:120])
+        out.append(f"\n{_where} · {_svc} · {_t}\n`{_rng}`\n{_tail}")
+    out.append(_bi("\n🔄 রিফ্রেশ করতে নিচের বাটন চাপুন।",
+                   "\n🔄 Press the button below to refresh.", en))
+    return "\n".join(out)
+
+
+def gn_open_orders(uid):
+    """এই ইউজারের এখনো OTP না আসা সব নাম্বার (সর্বোচ্চ GN_MAX_OPEN, নতুন আগে)।"""
     try:
         with _c() as c:
             return c.execute(
                 "SELECT * FROM getnum_orders WHERE user_id=%s AND status='waiting' "
-                "AND ts >= %s ORDER BY id DESC LIMIT 1",
-                (int(uid), _time.time() - GN_WAIT_MIN * 60)).fetchone()
+                "AND ts >= %s ORDER BY id DESC LIMIT %s",
+                (int(uid), _time.time() - GN_WAIT_MIN * 60,
+                 int(GN_MAX_OPEN))).fetchall() or []
     except Exception:
-        return None
+        return []
+
+
+def gn_open_order(uid):
+    """এই ইউজারের সবচেয়ে নতুন চলমান নাম্বার (２０ মিনিটের ভিতরে)।"""
+    rows = gn_open_orders(uid)
+    return rows[0] if rows else None
 
 
 def gn_wait_orders(limit=25):
@@ -8786,9 +8951,9 @@ def _gn_order_kb(o, en=False):
     _b.append([InlineKeyboardButton(_bi("🔁 নাম্বার বদলান", "🔁 Change Number", en),
                                     callback_data=f"gn:n:{_id}")])
     _b.append([InlineKeyboardButton(_bi("🌐 দেশ বদলান", "🌐 Change Country", en),
-                                    callback_data="gn:home")])
-    _b.append([InlineKeyboardButton(_bi("🔢 নিজের রেঞ্জ দিন", "🔢 Use my range", en),
-                                    callback_data="gn:rx")])
+                                    callback_data=(f"gn:cc:{_id}" if _id else "gn:home"))])
+    _b.append([InlineKeyboardButton(_bi("🚦 Live Traffic", "🚦 Live Traffic", en),
+                                    callback_data="gn:live")])
     _u = getnum_group_url()
     if _u:
         if _u.startswith("@"):
@@ -8860,17 +9025,31 @@ async def show_getnum(update, ctx=None):
             "⚠️ *Number service is not set up yet*\n\n"
             "The admin needs to add the API key and the service list.\n\n"
             "Help: @gmail4gg", en))
-    # আগের নাম্বার এখনো চালু থাকলে সেটাই দেখাও — নতুন করে টাকা কাটবে না
-    o = await asyncio.to_thread(gn_open_order, uid)
-    if o:
-        return await _gn_say(update, _gn_order_text(o, en), _gn_order_kb(o, en))
-    _one = [InlineKeyboardButton(str(sv["name"]), callback_data=f"gn:s:{i}")
-            for i, sv in enumerate(svcs)]
+    # Get Number চাপলেই সবসময় সার্ভিস-লিস্ট — নতুন নাম্বার আনা হবে।
+    # আগের চলমান নাম্বার আলাদা বাটনে (নিচে) থাকবে, হারাবে না।
+    _one, _sv_seen = [], set()
+    for i, sv in enumerate(svcs):
+        _k = _re.sub(r"\s+", "", str(sv["name"])).lower()
+        if _k in _sv_seen:
+            continue
+        _sv_seen.add(_k)
+        _one.append(InlineKeyboardButton(str(sv["name"]), callback_data=f"gn:s:{i}"))
     rows = _pair_rows(_one)
+    rows.append([InlineKeyboardButton(_bi("🔢 নিজের রেঞ্জ দিন", "🔢 Use my range", en),
+                                      callback_data="gn:rx")])
+    _open = await asyncio.to_thread(gn_open_orders, uid)
+    if _open:
+        _lft = _gn_left_min(_open[0])
+        _n = len(_open)
+        rows.append([InlineKeyboardButton(
+            _bi(f"📱 চলমান নাম্বার ({_n}) · {_lft} মিনিট",
+                f"📱 Current numbers ({_n}) · {_lft} min", en),
+            callback_data="gn:cur")])
     rows.append([InlineKeyboardButton(_bi("❌ বন্ধ", "❌ Close", en), callback_data="gn:close")])
     return await _gn_say(update, _bi(
-        "📱 *নাম্বার নিন*\n\nকোন সার্ভিসের নাম্বার চান বেছে নিন:",
-        "📱 *Get Number*\n\nSelect a service:", en), InlineKeyboardMarkup(rows))
+        "📱 *নাম্বার নিন*\n\nসার্ভিস বেছে নিন — নতুন নাম্বার এনে দেওয়া হবে:",
+        "📱 *Get Number*\n\nSelect a service — a new number will be issued:", en),
+        InlineKeyboardMarkup(rows))
 
 
 async def _gn_show_items(update, ctx, si):
@@ -8884,9 +9063,16 @@ async def _gn_show_items(update, ctx, si):
     if si < 0 or si >= len(svcs):
         return await show_getnum(update, ctx)
     sv = svcs[si]
-    _one = [InlineKeyboardButton(
-        f"{it['name']} · {getnum_price_text(_gn_rate_of(it))}",
-        callback_data=f"gn:r:{si}:{ii}") for ii, it in enumerate(sv["items"])]
+    # রেঞ্জ → দেশ + পতাকা; একই দেশ একবারই (Fb Clone/New Fb ডুপ্লিকেট বাদ)
+    _one, _seen = [], set()
+    for ii, it in enumerate(sv["items"]):
+        _lab, _key = _gn_range_label(it)
+        if not _key or _key in _seen:
+            continue
+        _seen.add(_key)
+        _one.append(InlineKeyboardButton(
+            f"{_lab} · {getnum_price_text(_gn_rate_of(it))}",
+            callback_data=f"gn:r:{si}:{ii}"))
     rows = _pair_rows(_one)          # দুটো করে পাশাপাশি — লিস্ট লম্বা হয় না
     rows.append([InlineKeyboardButton(_bi("🔙 সার্ভিস", "🔙 Services", en),
                                       callback_data="gn:home")])
@@ -8909,9 +9095,6 @@ async def _gn_issue(update, ctx, si, ii):
         return await show_getnum(update, ctx)
     sv = svcs[si]
     it = sv["items"][ii]
-    o = await asyncio.to_thread(gn_open_order, uid)
-    if o:
-        return await _gn_say(update, _gn_order_text(o, en), _gn_order_kb(o, en))
     return await _gn_place(update, ctx, sv["name"], it, en,
                            retry_cb=f"gn:r:{si}:{ii}")
 
@@ -8928,9 +9111,17 @@ async def _gn_place(update, ctx, service, item, en=False, retry_cb="gn:home"):
         return await _gn_say(update, _bi(
             "⚠️ *নাম্বার সার্ভিস এখনো সেট করা হয়নি*\n\nসাহায্য: @gmail4gg",
             "⚠️ *Number service is not set up yet*\n\nHelp: @gmail4gg", en))
-    o = await asyncio.to_thread(gn_open_order, uid)
-    if o:
-        return await _gn_say(update, _gn_order_text(o, en), _gn_order_kb(o, en))
+    _open = await asyncio.to_thread(gn_open_orders, uid)
+    if len(_open) >= GN_MAX_OPEN:
+        _list = "\n".join("`" + str(x.get("number") or "") + "`" for x in _open)
+        return await _gn_say(update, _bi(
+            f"📱 *একসাথে সর্বোচ্চ {GN_MAX_OPEN}টি নাম্বার চলতে পারে*\n\n{_list}\n\n"
+            "আগের কোনওটা OTP পেলে বা সময় শেষ হলে আবার নতুন নিতে পারবেন।",
+            f"📱 *Up to {GN_MAX_OPEN} numbers at a time*\n\n{_list}\n\n"
+            "Get a new one after an OTP arrives or the time runs out.", en),
+            InlineKeyboardMarkup([[InlineKeyboardButton(
+                _bi("📱 চলমান নাম্বার", "📱 Current numbers", en),
+                callback_data="gn:cur")]]))
     rate = _gn_rate_of(it)
     await _gn_say(update, _bi("⏳ নাম্বার আনা হচ্ছে...", "⏳ Getting a number...", en))
     ok, val, info, raw = await asyncio.to_thread(getnum_fetch, it["range"])
@@ -9002,6 +9193,10 @@ def _gn_learn_many(pairs):
         changed = True
     if changed:
         set_setting("getnum_services", _json.dumps(svcs, ensure_ascii=False)[:6000])
+        try:
+            _GN_SVC_CACHE["ts"] = 0.0        # ক্যাশ রিফ্রেশ — নতুন রেঞ্জ সাথে সাথে দেখা যাবে
+        except Exception:
+            pass
     if added:
         log.info(f"[GETNUM] অটো {added}টি নতুন রেঞ্জ যোগ")
     return added
@@ -9168,7 +9363,11 @@ def _gn_feed_once():
                 svc = _gn_svc_label(it.get("service"))
                 rng = str(it.get("number") or "").strip()[:40]
                 cty = str(it.get("country") or "").strip()[:40]
-                msg = str(it.get("otp") or "").strip()[:400]
+                if not cty:
+                    _f2, _c2 = _gn_country_of(rng)
+                    cty = _c2 or ""
+                msg = str(it.get("otp") or it.get("message") or it.get("sms")
+                          or it.get("text") or it.get("code") or "").strip()[:400]
                 if ext:
                     try:
                         c.execute(
@@ -9321,6 +9520,19 @@ async def getnum_callback(update, ctx):
             return await q.delete_message()
         except Exception:
             return await show_getnum(update, ctx)
+    if d == "gn:live":
+        _en = await _shop_is_en(uid)
+        _txt = await asyncio.to_thread(_gn_live_text, _en)
+        return await _gn_say(update, _txt, InlineKeyboardMarkup([[InlineKeyboardButton(
+            _bi("🔄 রিফ্রেশ", "🔄 Refresh", _en), callback_data="gn:live")]]))
+    if d == "gn:cur":
+        _en = await _shop_is_en(uid)
+        _rows = await asyncio.to_thread(gn_open_orders, uid)
+        if not _rows:
+            return await show_getnum(update, ctx)
+        for _o in _rows:
+            await _gn_say(update, _gn_order_text(_o, _en), _gn_order_kb(_o, _en))
+        return
     if d == "gn:rx":
         ctx.user_data["state"] = "gn_range"
         return await _gn_say(update, _bi(
@@ -9330,6 +9542,19 @@ async def getnum_callback(update, ctx):
             "📩 I will bring a number from that range.\n❌ Cancel: /cancel",
             await _shop_is_en(uid)))
     _p = d.split(":")
+    if len(_p) >= 3 and _p[1] == "cc":
+        # 🌐 দেশ বদলান — একই সার্ভিসের দেশ/রেঞ্জ লিস্ট
+        try:
+            oid = int(_p[2])
+        except Exception:
+            oid = 0
+        o = await asyncio.to_thread(gn_order_get, oid) if oid else None
+        if not o or int(o.get("user_id") or 0) != int(uid):
+            return await show_getnum(update, ctx)
+        si, _ii = await asyncio.to_thread(_gn_find, o.get("service"), o.get("range_val"))
+        if si < 0:
+            return await show_getnum(update, ctx)
+        return await _gn_show_items(update, ctx, si)
     if len(_p) >= 3 and _p[1] == "n":
         try:
             oid = int(_p[2])
@@ -38962,9 +39187,9 @@ def main():
                 job_getnum_otp, interval=5, first=3, name="getnum_otp")
             # 🔄 লাইভ রেঞ্জ (৫ মিনিট) + সবার OTP ফিড (৪৫ সেকেন্ড)
             application.job_queue.run_repeating(
-                job_getnum_sync, interval=300, first=60, name="getnum_sync")
+                job_getnum_sync, interval=600, first=60, name="getnum_sync")
             application.job_queue.run_repeating(
-                job_getnum_feed, interval=45, first=20, name="getnum_feed")
+                job_getnum_feed, interval=90, first=30, name="getnum_feed")
             application.job_queue.run_repeating(
                 job_clean_stuck_states,
                 interval=1800,

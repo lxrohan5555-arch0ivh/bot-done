@@ -552,7 +552,7 @@ def shop_number():
     if g:
         return g
     _init()
-    return page("📱 নাম্বার নিন (OTP)", _gn_page_html(), "shop")
+    return page("📱 নাম্বার নিন (OTP)", _gn_page_html(), "shopnum")
 
 
 @wadm.route("/admin/shop", methods=["GET"])
