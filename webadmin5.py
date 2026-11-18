@@ -273,6 +273,94 @@ def shop_mailcode_save():
         "🎫 মেইল কোড সেটিংস সেভ হয়েছে"))
 
 
+@wadm.route("/admin/shop/getnum", methods=["POST"])
+def shop_getnum_save():
+    """📱 নাম্বার নিন (Zenex) — API key, সার্ভিস/দেশ/দাম, OTP সেটিং।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    import json as _json
+    form = request.form
+    groups = []
+    _idx = {}
+    for _line in (form.get("getnum_services_text") or "").replace("\r", "").split("\n"):
+        _line = _line.strip()
+        if not _line:
+            continue
+        _p = [_x.strip() for _x in _line.split("|")]
+        if len(_p) >= 4:
+            _sv, _cty, _rng, _pr = _p[0], _p[1], _p[2], _p[3]
+        elif len(_p) == 3:
+            _sv, _cty, _rng, _pr = _p[0], _p[0], _p[1], _p[2]
+        elif len(_p) == 2:
+            _sv, _cty, _rng, _pr = _p[0], _p[0], _p[1], "0"
+        else:
+            _sv, _cty, _rng, _pr = _p[0], _p[0], _p[0], "0"
+        if not _rng:
+            continue
+        try:
+            _price = max(0.0, round(float(_pr.replace("৳", "").replace(",", ".") or 0), 4))
+        except Exception:
+            _price = 0.0
+        _sv = _sv[:40]
+        if _sv not in _idx:
+            _idx[_sv] = len(groups)
+            groups.append({"name": _sv, "items": []})
+        _g = groups[_idx[_sv]]
+        if len(_g["items"]) < 60:
+            _g["items"].append({"name": (_cty or _rng)[:40], "range": _rng[:40],
+                                "price": _price})
+        if len(groups) >= 12:
+            break
+    vals = {
+        "getnum_on": "off" if (form.get("getnum_on") or "").strip().lower() == "off" else "on",
+        "getnum_api": (form.get("getnum_api") or "").strip()[:300],
+        "getnum_sms_api": (form.get("getnum_sms_api") or "").strip()[:400],
+        "getnum_header": (form.get("getnum_header") or "").strip()[:40],
+        "getnum_ch_id": (form.get("getnum_ch_id") or "").strip()[:24],
+        "getnum_rate": (form.get("getnum_rate") or "0.25").replace(",", ".").strip()[:12],
+        "getnum_group_url": (form.get("getnum_group_url") or "").strip()[:300],
+        "getnum_list_api": (form.get("getnum_list_api") or "").strip()[:400],
+        "getnum_feed_api": (form.get("getnum_feed_api") or "").strip()[:400],
+        "getnum_services": _json.dumps(groups, ensure_ascii=False)[:6000],
+    }
+    _k = (form.get("getnum_key") or "").strip()[:300]
+    if _k:
+        vals["getnum_key"] = _k
+    try:
+        import bot as _bs
+        for k, v in vals.items():
+            _bs.set_setting(k, v)
+    except Exception:
+        for k, v in vals.items():
+            _x("INSERT INTO settings (key,value) VALUES (%s,%s) "
+               "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k, v))
+    log_admin("shop_getnum", 0, str(len(groups)))
+    return redirect("/admin/shop?ok=" + _q("📱 নাম্বার সার্ভিস সেভ হয়েছে"))
+
+
+@wadm.route("/admin/shop/getnum/test", methods=["GET"])
+def shop_getnum_test():
+    """সেভ করা প্রথম রেঞ্জ দিয়ে একবার নাম্বার আনি — ঠিক আছে কি না দেখা।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    try:
+        import bot as _bs
+        _all = _bs.getnum_all_items()
+        if not _all:
+            return redirect("/admin/shop?ok=" + _q("আগে একটা সার্ভিস/দেশ সেভ করুন"))
+        if not _bs.getnum_key():
+            return redirect("/admin/shop?ok=" + _q("আগে API Key সেভ করুন"))
+        _ok, _val, _raw = _bs.getnum_fetch(_all[0][3]["range"])
+    except Exception as _e:
+        return redirect("/admin/shop?ok=" + _q("❌ টেস্ট করা যায়নি: " + str(_e)[:150]))
+    _msg = ("✅ নাম্বার পাওয়া গেছে: " + str(_val)) if _ok else ("❌ " + str(_val)[:200])
+    return redirect("/admin/shop?ok=" + _q(_msg[:250]))
+
+
 @wadm.route("/admin/shop/closedmsg", methods=["POST"])
 def shop_closed_msg_save():
     """দোকান/ডিপোজিট বন্ধের সময় ইউজারকে যা দেখাবে — নিজের লেখা।"""
@@ -509,8 +597,131 @@ def shop_home():
             + _btn("✏️", f"/admin/shop/{int(p['id'])}", "btn gray sm"),
         ])
 
+    # ── 📱 নাম্বার নিন (Zenex Network) ──
+    try:
+        import bot as _gnt
+        _gn_on = bool(_gnt.getnum_on())
+        _gn_svcs = _gnt.getnum_services()
+        _gn_key_ok = bool(_gnt.getnum_key())
+        _gn_api = _gnt.getnum_api()
+        _gn_hdr = _gnt.getnum_header()
+        _gn_sms = _gnt.getnum_sms_api()
+        _gn_ch = _gnt.getnum_ch_id()
+        _gn_rate = _gnt.getnum_rate()
+        _gn_group = _gnt.getnum_group_url()
+        _gn_list = _gnt.getnum_list_api()
+        _gn_feedapi = _gnt.getnum_feed_api()
+    except Exception:
+        _gn_on, _gn_svcs, _gn_key_ok = True, [], False
+        _gn_api, _gn_hdr = "https://api.zenexnetwork.com/v1/getnum", "mapikey"
+        _gn_sms, _gn_ch = "", -1003728636195
+        _gn_rate, _gn_group, _gn_list = 0.25, "", ""
+        _gn_feedapi = "https://www.zenexnetwork.com/api/v1/global-broadcast"
+    _gn_sel = ("<option value='on' selected>চালু</option><option value='off'>বন্ধ</option>"
+               if _gn_on else
+               "<option value='on'>চালু</option><option value='off' selected>বন্ধ</option>")
+    _gn_txt = esc("\n".join(
+        f"{sv.get('name') or ''} | {it.get('name') or ''} | {it.get('range') or ''} | "
+        f"{(float(it.get('price') or 0)):g}"
+        for sv in _gn_svcs for it in (sv.get("items") or [])))
+    try:
+        _gn_live = many("SELECT service, range_name, range_val, COUNT(*) AS n, "
+                        "MAX(updated_at) AS last, SUM(price) AS paid "
+                        "FROM getnum_orders WHERE status='received' "
+                        "GROUP BY service, range_name, range_val ORDER BY n DESC LIMIT 30")
+    except Exception:
+        _gn_live = []
+    if _gn_live:
+        _live_html = table(
+            ["সার্ভিস", "দেশ", "রেঞ্জ", "কোড এসেছে", "দেওয়া হয়েছে", "শেষ কোড"],
+            [[esc(str(r.get("service") or "")), esc(str(r.get("range_name") or "")),
+              f"<span class='mono'>{esc(str(r.get('range_val') or ''))}</span>",
+              num(int(r.get("n") or 0)),
+              ("—" if not float(r.get("paid") or 0)
+               else f"{float(r.get('paid') or 0):.4g}৳"),
+              f"<span class='mut'>{esc(str(r.get('last') or ''))}</span>"
+              ] for r in _gn_live], "এখনো কোনো কোড আসেনি")
+    else:
+        _live_html = ("<div class='mut' style='font-size:12px;margin-top:8px'>"
+                      "এখনো কোনো OTP আসেনি — আসলে এখানে সার্ভিস/দেশ/রেঞ্জসহ দেখা যাবে "
+                      "(সব ইউজারের, শুধু আপনার না)।</div>")
+
+    try:
+        _gn_feed_rows = many("SELECT service, range_val, country, msg, created_at "
+                             "FROM getnum_feed ORDER BY id DESC LIMIT 25")
+    except Exception:
+        _gn_feed_rows = []
+    if _gn_feed_rows:
+        _feed_html = table(
+            ["সময়", "সার্ভিস", "রেঞ্জ", "দেশ", "কোডের মেসেজ"],
+            [[f"<span class='mut'>{esc(str(r.get('created_at') or '')[5:16])}</span>",
+              esc(str(r.get("service") or "")),
+              f"<span class='mono'>{esc(str(r.get('range_val') or ''))}</span>",
+              esc(str(r.get("country") or "")),
+              f"<span class='mut'>{esc(str(r.get('msg') or '')[:60])}</span>"]
+             for r in _gn_feed_rows], "ফিড এখনো খালি")
+    else:
+        _feed_html = ("<div class='mut' style='font-size:12px;margin-top:6px'>"
+                      "জেনেক্সের পাবলিক ফিড এখনো আসেনি — কয়েক সেকেন্ড পরে রিফ্রেশ করুন।</div>")
+
+    getnumcard = "".join([
+        "<div class='card'><b>📱 নাম্বার নিন (OTP)</b>",
+        "<div class='mut' style='font-size:12px;margin:6px 0'>বটের কীবোর্ডে “📱 নাম্বার নিন” → "
+        "সার্ভিস → দেশ → নাম্বার। OTP এলে ইউজারের ইনবক্সে আর নিচের চ্যানেলে যাবে। "
+        "API Key: ", ("✅ সেভ আছে" if _gn_key_ok else "❌ এখনো দেওয়া হয়নি"),
+        " · সার্ভিস: " + num(len(_gn_svcs)) + "টি · নাম্বার: " +
+        num(sum(len(sv.get("items") or []) for sv in _gn_svcs)) + "টি</div>",
+        "<form method='post' action='/admin/shop/getnum'>",
+        "<div class='field'><label>অপশন</label><select name='getnum_on'>" + _gn_sel + "</select></div>",
+        "<div class='field'><label>API Key (mapikey) — খালি রাখলে আগেরটাই থেকে যাবে</label>"
+        "<input name='getnum_key' placeholder='এখানে API Key পেস্ট করুন' autocomplete='off'></div>",
+        "<div class='field'><label>নাম্বার আনার API URL</label>"
+        f"<input name='getnum_api' value='{esc(_gn_api)}'></div>",
+        "<div class='field'><label>OTP চেক করার API URL — "
+        "{number} / {range} / {order} বসাতে পারেন</label>"
+        f"<input name='getnum_sms_api' value='{esc(_gn_sms)}' "
+        "placeholder='https://api.zenexnetwork.com/v1/sms?number={number}'></div>",
+        "<div class='field'><label>OTP চ্যানেল আইডি</label>"
+        f"<input name='getnum_ch_id' value='{_gn_ch}'></div>",
+        "<div class='field'><label>OTP রেট (৳) — প্রতি OTP-তে ইউজার যা পাবে "
+        "(ইউজার ডলারেও দেখবে)</label>"
+        f"<input name='getnum_rate' value='{_gn_rate:g}'></div>",
+        "<div class='field'><label>🛡 OTP গ্রুপের লিংক (খালি রাখলে বাটন দেখাবে না)</label>"
+        f"<input name='getnum_group_url' value='{esc(_gn_group)}' placeholder='https://t.me/...'></div>",
+        "<div class='field'><label>🔄 লাইভ রেঞ্জ API (সার্ভিস/দেশ/রেট নিজেই আপডেট হবে)</label>"
+        f"<input name='getnum_list_api' value='{esc(_gn_list)}'></div>",
+        "<div class='field'><label>🌍 সবার OTP ফিড API (পাবলিক — নতুন দেশ নিজে থেকে যোগ হয়; "
+        "বন্ধ করতে - লিখুন)</label>"
+        f"<input name='getnum_feed_api' value='{esc(_gn_feedapi)}'></div>",
+        "<div class='field'><label>Key যে হেডারে যাবে</label>"
+        f"<input name='getnum_header' value='{esc(_gn_hdr)}'></div>",
+        "<div class='field'><label>সার্ভিস | দেশ | range | রেট ৳/OTP (০ = উপরের রেট) — প্রতি লাইনে একটা, "
+        f"এখন {num(sum(len(sv.get('items') or []) for sv in _gn_svcs))}টি</label>",
+        "<textarea name='getnum_services_text' rows='10' style='width:100%' ",
+        "placeholder='📘 Facebook | 🇨🇲 Cameroon | 23769XXXX | 0.25&#10;"
+        "📘 Facebook | 🇬🇧 UK | 4473845XXX | 0.30&#10;"
+        "📸 Instagram | 🇨🇲 Cameroon | 23769XXXX | 0.28'>" + _gn_txt + "</textarea>",
+        "<div class='mut' style='font-size:11px;margin-top:4px'>⬆️ ধূসর লেখা শুধু উদাহরণ। "
+        "দাম 0 দিলে ইউজারের কাছ থেকে টাকা কাটবে না। একই সার্ভিসের অনেক দেশ একই নাম দিয়ে "
+        "লিখলে বটে এক বাটনের ভিতরে সব দেশ দেখাবে।</div></div>",
+        "<button class='ok sm' type='submit'>💾 সেভ করুন</button>",
+        " <a class='btn gray sm' href='/admin/shop/getnum/test'>🧪 টেস্ট (প্রথম নাম্বার)</a>",
+        "</form>",
+        "<div style='margin-top:14px;padding-top:10px;border-top:1px solid #ddd'>"
+        "<b>📊 কোথায় কোড আসছে (সব ইউজার)</b>"
+        "<div class='mut' style='font-size:11.5px;margin:4px 0'>"
+        "যে সার্ভিস/দেশে OTP এসেছে সেগুলো এখানে জমা হয়, আর ওগুলোই বট নিজে থেকে "
+        "লিস্টে যোগ করে দেয়।</div>" + _live_html + "</div>",
+        "<div style='margin-top:14px;padding-top:10px;border-top:1px solid #ddd'>"
+        "<b>🌍 জেনেক্স নেটওয়ার্কে সবার কোড (লাইভ)</b>"
+        "<div class='mut' style='font-size:11.5px;margin:4px 0'>"
+        "পাবলিক ফিড — সব ইউজারের কোড, নাম্বার মাস্ক করা। এখান থেকেই নতুন দেশ/রেঞ্জ "
+        "নিজে থেকে লিস্টে যোগ হয়।</div>" + _feed_html + "</div>",
+        "</div>",
+    ])
+
     body = (
-        head + switch_card + msg_card + mailcard + tools
+        head + switch_card + msg_card + mailcard + getnumcard + tools
         + "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
           "<b>📁 ক্যাটাগরি</b>" + _btn("🛒 অর্ডার দেখুন", "/admin/shop/orders", "btn gray sm")
         + "</div>" + table(["ক্যাটাগরি", "পণ্য", "স্ট্যাটাস", "অন/অফ", ""], cat_rows,

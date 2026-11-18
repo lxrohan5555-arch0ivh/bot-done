@@ -602,6 +602,7 @@ MENU_BTNS = (
     ("withdraw", "💸 Withdraw",     "💸 Withdraw"),
     ("support",  "📞 Support",      "📞 Support"),
     ("refer",    "🔗 Refer & Earn", "🔗 Refer & Earn"),
+    ("getnum",   "📱 নাম্বার নিন",   "📱 Get Number"),
     ("shop",     "🛍 পণ্য কিনুন",   "🛍 Buy Product"),
     ("language", "🌍 Language",     "🌍 Language"),
 )

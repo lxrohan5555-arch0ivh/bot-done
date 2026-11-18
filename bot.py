@@ -161,7 +161,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-18b111"
+BUILD_TAG       = "uid-auto-2026-11-18b128"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -333,6 +333,7 @@ DEFAULT_BTNS = {
     'support':  ('📞 Support',      '📞 Support'),
     'withdraw': ('💸 Withdraw',     '💸 Withdraw'),
     'language':     ('🌍 Language',       '🌍 Language'),
+    'getnum':       ('📱 নাম্বার নিন',     '📱 Get Number'),
 }
 
 # ──────────────────────────── TRANSLATIONS ────────────────────────────
@@ -366,8 +367,8 @@ MSGS = {
         'pf_completed': "✅ Completed:",
         'pf_pending': "⏳ Pending:",
         'pf_rejected': "❌ Rejected:",
-        'pf_earned': "💵 Total earned:",
-        'pf_earned_note': "   ({e} = {a} এখন আছে + {w} উইথড্র করা)",
+        'pf_earned': "💰 Earn (বটের মোট ইনকাম):",
+        'pf_earned_note': "",
         'pf_withdrawn': "📤 Withdrawn:",
         'pf_available': "✅ Available (Earn):",
         'pf_on_hold': "🔒 On hold:",
@@ -468,8 +469,8 @@ MSGS = {
         'pf_completed': "✅ Completed:",
         'pf_pending': "⏳ Pending:",
         'pf_rejected': "❌ Rejected:",
-        'pf_earned': "💵 Total earned:",
-        'pf_earned_note': "   ({e} = {a} available + {w} withdrawn)",
+        'pf_earned': "💰 Earn (total income):",
+        'pf_earned_note': "",
         'pf_withdrawn': "📤 Withdrawn:",
         'pf_available': "✅ Available (Earn):",
         'pf_on_hold': "🔒 On hold:",
@@ -3820,6 +3821,10 @@ def init_db():
             _dep_ddl()
         except Exception as _de:
             log.warning(f"[DEP] DDL ব্যর্থ: {_de}")
+        try:
+            _getnum_ddl()
+        except Exception as _ge:
+            log.warning(f"[GETNUM] DDL ব্যর্থ: {_ge}")
         # ── এককালীন: ডিপোজিটের সময়-লক (কুলডাউন) বন্ধ + ৫ মিনিট চেক-উইন্ডো ──
         #    (ইউজারের চাহিদা: সময় লক থাকলে নতুন ডিপোজিট আটকে যায়, তাই অফ)
         try:
@@ -6966,6 +6971,7 @@ def _shop_ddl():
                 "ALTER TABLE smm_orders ADD COLUMN IF NOT EXISTS refund_amt REAL DEFAULT 0",
                 "ALTER TABLE smm_orders ADD COLUMN IF NOT EXISTS start_count INTEGER DEFAULT 0",
                 "ALTER TABLE smm_orders ADD COLUMN IF NOT EXISTS ch_notified INTEGER DEFAULT 0",
+                "ALTER TABLE smm_orders ADD COLUMN IF NOT EXISTS settle_state INTEGER DEFAULT 0",
             ):
                 try:
                     c.execute(_al)
@@ -8042,6 +8048,1271 @@ async def mailcode_input(update, ctx, st):
         parse_mode="Markdown")
     return True
 
+
+# ───────────────── 📱 নাম্বার ও OTP (Zenex Network API) ─────────────────
+# প্যানেল → শপ → "📱 নাম্বার নিন" কার্ড থেকে সব সেট হয়:
+#   getnum_on       চালু/বন্ধ
+#   getnum_key      API Key (হেডার: mapikey)
+#   getnum_api      নাম্বার আনার URL
+#   getnum_sms_api  OTP চেক করার URL ({number}/{range}/{order} বসে)
+#   getnum_ch_id    OTP যে চ্যানেলে যাবে
+#   getnum_services [{"name":"📘 Facebook","items":[{"name":"🇨🇲 Cameroon","range":"23769XXXX","price":0.25}]}]
+GETNUM_API_DEF  = "https://api.zenexnetwork.com/v1/getnum"
+GETNUM_SMS_DEF  = "https://api.zenexnetwork.com/v1/numsuccess/info"
+GETNUM_LIST_DEF = "https://api.zenexnetwork.com/v1/active-ranges"
+GETNUM_FEED_DEF = "https://www.zenexnetwork.com/api/v1/global-broadcast"
+GETNUM_CH_DEF   = "-1003728636195"
+GN_WAIT_MIN = 20          # নাম্বার কত মিনিট লাইভ
+GN_MAX_SERVICES = 12
+GN_MAX_ITEMS = 60
+GN_SMS_TTL = 3            # OTP লিস্ট ক্যাশ (সেকেন্ড)
+_GN_SMS_CACHE = {"ts": 0.0, "rows": []}
+# সার্ভিসের নাম → সুন্দর লেবেল
+_GN_SVC = {
+    "facebook": "📘 Facebook", "fb": "📘 Facebook",
+    "instagram": "📸 Instagram", "ig": "📸 Instagram",
+    "telegram": "✈️ Telegram", "whatsapp": "💬 WhatsApp",
+    "whats app": "💬 WhatsApp", "twitter": "🐦 Twitter/X",
+    "tiktok": "🎵 TikTok", "google": "🔍 Google", "gmail": "📧 Gmail",
+    "snapchat": "👻 Snapchat", "discord": "🎮 Discord",
+    "microsoft": "🪟 Microsoft", "yahoo": "🟣 Yahoo", "imo": "📞 IMO",
+    "viber": "📲 Viber", "line": "🟩 LINE", "truecaller": "📗 Truecaller",
+}
+
+def _getnum_ddl():
+    with _c() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS getnum_log (
+            id          BIGSERIAL PRIMARY KEY,
+            user_id     BIGINT DEFAULT 0,
+            range_name  TEXT DEFAULT '',
+            range_val   TEXT DEFAULT '',
+            number      TEXT DEFAULT '',
+            status      TEXT DEFAULT '',
+            detail      TEXT DEFAULT '',
+            created_at  TEXT DEFAULT ''
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS getnum_log_user ON getnum_log (user_id, id)")
+        c.execute("""CREATE TABLE IF NOT EXISTS getnum_orders (
+            id          BIGSERIAL PRIMARY KEY,
+            user_id     BIGINT DEFAULT 0,
+            service     TEXT DEFAULT '',
+            range_name  TEXT DEFAULT '',
+            range_val   TEXT DEFAULT '',
+            number      TEXT DEFAULT '',
+            price       REAL DEFAULT 0,
+            status      TEXT DEFAULT 'waiting',
+            otp         TEXT DEFAULT '',
+            sms         TEXT DEFAULT '',
+            country     TEXT DEFAULT '',
+            iso         TEXT DEFAULT '',
+            operator    TEXT DEFAULT '',
+            last_nid    TEXT DEFAULT '',
+            ts          REAL DEFAULT 0,
+            notified    INTEGER DEFAULT 0,
+            created_at  TEXT DEFAULT '',
+            updated_at  TEXT DEFAULT ''
+        )""")
+        for _al in (
+            "ALTER TABLE getnum_orders ADD COLUMN IF NOT EXISTS country TEXT DEFAULT ''",
+            "ALTER TABLE getnum_orders ADD COLUMN IF NOT EXISTS iso TEXT DEFAULT ''",
+            "ALTER TABLE getnum_orders ADD COLUMN IF NOT EXISTS operator TEXT DEFAULT ''",
+            "ALTER TABLE getnum_orders ADD COLUMN IF NOT EXISTS last_nid TEXT DEFAULT ''",
+        ):
+            try:
+                c.execute(_al)
+            except Exception:
+                pass
+        c.execute("CREATE INDEX IF NOT EXISTS getnum_orders_user "
+                  "ON getnum_orders (user_id, id)")
+        c.execute("CREATE INDEX IF NOT EXISTS getnum_orders_status "
+                  "ON getnum_orders (status, ts)")
+        # 🌍 সবার লাইভ OTP ফিড (প্যানেলে দেখানোর জন্য)
+        c.execute("""CREATE TABLE IF NOT EXISTS getnum_feed (
+            id          BIGSERIAL PRIMARY KEY,
+            ext_id      TEXT UNIQUE,
+            service     TEXT DEFAULT '',
+            range_val   TEXT DEFAULT '',
+            country     TEXT DEFAULT '',
+            msg         TEXT DEFAULT '',
+            created_at  TEXT DEFAULT ''
+        )""")
+
+def getnum_on():
+    """📱 নাম্বার নিন — চালু কি না (ডিফল্ট: চালু)।"""
+    try:
+        return (get_setting("getnum_on") or "on") != "off"
+    except Exception:
+        return True
+
+
+def getnum_api():
+    try:
+        return str(get_setting("getnum_api") or "").strip() or GETNUM_API_DEF
+    except Exception:
+        return GETNUM_API_DEF
+
+
+def getnum_sms_api():
+    """OTP চেক করার API — ডিফল্ট Zenex numsuccess।"""
+    try:
+        return str(get_setting("getnum_sms_api") or "").strip() or GETNUM_SMS_DEF
+    except Exception:
+        return GETNUM_SMS_DEF
+
+def getnum_header():
+    """API Key যে হেডারে যাবে (Zenex-এ: mapikey)।"""
+    try:
+        return str(get_setting("getnum_header") or "").strip() or "mapikey"
+    except Exception:
+        return "mapikey"
+
+
+def getnum_key():
+    try:
+        return str(get_setting("getnum_key") or "").strip()
+    except Exception:
+        return ""
+
+
+def getnum_ch_id():
+    """OTP যে চ্যানেলে যাবে (ডিফল্ট: -1003728636195)।"""
+    try:
+        v = str(get_setting("getnum_ch_id") or "").strip()
+        return int(v) if v else int(GETNUM_CH_DEF)
+    except Exception:
+        return int(GETNUM_CH_DEF)
+
+
+def getnum_services():
+    """[{'name': '📘 Facebook', 'items': [{'name','range','price'}, …]}, …]"""
+    out = []
+    try:
+        j = _json.loads(str(get_setting("getnum_services") or "[]"))
+    except Exception:
+        j = []
+    if not isinstance(j, list):
+        return out
+    for sv in j:
+        if not isinstance(sv, dict):
+            continue
+        _nm = str(sv.get("name") or "").strip()[:40]
+        if not _nm:
+            continue
+        items = []
+        for it in (sv.get("items") or []):
+            if not isinstance(it, dict):
+                continue
+            _rng = str(it.get("range") or "").strip()[:40]
+            if not _rng:
+                continue
+            try:
+                _p = round(float(it.get("price") or 0), 4)
+            except Exception:
+                _p = 0.0
+            items.append({"name": (str(it.get("name") or "").strip()[:40] or _rng),
+                          "range": _rng, "price": max(0.0, _p)})
+            if len(items) >= GN_MAX_ITEMS:
+                break
+        if items:
+            out.append({"name": _nm, "items": items})
+        if len(out) >= GN_MAX_SERVICES:
+            break
+    return out
+
+
+def getnum_all_items():
+    """[(service_index, item_index, service_name, item), …] — প্যানেল/সিঙ্কে গোনার জন্য।"""
+    out = []
+    for si, sv in enumerate(getnum_services()):
+        for ii, it in enumerate(sv["items"]):
+            out.append((si, ii, sv["name"], it))
+    return out
+
+
+def getnum_rate():
+    """OTP রেট — প্রতি OTP-তে ইউজার কত ৳ পাবে (ডিফল্ট ০.২৫)।"""
+    try:
+        v = float(str(get_setting("getnum_rate") or "0.25").replace(",", "."))
+        return max(0.0, round(v, 4))
+    except Exception:
+        return 0.25
+
+
+def getnum_group_url():
+    """🛡 OTP গ্রুপের লিংক (থাকলে বাটন দেখাবে)।"""
+    try:
+        return str(get_setting("getnum_group_url") or "").strip()
+    except Exception:
+        return ""
+
+
+def getnum_list_api():
+    """লাইভ রেঞ্জ ফিড — ডিফল্ট Zenex active-ranges।"""
+    try:
+        return str(get_setting("getnum_list_api") or "").strip() or GETNUM_LIST_DEF
+    except Exception:
+        return GETNUM_LIST_DEF
+
+
+def getnum_feed_api():
+    """সবার লাইভ OTP ফিড (পাবলিক) — ডিফল্ট global-broadcast।"""
+    try:
+        v = str(get_setting("getnum_feed_api") or "").strip()
+    except Exception:
+        return GETNUM_FEED_DEF
+    if v == "-":
+        return ""
+    return v or GETNUM_FEED_DEF
+
+
+def _gn_svc_label(name):
+    """'FACEBOOK' → '📘 Facebook', 'Telegram' → '✈️ Telegram'।"""
+    x = str(name or "").strip()
+    if not x:
+        return "🔹 OTP"
+    key = x.lower().replace("_", " ").strip()
+    if key in _GN_SVC:
+        return _GN_SVC[key]
+    for k, v in _GN_SVC.items():
+        if k and k in key:
+            return v
+    return "🔹 " + x[:32]
+
+
+def _gn_rng_key(r):
+    """রেঞ্জের মিল খোঁজার কী — '237688XXX' আর '237688763XXX' একই গ্রুপ।"""
+    try:
+        s = str(r or "").strip().upper().split("X")[0]
+        d = _re.sub(r"\D", "", s)
+        return d[:6]
+    except Exception:
+        return ""
+
+
+def _gn_flag(iso):
+    """'gb' → 🇬🇧"""
+    try:
+        i = str(iso or "").strip().lower()
+        if len(i) != 2 or not i.isalpha():
+            return ""
+        return "".join(chr(0x1F1E6 + ord(ch) - 97) for ch in i)
+    except Exception:
+        return ""
+
+def _gn_rate_of(it):
+    """এই দেশ/রেঞ্জে প্রতি OTP-তে ইউজার যা পাবে (৳)।"""
+    try:
+        p = float((it or {}).get("price") or 0)
+    except Exception:
+        p = 0.0
+    return p if p > 0 else getnum_rate()
+
+
+def _gn_usd(bdt):
+    """৳ → $ (ডিপোজিট রেট ধরে)।"""
+    try:
+        r = float(dep_rate() or 125) or 125
+        return round(float(bdt or 0) / r, 4)
+    except Exception:
+        return 0.0
+
+
+def getnum_price_text(p):
+    """বাটনের লেবেলে ছোট রাখতে শুধু ৳।"""
+    try:
+        p = float(p or 0)
+    except Exception:
+        p = 0.0
+    return f"{p:g}৳"
+
+
+def getnum_money2(bdt):
+    """$ আগে, পাশে ৳ — ইউজার দুই মুদ্রাতেই দেখবে।"""
+    return f"{_gn_usd(bdt):.4f}$ · {getnum_price_text(bdt)}"
+
+
+def _gn_phone(v):
+    """মান থেকে ফোন নাম্বার — শুধু ৭–১৬ ডিজিট, নাহলে None।"""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        s = str(int(v))
+    elif isinstance(v, str):
+        s = v.strip()
+    else:
+        return None
+    t = _re.sub(r"[\s\-()]", "", s)
+    if _re.match(r"^\+?\d{7,16}$", t):
+        return t
+    return None
+
+
+def _gn_walk(obj):
+    """JSON-এর ভিতরে যেখানেই নাম্বার-জাতীয় ফিল্ড থাকুক বের করে আনে।"""
+    _hint = ("number", "phone", "msisdn", "did", "virtual")
+    _bad = ("code", "otp", "id", "price", "amount", "balance", "count",
+            "range", "time", "date", "status", "success", "error")
+    if isinstance(obj, dict):
+        # আগে একদম নাম-মিলানো কী (Zenex: number / copy)
+        for k in ("number", "copy", "phone", "msisdn", "did", "phone_number"):
+            if k in obj:
+                got = _gn_phone(obj.get(k))
+                if got:
+                    return got
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if any(h in kl for h in _hint) and not any(b in kl for b in _bad):
+                got = _gn_phone(v)
+                if got:
+                    return got
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                got = _gn_walk(v)
+                if got:
+                    return got
+        for k, v in obj.items():
+            if str(k).lower() in ("data", "result", "value"):
+                got = _gn_phone(v)
+                if got:
+                    return got
+        return None
+    if isinstance(obj, list):
+        for it in obj:
+            got = _gn_walk(it)
+            if got:
+                return got
+        return None
+    return _gn_phone(obj)
+
+
+def _gn_parse(raw):
+    """(number, error_text, info) — getnum-এর উত্তর যেভাবেই আসুক।"""
+    txt = str(raw or "").strip()
+    if not txt:
+        return None, "সার্ভার খালি উত্তর দিয়েছে", {}
+    try:
+        j = _json.loads(txt)
+    except Exception:
+        got = _gn_phone(txt)
+        return (got, "", {}) if got else (None, txt[:250], {})
+    info = {}
+    if isinstance(j, dict) and isinstance(j.get("data"), dict):
+        d = j["data"]
+        info = {"country": str(d.get("country") or "")[:40],
+                "iso": str(d.get("iso") or "")[:8],
+                "operator": str(d.get("operator") or "")[:40]}
+    num = _gn_walk(j)
+    if num:
+        return num, "", info
+    msg = ""
+    if isinstance(j, dict):
+        for k in ("message", "msg", "error", "detail", "response"):
+            v = j.get(k)
+            if isinstance(v, (str, int, float)) and str(v).strip():
+                msg = str(v).strip()
+                break
+    return None, (msg or txt[:250]), info
+
+
+def getnum_fetch(rng):
+    """Zenex getnum — (ok, number, info, কারণ)।"""
+    api = getnum_api()
+    key = getnum_key()
+    hdr = getnum_header()
+    if not key:
+        return False, "nokey", {}, ""
+    body = {"range": str(rng or "").strip(),
+            "is_national": False, "remove_plus": False}
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "User-Agent": "TaskEarnBot/1.0", hdr: key}
+    try:
+        req = urllib.request.Request(api, data=_json.dumps(body).encode(),
+                                     headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=25) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        try:
+            _t = e.read().decode("utf-8", "replace")[:250]
+        except Exception:
+            _t = ""
+        return False, f"HTTP {e.code} {_t}".strip(), {}, _t
+    except Exception as e:
+        return False, f"সার্ভারে পৌঁছানো যায়নি: {str(e)[:150]}", {}, ""
+    num, err, info = _gn_parse(raw)
+    if num:
+        return True, num, info, raw
+    return False, (err or "নাম্বার পাওয়া যায়নি"), info, raw
+
+def _gn_otp_parse(raw):
+    """SMS API-র উত্তর থেকে (otp, পুরো মেসেজ)।"""
+    txt = str(raw or "").strip()
+    code, full = "", ""
+    try:
+        j = _json.loads(txt)
+    except Exception:
+        j = None
+
+    def _pick(obj):
+        nonlocal code, full
+        if isinstance(obj, dict):
+            for k in ("otp", "code", "pin", "otp_code", "otpcode"):
+                v = obj.get(k)
+                if isinstance(v, (str, int)) and str(v).strip():
+                    code = str(v).strip()
+                    break
+            for k in ("full_message", "message", "msg", "text", "sms",
+                      "body", "content", "text_message"):
+                v = obj.get(k)
+                if isinstance(v, str) and v.strip():
+                    full = v.strip()
+                    break
+            if not (code and full):
+                for v in obj.values():
+                    if isinstance(v, (dict, list)):
+                        _pick(v)
+                        if code and full:
+                            return
+        elif isinstance(obj, list):
+            for it in obj:
+                _pick(it)
+                if code and full:
+                    return
+
+    if j is not None:
+        _pick(j)
+    if not full:
+        full = txt[:600]
+    if not code:
+        m = _re.search(r"(?<!\d)(\d{4,8})(?!\d)", full)
+        code = m.group(1) if m else ""
+    return code, full
+
+
+def _gn_norm_num(v):
+    return _re.sub(r"\D", "", str(v or ""))
+
+
+def _gn_otp_code(msg):
+    """OTP মেসেজ থেকে কোড (৪–৮ ডিজিট)।"""
+    m = _re.search(r"(?<!\d)(\d{4,8})(?!\d)", str(msg or ""))
+    return m.group(1) if m else ""
+
+
+def getnum_sms_all():
+    """Zenex numsuccess/info — সব সাম্প্রতিক OTP (কয়েক সেকেন্ড ক্যাশ)।"""
+    now_ts = _time.time()
+    if _GN_SMS_CACHE["rows"] and (now_ts - _GN_SMS_CACHE["ts"]) < GN_SMS_TTL:
+        return _GN_SMS_CACHE["rows"]
+    url = getnum_sms_api()
+    key = getnum_key()
+    if not url or not key:
+        return _GN_SMS_CACHE["rows"]
+    try:
+        j = _gn_http_json(url, timeout=20)
+    except Exception as e:
+        log.debug(f"[GETNUM] SMS API: {str(e)[:120]}")
+        return _GN_SMS_CACHE["rows"]
+    data = j.get("data") if isinstance(j, dict) else None
+    otps = None
+    if isinstance(data, dict):
+        otps = data.get("otps") or data.get("items") or data.get("list")
+    elif isinstance(data, list):
+        otps = data
+    rows = []
+    if isinstance(otps, list):
+        for it in otps:
+            if not isinstance(it, dict):
+                continue
+            rows.append({
+                "nid": str(it.get("nid") or it.get("id") or "")[:60],
+                "number": str(it.get("number") or "")[:32],
+                "otp": str(it.get("otp") or it.get("message") or "")[:1200],
+                "country": str(it.get("country") or "")[:40],
+                "operator": str(it.get("operator") or "")[:40],
+                "created_at": str(it.get("created_at") or "")[:24],
+            })
+    _GN_SMS_CACHE["rows"] = rows
+    _GN_SMS_CACHE["ts"] = now_ts
+    return rows
+
+
+def gn_find_otp(o, rows=None):
+    """এই নাম্বারের নতুন (আগে না দেখা) OTP — না পেলে None।"""
+    rows = rows if rows is not None else getnum_sms_all()
+    mine = _gn_norm_num(o.get("number"))
+    if not mine or not rows:
+        return None
+    last = str(o.get("last_nid") or "")
+    for it in rows:
+        if str(it.get("nid") or "") and str(it.get("nid")) == last:
+            continue
+        otn = _gn_norm_num(it.get("number"))
+        if not otn or len(otn) < 7:
+            continue
+        if otn == mine or otn.endswith(mine) or mine.endswith(otn):
+            return it
+    return None
+
+def _gn_log(uid, rng, number, status, detail=""):
+    try:
+        with _c() as c:
+            c.execute("INSERT INTO getnum_log "
+                      "(user_id,range_name,range_val,number,status,detail,created_at) "
+                      "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                      (int(uid or 0), str(rng.get("name") or "")[:40],
+                       str(rng.get("range") or "")[:40], str(number or "")[:32],
+                       str(status or "")[:16], str(detail or "")[:300], now()))
+    except Exception as e:
+        log.debug(f"[GETNUM] log ব্যর্থ: {e}")
+
+
+def gn_order_new(uid, service, item, number, price, info=None):
+    info = info or {}
+    with _c() as c:
+        r = c.execute(
+            "INSERT INTO getnum_orders (user_id,service,range_name,range_val,number,"
+            "price,status,country,iso,operator,ts,created_at,updated_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,'waiting',%s,%s,%s,%s,%s,%s) RETURNING id",
+            (int(uid), str(service)[:40], str(item.get("name") or "")[:40],
+             str(item.get("range") or "")[:40], str(number)[:32], float(price or 0),
+             str(info.get("country") or "")[:40], str(info.get("iso") or "")[:8],
+             str(info.get("operator") or "")[:40],
+             _time.time(), now(), now())).fetchone()
+    return int(r["id"])
+
+def gn_order_get(oid):
+    try:
+        with _c() as c:
+            return c.execute("SELECT * FROM getnum_orders WHERE id=%s",
+                             (int(oid),)).fetchone()
+    except Exception:
+        return None
+
+
+def gn_open_order(uid):
+    """এই ইউজারের এখনো OTP না আসা নাম্বার (২০ মিনিটের ভিতরে)।"""
+    try:
+        with _c() as c:
+            return c.execute(
+                "SELECT * FROM getnum_orders WHERE user_id=%s AND status='waiting' "
+                "AND ts >= %s ORDER BY id DESC LIMIT 1",
+                (int(uid), _time.time() - GN_WAIT_MIN * 60)).fetchone()
+    except Exception:
+        return None
+
+
+def gn_wait_orders(limit=25):
+    """OTP এখনো না আসা + সদ্য এসেছে এমন নাম্বার (resend কোডও ধরার জন্য)।"""
+    try:
+        with _c() as c:
+            return c.execute(
+                "SELECT * FROM getnum_orders WHERE status IN ('waiting','received') "
+                "AND ts >= %s ORDER BY id LIMIT %s",
+                (_time.time() - GN_WAIT_MIN * 60, int(limit))).fetchall() or []
+    except Exception:
+        return []
+
+def gn_order_set(oid, status, otp="", sms="", nid=None):
+    try:
+        with _c() as c:
+            if nid is None:
+                c.execute("UPDATE getnum_orders SET status=%s, otp=%s, sms=%s, "
+                          "updated_at=%s WHERE id=%s",
+                          (str(status)[:16], str(otp or "")[:32], str(sms or "")[:1200],
+                           now(), int(oid)))
+            else:
+                c.execute("UPDATE getnum_orders SET status=%s, otp=%s, sms=%s, "
+                          "last_nid=%s, updated_at=%s WHERE id=%s",
+                          (str(status)[:16], str(otp or "")[:32], str(sms or "")[:1200],
+                           str(nid or "")[:60], now(), int(oid)))
+    except Exception as e:
+        log.warning(f"[GETNUM] order update ব্যর্থ: {e}")
+
+def gn_order_claim(oid):
+    """একবারই OTP নোটিফিকেশন — atomic claim।"""
+    try:
+        with _c() as c:
+            cur = c.execute("UPDATE getnum_orders SET notified=1 "
+                            "WHERE id=%s AND COALESCE(notified,0)=0", (int(oid),))
+            return bool(cur.rowcount)
+    except Exception:
+        return False
+
+
+def _gn_left_min(o):
+    try:
+        left = (float(o.get("ts") or 0) + GN_WAIT_MIN * 60 - _time.time()) / 60.0
+        return max(0, int(left + 0.5))
+    except Exception:
+        return 0
+
+
+def _gn_ch_send(text):
+    """OTP চ্যানেলে পোস্ট — বট ইনস্ট্যান্স ছাড়াও কাজ করে।"""
+    tok = (os.environ.get("BOT_TOKEN") or "").strip()
+    cid = getnum_ch_id()
+    if not (tok and cid):
+        return False
+    try:
+        body = _json.dumps({"chat_id": cid, "text": str(text)[:3900],
+                            "disable_web_page_preview": True}).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot" + tok + "/sendMessage",
+            data=body, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=8).read()
+        return True
+    except Exception as e:
+        log.warning(f"[GETNUM-CH] চ্যানেলে পাঠানো যায়নি: {str(e)[:120]}")
+        return False
+
+
+def _gn_ch_text(o):
+    """চ্যানেলের নোটিশ — অন্য OTP বটের মতো।"""
+    _loc = " ".join(x for x in (_gn_flag(o.get("iso")), str(o.get("country") or "")) if x).strip()
+    _range = str(o.get("range_name") or o.get("range_val") or "")
+    return ("♻️ New Otp receive (Resend)\n\n" if o.get("resend")
+            else "🆕 New Otp receive\n\n") + (
+            f"Service : {str(o.get('service') or '')}\n"
+            f"Range : {_range}  {str(o.get('range_val') or '')}\n"
+            + (f"Country : {_loc}\n" if _loc else "")
+            + (f"Operator : {str(o.get('operator') or '')}\n"
+               if o.get("operator") else "")
+            + f"Number : {str(o.get('number') or '')}\n"
+            f"Otp : {str(o.get('otp') or '') or '—'}\n"
+            + (f"Paid : +{float(o.get('paid_usd') or 0):.4f}$ "
+               f"({getnum_price_text(o.get('price'))})\n"
+               if float(o.get("paid_usd") or 0) > 0 else "")
+            + "Full Message :\n"
+            f"“{str(o.get('sms') or '')[:600]}”\n\n"
+            f"👤 User : {int(o.get('user_id') or 0)}\n"
+            f"🕒 {now()}")
+
+async def _gn_say(update, text, kb=None):
+    """কার্ড পাঠানো/এডিট করা — message বা callback, দুইভাবেই।"""
+    q = getattr(update, "callback_query", None)
+    if q:
+        try:
+            return await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            try:
+                return await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+            except Exception:
+                pass
+    _msg = getattr(update, "message", None) or getattr(update, "effective_message", None)
+    if _msg:
+        try:
+            return await _msg.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            try:
+                return await _msg.reply_text(text, reply_markup=kb)
+            except Exception:
+                pass
+    return None
+
+
+def _gn_uid(update):
+    u = getattr(update, "effective_user", None)
+    if not u:
+        q = getattr(update, "callback_query", None)
+        u = getattr(q, "from_user", None) if q else None
+    try:
+        return int(u.id) if u else 0
+    except Exception:
+        return 0
+
+
+def _gn_order_kb(o, en=False):
+    _id = int(o.get("id") or 0)
+    _b = [[InlineKeyboardButton(_bi("🔄 OTP চেক করুন", "🔄 Check OTP", en),
+                                callback_data=f"gn:c:{_id}")]]
+    _b.append([InlineKeyboardButton(_bi("🔁 নাম্বার বদলান", "🔁 Change Number", en),
+                                    callback_data=f"gn:n:{_id}")])
+    _b.append([InlineKeyboardButton(_bi("🌐 দেশ বদলান", "🌐 Change Country", en),
+                                    callback_data="gn:home")])
+    _b.append([InlineKeyboardButton(_bi("🔢 নিজের রেঞ্জ দিন", "🔢 Use my range", en),
+                                    callback_data="gn:rx")])
+    _u = getnum_group_url()
+    if _u:
+        if _u.startswith("@"):
+            _u = "https://t.me/" + _u[1:]
+        elif not _u.lower().startswith(("http://", "https://")):
+            _u = "https://t.me/" + _u.lstrip("/")
+        try:
+            _b.append([InlineKeyboardButton(_bi("🛡 OTP গ্রুপ", "🛡 OTP Group", en),
+                                            url=_u)])
+        except Exception:
+            pass
+    return InlineKeyboardMarkup(_b)
+
+
+def _gn_order_text(o, en=False):
+    _num = str(o.get("number") or "")
+    _head = _bi(f"📱 *আপনার নাম্বার*\n\n`{_num}`\n\n",
+                f"📱 *Your number*\n\n`{_num}`\n\n", en)
+    _rate = o.get("price") or getnum_rate()
+    _loc = " ".join(x for x in (_gn_flag(o.get("iso")), str(o.get("country") or "")) if x).strip()
+    _where = _loc or str(o.get("range_name") or "")
+    _meta = (f"{str(o.get('service') or '')} · {_where}\n"
+             f"💵 {'OTP রেট' if not en else 'OTP rate'}: {getnum_money2(_rate)}\n")
+    if str(o.get("otp") or "").strip() or str(o.get("sms") or "").strip():
+        _paid = 0.0
+        try:
+            _paid = float(o.get("paid_usd") or 0)
+        except Exception:
+            _paid = 0.0
+        _pay = ""
+        if _paid > 0:
+            _pay = _bi(f"\n💰 *+{_paid:.4f}$ ({getnum_price_text(_rate)}) Earn ব্যালেন্সে যোগ হয়েছে*\n",
+                       f"\n💰 *+{_paid:.4f}$ ({getnum_price_text(_rate)}) added to Earn balance*\n", en)
+        elif o.get("resend"):
+            _pay = _bi("\n♻️ এটা রিসেন্ড কোড — এই কোডে টাকা যোগ হয়নি।\n",
+                       "\n♻️ This is a resend code — no reward for it.\n", en)
+        return (_head + _meta + "\n"
+                + _bi("🎉 *OTP এসেছে*\n" if not o.get("resend") else "♻️ *নতুন কোড এসেছে*\n",
+                      "🎉 *OTP received*\n" if not o.get("resend") else "♻️ *New code received*\n", en)
+                + f"\n`{str(o.get('otp') or '').strip() or '—'}`\n\n" + _pay
+                + _bi("📩 পুরো মেসেজ:\n", "📩 Full message:\n", en)
+                + f"{_md_esc(str(o.get('sms') or '')[:500])}\n\n"
+                + _bi("⏱ দ্রুত কোডটি ব্যবহার করুন।", "⏱ Use the code quickly.", en))
+    _left = _gn_left_min(o)
+    if _left <= 0:
+        return (_head + _meta + "\n" + _bi("⌛ সময় শেষ — নতুন নাম্বার নিন।",
+                                           "⌛ Time is over — get a new number.", en))
+    return (_head + _meta
+            + _bi(f"⏳ এখনো OTP আসেনি · {_left} মিনিট বাকি\n\n"
+                  "📩 OTP এলেই এখানে পাঠিয়ে দেব। চাইলে 🔄 চেক করতে পারেন।",
+                  f"⏳ No OTP yet · {_left} min left\n\n"
+                  "📩 I will send the OTP here. You can also press 🔄 Check.", en))
+
+async def show_getnum(update, ctx=None):
+    """📱 নাম্বার নিন — আগে সার্ভিস, তারপর দেশ/রেঞ্জ।"""
+    uid = _gn_uid(update)
+    en = await _shop_is_en(uid)
+    if not await asyncio.to_thread(getnum_on):
+        return await _gn_say(update, _bi(
+            "🔒 *নাম্বার সার্ভিস এখন বন্ধ আছে*\n\nপরে আবার চেষ্টা করুন।",
+            "🔒 *Number service is off right now*\n\nPlease try again later.", en))
+    svcs = await asyncio.to_thread(getnum_services)
+    key = await asyncio.to_thread(getnum_key)
+    if not svcs or not key:
+        return await _gn_say(update, _bi(
+            "⚠️ *নাম্বার সার্ভিস এখনো সেট করা হয়নি*\n\n"
+            "অ্যাডমিন প্যানেল থেকে API Key আর সার্ভিস/দেশের লিস্ট যোগ করলেই কাজ করবে।\n\n"
+            "সাহায্য: @gmail4gg",
+            "⚠️ *Number service is not set up yet*\n\n"
+            "The admin needs to add the API key and the service list.\n\n"
+            "Help: @gmail4gg", en))
+    # আগের নাম্বার এখনো চালু থাকলে সেটাই দেখাও — নতুন করে টাকা কাটবে না
+    o = await asyncio.to_thread(gn_open_order, uid)
+    if o:
+        return await _gn_say(update, _gn_order_text(o, en), _gn_order_kb(o, en))
+    _one = [InlineKeyboardButton(str(sv["name"]), callback_data=f"gn:s:{i}")
+            for i, sv in enumerate(svcs)]
+    rows = _pair_rows(_one)
+    rows.append([InlineKeyboardButton(_bi("❌ বন্ধ", "❌ Close", en), callback_data="gn:close")])
+    return await _gn_say(update, _bi(
+        "📱 *নাম্বার নিন*\n\nকোন সার্ভিসের নাম্বার চান বেছে নিন:",
+        "📱 *Get Number*\n\nSelect a service:", en), InlineKeyboardMarkup(rows))
+
+
+async def _gn_show_items(update, ctx, si):
+    uid = _gn_uid(update)
+    en = await _shop_is_en(uid)
+    svcs = await asyncio.to_thread(getnum_services)
+    try:
+        si = int(si)
+    except Exception:
+        si = -1
+    if si < 0 or si >= len(svcs):
+        return await show_getnum(update, ctx)
+    sv = svcs[si]
+    _one = [InlineKeyboardButton(
+        f"{it['name']} · {getnum_price_text(_gn_rate_of(it))}",
+        callback_data=f"gn:r:{si}:{ii}") for ii, it in enumerate(sv["items"])]
+    rows = _pair_rows(_one)          # দুটো করে পাশাপাশি — লিস্ট লম্বা হয় না
+    rows.append([InlineKeyboardButton(_bi("🔙 সার্ভিস", "🔙 Services", en),
+                                      callback_data="gn:home")])
+    return await _gn_say(update,
+                         _bi(f"{sv['name']}\n\n🌍 *কোন দেশের নাম্বার নিতে চান?*",
+                             f"{sv['name']}\n\n🌍 *Which country number do you want?*", en),
+                         InlineKeyboardMarkup(rows))
+
+
+async def _gn_issue(update, ctx, si, ii):
+    """নাম্বার আনা + OTP অপেক্ষায় রাখা।"""
+    uid = _gn_uid(update)
+    en = await _shop_is_en(uid)
+    svcs = await asyncio.to_thread(getnum_services)
+    try:
+        si, ii = int(si), int(ii)
+    except Exception:
+        si = ii = -1
+    if si < 0 or si >= len(svcs) or ii < 0 or ii >= len(svcs[si]["items"]):
+        return await show_getnum(update, ctx)
+    sv = svcs[si]
+    it = sv["items"][ii]
+    o = await asyncio.to_thread(gn_open_order, uid)
+    if o:
+        return await _gn_say(update, _gn_order_text(o, en), _gn_order_kb(o, en))
+    return await _gn_place(update, ctx, sv["name"], it, en,
+                           retry_cb=f"gn:r:{si}:{ii}")
+
+
+async def _gn_place(update, ctx, service, item, en=False, retry_cb="gn:home"):
+    """যেকোনো রেঞ্জ থেকে নাম্বার আনা + অর্ডার তৈরি (একজায়গা থেকে)।"""
+    uid = _gn_uid(update)
+    it = {"name": str(item.get("name") or item.get("range") or "")[:40],
+          "range": str(item.get("range") or "")[:40],
+          "price": item.get("price") or 0}
+    if not it["range"]:
+        return await show_getnum(update, ctx)
+    if not await asyncio.to_thread(getnum_key):
+        return await _gn_say(update, _bi(
+            "⚠️ *নাম্বার সার্ভিস এখনো সেট করা হয়নি*\n\nসাহায্য: @gmail4gg",
+            "⚠️ *Number service is not set up yet*\n\nHelp: @gmail4gg", en))
+    o = await asyncio.to_thread(gn_open_order, uid)
+    if o:
+        return await _gn_say(update, _gn_order_text(o, en), _gn_order_kb(o, en))
+    rate = _gn_rate_of(it)
+    await _gn_say(update, _bi("⏳ নাম্বার আনা হচ্ছে...", "⏳ Getting a number...", en))
+    ok, val, info, raw = await asyncio.to_thread(getnum_fetch, it["range"])
+    if not ok:
+        _why = str(val or "").replace("`", "'")[:200]
+        await asyncio.to_thread(_gn_log, uid, it, "", "fail", _why)
+        if val == "nokey":
+            return await _gn_say(update, _bi(
+                "⚠️ *নাম্বার সার্ভিস এখনো সেট করা হয়নি*\n\nসাহায্য: @gmail4gg",
+                "⚠️ *Number service is not set up yet*\n\nHelp: @gmail4gg", en))
+        rows = [[InlineKeyboardButton(_bi("🔄 আবার চেষ্টা", "🔄 Try again", en),
+                                      callback_data=retry_cb)],
+                [InlineKeyboardButton(_bi("🔙 সার্ভিস", "🔙 Services", en),
+                                      callback_data="gn:home")]]
+        return await _gn_say(update, _bi(
+            f"❌ *নাম্বার পাওয়া যায়নি*\n\n`{_why}`\n\n"
+            "🔁 আবার চেষ্টা করুন, না হলে @gmail4gg এ জানান।",
+            f"❌ *Could not get a number*\n\n`{_why}`\n\n"
+            "🔁 Try again, or tell @gmail4gg.", en), InlineKeyboardMarkup(rows))
+    try:
+        oid = await asyncio.to_thread(gn_order_new, uid, service, it, val, rate, info)
+    except Exception as e:
+        log.warning(f"[GETNUM] order সেভ ব্যর্থ: {e}")
+        oid = 0
+    await asyncio.to_thread(_gn_log, uid, it, val, "ok", "")
+    row = await asyncio.to_thread(gn_order_get, oid) if oid else None
+    if not row:
+        row = {"id": 0, "user_id": uid, "service": service, "range_name": it["name"],
+               "range_val": it["range"], "number": val, "price": rate, "status": "waiting",
+               "ts": _time.time(), "otp": "", "sms": "",
+               "country": (info or {}).get("country") or "",
+               "iso": (info or {}).get("iso") or "",
+               "operator": (info or {}).get("operator") or ""}
+    return await _gn_say(update, _gn_order_text(row, en), _gn_order_kb(row, en))
+
+
+def _gn_learn_many(pairs):
+    """[(service, name, range), …] একবারে লিস্টে যোগ — সম্পূর্ণ অটো।"""
+    pairs = [p for p in (pairs or []) if p and str(p[2] or "").strip()]
+    if not pairs:
+        return 0
+    svcs = getnum_services()
+    idx = {sv["name"]: sv for sv in svcs}
+    added, changed = 0, False
+    for svc, name, rng in pairs:
+        rng = str(rng or "").strip()[:40]
+        if not rng:
+            continue
+        sv_name = str(svc or "").strip()[:40] or "OTP"
+        nm = str(name or "").strip()[:40]
+        sv = idx.get(sv_name)
+        if not sv:
+            if len(svcs) >= GN_MAX_SERVICES:
+                continue
+            sv = {"name": sv_name, "items": []}
+            svcs.append(sv)
+            idx[sv_name] = sv
+            changed = True
+        cur = next((it for it in sv["items"] if it["range"] == rng), None)
+        if cur:
+            if nm and (not cur.get("name") or cur.get("name") == rng) and cur.get("name") != nm:
+                cur["name"] = nm
+                changed = True
+            continue
+        if len(sv["items"]) >= GN_MAX_ITEMS:
+            continue
+        sv["items"].append({"name": nm or rng, "range": rng, "price": 0})
+        added += 1
+        changed = True
+    if changed:
+        set_setting("getnum_services", _json.dumps(svcs, ensure_ascii=False)[:6000])
+    if added:
+        log.info(f"[GETNUM] অটো {added}টি নতুন রেঞ্জ যোগ")
+    return added
+
+
+def _gn_learn(service, name, rng):
+    """একটা রেঞ্জ/দেশ লিস্টে যোগ (থাকলে নাম ঠিক করে)।"""
+    return _gn_learn_many([(service, name, rng)]) > 0
+
+def _gn_find(service, rng):
+    """সার্ভিসের নাম + রেঞ্জ দিয়ে (si, ii) খোঁজা।"""
+    svcs = getnum_services()
+    for si, sv in enumerate(svcs):
+        if str(sv.get("name") or "").strip() != str(service or "").strip():
+            continue
+        for ii, it in enumerate(sv.get("items") or []):
+            if str(it.get("range")) == str(rng):
+                return si, ii
+    for si, sv in enumerate(svcs):
+        for ii, it in enumerate(sv.get("items") or []):
+            if str(it.get("range")) == str(rng):
+                return si, ii
+    return -1, -1
+
+
+async def getnum_range_input(update, ctx):
+    """ইউজার নিজে রেঞ্জ লিখলে সেটা দিয়েই নাম্বার আনা।"""
+    uid = update.effective_user.id if update.effective_user else 0
+    try:
+        en = (await asyncio.to_thread(get_lang, uid)) == "en"
+    except Exception:
+        en = False
+    txt = str(update.message.text or "").strip()
+    # মেনু বাটনে চাপলে স্টেট বাদ — মেনুই কাজ করবে
+    try:
+        _labels = set((await asyncio.to_thread(get_all_btns, "en" if en else "bn")).values())
+    except Exception:
+        _labels = set()
+    if txt in _labels:
+        ctx.user_data.pop("state", None)
+        return False
+    if txt.lower() in ("/cancel", "cancel", "বাতিল"):
+        ctx.user_data.pop("state", None)
+        await update.message.reply_text(_bi("✅ বাতিল হয়েছে।", "✅ Cancelled.", en))
+        return True
+    _rng = _re.sub(r"[^0-9Xx]", "", txt).upper()
+    if len(_rng) < 4 or len(_rng) > 20:
+        await update.message.reply_text(_bi(
+            "❌ রেঞ্জ ঠিক নয়।\n\nউদাহরণ: `23768XXX` — শুধু ডিজিট আর X দিন।",
+            "❌ Invalid range.\n\nExample: `23768XXX` — digits and X only.", en),
+            parse_mode="Markdown")
+        return True
+    ctx.user_data.pop("state", None)
+    await _gn_place(update, ctx, _bi("🎯 নিজের রেঞ্জ", "🎯 My range", en),
+                    {"name": _rng, "range": _rng, "price": 0}, en,
+                    retry_cb="gn:rx")
+    return True
+
+
+def _gn_http_json(url, key=True, timeout=20):
+    headers = {"Accept": "application/json", "User-Agent": "TaskEarnBot/1.0"}
+    _k = getnum_key()
+    if key and _k:
+        headers[getnum_header()] = _k
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return _json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _gn_sync_once():
+    """Zenex active-ranges → সার্ভিস/রেঞ্জ বাটন (হিট বেশি ওগুলো আগে)।"""
+    url = getnum_list_api()
+    if not url:
+        return 0
+    try:
+        j = _gn_http_json(url)
+    except Exception as e:
+        log.warning(f"[GETNUM-SYNC] {str(e)[:120]}")
+        return 0
+    data = j.get("data") if isinstance(j, dict) else None
+    rows = None
+    if isinstance(data, dict):
+        rows = data.get("active_ranges") or data.get("ranges") or data.get("items")
+    elif isinstance(data, list):
+        rows = data
+    if rows is None and isinstance(j, list):
+        rows = j
+    if not isinstance(rows, list):
+        return 0
+    # দেশের নাম থাকলে সেটাই, না থাকলে tag/range
+    _known = {}
+    try:
+        with _c() as c:
+            for r in c.execute("SELECT range_val, country FROM getnum_feed "
+                               "WHERE range_val<>'' ORDER BY id DESC LIMIT 500").fetchall():
+                _known.setdefault(_gn_rng_key(r["range_val"]), str(r["country"] or ""))
+    except Exception:
+        pass
+    pairs, seen = [], set()
+    for it in rows:
+        if not isinstance(it, dict):
+            continue
+        _rng = str(it.get("range") or it.get("prefix") or "").strip()[:40]
+        if not _rng or _rng in seen:
+            continue
+        seen.add(_rng)
+        svc = _gn_svc_label(it.get("service"))
+        tag = str(it.get("tag") or "").strip()
+        nm = (_known.get(_gn_rng_key(_rng))
+              or ("" if tag.lower() in ("", "general") else tag) or _rng)
+        try:
+            hits = int(it.get("hits") or 0)
+        except Exception:
+            hits = 0
+        pairs.append((hits, svc, nm, _rng))
+    pairs.sort(key=lambda x: -x[0])
+    added = _gn_learn_many([(p[1], p[2], p[3]) for p in pairs[:GN_MAX_ITEMS]])
+    return added or len(pairs)
+
+
+def _gn_feed_once():
+    """সবার লাইভ OTP ফিড (পাবলিক) → প্যানেলে দেখাও + দেশ/রেঞ্জ শিখে নাও।"""
+    url = getnum_feed_api()
+    if not url:
+        return 0
+    try:
+        j = _gn_http_json(url, key=False, timeout=15)
+    except Exception as e:
+        log.debug(f"[GETNUM-FEED] {str(e)[:120]}")
+        return 0
+    rows = j.get("data") if isinstance(j, dict) else (j if isinstance(j, list) else None)
+    if not isinstance(rows, list):
+        return 0
+    pairs = []
+    # ফিডের মাস্ক-নাম্বার → লিস্টে থাকা রেঞ্জ প্যাটার্ন (থাকলে সেটাই ব্যবহার)
+    _have = {}
+    try:
+        for sv in getnum_services():
+            for it in sv["items"]:
+                _have.setdefault(_gn_rng_key(it["range"]), it["range"])
+    except Exception:
+        _have = {}
+    try:
+        with _c() as c:
+            for it in rows[:80]:
+                if not isinstance(it, dict):
+                    continue
+                ext = str(it.get("id") or "")[:80]
+                svc = _gn_svc_label(it.get("service"))
+                rng = str(it.get("number") or "").strip()[:40]
+                cty = str(it.get("country") or "").strip()[:40]
+                msg = str(it.get("otp") or "").strip()[:400]
+                if ext:
+                    try:
+                        c.execute(
+                            "INSERT INTO getnum_feed (ext_id,service,range_val,country,msg,"
+                            "created_at) VALUES (%s,%s,%s,%s,%s,%s) "
+                            "ON CONFLICT (ext_id) DO NOTHING",
+                            (ext, svc, rng, cty, msg, now()))
+                    except Exception:
+                        pass
+                if rng:
+                    pairs.append((svc, cty, _have.get(_gn_rng_key(rng), rng)))
+            # পুরোনো ফিড ছেঁটে ফেলো
+            try:
+                c.execute("DELETE FROM getnum_feed WHERE id < "
+                          "(SELECT COALESCE(MAX(id),0)-600 FROM getnum_feed)")
+            except Exception:
+                pass
+    except Exception as e:
+        log.debug(f"[GETNUM-FEED] save: {str(e)[:120]}")
+    if pairs:
+        # বিদ্যমান রেঞ্জের নাম (দেশ) ঠিক করা — overwrite পথ
+        svcs = getnum_services()
+        changed = False
+        for svc, cty, rng in pairs:
+            for sv in svcs:
+                if sv["name"] != svc:
+                    continue
+                for it in sv["items"]:
+                    if it["range"] == rng and cty and it.get("name") != cty:
+                        it["name"] = cty
+                        changed = True
+        if changed:
+            set_setting("getnum_services", _json.dumps(svcs, ensure_ascii=False)[:6000])
+        _gn_learn_many(pairs)
+    return len(pairs)
+
+
+async def job_getnum_sync(context):
+    """প্রতি ৫ মিনিটে লাইভ রেঞ্জ আপডেট।"""
+    try:
+        if not getnum_on():
+            return
+        n = await asyncio.to_thread(_gn_sync_once)
+        if n:
+            log.info(f"[GETNUM-SYNC] {n}টি রেঞ্জ আপডেট")
+    except Exception as e:
+        log.warning(f"[GETNUM-SYNC] job: {str(e)[:120]}")
+
+
+async def job_getnum_feed(context):
+    """প্রতি ৪৫ সেকেন্ডে সবার লাইভ OTP ফিড (প্যানেল + অটো দেশ শেখা)।"""
+    try:
+        if not getnum_on():
+            return
+        await asyncio.to_thread(_gn_feed_once)
+    except Exception as e:
+        log.debug(f"[GETNUM-FEED] job: {str(e)[:120]}")
+
+async def _gn_check_and_notify(bot_obj, o, quiet=False, rows=None):
+    """OTP চেক → পেলে চ্যানেলে + ইউজারের ইনবক্সে (resend কোডও)।"""
+    try:
+        oid = int(o.get("id") or 0)
+    except Exception:
+        return False
+    st = str(o.get("status") or "")
+    if oid <= 0 or st not in ("waiting", "received"):
+        return False
+    if _gn_left_min(o) <= 0:
+        if st == "waiting":
+            await asyncio.to_thread(gn_order_set, oid, "expired")
+            if not quiet and bot_obj:
+                try:
+                    await bot_obj.send_message(
+                        int(o.get("user_id") or 0),
+                        "⌛ নাম্বারটির সময় শেষ। নতুন নাম্বার নিতে 📱 নাম্বার নিন চাপুন।")
+                except Exception:
+                    pass
+        return False
+    hit = await asyncio.to_thread(gn_find_otp, o, rows)
+    if not hit:
+        return False
+    full = str(hit.get("otp") or "")
+    code = _gn_otp_code(full)
+    nid = str(hit.get("nid") or "")
+    first = (st == "waiting")
+    if first:
+        if not await asyncio.to_thread(gn_order_claim, oid):
+            return False
+        await asyncio.to_thread(gn_order_set, oid, "received", code, full, nid)
+    else:
+        await asyncio.to_thread(gn_order_set, oid, "received", code, full, nid)
+    row = await asyncio.to_thread(gn_order_get, oid) or o
+    row = dict(row)
+    row["otp"], row["sms"], row["status"] = code, full, "received"
+    row["last_nid"] = nid
+    row["country"] = hit.get("country") or row.get("country") or ""
+    row["operator"] = hit.get("operator") or row.get("operator") or ""
+    if first:
+        # 💰 OTP রেট ইউজারের Earn (balance) এ যোগ — টাকা ও ডলার দুটোই
+        try:
+            _bdt = float(row.get("price") or 0)
+        except Exception:
+            _bdt = 0.0
+        _usd = _gn_usd(_bdt)
+        if _usd > 0:
+            try:
+                if await asyncio.to_thread(add_bal, int(row.get("user_id") or 0), _usd):
+                    row["paid_usd"] = _usd
+            except Exception as _pe:
+                log.warning(f"[GETNUM] OTP রিওয়ার্ড ব্যর্থ: {str(_pe)[:120]}")
+    else:
+        row["resend"] = True
+    # 🤖 যে দেশ/রেঞ্জে কোড এলো সেটা লিস্টে নিজেই যোগ
+    try:
+        await asyncio.to_thread(_gn_learn, row.get("service"),
+                                row.get("country") or row.get("range_name"),
+                                row.get("range_val"))
+    except Exception as _le:
+        log.debug(f"[GETNUM] learn: {_le}")
+    await asyncio.to_thread(_gn_ch_send, _gn_ch_text(row))
+    if bot_obj:
+        try:
+            await bot_obj.send_message(
+                int(row.get("user_id") or 0), _gn_order_text(row, False),
+                parse_mode="Markdown", reply_markup=_gn_order_kb(row, False))
+        except Exception as e:
+            log.debug(f"[GETNUM] ইউজারকে OTP পাঠানো যায়নি: {e}")
+    return True
+
+async def getnum_callback(update, ctx):
+    """📱 নাম্বার নিন — ইনলাইন বাটন।"""
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    d = q.data or ""
+    uid = q.from_user.id
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    try:
+        if not await _bot_accessible(uid):
+            return
+    except Exception:
+        pass
+    if d in ("gn:home", "gn"):
+        return await show_getnum(update, ctx)
+    if d == "gn:close":
+        try:
+            return await q.delete_message()
+        except Exception:
+            return await show_getnum(update, ctx)
+    if d == "gn:rx":
+        ctx.user_data["state"] = "gn_range"
+        return await _gn_say(update, _bi(
+            "🔢 *নিজের রেঞ্জ দিন*\n\nযেমন: `23768XXX`\n(শুধু ডিজিট আর X)\n\n"
+            "📩 রেঞ্জ পাঠালেই ওই রেঞ্জ থেকে নাম্বার এনে দেব।\n❌ বাতিল: /cancel",
+            "🔢 *Send your range*\n\nExample: `23768XXX`\n(digits and X only)\n\n"
+            "📩 I will bring a number from that range.\n❌ Cancel: /cancel",
+            await _shop_is_en(uid)))
+    _p = d.split(":")
+    if len(_p) >= 3 and _p[1] == "n":
+        try:
+            oid = int(_p[2])
+        except Exception:
+            oid = 0
+        o = await asyncio.to_thread(gn_order_get, oid) if oid else None
+        if not o or int(o.get("user_id") or 0) != int(uid):
+            return await show_getnum(update, ctx)
+        _en = await _shop_is_en(uid)
+        si, ii = await asyncio.to_thread(_gn_find, o.get("service"), o.get("range_val"))
+        await asyncio.to_thread(gn_order_set, oid, "changed")
+        if si >= 0:
+            return await _gn_issue(update, ctx, si, ii)
+        return await _gn_place(update, ctx, str(o.get("service") or ""),
+                               {"name": str(o.get("range_name") or ""),
+                                "range": str(o.get("range_val") or ""),
+                                "price": o.get("price") or 0}, _en)
+    if len(_p) >= 4 and _p[1] == "r":
+        return await _gn_issue(update, ctx, _p[2], _p[3])
+    if len(_p) >= 3 and _p[1] == "s":
+        return await _gn_show_items(update, ctx, _p[2])
+    if len(_p) >= 3 and _p[1] == "c":
+        try:
+            oid = int(_p[2])
+        except Exception:
+            oid = 0
+        o = await asyncio.to_thread(gn_order_get, oid) if oid else None
+        if not o or int(o.get("user_id") or 0) != int(uid):
+            return await show_getnum(update, ctx)
+        _en = await _shop_is_en(uid)
+        await _gn_say(update, _bi("🔄 OTP চেক করা হচ্ছে...", "🔄 Checking OTP...", _en))
+        got = await _gn_check_and_notify(ctx.bot if ctx else None, o, quiet=True)
+        row = await asyncio.to_thread(gn_order_get, oid) or o
+        if not got:
+            return await _gn_say(update, _gn_order_text(row, _en), _gn_order_kb(row, _en))
+        return None
+    return await show_getnum(update, ctx)
+
+
+async def job_getnum_otp(context):
+    """প্রতি ২০ সেকেন্ডে OTP চেক — একবার API, তারপর সব নাম্বার মিলিয়ে।"""
+    try:
+        if not getnum_on():
+            return
+        _orders = await asyncio.to_thread(gn_wait_orders)
+        if not _orders:
+            return
+        _rows = await asyncio.to_thread(getnum_sms_all)
+        _bot = getattr(context, "bot", None)
+        for o in _orders:
+            try:
+                await _gn_check_and_notify(_bot, o, rows=_rows)
+            except Exception as e:
+                log.debug(f"[GETNUM] job order #{o.get('id')}: {e}")
+    except Exception as e:
+        log.warning(f"[GETNUM] job ব্যর্থ: {str(e)[:150]}")
 
 async def _shop_is_en(uid):
     """ইউজারের ভাষা ইংরেজি কি না — ব্যর্থ হলে বাংলা ধরে নেয়।"""
@@ -17464,6 +18735,7 @@ def main_kb(uid=None):
         [b['balance'],       b['tasks']],
         [b['withdraw'],      b['profile']],
         [b['support'],       b['refer']],
+        [b['getnum']],
         [b['shop'],          b['language']],
     ], resize_keyboard=True)
 
@@ -18458,7 +19730,7 @@ def earn_audit_report(uid):
     """
     d = {"bal": 0.0, "dep": 0.0, "dep_wd": 0.0, "wd": 0.0, "wd_n": 0,
          "gmail": 0.0, "fb": 0.0, "ig": 0.0, "tg": 0.0, "bio": 0.0,
-         "promo": 0, "wd_pend": 0.0}
+         "promo": 0, "promo_amt": 0.0, "wd_pend": 0.0}
 
     def _one(sql, args, key, cnt=False):
         try:
@@ -18493,39 +19765,52 @@ def earn_audit_report(uid):
     _one("SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE user_id=%s "
          "AND status IN ('pending','processing','gas_pending')", (uid,), "wd_pend")
     _one("SELECT COUNT(*) FROM promo_uses WHERE user_id=%s", (uid,), "promo")
+    _one("SELECT COALESCE(SUM(p.amount),0), COUNT(*) FROM promo_uses u "
+         "JOIN promocodes p ON p.id=u.code_id WHERE u.user_id=%s",
+         (uid,), "promo_amt", cnt=True)
 
     _task = round(d["gmail"] + d["fb"] + d["ig"] + d["tg"] + d["bio"], 2)
+    _promo_amt = round(float(d.get("promo_amt") or 0), 2)
     try:
         _rate = float(dep_rate() or 125)
     except Exception:
         _rate = 125.0
     _dep_usd = round(d["dep"] / (_rate or 125.0), 2)
     _used = round(d["bal"] + d["wd"] + d["wd_pend"], 2)
-    _gap = round(_used - _task, 2)
+    _known = round(_task + _promo_amt, 2)
+    _gap = round(_used - _known, 2)
     out = [f"🔍 *Earn অডিট* · uid `{uid}` · বিল্ড `{BUILD_TAG}`",
            "━━━━━━━━━━━━━━",
-           f"💵 Earn ব্যালেন্স: `${d['bal']:.2f}`",
-           f"💰 ডিপোজিট ব্যালেন্স: `{_shop_money(d['dep'])}` *(≈ ${_dep_usd:.2f})*",
+           f"💰 Earn (বটের ইনকাম): `${d['bal']:.2f}`",
+           f"💳 ডিপোজিট (শুধু ডিপোজিট থেকে): `{_shop_money(d['dep'])}` *(≈ ${_dep_usd:.2f})*",
            f"📤 উইথড্র (approved): `${d['wd']:.2f}` *({d.get('wd_n', 0)}টা)*",
            "",
-           "📋 *টাস্ক থেকে রেকর্ড-মাফিক পাওয়া:*"]
+           "📋 *ইনকামের সোর্স:*"]
     for _lbl, _k in (("Gmail", "gmail"), ("Facebook", "fb"), ("Instagram", "ig"),
                      ("Telegram", "tg"), ("Bio", "bio")):
         if d[_k] > 0:
             out.append(f"• {_lbl}: `${d[_k]:.2f}`")
-    out.append(f"✅ মোট টাস্ক আয়: `${_task:.2f}`")
-    out.append(f"🎁 প্রোমো কোড ব্যবহার: `{int(d['promo'])}` বার")
+    out.append(f"• টাস্ক মোট: `${_task:.2f}`")
+    if int(d.get("promo_amt_n") or d.get("promo") or 0) or _promo_amt > 0:
+        out.append(f"• প্রোমো কোড ({int(d.get('promo_amt_n') or d.get('promo') or 0)} বার): "
+                   f"`${_promo_amt:.2f}`")
+    out.append(f"✅ চিহ্নিত ইনকাম: `${_known:.2f}`")
     out.append("")
     out.append(f"🧮 Earn + উইথড্র = `${_used:.2f}`")
-    if abs(_gap) <= 0.01:
-        out.append("✅ *হিসাব মিলে গেছে* — Earn-এর টাকা পুরোটাই টাস্ক থেকে এসেছে।")
-    else:
-        out.append(f"⚠️ পার্থক্য: `${_gap:.2f}`")
-        out.append("এই টাকা টাস্ক ছাড়া অন্য সোর্স থেকে এসেছে — প্রোমো/বোনাস/"
-                   "রিফান্ড/অ্যাডমিন যোগ।")
+    if abs(_gap) <= 0.02:
+        out.append("✅ *হিসাব মিলে গেছে* — Earn-এর টাকা টাস্ক ও প্রোমো থেকেই এসেছে, "
+                   "ডিপোজিটের টাকা Earn-এ ঢোকেনি।")
+    elif _gap > 0:
+        out.append(f"➕ টাস্ক/প্রোমোর বাইরে আরও `${_gap:.2f}` এসেছে — "
+                   "বোনাস/রিফান্ড/রেফারেল/অ্যাডমিন যোগ।")
         if _dep_usd > 0.01 and abs(_gap - _dep_usd) <= 0.03:
             out.append(f"🚨 *সন্দেহ:* পার্থক্যটা ডিপোজিটের ডলার-মান (${_dep_usd:.2f}) এর "
-                       "সমান — মানে ডিপোজিটের টাকা ভুল করে Earn-এ ঢুকেছে।")
+                       "সমান — ডিপোজিটের টাকা ভুল করে Earn-এ ঢুকতে পারে।")
+    else:
+        out.append(f"➖ চিহ্নিত ইনকামের চেয়ে `${abs(_gap):.2f}` কম — টাকা খরচ/উইথড্র হয়েছে।")
+    out.append("")
+    out.append("ℹ️ Earn = বটের সব ইনকাম (টাস্ক, প্রোমো, বোনাস, রিফান্ড)। "
+               "ডিপোজিট আলাদা ৳ ওয়ালেটে থাকে — Earn-এ মেশে না।")
     return "\n".join(out)
 
 
@@ -18563,15 +19848,9 @@ async def show_profile(update, ctx):
     )
     _dep_bal = float(st.get("dep_bal") or 0)
     # সবসময় দেখাও (ডিপোজিট না থাকলে $0.00)
-    _dep_line = (f"💰 *{'Deposit balance' if _lang == 'en' else 'ডিপোজিট ব্যালেন্স'}:* "
+    _dep_line = (f"💳 *{'Deposit (from deposits only)' if _lang == 'en' else 'ডিপোজিট (শুধু ডিপোজিট থেকে জমা)'}:* "
                  f"`{_shop_money(_dep_bal)}`\n")
     _name = _md_esc(user.full_name or user.username or "—")
-    # Total earned সংখ্যাটা কোথা থেকে এলো — balance + withdrawn, যাতে ইউজার
-    # মনে না করে বাড়তি টাকা যোগ হয়েছে।
-    _earned_note = T(uid, 'pf_earned_note',
-                     e="$%.2f" % st['earned'],
-                     a="$%.2f" % float(bal or 0),
-                     w="$%.2f" % st['withdrawn'])
     if user.username and user.full_name:
         _name += f" (@{_md_esc(user.username)})"
     await update.message.reply_text(
@@ -18582,7 +19861,6 @@ async def show_profile(update, ctx):
         f"{T(uid,'pf_pending')} `{st['pending']}`\n"
         f"{T(uid,'pf_rejected')} `{st['rejected']}`\n\n"
         f"{T(uid,'pf_earned')} `${st['earned']:.2f}`\n"
-        f"{_earned_note}\n"
         f"{_dep_line}"
         f"{T(uid,'pf_withdrawn')} `${st['withdrawn']:.2f}`\n"
         f"{T(uid,'pf_available')} `${float(bal or 0):.2f}`\n"
@@ -27150,6 +28428,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as _depe:
             log.warning(f"[DEP] input ব্যর্থ: {_depe}")
 
+    # ── 📱 নাম্বার: ইউজারের নিজের রেঞ্জ ইনপুট ──
+    if st == "gn_range":
+        try:
+            if await getnum_range_input(update, ctx):
+                return
+        except Exception as _gne:
+            log.warning(f"[GETNUM] range input ব্যর্থ: {_gne}")
+
     # ── 🎫 মেইল কোড: টোকেন ইনপুট ──
     if st == "mail_tok":
         try:
@@ -29536,6 +30822,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif txt == btns['refer']:    await show_refer(update, ctx)
     elif txt == btns['support']:  await show_support(update, ctx)
     elif txt == btns['withdraw']: await show_withdraw(update, ctx)
+    elif txt == btns['getnum']:    await show_getnum(update, ctx)
     elif txt == btns['shop']:          await show_shop(update, ctx)
     elif txt == btns['language']:      await show_language(update, ctx)
     else:
@@ -37579,6 +38866,20 @@ def main():
                 job_smm_balance, interval=1800, first=90, name="smm_balance")
             application.job_queue.run_repeating(
                 job_smm_refund_sync, interval=600, first=120, name="smm_refund_sync")
+            # 🕒 টাকা বাকি অর্ডার — টাকা এলেই নিজে থেকে চালু
+            application.job_queue.run_repeating(
+                job_smm_wait_orders, interval=30, first=25, name="smm_wait_orders")
+            # 💵 Subscription-এর আনুমানিক দাম আসল দামে মেলানো (৫ মিনিট)
+            application.job_queue.run_repeating(
+                job_smm_settle_pending, interval=300, first=150, name="smm_settle_pending")
+            # 📱 নাম্বারের OTP — প্রতি ২০ সেকেন্ডে চেক
+            application.job_queue.run_repeating(
+                job_getnum_otp, interval=5, first=3, name="getnum_otp")
+            # 🔄 লাইভ রেঞ্জ (৫ মিনিট) + সবার OTP ফিড (৪৫ সেকেন্ড)
+            application.job_queue.run_repeating(
+                job_getnum_sync, interval=300, first=60, name="getnum_sync")
+            application.job_queue.run_repeating(
+                job_getnum_feed, interval=45, first=20, name="getnum_feed")
             application.job_queue.run_repeating(
                 job_clean_stuck_states,
                 interval=1800,
@@ -37723,6 +39024,11 @@ def main():
                 asyncio.create_task(_run_periodically(job_task_timeout,       30, first_sec=20)),
                 asyncio.create_task(_run_periodically(job_history_sync,     1800, first_sec=120)),
                 asyncio.create_task(_run_periodically(job_smm_refund_sync,    600, first_sec=120)),
+                asyncio.create_task(_run_periodically(job_smm_wait_orders,     30, first_sec=25)),
+                asyncio.create_task(_run_periodically(job_smm_settle_pending,300, first_sec=150)),
+                asyncio.create_task(_run_periodically(job_getnum_otp,           5, first_sec=3)),
+                asyncio.create_task(_run_periodically(job_getnum_sync,        300, first_sec=60)),
+                asyncio.create_task(_run_periodically(job_getnum_feed,         45, first_sec=20)),
                 asyncio.create_task(_run_daily_at(job_bio_task_check,   0, 5, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_post_leaderboard, 0, 0, BD_TZ)),
                 asyncio.create_task(_run_daily_at(job_winback,        21, 0, BD_TZ)),
@@ -37815,6 +39121,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_resetall_cb, pattern=r"^resetall_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(fb_callback, pattern=r"^(fbt_list|fbspwid:\d+|fbtn:\d+|fbr:\d+|fbs:\d+|fbd:\d+|fbc:\d+|fbt_cancel|adm_fb|fbx:\d+|fbnt:\d+|fbvid:\d+|fbvideo:\d+|fbvurl:\d+|fbvup:\d+|fbvdel:\d+)$"))
     app.add_handler(CallbackQueryHandler(ig_callback, pattern=r"^(igt_list|igtn:\d+|igtr:\d+|igts:\d+|igc:\d+|igt_cancel|igu:\d+|igd:\d+|adm_ig|igx:\d+|ignt:\d+|igvid:\d+|igvideo:\d+|igvurl:\d+|igvup:\d+|igvdel:\d+)$"))
+    app.add_handler(CallbackQueryHandler(getnum_callback, pattern=r"^gn:"))
     app.add_handler(CallbackQueryHandler(on_callback))
     # ~filters.VIA_BOT → inline-bot দিয়ে পাঠানো message ignore করো
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & ~filters.VIA_BOT, _gate(on_photo, "ph")))
@@ -37980,6 +39287,15 @@ def smm_services(force=False):
             except Exception:
                 continue
     _SMM_CACHE.update({"ts": _time.time(), "svc": out})
+    # ওয়েবের description আলাদা থ্রেডে আগেই এনে রাখি — কার্ড খুলতে দেরি হয় না
+    _wdesc = globals().get("_SMM_WEB_DESC") or {}
+    if (not _wdesc.get("map")) and (_time.time() - float(_wdesc.get("ts") or 0) > 120):
+        _SMM_WEB_DESC["ts"] = _time.time()
+        try:
+            threading.Thread(target=smm_web_desc, args=(0,), daemon=True,
+                             name="smm-desc-warm").start()
+        except Exception:
+            pass
     return out
 
 
@@ -38074,6 +39390,132 @@ def smm_price(rate, qty):
     except Exception:
         _pct = float(cfg["markup"])
     return round(base * (1.0 + _pct / 100.0), 2)
+
+
+def smm_price_for(s, qty):
+    """সার্ভিসের ধরন বুঝে ইউজারের দাম — Package-এ rate-ই পুরো দাম।"""
+    if _smm_is_package(s):
+        cfg = smm_cfg()
+        base = float(s.get("rate") or 0)
+        if cfg.get("cur_eff") == "usd":
+            base *= float(cfg["usd"])
+        try:
+            _pct = smm_markup_pct(base)
+        except Exception:
+            _pct = float(cfg["markup"])
+        return round(base * (1.0 + _pct / 100.0), 2)
+    return smm_price(s["rate"], qty)
+
+
+def smm_price_from_charge(charge):
+    """প্যানেলের `charge` (প্যানেলের মুদ্রায়) → ইউজারের ৳ (markup সহ)।"""
+    try:
+        base = float(str(charge).replace(",", "").replace("$", "").strip())
+    except Exception:
+        return None
+    if base <= 0:
+        return None
+    cfg = smm_cfg()
+    if cfg.get("cur_eff") == "usd":
+        base *= float(cfg["usd"])
+    try:
+        _pct = smm_markup_pct(base)
+    except Exception:
+        _pct = float(cfg["markup"])
+    return round(base * (1.0 + _pct / 100.0), 2)
+
+
+def _smm_mark_settled(oid):
+    """এই অর্ডারের দাম আর মেলানোর দরকার নেই।"""
+    try:
+        with _c() as c:
+            c.execute("UPDATE smm_orders SET settle_state=1 WHERE id=%s", (int(oid),))
+    except Exception:
+        pass
+
+
+def _smm_settle_once(uid, oid, api_id, taken):
+    """একবার চেষ্টা — (আসল ৳, সমস্যা, দাম পড়া গেছে কি না)।"""
+    taken = round(float(taken or 0), 2)
+    if not str(api_id or "").strip():
+        return taken, "", False
+    try:
+        js = _smm_api({"action": "status", "order": str(api_id)})
+    except Exception:
+        return taken, "", False
+    if not isinstance(js, dict):
+        return taken, "", False
+    real = smm_price_from_charge(js.get("charge"))
+    if real is None or real <= 0:
+        return taken, "", False
+    diff = round(real - taken, 2)
+    if abs(diff) < 0.01:
+        _smm_mark_settled(oid)
+        return taken, "", True
+    if diff > 0:
+        try:
+            shop_fund_from_earn(uid, diff)
+        except Exception:
+            pass
+        if not smm_dep_deduct(uid, diff):
+            try:
+                _smm_api({"action": "cancel", "orders": str(api_id)})
+            except Exception:
+                pass
+            try:
+                smm_dep_refund(uid, taken)
+            except Exception:
+                pass
+            try:
+                smm_order_set(int(oid), None, "failed")
+                smm_refund_mark_notified(int(oid))
+            except Exception:
+                pass
+            _smm_mark_settled(oid)
+            return taken, "ব্যালেন্স কম ছিল — অর্ডার বাতিল, টাকা ফেরত", True
+        try:
+            with _c() as c:
+                c.execute("UPDATE smm_orders SET price=%s WHERE id=%s",
+                          (round(taken + diff, 2), int(oid)))
+        except Exception:
+            pass
+        _smm_mark_settled(oid)
+        return round(taken + diff, 2), "", True
+    try:
+        smm_dep_refund(uid, -diff)
+    except Exception:
+        pass
+    try:
+        with _c() as c:
+            c.execute("UPDATE smm_orders SET price=%s WHERE id=%s",
+                      (real, int(oid)))
+    except Exception:
+        pass
+    _smm_mark_settled(oid)
+    return real, "", True
+
+
+def smm_settle_charge(uid, oid, api_id, taken):
+    """প্যানেলের আসল দাম দেখে ইউজারের ৳ মিলিয়ে নেওয়া (একবার)।
+
+    (ফেরত) (আসল ৳, সমস্যা)
+    """
+    price, warn, _seen = _smm_settle_once(uid, oid, api_id, taken)
+    return price, warn
+
+
+def smm_settle_charge_retry(uid, oid, api_id, taken, tries=3, gap=1.5):
+    """প্যানেল দেরিতে `charge` দিলে কিছুক্ষণ অপেক্ষা করে আবার চেষ্টা।"""
+    price, warn, seen = _smm_settle_once(uid, oid, api_id, taken)
+    _i = 1
+    while not seen and not warn and _i < int(tries or 1):
+        try:
+            _time.sleep(float(gap))
+        except Exception:
+            break
+        price, warn, seen = _smm_settle_once(uid, oid, api_id, taken)
+        _i += 1
+    return price, warn
 
 
 def _smm_min_bal():
@@ -38206,9 +39648,17 @@ async def job_smm_balance(context):
 
 
 def smm_panel_cost(serv_or_rate, qty):
-    """প্যানেলে অর্ডারটার আসল খরচ (প্যানেলের মুদ্রায়) — rate/১০০০ × পরিমাণ।"""
+    """প্যানেলে অর্ডারটার আসল খরচ (প্যানেলের মুদ্রায়)।
+
+    সাধারণ সার্ভিসে rate/১০০০ × পরিমাণ; Package-এ rate-টাই পুরো দাম।
+    """
     try:
-        rate = serv_or_rate["rate"] if isinstance(serv_or_rate, dict) else serv_or_rate
+        if isinstance(serv_or_rate, dict):
+            if _smm_is_package(serv_or_rate):
+                return float(serv_or_rate.get("rate") or 0)
+            rate = serv_or_rate["rate"]
+        else:
+            rate = serv_or_rate
         return float(rate) / 1000.0 * float(qty)
     except Exception:
         return 0.0
@@ -38244,6 +39694,93 @@ def _smm_need_comments(serv):
     """কমেন্ট টাইপ সার্ভিসে ইউজারকে কমেন্ট লিখতে হবে।"""
     t = str((serv or {}).get("type") or "").lower()
     return ("comment" in t) or t.startswith("mention")
+
+
+def _smm_kind(serv):
+    """প্যানেলের সার্ভিস-ধরন (Default / Package / Drip-feed / Poll …)।"""
+    return str((serv or {}).get("type") or "default").strip().lower()
+
+
+def _smm_is_package(serv):
+    """📦 Package — এতে quantity পাঠানো যায় না, শুধু service + link।"""
+    return "package" in _smm_kind(serv)
+
+
+def _smm_needs_drip(serv):
+    """🔁 Drip-feed — runs ও interval লাগে।"""
+    if "drip" in _smm_kind(serv):
+        return True
+    ex = (serv or {}).get("extra") or {}
+    v = str(ex.get("dripfeed") or "").strip().lower()
+    return v not in ("", "0", "no", "none", "false")
+
+
+def _smm_needs_poll(serv):
+    """🗳 Poll — answer_number লাগে।"""
+    return "poll" in _smm_kind(serv)
+
+
+def _smm_is_sub(serv):
+    """📅 Subscription — username, min/max, posts, delay, expiry লাগে (link/quantity নয়)।"""
+    return "subscription" in _smm_kind(serv)
+
+
+def _smm_is_webtraffic(serv):
+    """🌐 Web traffic — দেশ/ডিভাইস/ধরন/কীওয়ার্ড লাগে।"""
+    t = _smm_kind(serv)
+    return ("web traffic" in t) or ("webtraffic" in t)
+
+
+def _smm_wt_text(ud, en=False):
+    """ওয়েব-ট্রাফিকের তথ্য এক লাইনে।"""
+    ud = ud or {}
+    _c = str(ud.get("smm_wt_country") or "")
+    _d = str(ud.get("smm_wt_device") or "Desktop")
+    _t = str(ud.get("smm_wt_type") or 1)
+    _k = str(ud.get("smm_wt_kw") or "").strip()
+    s = f"{_c} · {_d} · " + ("ধরন " if not en else "type ") + _t
+    if _k:
+        s += " · " + ("কীওয়ার্ড: " if not en else "keyword: ") + _k[:40]
+    return s
+
+
+def _smm_next_step(ctx, s, qty):
+    """পরিমাণ ঠিক হওয়ার পরের ধাপ ঠিক করে state বসায়।
+
+    (বাংলা প্রশ্ন, English প্রশ্ন) ফেরত দেয়; None মানে সোজা কনফার্মে যাবে।
+    """
+    if _smm_is_webtraffic(s):
+        ctx.user_data["state"] = f"smm_wt:{s['id']}:{qty}"
+        return ("🌐 *ট্রাফিকের তথ্য দিন*\n\n`দেশ ডিভাইস ধরন কীওয়ার্ড`\n"
+                "যেমন `US Mobile 1` অথবা `US Desktop 1 my keyword`\n\n"
+                "• দেশ: ২ অক্ষর (US, BD, UK …)\n"
+                "• ডিভাইস: Desktop / Mobile / Tablet\n"
+                "• ধরন: ১–৪ (ডিফল্ট ১)\n"
+                "• কীওয়ার্ড: না চাইলে বাদ দিন\n\n/cancel — বাতিল",
+                "🌐 *Traffic details*\n\n`country device type keyword`\n"
+                "e.g. `US Mobile 1` or `US Desktop 1 my keyword`\n\n"
+                "• country: 2 letters (US, BD, UK …)\n"
+                "• device: Desktop / Mobile / Tablet\n"
+                "• type: 1–4 (default 1)\n"
+                "• keyword: optional\n\n/cancel — Cancel")
+    if _smm_needs_poll(s):
+        ctx.user_data["state"] = f"smm_poll:{s['id']}:{qty}"
+        return ("🗳 *কোন উত্তর নম্বরটি চান?*\n\nশুধু নম্বরটা লিখুন (যেমন `7`)।\n\n/cancel — বাতিল",
+                "🗳 *Which answer number?*\n\nSend just the number (e.g. `7`).\n\n"
+                "/cancel — Cancel")
+    if _smm_needs_drip(s):
+        ctx.user_data["state"] = f"smm_drip:{s['id']}:{qty}"
+        return ("🔁 *ড্রিপফিড সেট করুন*\n\nদুটো সংখ্যা পাঠান: `রান  ব্যবধান`\n"
+                "যেমন `10 60` = ১০ বার, প্রতি ৬০ মিনিট পর পর।\n\n/cancel — বাতিল",
+                "🔁 *Drip-feed settings*\n\nSend two numbers: `runs  interval`\n"
+                "e.g. `10 60` = 10 runs, every 60 minutes.\n\n/cancel — Cancel")
+    if _smm_need_comments(s):
+        ctx.user_data["state"] = f"smm_cmt:{s['id']}:{qty}"
+        return (f"💬 *কমেন্টগুলো পাঠান*\n\nপ্রতি লাইনে একটা করে কমেন্ট লিখুন।\n"
+                f"দরকার: {qty:,} টা কমেন্ট।\n\n/cancel — বাতিল",
+                "💬 *Send the comments*\n\nOne comment per line.\n"
+                f"Needed: {qty:,} comments.\n\n/cancel — Cancel")
+    return None
 
 
 def smm_dep_deduct(uid, amt):
@@ -38282,6 +39819,372 @@ def smm_order_new(uid, sid, sname, link, qty, price):
             (uid, int(sid), str(sname)[:200], str(link)[:500], int(qty),
              round(float(price), 4), now())).fetchone()
     return int(r["id"])
+
+
+# 💤 টাকা কম থাকলে অর্ডার এই অবস্থায় জমা থাকে — টাকা এলেই নিজে চালু হয়
+SMM_WAIT_STATUS = "pending_payment"
+SMM_WAIT_CANCEL = "wait_canceled"
+
+
+def _smm_st_label(st, en=False):
+    """ইউজারকে দেখানোর জন্য স্ট্যাটাসের নাম।"""
+    s = str(st or "").strip()
+    if s == SMM_WAIT_STATUS:
+        return _bi("⏳ প্রসেসিং", "⏳ Processing", en)
+    if s == SMM_WAIT_CANCEL:
+        return _bi("🔴 বাতিল", "🔴 Cancelled", en)
+    return s
+
+
+def smm_order_new_wait(uid, sid, sname, link, qty, price, comments="", extra=None):
+    """টাকার অভাবে অর্ডার অপেক্ষায় রাখা (এখনো কোনো ৳ কাটা হয়নি)।"""
+    with _c() as c:
+        r = c.execute(
+            "INSERT INTO smm_orders(user_id,service_id,service_name,link,qty,price,status,created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (uid, int(sid), str(sname)[:200], str(link)[:500], int(qty),
+             round(float(price), 4), SMM_WAIT_STATUS, now())).fetchone()
+    _oid = int(r["id"])
+    if str(comments or "").strip():
+        try:
+            set_setting(f"smm_wait_cmt_{_oid}", str(comments)[:4000])
+        except Exception:
+            pass
+    if extra:
+        try:
+            set_setting(f"smm_wait_extra_{_oid}",
+                        _json.dumps(extra, ensure_ascii=False)[:1500])
+        except Exception:
+            pass
+    return _oid
+
+
+SMM_WAIT_DAYS = 3          # এত দিন পরে অপেক্ষমাণ অর্ডার নিজেই বাতিল হয়ে যায়
+SMM_WAIT_MAX_PER_USER = 3  # এক ইউজার একসাথে এতগুলোর বেশি অপেক্ষমাণ রাখতে পারে না
+
+
+def smm_wait_count(uid):
+    """ইউজারের কতগুলো অর্ডার এখনো অপেক্ষায় আছে।"""
+    try:
+        with _c() as c:
+            r = c.execute("SELECT COUNT(*) AS n FROM smm_orders "
+                          "WHERE user_id=%s AND status=%s",
+                          (int(uid), SMM_WAIT_STATUS)).fetchone()
+        return int(dict(r).get("n") or 0) if r else 0
+    except Exception:
+        return 0
+
+
+def _smm_wait_expired(o):
+    """অনেক পুরোনো অপেক্ষমাণ অর্ডার — এমনিতেই বাতিল।"""
+    try:
+        _cr = datetime.strptime(str(dict(o).get("created_at") or "")[:16], "%Y-%m-%d %H:%M")
+    except Exception:
+        return False
+    try:
+        _age = datetime.now(pytz.timezone("Asia/Dhaka")).replace(tzinfo=None) - _cr
+    except Exception:
+        return False
+    return _age.total_seconds() > SMM_WAIT_DAYS * 86400
+
+
+def smm_wait_orders(limit=25):
+    """টাকা বাকি আছে এমন অর্ডারগুলো (পুরোনো আগে; পুরোনো হলে বাতিল)।"""
+    with _c() as c:
+        rows = c.execute(
+            "SELECT * FROM smm_orders WHERE status=%s ORDER BY id ASC LIMIT %s",
+            (SMM_WAIT_STATUS, int(limit))).fetchall() or []
+    out = []
+    for o in rows:
+        if _smm_wait_expired(o):
+            try:
+                smm_order_set(int(dict(o).get("id") or 0), None, SMM_WAIT_CANCEL)
+                log.info(f"[SMM-WAIT] #{dict(o).get('id')} পুরোনো — বাতিল হলো")
+            except Exception:
+                pass
+            continue
+        out.append(o)
+    return out
+
+
+def smm_wait_place(oid):
+    """অপেক্ষমাণ অর্ডার চালু করার চেষ্টা।
+
+    Returns:
+      ("placed", api_id)  — টাকা কেটে প্যানেলে অর্ডার গেছে
+      ("wait",  need_৳)   — এখনো টাকা কম / প্যানেল ব্যস্ত, পরে আবার চেষ্টা হবে
+      ("fail",  কারণ)    — সার্ভিস নেই বা প্যানেল রাজি হলো না (৳ কাটা হয়নি)
+      ("skip",  "")       — এই অর্ডার আর অপেক্ষায় নেই
+    """
+    o = smm_order_get(oid)
+    if not o or str(dict(o).get("status") or "") != SMM_WAIT_STATUS:
+        return "skip", ""
+    uid = int(dict(o).get("user_id") or 0)
+    price = float(dict(o).get("price") or 0)
+    try:
+        _power = float(shop_pay_power(uid) or 0)
+    except Exception:
+        _power = 0.0
+    if _power + 0.009 < price:
+        return "wait", round(price - _power, 2)
+    try:
+        svcs = smm_services()
+    except Exception as e:
+        return "wait", 0.0
+    _sid = int(dict(o).get("service_id") or 0)
+    s = next((x for x in svcs if x["id"] == _sid), None)
+    if not s:
+        smm_order_set(int(oid), None, "failed")
+        try:      # টাকা কাটা হয়নি — রিফান্ড জব যেন কিছু ফেরত না দেয়
+            smm_refund_mark_notified(int(oid))
+        except Exception:
+            pass
+        return "fail", "সার্ভিসটি এখন আর পাওয়া যাচ্ছে না"
+    _qty = int(dict(o).get("qty") or 0)
+    if not smm_can_afford(s, _qty):
+        return "wait", 0.0          # প্যানেলের ব্যালেন্স কম — পরে আবার
+    try:
+        shop_fund_from_earn(uid, price)
+    except Exception:
+        pass
+    if not smm_dep_deduct(uid, price):
+        return "wait", round(price - float(shop_pay_power(uid) or 0), 2)
+    try:
+        _ud = {}
+        try:
+            _ud["smm_cmt_text"] = str(get_setting(f"smm_wait_cmt_{int(oid)}") or "")
+            _exj = str(get_setting(f"smm_wait_extra_{int(oid)}") or "").strip()
+            if _exj:
+                _ud.update(_json.loads(_exj) or {})
+        except Exception:
+            pass
+        js = _smm_api(_smm_add_params(s, dict(o).get("link") or "", _qty, _ud))
+        api_id = ""
+        if isinstance(js, dict):
+            api_id = str(js.get("order") or js.get("order_id") or "")
+        if not api_id:
+            raise RuntimeError("প্যানেল অর্ডার আইডি দেয়নি")
+    except Exception as e:
+        smm_dep_refund(uid, price)
+        # ⚠️ failed না করলে প্রতি ৩০ সেকেন্ডে আবার চেষ্টা/মেসেজ চলতে থাকবে
+        try:
+            smm_order_set(int(oid), None, "failed")
+        except Exception:
+            pass
+        # 💸 টাকা এখানেই ফেরত দিয়েছি — ১০ মিনিটের রিফান্ড জব যাতে আর না দেয়
+        try:
+            smm_refund_mark_notified(int(oid))
+        except Exception:
+            pass
+        return "fail", str(e)[:150]
+    if _smm_is_sub(s):
+        try:
+            _real, _warn = smm_settle_charge_retry(uid, int(oid), api_id, price)
+            if _warn:
+                return "fail", _warn
+            price = _real
+        except Exception as _we:
+            log.warning(f"[SMM-WAIT] #{oid} দাম সমন্বয় করা যায়নি: {_we}")
+    try:
+        smm_order_set(int(oid), api_id, "Pending", None)
+    except Exception as _se:
+        # প্যানেলে অর্ডার গেছে — DB আপডেটটা আবার চেষ্টা করি (ডাবল অর্ডার রোধ)
+        log.error(f"[SMM-WAIT] #{oid} প্যানেলে গেছে api={api_id} কিন্তু DB আপডেট হয়নি: {_se}")
+        try:
+            smm_order_set(int(oid), api_id, "Pending", None)
+        except Exception:
+            pass
+    try:
+        set_setting(f"smm_wait_cmt_{int(oid)}", "")
+        set_setting(f"smm_wait_extra_{int(oid)}", "")
+    except Exception:
+        pass
+    return "placed", api_id
+
+
+def _smm_user_name(uid):
+    try:
+        with _c() as c:
+            r = c.execute("SELECT full_name FROM users WHERE user_id=%s", (uid,)).fetchone()
+        return str(dict(r).get("full_name") or "")[:40] if r else ""
+    except Exception:
+        return ""
+
+
+async def _smm_wait_tell(bot, uid, o, kind, val=""):
+    """অপেক্ষমাণ অর্ডারের খবর ইউজারকে (wait/placed/fail)।"""
+    if bot is None or not uid:
+        return
+    try:
+        _en = (await asyncio.to_thread(get_lang, uid)) == "en"
+    except Exception:
+        _en = False
+    _oid = int(dict(o).get("id") or 0)
+    _rno = await asyncio.to_thread(smm_no, _oid)
+    _snm = _md_esc(str(dict(o).get("service_name") or "")[:60])
+    _lk = _md_esc(str(dict(o).get("link") or "")[:80])
+    _qty = int(dict(o).get("qty") or 0)
+    if kind == "wait":
+        # ⚠️ ইউজারকে টাকা/ডিপোজিটের কথা দেখানো হয় না — শুধু অর্ডার জমা হয়েছে
+        txt = _bi(
+            f"✅ *আপনার অর্ডার জমা হয়েছে*\n\n"
+            f"🧾 `#{_rno}`\n🌐 {_snm}\n🔗 {_lk}\n🔢 {_qty:,} ইউনিট\n\n"
+            f"⏳ তাড়াতাড়ি প্রসেসিং হবে।",
+            f"✅ *Your order has been placed*\n\n"
+            f"🧾 `#{_rno}`\n🌐 {_snm}\n🔗 {_lk}\n🔢 {_qty:,} units\n\n"
+            f"⏳ We'll process it shortly.", _en)
+        _kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(_bi("📄 আমার অর্ডার", "📄 My order", _en),
+                                  callback_data=f"smm:v:{_oid}")],
+            [InlineKeyboardButton(_bi("🔙 SMM প্যানেল", "🔙 SMM Panel", _en),
+                                  callback_data="smm:home")]])
+    elif kind == "placed":
+        txt = _bi(
+            f"🚀 *আপনার অর্ডার প্রসেসিং শুরু হয়েছে*\n\n"
+            f"🧾 `#{_rno}`\n🌐 {_snm}\n🔗 {_lk}\n🔢 {_qty:,} ইউনিট\n\n"
+            f"👉 এখন স্ট্যাটাস দেখতে পারেন।",
+            f"🚀 *Your order is now processing*\n\n"
+            f"🧾 `#{_rno}`\n🌐 {_snm}\n🔗 {_lk}\n🔢 {_qty:,} units\n\n"
+            f"👉 You can check the status now.", _en)
+        _kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(_bi("🔄 স্ট্যাটাস দেখুন", "🔄 Check status", _en),
+                                  callback_data=f"smm:v:{_oid}")]])
+    else:
+        txt = _bi(
+            f"⚠️ *অর্ডারটি নেওয়া যায়নি*\n\n"
+            f"🧾 `#{_rno}`\n🌐 {_snm}\n\n"
+            f"💸 কোনো টাকা কেটে থাকলে পুরোটা ফেরত দেওয়া হয়েছে।\n"
+            f"দয়া করে সাপোর্টে যোগাযোগ করুন — @gmail4gg",
+            f"⚠️ *Order could not be placed*\n\n"
+            f"🧾 `#{_rno}`\n🌐 {_snm}\n\n"
+            f"💸 Anything charged has been fully refunded.\n"
+            f"Please contact support — @gmail4gg", _en)
+        _kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            _bi("🔙 SMM প্যানেল", "🔙 SMM Panel", _en), callback_data="smm:home")]])
+    try:
+        await bot.send_message(uid, txt, parse_mode="Markdown", reply_markup=_kb)
+    except Exception:
+        pass
+
+
+async def _smm_wait_admin_note(bot, o, need=0.0):
+    """অর্ডার অপেক্ষায় রাখার খবর অ্যাডমিনদের।"""
+    if bot is None:
+        return
+    uid = int(dict(o).get("user_id") or 0)
+    _nm = await asyncio.to_thread(_smm_user_name, uid)
+    _price = float(dict(o).get("price") or 0)
+    try:
+        _have = float(await asyncio.to_thread(shop_pay_power, uid) or 0)
+    except Exception:
+        _have = 0.0
+    _rno = await asyncio.to_thread(smm_no, int(dict(o).get("id") or 0))
+    txt = (_bi("🕒 *টাকা নেই — SMM অর্ডার অপেক্ষায়*",
+               "🕒 *No funds — SMM order waiting*", False)
+           + f"\n\n🧾 `#{_rno}`\n"
+             f"👤 `{uid}` {_md_esc(_nm)}\n"
+             f"🌐 {_md_esc(str(dict(o).get('service_name') or '')[:60])}\n"
+             f"🔗 {_md_esc(str(dict(o).get('link') or '')[:80])}\n"
+             f"🔢 {int(dict(o).get('qty') or 0):,} ইউনিট\n"
+             f"💵 দাম: {_shop_money(_price)}\n"
+             f"💰 ইউজারের আছে: {_shop_money(_have)}\n"
+             f"➖ কম: {float(need or 0):,.2f}৳\n\n"
+             "ইউজার টাকা যোগ করলেই (ডিপোজিট/অ্যাডমিন) অর্ডার নিজে থেকেই প্যানেলে চলে যাবে।")
+    try:
+        await notify_full_admins(bot, txt)
+    except Exception as e:
+        log.debug(f"[SMM-WAIT] অ্যাডমিন নোটিফাই ব্যর্থ: {e}")
+
+
+async def job_smm_wait_orders(context):
+    """প্রতি ৩০ সেকেন্ডে: টাকা যোগ হলে অপেক্ষমাণ SMM অর্ডার নিজে থেকে চালু হয়।"""
+    try:
+        rows = await asyncio.to_thread(smm_wait_orders, 25)
+    except Exception as e:
+        log.warning(f"[SMM-WAIT] তালিকা আনা যায়নি: {e}")
+        return
+    if not rows:
+        return
+    _bot = getattr(context, "bot", None)
+    for o in rows:
+        _oid = int(dict(o).get("id") or 0)
+        try:
+            _st, _val = await asyncio.to_thread(smm_wait_place, _oid)
+        except Exception as e:
+            log.warning(f"[SMM-WAIT] #{_oid} চালু করা যায়নি: {e}")
+            continue
+        if _st not in ("placed", "fail"):
+            continue
+        _uid = int(dict(o).get("user_id") or 0)
+        await _smm_wait_tell(_bot, _uid, o, _st, _val)
+        log.info(f"[SMM-WAIT] #{_oid} → {_st}")
+        if _st == "placed":
+            try:
+                await notify_full_admins(_bot, _bi(
+                    f"✅ *অপেক্ষমাণ SMM অর্ডার চালু হয়েছে*\n\n"
+                    f"🧾 `#{await asyncio.to_thread(smm_no, _oid)}`\n"
+                    f"👤 `{_uid}`\n🆔 প্যানেল: `{_val}`",
+                    f"✅ *Waiting SMM order started*\n\n"
+                    f"🧾 `#{await asyncio.to_thread(smm_no, _oid)}`\n"
+                    f"👤 `{_uid}`\n🆔 Panel: `{_val}`", False))
+            except Exception:
+                pass
+
+
+def smm_settle_pending_list(limit=15):
+    """যেসব অর্ডারের আনুমানিক দাম এখনো মেলানো হয়নি।"""
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT id FROM smm_orders WHERE COALESCE(settle_state,0)=0 "
+                "AND COALESCE(api_id,'')<>'' AND COALESCE(price,0)>0 "
+                "AND LOWER(COALESCE(status,'')) IN "
+                "('new','pending','processing','in progress','inprogress') "
+                "ORDER BY id DESC LIMIT %s", (int(limit),)).fetchall() or []
+        return [int(r["id"]) for r in rows]
+    except Exception:
+        return []
+
+
+async def job_smm_settle_pending(context):
+    """📅 Subscription-এর আনুমানিক দাম প্যানেলের আসল দামে নিজে থেকেই মেলায়।"""
+    try:
+        ids = await asyncio.to_thread(smm_settle_pending_list, 15)
+    except Exception:
+        return
+    if not ids:
+        return
+    _b = getattr(context, "bot", None)
+    for _oid in ids:
+        try:
+            o = await asyncio.to_thread(smm_order_get, _oid)
+            if not o:
+                continue
+            _sid = int(dict(o).get("service_id") or 0)
+            svcs = await asyncio.to_thread(smm_services)
+            s = next((x for x in svcs if int(x["id"]) == _sid), None)
+            if not s or not _smm_is_sub(s):
+                await asyncio.to_thread(_smm_mark_settled, _oid)   # সাধারণ সার্ভিস → কিছু করার নেই
+                continue
+            _uid = int(dict(o).get("user_id") or 0)
+            _price = float(dict(o).get("price") or 0)
+            _api = str(dict(o).get("api_id") or "")
+            _real, _warn = await asyncio.to_thread(
+                smm_settle_charge_retry, _uid, _oid, _api, _price, 2, 1.5)
+            if _warn and _b is not None and _uid:
+                try:
+                    await _b.send_message(
+                        _uid,
+                        _bi(f"⚠️ *অর্ডার #{await asyncio.to_thread(smm_no, _oid)} নেওয়া যায়নি*\n\n"
+                            f"{_warn}\n💸 {_price:g}৳ ফেরত দেওয়া হয়েছে।",
+                            f"⚠️ *Order #{await asyncio.to_thread(smm_no, _oid)} failed*\n\n"
+                            f"Not enough balance for the actual price — "
+                            f"{_price:g}৳ refunded.", False),
+                        parse_mode="Markdown")
+                except Exception:
+                    pass
+        except Exception as e:
+            log.debug(f"[SMM-SETTLE] #{_oid}: {e}")
 
 
 def smm_order_set(oid, api_id=None, status=None, charge=None, remains=None,
@@ -38351,11 +40254,31 @@ _SMM_DONE = ("completed", "complete", "canceled", "cancelled", "partial", "refun
 _SMM_CANCELED = ("canceled", "cancelled", "refunded", "failed")
 
 
+def _smm_order_is_sub(o):
+    """এই অর্ডারটা Subscription সার্ভিসের কি না (আংশিক রিফান্ড এড়াতে)।"""
+    try:
+        sid = int(o["service_id"] or 0)
+    except Exception:
+        sid = 0
+    try:
+        if sid:
+            for s in smm_services():
+                if int(s["id"]) == sid:
+                    return _smm_is_sub(s)
+    except Exception:
+        pass
+    try:
+        return "subscription" in str(o["service_name"] or "").lower()
+    except Exception:
+        return False
+
+
 def _smm_refund_amount(o):
     """ওয়েবসাইটের মতো: প্যানেল যতটা ডেলিভারি দেয়নি ঠিক ততটার টাকা ফেরত।
 
     • বাতিল/ফেরত/ব্যর্থ → পুরো টাকা
     • partial বা কিছু বাকি (remains) → (দাম × বাকি ইউনিট ÷ মোট ইউনিট)
+    • Subscription-এ remains-এর মানে আলাদা, তাই আংশিক হিসাব করা হয় না।
     """
     try:
         price = float(o["price"] or 0)
@@ -38374,7 +40297,8 @@ def _smm_refund_amount(o):
         return 0.0
     if st in _SMM_CANCELED:
         return round(price, 4)              # পুরো অর্ডার বাতিল → পুরো টাকা
-    if remains > 0 and qty > 0:            # আংশিক → শুধু বাকি অংশের টাকা
+    if remains > 0 and qty > 0 and not _smm_order_is_sub(o):
+        # আংশিক → শুধু বাকি অংশের টাকা
         remains = min(remains, qty)
         return round(price * remains / qty, 4)
     return 0.0
@@ -38546,6 +40470,67 @@ def smm_orders_sync_user(uid, limit=10):
     return smm_orders_user(uid, limit)
 
 
+def _smm_wait_ud(ctx):
+    """অপেক্ষমাণ অর্ডারের জন্য বাড়তি তথ্য (drip/poll)।"""
+    ud = getattr(ctx, "user_data", {}) or {}
+    out = {}
+    if ud.get("smm_runs"):
+        out["smm_runs"] = int(ud["smm_runs"])
+    if ud.get("smm_interval") is not None and ud.get("smm_interval") != "":
+        out["smm_interval"] = int(ud["smm_interval"])
+    if ud.get("smm_answer"):
+        out["smm_answer"] = str(ud["smm_answer"])
+    for _k in ("smm_sub_user", "smm_sub_min", "smm_sub_max", "smm_sub_old",
+               "smm_sub_delay", "smm_sub_expiry", "smm_wt_country",
+               "smm_wt_device", "smm_wt_type", "smm_wt_kw"):
+        if ud.get(_k) not in (None, ""):
+            out[_k] = ud[_k]
+    return out
+
+
+def _smm_add_params(s, link, qty, ud):
+    """প্যানেলের add API-র প্যারামিটার — ডকের নিয়মে, ধরন অনুযায়ী।"""
+    ud = ud or {}
+    p = {"action": "add", "service": str(s["id"])}
+    if _smm_is_sub(s):
+        p["username"] = str(ud.get("smm_sub_user") or "").lstrip("@")
+        p["min"] = str(int(ud.get("smm_sub_min") or 0))
+        p["max"] = str(int(ud.get("smm_sub_max") or 0))
+        _old = str(ud.get("smm_sub_old") or "0").strip()
+        if _old.lower() in ("old", "all"):
+            p["posts"] = "0"
+        else:
+            try:
+                p["old_posts"] = str(int(float(_old or 0)))
+            except Exception:
+                p["old_posts"] = "0"
+        p["delay"] = str(int(ud.get("smm_sub_delay") or 0))
+        _ep = str(ud.get("smm_sub_expiry") or "").strip()
+        if _ep:
+            p["expiry"] = _ep
+        return p
+    p["link"] = str(link or "")
+    if not _smm_is_package(s):
+        p["quantity"] = str(int(qty or 0))
+    if _smm_is_webtraffic(s):
+        if ud.get("smm_wt_country"):
+            p["country"] = str(ud.get("smm_wt_country"))
+        p["device"] = str(ud.get("smm_wt_device") or "Desktop")
+        p["type_of_traffic"] = str(int(ud.get("smm_wt_type") or 1))
+        _kw = str(ud.get("smm_wt_kw") or "").strip()
+        if _kw:
+            p["google_keyword"] = _kw
+    cmt = str(ud.get("smm_cmt_text") or "").strip()
+    if cmt:
+        p["comments"] = cmt
+    if _smm_needs_drip(s):
+        p["runs"] = str(int(ud.get("smm_runs") or 1))
+        p["interval"] = str(int(ud.get("smm_interval") or 0))
+    if _smm_needs_poll(s):
+        p["answer_number"] = str(ud.get("smm_answer") or "")
+    return p
+
+
 def smm_cancel_order(oid):
     """প্যানেলে ক্যানসেল রিকোয়েস্ট। (True, msg) ফেরত দেয়।"""
     o = smm_order_get(oid)
@@ -38581,9 +40566,21 @@ def smm_refill_order(oid):
         js = _smm_api({"action": "refill", "orders": str(o["api_id"])})
     except Exception as e:
         return False, str(e)[:150]
-    msg = ""
+    msg, rid = "", ""
     if isinstance(js, dict):
         msg = str(js.get("success") or js.get("message") or "")
+        rid = str(js.get("refill") or js.get("refill_id") or "")
+    elif isinstance(js, list) and js and isinstance(js[0], dict):
+        rid = str(js[0].get("refill") or "")
+        msg = str(js[0].get("success") or "")
+    if rid:
+        try:
+            with _c() as c:
+                c.execute("ALTER TABLE smm_orders ADD COLUMN IF NOT EXISTS refill_id TEXT DEFAULT ''")
+                c.execute("UPDATE smm_orders SET refill_id=%s WHERE id=%s", (rid[:40], int(oid)))
+        except Exception:
+            pass
+        msg = (msg + f" (Refill #{rid})").strip()
     return True, msg or "রিফিল রিকোয়েস্ট পাঠানো হয়েছে"
 
 
@@ -38875,6 +40872,142 @@ def _smm_desc_text(t, limit=800):
     return _md_esc(s)
 
 
+_SMM_WEB_DESC = {"ts": 0.0, "base": "", "map": {}}
+
+
+def _smm_site_base():
+    """API URL থেকে প্যানেল সাইটের মূল ঠিকানা (যেমন https://bdsmmpanel.com)।"""
+    _u = str(smm_cfg().get("url") or SMM_DEF_URL).strip()
+    _m = re.match(r"^(https?://[^/]+)", _u, re.I)
+    return _m.group(1) if _m else ""
+
+
+def _smm_desc_map_from_html(page):
+    """Services পেজের HTML → {service_id: description_html}।
+
+    ওয়েবের প্রতিটি সার্ভিস কার্ডের ভিতরে <template class="sc-desc">…</template>
+    থাকে — ওটাই ওয়েবের Description (Start/Speed/Refill/Quality) এবং
+    "Please read before ordering" বক্সের আসল লেখা।
+    """
+    out = {}
+    for _chunk in re.split(r'(?=data-service-id=")', str(page or ""))[1:]:
+        _m = re.match(r'data-service-id="(\d+)"', _chunk)
+        if not _m:
+            continue
+        _t = re.search(r'<template class="sc-desc">(.*?)</template>', _chunk, re.S)
+        if not _t:
+            continue
+        _d = _t.group(1).strip()
+        if _d:
+            out[int(_m.group(1))] = _d
+    return out
+
+
+def smm_web_desc(sid, force=False):
+    """সার্ভিসের ওয়েব-ডেসক্রিপশন (৩০ মিনিট ক্যাশ); না পেলে খালি স্ট্রিং।"""
+    try:
+        _sid = int(sid)
+    except Exception:
+        return ""
+    base = _smm_site_base()
+    if not base:
+        return ""
+    if (not force and _SMM_WEB_DESC["map"] and _SMM_WEB_DESC["base"] == base
+            and (_time.time() - _SMM_WEB_DESC["ts"] < 1800)):
+        return _SMM_WEB_DESC["map"].get(_sid, "")
+    try:
+        req = urllib.request.Request(
+            base + "/services",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; TaskEarnBot)"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            page = r.read().decode("utf-8", "replace")
+        mp = _smm_desc_map_from_html(page)
+        # খালি হলেও সময়/ঠিকানা রাখি — নাহলে প্রতি কার্ড খোলায় ৪MB আবার নামে
+        _SMM_WEB_DESC.update({"ts": _time.time(), "base": base,
+                              "map": mp or _SMM_WEB_DESC["map"]})
+    except Exception:
+        pass
+    return _SMM_WEB_DESC["map"].get(_sid, "")
+
+
+def _smm_desc_lines(raw):
+    """HTML description → পরিষ্কার লাইন (ট্যাগ বাদ, বাড়তি স্পেস ঠিক)।"""
+    s = str(raw or "")
+    if not s.strip():
+        return []
+    s = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", s)
+    s = re.sub(r"(?i)<\s*/?\s*(?:p|div|li|tr|h[1-6])\b[^>]*>", "\n", s)
+    s = re.sub(r"(?is)<[^>]+>", "", s)
+    try:
+        s = html.unescape(s)
+    except Exception:
+        pass
+    out = []
+    for _ln in s.replace("\r", "").split("\n"):
+        _ln = re.sub(r"[ \t]+", " ", _ln).strip()
+        if _ln:
+            out.append(_ln)
+    return out
+
+
+_SMM_DESC_KEYS = (("start", ("start", "start time", "শুরু")),
+                  ("speed", ("speed", "গতি")),
+                  ("refill", ("refill", "রিফিল")),
+                  ("quality", ("quality", "কোয়ালিটি")),
+                  ("drop", ("drop rate", "drops", "drop", "ড্রপ রেট")),
+                  ("country", ("country", "দেশ")))
+
+
+def _smm_split_desc(raw):
+    """ওয়েবের description → (ফিল্ড লিস্ট, বাকি নোট)।
+
+    Start/Speed/Refill/Quality/Country ওয়েবের Description টেবিলে যায়,
+    বাকি লেখা (❐ …) ওয়েবের "Please read before ordering" বক্সে যায়।
+    কিছু না থাকলে দুটোই খালি — তখন বটেও কিছু দেখানো হয় না।
+    """
+    fields, notes = [], []
+    for ln in _smm_desc_lines(raw):
+        _m = re.match(r"^([A-Za-z .]+?)\s*[::]\s*(.+)$", ln)
+        _key = None
+        if _m:
+            _name = _m.group(1).strip().lower()
+            for _k, _names in _SMM_DESC_KEYS:
+                if _name in _names:
+                    _key = _k
+                    break
+        if _key and not any(k == _key for k, _ in fields):
+            fields.append((_key, _m.group(2).strip()))
+        else:
+            notes.append(ln)
+    return fields, notes
+
+
+def _smm_cut_md(s, limit):
+    """Markdown-safe কাটা — শেষে ভাঙা \\ এস্কেপ থেকে গেলে Telegram ভাঙে।"""
+    s = str(s or "")
+    if len(s) <= limit:
+        return s
+    s = s[:limit].rstrip()
+    if s.endswith("\\"):
+        s = s[:-1]
+    return s + "…"
+
+
+def _smm_hint(s, en=False):
+    """সার্ভিস পেজের নিচের লাইন — ধরন অনুযায়ী কী কী লাগবে।"""
+    if _smm_is_sub(s):
+        return ("\n👉 কিনতে চাইলে নিচের বাটন চাপুন — ইউজারনেম, পোস্ট রেঞ্জ, ডিলে ধাপে ধাপে নেওয়া হবে।"
+                if not en else
+                "\n👉 Tap the button below — username, posts range and delay are asked step by step.")
+    if _smm_is_webtraffic(s):
+        return ("\n👉 কিনতে চাইলে নিচের বাটন চাপুন — লিংক, পরিমাণ, দেশ/ডিভাইস ধাপে ধাপে নেওয়া হবে।"
+                if not en else
+                "\n👉 Tap the button below — link, quantity, country/device are asked step by step.")
+    return ("\n👉 কিনতে চাইলে নিচের বাটন চাপুন — লিংক ও পরিমাণ ধাপে ধাপে নেওয়া হবে।"
+            if not en else
+            "\n👉 Tap the button below — link and quantity are asked step by step.")
+
+
 async def show_smm_service(q, ctx, sid):
     uid = q.from_user.id if getattr(q, "from_user", None) else 0
     _en = await _shop_is_en(uid)
@@ -38888,36 +41021,53 @@ async def show_smm_service(q, ctx, sid):
         return
     p1000 = await asyncio.to_thread(smm_price, s["rate"], 1000)
     pmin = await asyncio.to_thread(smm_price, s["rate"], s["min"])
-    # 📋 প্যানেল বিস্তারিত (গতি/রিফিল/কোয়ালিটি) পাঠালে সেগুলোও দেখাও
+    # 🌐 ওয়েবের মতোই দুইটা আলাদা ব্লক, প্রতিটা সার্ভিসে আলাদা লেখা:
+    #    📋 বিস্তারিত = Start/Speed/Refill/Quality/Example link …
+    #    ⚠️ পড়ে নিন  = ওয়েবের "Please read before ordering" লেখা
+    #    ওয়েবে কিছু না থাকলে বটেও কিছু দেখানো হয় না।
     _ex = s.get("extra") or {}
+    _raw = await asyncio.to_thread(smm_web_desc, s["id"])
+    if not _raw:
+        _raw = str(_ex.get("description") or _ex.get("desc") or "")
+    _fields, _notes = _smm_split_desc(_raw)
+    _flab = {"start": ("শুরু", "Start"), "speed": ("গতি", "Speed"),
+             "refill": ("রিফিল", "Refill"), "quality": ("কোয়ালিটি", "Quality"),
+             "drop": ("ড্রপ রেট", "Drop rate"), "country": ("দেশ", "Country")}
     _ex_rows = []
-    for _k, _lab in (("start_time", _bi("শুরু", "Start", _en)),
-                     ("speed", _bi("গতি", "Speed", _en)),
-                     ("refill", _bi("রিফিল", "Refill", _en)),
-                     ("quality", _bi("কোয়ালিটি", "Quality", _en)),
-                     ("example_link", _bi("উদাহরণ লিংক", "Example link", _en)),
-                     ("dripfeed", _bi("ড্রিপফিড", "Drip-feed", _en)),
-                     ("cancel", _bi("ক্যানসেল", "Cancel", _en))):
+    _done = set()
+    for _k, _v in _fields:
+        _bnl, _enl = _flab.get(_k, (_k, _k))
+        _ex_rows.append(f"• {_bi(_bnl, _enl, _en)}: {_md_esc(_v[:80])}")
+        _done.add(_k)
+    # প্যানেলের API আলাদা করে দিলে (start_time/speed/refill/quality) সেটাও ধরো
+    for _k, _key, _lb, _le in (("start_time", "start", "শুরু", "Start"),
+                               ("speed", "speed", "গতি", "Speed"),
+                               ("refill", "refill", "রিফিল", "Refill"),
+                               ("quality", "quality", "কোয়ালিটি", "Quality")):
         _v = str(_ex.get(_k) or "").strip()
-        if not _v or _v.lower() in ("0", "none", "no"):
+        if not _v or _key in _done or _v.lower() in ("0", "none", "no"):
             continue
-        if _k in ("refill", "cancel") and _v.lower() in ("true", "false", "yes"):
-            _ex_rows.append(
-                f"• {_lab}: {_bi('হ্যাঁ', 'Yes', _en) if _v.lower() in ('true', 'yes') else _bi('না', 'No', _en)}")
-            continue
-        _ex_rows.append(f"• {_lab}: {_md_esc(_v[:60 if _k != 'example_link' else 120])}")
-    # 🧾 ওয়েবের মতো দুইটা আলাদা ব্লক:
-    #    📋 বিস্তারিত = Start/Speed/Refill/Quality/Example link
-    #    ⚠️ পড়ে নিন = প্যানেলের নিজের description (না থাকলে সাধারণ টিপস)
-    _desc = _smm_desc_text(_ex.get("description") or _ex.get("desc") or "")
-    _tips_bn = ("• সার্ভিস ব্যস্ত থাকলে কাজ শুরু হতে একটু দেরি হতে পারে।\n"
-                "• আগের অর্ডার শেষ হওয়ার আগে একই লিংকে দ্বিতীয় অর্ডার দেবেন না।\n"
-                "• কাজ শুরু হলে অর্ডার আর বাতিল করা যায় না।\n")
-    _tips_en = ("• When the service is busy, the start may be delayed.\n"
-                "• Do not place a second order on the same link before this one finishes.\n"
-                "• Once started, an order cannot be cancelled.\n")
-    _read_bn = "\n⚠️ *পড়ে নিন*\n" + ((_desc + "\n") if _desc else _tips_bn)
-    _read_en = "\n⚠️ *Please read before ordering*\n" + ((_desc + "\n") if _desc else _tips_en)
+        if _key == "refill" and _v.lower() in ("true", "false", "yes"):
+            _v = _bi("হ্যাঁ", "Yes", _en) if _v.lower() in ("true", "yes") else _bi("না", "No", _en)
+        _ex_rows.append(f"• {_bi(_lb, _le, _en)}: {_md_esc(_v[:80])}")
+        _done.add(_key)
+    _el = str(_ex.get("example_link") or "").strip()
+    if _el:
+        _ex_rows.append(f"• {_bi('উদাহরণ লিংক', 'Example link', _en)}: {_md_esc(_el[:120])}")
+    _drv = str(_ex.get("dripfeed") or "").strip()
+    if _drv and _drv.lower() not in ("0", "none", "no", "false"):
+        _ex_rows.append(f"• {_bi('ড্রিপফিড', 'Drip-feed', _en)}: {_md_esc(_drv[:60])}")
+    _cl = str(_ex.get("cancel") or "").strip()
+    if _cl and _cl.lower() not in ("0", "none", "no", "false"):
+        if _cl.lower() in ("true", "false", "yes"):
+            _cl = _bi("হ্যাঁ", "Yes", _en) if _cl.lower() in ("true", "yes") else _bi("না", "No", _en)
+        _ex_rows.append(f"• {_bi('ক্যানসেল', 'Cancel', _en)}: {_md_esc(_cl[:60])}")
+    _ntxt = ""
+    if _notes:
+        _ntxt = "\n".join("• " + _md_esc(x[:200]) for x in _notes[:12])
+        _ntxt = _smm_cut_md(_ntxt, 900)
+    _read_bn = ("\n⚠️ *পড়ে নিন*\n" + _ntxt + "\n") if _ntxt else ""
+    _read_en = ("\n⚠️ *Please read before ordering*\n" + _ntxt + "\n") if _ntxt else ""
     txt = _bi(
         f"🌐 *{_md_esc(s['name'])}*\n"
         f"━━━━━━━━━━━━━━\n"
@@ -38929,7 +41079,7 @@ async def show_smm_service(q, ctx, sid):
         + ("💬 এই সার্ভিসে কমেন্ট লিখতে হবে।\n" if _smm_need_comments(s) else "")
         + ("\n📋 *বিস্তারিত*\n" + "\n".join(_ex_rows) + "\n" if _ex_rows else "")
         + _read_bn
-        + "\n👉 কিনতে চাইলে নিচের বাটন চাপুন — লিংক ও পরিমাণ ধাপে ধাপে নেওয়া হবে।",
+        + _smm_hint(s, False),
         f"🌐 *{_md_esc(s['name'])}*\n"
         f"━━━━━━━━━━━━━━\n"
         f"📁 Category: {_md_esc(s['cat'])}\n"
@@ -38939,7 +41089,7 @@ async def show_smm_service(q, ctx, sid):
         f"➡️ Minimum order cost: ~{_shop_money(pmin)}\n"
         + ("\n📋 *Details*\n" + "\n".join(_ex_rows) + "\n" if _ex_rows else "")
         + _read_en
-        + "\n👉 Tap the button below — link and quantity are asked step by step.", _en)
+        + _smm_hint(s, _en), _en)
     await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([
         [InlineKeyboardButton(_bi("🛒 অর্ডার করুন", "🛒 Order now", _en), callback_data=f"smm:b:{s['id']}")],
         [InlineKeyboardButton(_bi("🔙 পিছনে", "🔙 Back", _en), callback_data="smm:home")]]))
@@ -39001,6 +41151,10 @@ async def smm_ask_link(update, ctx, sid):
         await update.message.reply_text(_bi("সার্ভিসটি পাওয়া যায়নি।", "Service not found.", _en))
         return True
     ctx.user_data["smm_link"] = txt
+    if _smm_is_package(s):
+        ctx.user_data.pop("state", None)
+        await _smm_send_confirm(update, ctx, s, 1)
+        return True
     ctx.user_data["state"] = f"smm_qty:{sid}"
     _qkb = _smm_qty_kb(s, _en)
     await update.message.reply_text(
@@ -39016,32 +41170,73 @@ async def smm_ask_link(update, ctx, sid):
     return True
 
 
+def _smm_summary(s, ud, qty, link, en=False):
+    """কনফার্ম স্ক্রিনের মূল লাইনগুলো (এক ভাষায়)।"""
+    ud = ud or {}
+    out = []
+    if _smm_is_sub(s):
+        _u = str(ud.get("smm_sub_user") or "").lstrip("@")
+        _mn = int(ud.get("smm_sub_min") or 0)
+        _mx = int(ud.get("smm_sub_max") or 0)
+        out.append("👤 " + _u)
+        out.append(("📊 পোস্ট: " if not en else "📊 Posts: ") + f"{_mn:,}–{_mx:,}")
+        _old = str(ud.get("smm_sub_old") or "0")
+        if _old.lower() in ("old", "all"):
+            out.append("🕓 " + ("শুধু পুরোনো পোস্ট" if not en else "Old posts only"))
+        else:
+            out.append(("🕓 পুরোনো পোস্ট: " if not en else "🕓 Old posts: ") + _old)
+        out.append(("⏱ ডিলে: " if not en else "⏱ Delay: ")
+                    + f"{int(ud.get('smm_sub_delay') or 0)}"
+                    + (" মিনিট" if not en else " min"))
+        _ep = str(ud.get("smm_sub_expiry") or "")
+        if _ep:
+            out.append(("📅 মেয়াদ: " if not en else "📅 Expiry: ") + _ep)
+    else:
+        out.append("🔗 " + _md_esc(str(link or "")[:80]))
+        if _smm_is_package(s):
+            out.append("📦 " + ("প্যাকেজ" if not en else "Package"))
+        else:
+            out.append(f"🔢 {qty:,} " + ("ইউনিট" if not en else "units"))
+    if _smm_is_webtraffic(s):
+        out.append("🌐 " + _smm_wt_text(ud, en))
+    _cmt = str(ud.get("smm_cmt_text") or "").strip()
+    if _cmt:
+        _n = len([x for x in _cmt.splitlines() if x.strip()])
+        out.append(f"💬 " + (f"কমেন্ট: {_n} লাইন" if not en else f"Comments: {_n} line(s)"))
+    if _smm_needs_drip(s):
+        out.append(("🔁 ড্রিপফিড: " if not en else "🔁 Drip-feed: ")
+                    + f"{int(ud.get('smm_runs') or 1)}"
+                    + (" রান × " if not en else " runs × ")
+                    + f"{int(ud.get('smm_interval') or 0)}"
+                    + (" মিনিট" if not en else " min"))
+    if _smm_needs_poll(s):
+        out.append(("🗳 উত্তর নম্বর: " if not en else "🗳 Answer number: ")
+                    + str(ud.get("smm_answer") or "-"))
+    return "\n".join(out) + "\n"
+
+
 async def _smm_send_confirm(update, ctx, s, qty):
     """অর্ডার কনফার্ম মেসেজ — লিংক ও (দরকার হলে) কমেন্ট সহ।"""
     uid = update.effective_user.id
     _en = await _shop_is_en(uid)
-    price = await asyncio.to_thread(smm_price, s["rate"], qty)
+    price = await asyncio.to_thread(smm_price_for, s, qty)
     dep = await asyncio.to_thread(shop_pay_power, uid)   # Earn + ডিপোজিট (৳)
     link = ctx.user_data.get("smm_link", "")
-    cmt = ctx.user_data.get("smm_cmt_text", "")
+    extra = _smm_summary(s, ctx.user_data, qty, link, _en)
     ctx.user_data.pop("state", None)
-    extra = ""
-    if cmt:
-        _n = len([x for x in cmt.splitlines() if x.strip()])
-        extra = _bi(f"💬 কমেন্ট: {_n} লাইন\n", f"💬 Comments: {_n} line(s)\n", _en)
+    if _smm_is_sub(s):
+        extra += _bi("ℹ️ দাম আনুমানিক — প্যানেলের আসল দাম অনুযায়ী নিজেই সমন্বয় হবে।\n",
+                     "ℹ️ Price is an estimate — it is adjusted automatically to the "
+                     "panel's actual charge.\n", _en)
     txt2 = _bi(
         f"🧾 *অর্ডার কনফার্ম করুন*\n\n"
         f"🌐 {_md_esc(s['name'])}\n"
-        f"🔗 {_md_esc(link[:80])}\n"
-        f"🔢 {qty:,} ইউনিট\n"
         f"{extra}"
         f"💵 খরচ: *{_shop_money(price)}*\n"
         f"💰 আপনার ব্যালেন্স (Earn + ডিপোজিট): {_shop_money(dep)}\n\n"
         f"ঠিক থাকলে নিচের বাটন চাপুন।",
         f"🧾 *Confirm order*\n\n"
         f"🌐 {_md_esc(s['name'])}\n"
-        f"🔗 {_md_esc(link[:80])}\n"
-        f"🔢 {qty:,} units\n"
         f"{extra}"
         f"💵 Cost: *{_shop_money(price)}*\n"
         f"💰 Your balance (earn + deposit): {_shop_money(dep)}\n\nPress the button to confirm.", _en)
@@ -39100,14 +41295,227 @@ async def smm_ask_qty(update, ctx, sid):
             _bi(f"❌ পরিমাণ {s['min']:,} থেকে {s['max']:,} এর মধ্যে হতে হবে।",
                 f"❌ Quantity must be between {s['min']:,} and {s['max']:,}.", _en))
         return True
+    _nxt = _smm_next_step(ctx, s, qty)
+    if _nxt:
+        await update.message.reply_text(_bi(_nxt[0], _nxt[1], _en), parse_mode="Markdown")
+        return True
+    await _smm_send_confirm(update, ctx, s, qty)
+    return True
+
+
+async def smm_ask_poll(update, ctx, st):
+    """Poll — answer_number নেওয়া।"""
+    uid = update.effective_user.id
+    _en = await _shop_is_en(uid)
+    txt = (update.message.text or "").strip()
+    try:
+        _a, _sid, _q = str(st).split(":")
+        sid, qty = int(_sid), int(_q)
+    except Exception:
+        ctx.user_data.pop("state", None)
+        return True
+    _num = re.sub(r"\D", "", txt)
+    if not _num:
+        await update.message.reply_text(_bi("❌ শুধু নম্বরটা লিখুন (যেমন `7`)।",
+                                            "❌ Send only the number (e.g. `7`).", _en),
+                                        parse_mode="Markdown")
+        return True
+    ctx.user_data["smm_answer"] = _num
+    svcs = await asyncio.to_thread(smm_services)
+    s = next((x for x in svcs if x["id"] == sid), None)
+    if not s:
+        ctx.user_data.pop("state", None)
+        return True
     if _smm_need_comments(s):
         ctx.user_data["state"] = f"smm_cmt:{s['id']}:{qty}"
         await update.message.reply_text(
-            _bi("💬 *কমেন্টগুলো পাঠান*\n\nপ্রতি লাইনে একটা করে কমেন্ট লিখুন।\n"
-                f"দরকার: {qty:,} টা কমেন্ট।\n\n/cancel — বাতিল",
-                "💬 *Send the comments*\n\nOne comment per line.\n"
-                f"Needed: {qty:,} comments.\n\n/cancel — Cancel", _en),
+            _bi("💬 *কমেন্টগুলো পাঠান*\n\nপ্রতি লাইনে একটা করে কমেন্ট।\n\n/cancel — বাতিল",
+                "💬 *Send the comments*\n\nOne per line.\n\n/cancel — Cancel", _en),
             parse_mode="Markdown")
+        return True
+    await _smm_send_confirm(update, ctx, s, qty)
+    return True
+
+
+async def smm_ask_drip(update, ctx, st):
+    """Drip-feed — runs ও interval নেওয়া।"""
+    uid = update.effective_user.id
+    _en = await _shop_is_en(uid)
+    txt = (update.message.text or "").strip().replace(",", " ").replace("x", " ")
+    try:
+        _a, _sid, _q = str(st).split(":")
+        sid, qty = int(_sid), int(_q)
+    except Exception:
+        ctx.user_data.pop("state", None)
+        return True
+    _bits = [b for b in re.split(r"\s+", txt) if b]
+    if len(_bits) < 2 or not _bits[0].isdigit() or not _bits[1].isdigit():
+        await update.message.reply_text(
+            _bi("❌ দুটো সংখ্যা লিখুন — যেমন `10 60` (রান, ব্যবধান মিনিট)।",
+                "❌ Send two numbers — e.g. `10 60` (runs, interval minutes).", _en),
+            parse_mode="Markdown")
+        return True
+    runs, interval = int(_bits[0]), int(_bits[1])
+    if runs < 1 or interval < 0:
+        await update.message.reply_text(_bi("❌ রান অন্তত ১, ব্যবধান ০ বা তার বেশি।",
+                                            "❌ Runs must be ≥1, interval ≥0.", _en))
+        return True
+    ctx.user_data["smm_runs"] = runs
+    ctx.user_data["smm_interval"] = interval
+    svcs = await asyncio.to_thread(smm_services)
+    s = next((x for x in svcs if x["id"] == sid), None)
+    if not s:
+        ctx.user_data.pop("state", None)
+        return True
+    if _smm_need_comments(s):
+        ctx.user_data["state"] = f"smm_cmt:{s['id']}:{qty}"
+        await update.message.reply_text(
+            _bi("💬 *কমেন্টগুলো পাঠান*\n\nপ্রতি লাইনে একটা করে কমেন্ট।\n\n/cancel — বাতিল",
+                "💬 *Send the comments*\n\nOne per line.\n\n/cancel — Cancel", _en),
+            parse_mode="Markdown")
+        return True
+    await _smm_send_confirm(update, ctx, s, qty)
+    return True
+
+
+async def smm_ask_sub_user(update, ctx, st):
+    """📅 Subscription — ইউজারনেম নেওয়া (state: smm_sub_u:<sid>)।"""
+    uid = update.effective_user.id
+    _en = await _shop_is_en(uid)
+    try:
+        sid = int(str(st).split(":")[1])
+    except Exception:
+        ctx.user_data.pop("state", None)
+        return True
+    txt = (update.message.text or "").strip()
+    _u = txt.rstrip("/").split("/")[-1].split("?")[0].strip()
+    if _u.startswith("@"):
+        _u = _u[1:]
+    if not re.fullmatch(r"[A-Za-z0-9._]{2,40}", _u or ""):
+        await update.message.reply_text(
+            _bi("❌ ইউজারনেম ঠিক নয় — যেমন `@username` বা `https://instagram.com/username`।",
+                "❌ Invalid username — e.g. `@username` or `https://instagram.com/username`.", _en),
+            parse_mode="Markdown")
+        return True
+    ctx.user_data["smm_sub_user"] = _u
+    ctx.user_data["state"] = f"smm_sub_mm:{sid}"
+    await update.message.reply_text(
+        _bi("📊 *পোস্ট সংখ্যা (min max)*\n\nদুটো সংখ্যা পাঠান — যেমন `100 110`।\n\n/cancel — বাতিল",
+            "📊 *Posts range (min max)*\n\nSend two numbers — e.g. `100 110`.\n\n/cancel — Cancel", _en),
+        parse_mode="Markdown")
+    return True
+
+
+async def smm_ask_sub_range(update, ctx, st):
+    """📅 Subscription — min max নেওয়া।"""
+    uid = update.effective_user.id
+    _en = await _shop_is_en(uid)
+    try:
+        sid = int(str(st).split(":")[1])
+    except Exception:
+        ctx.user_data.pop("state", None)
+        return True
+    _bits = [x for x in re.split(r"[\s,]+", (update.message.text or "").strip()) if x]
+    if len(_bits) < 2 or not _bits[0].isdigit() or not _bits[1].isdigit():
+        await update.message.reply_text(
+            _bi("❌ দুটো সংখ্যা লিখুন — যেমন `100 110`।",
+                "❌ Send two numbers — e.g. `100 110`.", _en), parse_mode="Markdown")
+        return True
+    mn, mx = int(_bits[0]), int(_bits[1])
+    if mn < 1 or mx < mn:
+        await update.message.reply_text(_bi("❌ min কমপক্ষে ১ আর max min-এর সমান বা বড় হতে হবে।",
+                                            "❌ min must be ≥1 and max must be ≥ min.", _en))
+        return True
+    ctx.user_data["smm_sub_min"] = mn
+    ctx.user_data["smm_sub_max"] = mx
+    ctx.user_data["state"] = f"smm_sub_o:{sid}"
+    await update.message.reply_text(
+        _bi("🕓 *পুরোনো পোস্ট, ডিলে, মেয়াদ*\n\nএক লাইনে: `পুরোনো পোস্ট  ডিলে  মেয়াদ`\n"
+            "যেমন `0 30 11/11/2026`\n\n"
+            "• পুরোনো পোস্ট: `0` = শুধু নতুন, `old` = শুধু পুরোনো, নাহলে সংখ্যা\n"
+            "• ডিলে: মিনিট (না চাইলে `0`)\n"
+            "• মেয়াদ: `dd/mm/yyyy` (না চাইলে বাদ দিন)\n\n/cancel — বাতিল",
+            "🕓 *Old posts, delay, expiry*\n\nOne line: `old-posts  delay  expiry`\n"
+            "e.g. `0 30 11/11/2026`\n\n"
+            "• old posts: `0` = new only, `old` = old only, else a number\n"
+            "• delay: minutes (`0` if none)\n"
+            "• expiry: `dd/mm/yyyy` (leave out if none)\n\n/cancel — Cancel", _en),
+        parse_mode="Markdown")
+    return True
+
+
+async def smm_ask_sub_opts(update, ctx, st):
+    """📅 Subscription — পুরোনো পোস্ট/ডিলে/মেয়াদ নিয়ে কনফার্ম।"""
+    uid = update.effective_user.id
+    _en = await _shop_is_en(uid)
+    try:
+        sid = int(str(st).split(":")[1])
+    except Exception:
+        ctx.user_data.pop("state", None)
+        return True
+    _bits = [x for x in re.split(r"\s+", (update.message.text or "").strip()) if x]
+    _old = (_bits[0] if _bits else "0")
+    if _old.lower() not in ("old", "all") and not _old.isdigit():
+        _old = "0"
+    _delay = _bits[1] if len(_bits) > 1 and _bits[1].isdigit() else "0"
+    _exp = _bits[2] if len(_bits) > 2 else ""
+    ctx.user_data["smm_sub_old"] = _old
+    ctx.user_data["smm_sub_delay"] = int(_delay)
+    ctx.user_data["smm_sub_expiry"] = _exp
+    svcs = await asyncio.to_thread(smm_services)
+    s = next((x for x in svcs if x["id"] == sid), None)
+    if not s:
+        ctx.user_data.pop("state", None)
+        return True
+    await _smm_send_confirm(update, ctx, s, int(ctx.user_data.get("smm_sub_max") or 1))
+    return True
+
+
+async def smm_ask_wt(update, ctx, st):
+    """🌐 Web traffic — দেশ/ডিভাইস/ধরন/কীওয়ার্ড।"""
+    uid = update.effective_user.id
+    _en = await _shop_is_en(uid)
+    try:
+        _a, _sid, _q = str(st).split(":")
+        sid, qty = int(_sid), int(_q)
+    except Exception:
+        ctx.user_data.pop("state", None)
+        return True
+    _bits = [x for x in re.split(r"\s+", (update.message.text or "").strip()) if x]
+    if len(_bits) < 2:
+        await update.message.reply_text(
+            _bi("❌ অন্তত দেশ আর ডিভাইস দিন — যেমন `US Mobile`।",
+                "❌ Send at least country and device — e.g. `US Mobile`.", _en),
+            parse_mode="Markdown")
+        return True
+    _c = _bits[0].upper()
+    if not re.fullmatch(r"[A-Z]{2}", _c):
+        await update.message.reply_text(
+            _bi("❌ দেশ ২ অক্ষরে দিন — যেমন `US`, `BD`, `UK`।",
+                "❌ Country must be 2 letters — e.g. `US`, `BD`, `UK`.", _en))
+        return True
+    _dev = "Desktop"
+    if len(_bits) > 1:
+        _d = _bits[1].strip().lower()
+        if _d.startswith("mob"):
+            _dev = "Mobile"
+        elif _d.startswith("tab"):
+            _dev = "Tablet"
+    _type, _kw = 1, ""
+    if len(_bits) > 2:
+        if _bits[2].isdigit() and 1 <= int(_bits[2]) <= 4:
+            _type = int(_bits[2])
+            _kw = " ".join(_bits[3:]).strip()
+        else:
+            _kw = " ".join(_bits[2:]).strip()
+    ctx.user_data["smm_wt_country"] = _c
+    ctx.user_data["smm_wt_device"] = _dev
+    ctx.user_data["smm_wt_type"] = _type
+    ctx.user_data["smm_wt_kw"] = _kw
+    svcs = await asyncio.to_thread(smm_services)
+    s = next((x for x in svcs if x["id"] == sid), None)
+    if not s:
+        ctx.user_data.pop("state", None)
         return True
     await _smm_send_confirm(update, ctx, s, qty)
     return True
@@ -39175,13 +41583,16 @@ async def _smm_place_order_do(q, ctx, sid, qty):
             pass
         return
     qty = int(qty)
-    if qty < s["min"] or (s["max"] and qty > s["max"]):
+    if not (_smm_is_package(s) or _smm_is_sub(s)) and (qty < s["min"] or (s["max"] and qty > s["max"])):
         try:
             await q.answer(_bi("পরিমাণ সীমার বাইরে", "Quantity out of range", _en), show_alert=True)
         except Exception:
             pass
         return
     link = ctx.user_data.get("smm_link", "")
+    if _smm_is_sub(s):
+        # 📅 Subscription-এ লিংক থাকে না — অর্ডার-তালিকায় ইউজারনেম দেখানোর জন্য
+        link = "@" + str(ctx.user_data.get("smm_sub_user") or "")
     if not link:
         try:
             await q.answer(_bi("লিংক পাওয়া যায়নি — আবার শুরু করুন", "Link missing — start again", _en),
@@ -39189,7 +41600,7 @@ async def _smm_place_order_do(q, ctx, sid, qty):
         except Exception:
             pass
         return
-    price = await asyncio.to_thread(smm_price, s["rate"], qty)
+    price = await asyncio.to_thread(smm_price_for, s, qty)
     # 🛡️ প্যানেলে আমাদের নিজের টাকা যথেষ্ট আছে? না থাকলে ইউজারের ৳ কাটাই না।
     _afford = await asyncio.to_thread(smm_can_afford, s, qty)
     if not _afford:
@@ -39209,20 +41620,63 @@ async def _smm_place_order_do(q, ctx, sid, qty):
     await asyncio.to_thread(shop_fund_from_earn, uid, price)
     ok = await asyncio.to_thread(smm_dep_deduct, uid, price)
     if not ok:
+        # 🕒 টাকা কম — অর্ডার ফেলে দেওয়া হয় না; "টাকা বাকি" অবস্থায় জমা থাকে।
+        #    ইউজার টাকা যোগ করলেই job_smm_wait_orders নিজেই চালু করে প্যানেলে পাঠায়।
         try:
-            await q.answer(_bi("💳 ৳ ব্যালেন্স যথেষ্ট নয় — ডিপোজিট করুন",
-                               "💳 Not enough ৳ balance — please deposit", _en), show_alert=True)
+            _have = float(await asyncio.to_thread(shop_pay_power, uid) or 0)
+        except Exception:
+            _have = 0.0
+        _need = round(price - _have, 2)
+        _woid = 0
+        _wo = None
+        # 🧱 এক ইউজার অনেকগুলো অপেক্ষমাণ অর্ডার জমিয়ে রাখতে পারবে না
+        try:
+            _wq = await asyncio.to_thread(smm_wait_count, uid)
+        except Exception:
+            _wq = 0
+        if _wq >= SMM_WAIT_MAX_PER_USER:
+            try:
+                await q.answer(_bi("⏳ আপনার আগের অর্ডারগুলো এখনো প্রসেসিং — একটু পরে আবার চেষ্টা করুন",
+                                   "⏳ Your previous orders are still processing — try again a bit later",
+                                   _en), show_alert=True)
+            except Exception:
+                pass
+            return
+        try:
+            _woid = await asyncio.to_thread(
+                smm_order_new_wait, uid, s["id"], s["name"], link, qty, price,
+                (ctx.user_data.get("smm_cmt_text") or ""),_smm_wait_ud(ctx))
+            _wo = await asyncio.to_thread(smm_order_get, _woid)
+        except Exception as _we:
+            log.warning(f"[SMM-WAIT] অপেক্ষমাণ অর্ডার রাখা যায়নি uid={uid}: {_we}")
+        if _wo:
+            _botw = getattr(ctx, "bot", None)
+            if _botw is None:
+                try:
+                    _botw = q.get_bot()
+                except Exception:
+                    _botw = None
+            try:
+                await _smm_wait_admin_note(_botw, _wo, _need)
+            except Exception as _ne:
+                log.debug(f"[SMM-WAIT] অ্যাডমিন নোটিফাই ব্যর্থ: {_ne}")
+            try:
+                await _smm_wait_tell(_botw, uid, _wo, "wait", _need)
+            except Exception:
+                pass
+            ctx.user_data.pop("smm_link", None)
+            ctx.user_data.pop("smm_cmt_text", None)
+        try:
+            await q.answer(_bi("✅ অর্ডার জমা হয়েছে — তাড়াতাড়ি প্রসেসিং হবে",
+                               "✅ Order placed — we'll process it shortly",
+                               _en), show_alert=True)
         except Exception:
             pass
         return
     oid = await asyncio.to_thread(smm_order_new, uid, s["id"], s["name"], link, qty, price)
     try:
-        _params = {"action": "add", "service": str(s["id"]),
-                   "link": link, "quantity": str(qty)}
-        _cmt = (ctx.user_data.get("smm_cmt_text") or "").strip()
-        if _cmt:
-            _params["comments"] = _cmt
-        js = await asyncio.to_thread(_smm_api, _params)
+        params = _smm_add_params(s, link, qty, ctx.user_data)
+        js = await asyncio.to_thread(_smm_api, params)
         api_id = ""
         if isinstance(js, dict):
             api_id = str(js.get("order") or js.get("order_id") or "")
@@ -39232,6 +41686,11 @@ async def _smm_place_order_do(q, ctx, sid, qty):
     except Exception as e:
         await asyncio.to_thread(smm_dep_refund, uid, price)
         await asyncio.to_thread(smm_order_set, oid, None, "failed")
+        # 💸 এখানেই টাকা ফেরত — ১০ মিনিটের রিফান্ড জব যাতে দুইবার না দেয়
+        try:
+            await asyncio.to_thread(smm_refund_mark_notified, oid)
+        except Exception:
+            pass
         log.warning(f"[SMM] অর্ডার ব্যর্থ #{oid}: {e}")
         await q.edit_message_text(
             _bi(f"❌ *অর্ডার হয়নি*\n\nকারণ: `{str(e)[:150]}`\n\n"
@@ -39242,15 +41701,38 @@ async def _smm_place_order_do(q, ctx, sid, qty):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(_bi("🔙 SMM প্যানেল", "🔙 SMM Panel", _en), callback_data="smm:home")]]))
         return
+    _settle_msg = ""
+    # ⚠️ শুধু Subscription-এ দাম আনুমানিক — বাকি সার্ভিসের হিসাব ঠিকঠাক,
+    #    তাই ওগুলোতে হাত দেওয়া হয় না (ভুল রিফান্ডের ঝুঁকি নেই)।
+    if api_id and _smm_is_sub(s):
+        try:
+            _real, _warn = await asyncio.to_thread(smm_settle_charge_retry, uid, oid, api_id, price)
+            price = _real
+            _settle_msg = _warn or ""
+        except Exception as _se:
+            log.warning(f"[SMM] #{oid} দাম সমন্বয় করা যায়নি: {_se}")
     ctx.user_data.pop("smm_link", None)
     ctx.user_data.pop("smm_cmt_text", None)
+    if _settle_msg:
+        return await q.edit_message_text(
+            _bi(f"⚠️ *অর্ডার নেওয়া যায়নি*\n\n{_settle_msg}\n\n💸 {price:g}৳ ফেরত দেওয়া হয়েছে।",
+                f"⚠️ *Order could not be placed*\n\nBalance was not enough for the "
+                f"actual price — the order was cancelled and {price:g}৳ refunded.", _en),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(_bi("🔙 SMM প্যানেল", "🔙 SMM Panel", _en),
+                                      callback_data="smm:home")]]))
+    _det_bn = (_smm_summary(s, ctx.user_data, qty, link, False) if _smm_is_sub(s)
+               else f"🔗 {_md_esc(link[:80])}\n🔢 {qty:,} ইউনিট\n")
+    _det_en = (_smm_summary(s, ctx.user_data, qty, link, True) if _smm_is_sub(s)
+               else f"🔗 {_md_esc(link[:80])}\n🔢 {qty:,} units\n")
     await q.edit_message_text(
         _bi(f"✅ *অর্ডার সফল*\n\n🌐 {_md_esc(s['name'])}\n"
-            f"🔗 {_md_esc(link[:80])}\n🔢 {qty:,} ইউনিট\n"
+            f"{_det_bn}"
             f"💵 কাটা হয়েছে: {_shop_money(price)}\n🆔 প্যানেল অর্ডার: `{api_id}`\n\n"
             f"⏳ কাজ শুরু হতে কয়েক মিনিট লাগতে পারে। স্ট্যাটাস দেখতে নিচের বাটন।",
             f"✅ *Order placed*\n\n🌐 {_md_esc(s['name'])}\n"
-            f"🔗 {_md_esc(link[:80])}\n🔢 {qty:,} units\n"
+            f"{_det_en}"
             f"💵 Charged: {_shop_money(price)}\n🆔 Panel order: `{api_id}`\n\n"
             f"⏳ Delivery may take a few minutes. Check status below.", _en),
         parse_mode="Markdown",
@@ -39278,7 +41760,7 @@ async def show_smm_my(q):
     rows = []
     for o in rows_db:
         rows.append([InlineKeyboardButton(
-            f"#{smm_no(int(o['id']))} {str(o['service_name'])[:20]} — {str(o['status'])[:12]}",
+            f"#{smm_no(int(o['id']))} {str(o['service_name'])[:20]} — {_smm_st_label(o['status'], _en)[:16]}",
             callback_data=f"smm:v:{int(o['id'])}")])
     rows.append([InlineKeyboardButton(_bi("🔄 স্ট্যাটাস রিফ্রেশ", "🔄 Refresh status", _en),
                                       callback_data="smm:my")])
@@ -39295,7 +41777,7 @@ def smm_can_cancel(o):
         st = str((dict(o) if o else {}).get("status") or "").strip().lower()
     except Exception:
         st = ""
-    return st in ("", "new", "pending", "processing")
+    return st in ("", "new", "pending", "processing", "pending_payment")
 
 
 async def show_smm_order(q, ctx, oid):
@@ -39316,6 +41798,8 @@ async def show_smm_order(q, ctx, oid):
     emoji = "🟡" if st.lower() in ("pending", "in progress", "processing", "new") else \
             ("🟢" if st.lower() in ("completed", "complete") else
              ("🔴" if st.lower() in ("canceled", "cancelled", "failed") else "⚪️"))
+    if st == SMM_WAIT_STATUS:
+        emoji = "⏳"
     _no = await asyncio.to_thread(smm_no, oid)
     try:
         _rem = int(dict(o).get("remains") or 0)
@@ -39329,6 +41813,11 @@ async def show_smm_order(q, ctx, oid):
                 if (_stc or _rem) else "")
     _live_en = (f"📊 Start count: `{_stc:,}`\n📉 Remains: `{_rem:,}`\n"
                 if (_stc or _rem) else "")
+    # 🕒 টাকা বাকি থাকলে স্পষ্ট করে বলা
+    _wait_bn = _wait_en = ""
+    if st == SMM_WAIT_STATUS:
+        _wait_bn = "⏳ আপনার অর্ডার জমা হয়েছে — তাড়াতাড়ি প্রসেসিং হবে।\n"
+        _wait_en = "⏳ Your order is placed — we'll process it shortly.\n"
     # ❌ ক্যানসেল শুধু কাজ শুরুর আগে — ওয়েবের মতো
     _can_cancel = smm_can_cancel(o)
     _btns = [[InlineKeyboardButton(_bi("🔄 রিফ্রেশ", "🔄 Refresh", _en), callback_data=f"smm:v:{oid}")]]
@@ -39343,7 +41832,8 @@ async def show_smm_order(q, ctx, oid):
             f"🔢 {int(o['qty'] or 0):,} ইউনিট\n"
             f"💵 {_shop_money(float(o['price'] or 0))}\n"
             f"{_live_bn}"
-            f"📌 স্ট্যাটাস: *{_md_esc(st)}*"
+            f"{_wait_bn}"
+            f"📌 স্ট্যাটাস: *{_md_esc(_smm_st_label(st, _en))}*"
             + (("\n💸 অর্ডার বাতিল — টাকা ব্যালেন্সে ফেরত দেওয়া হয়েছে"
                 if st.strip().lower() in _SMM_CANCELED else
                 "\n💸 কিছু অংশ ডেলিভারি হয়নি — ওই টাকা ব্যালেন্সে ফেরত দেওয়া হয়েছে")
@@ -39354,7 +41844,8 @@ async def show_smm_order(q, ctx, oid):
             f"🔢 {int(o['qty'] or 0):,} units\n"
             f"💵 {_shop_money(float(o['price'] or 0))}\n"
             f"{_live_en}"
-            f"📌 Status: *{_md_esc(st)}*"
+            f"{_wait_en}"
+            f"📌 Status: *{_md_esc(_smm_st_label(st, _en))}*"
             + (("\n💸 Order cancelled — money refunded to your balance"
                 if st.strip().lower() in _SMM_CANCELED else
                 "\n💸 Part was not delivered — that money is refunded to your balance")
@@ -39408,8 +41899,28 @@ async def smm_callback(update, ctx):
             return await show_smm_service(q, ctx, int(d.split(":")[2]))
         if d.startswith("smm:b:"):
             sid = int(d.split(":")[2])
-            ctx.user_data["state"] = f"smm_link:{sid}"
             _en = await _shop_is_en(uid)
+            # 🧹 আগের অর্ডারের অসম্পূর্ণ তথ্য মুছে ফেলো (নতুন অর্ডার পরিষ্কার শুরু)
+            for _k in list(ctx.user_data):
+                if str(_k).startswith(("smm_sub_", "smm_wt_", "smm_runs",
+                                       "smm_interval", "smm_answer")):
+                    ctx.user_data.pop(_k, None)
+            _sub = None
+            try:
+                _sub = next((x for x in await asyncio.to_thread(smm_services)
+                             if x["id"] == sid), None)
+            except Exception:
+                _sub = None
+            if _sub and _smm_is_sub(_sub):
+                ctx.user_data["state"] = f"smm_sub_u:{sid}"
+                await q.edit_message_text(
+                    _bi("👤 *ইউজারনেম দিন*\n\nযে অ্যাকাউন্টে সার্ভিস চলবে — "
+                        "যেমন `@username` অথবা `https://instagram.com/username`।\n\n/cancel — বাতিল",
+                        "👤 *Send the username*\n\nThe account to run the service on — "
+                        "e.g. `@username` or `https://instagram.com/username`.\n\n/cancel — Cancel", _en),
+                    parse_mode="Markdown")
+                return
+            ctx.user_data["state"] = f"smm_link:{sid}"
             await q.edit_message_text(
                 _bi("🔗 *লিংক পাঠান*\n\nযে পেজ/প্রোফাইলে অর্ডার হবে তার লিংক "
                     "(যেমন `https://instagram.com/username`)।\n\n/cancel — বাতিল",
@@ -39430,6 +41941,11 @@ async def smm_callback(update, ctx):
                 except Exception:
                     pass
                 return
+            _bnext = _smm_next_step(ctx, _s, _qty)
+            if _bnext:
+                _ben = await _shop_is_en(uid)
+                return await q.edit_message_text(_bi(_bnext[0], _bnext[1], _ben),
+                                                 parse_mode="Markdown")
             ctx.user_data["state"] = f"smm_qty:{_sid}"
             return await _smm_send_confirm(update, ctx, _s, _qty)
         if d.startswith("smm:qo:"):
@@ -39461,6 +41977,20 @@ async def smm_callback(update, ctx):
                     pass
                 return
             if d.startswith("smm:x:"):
+                # 🕒 টাকা বাকি অর্ডার — প্যানেলে যায়নি, তাই সরাসরি বাতিল
+                if str(dict(_oX).get("status") or "") == SMM_WAIT_STATUS:
+                    await asyncio.to_thread(smm_order_set, _o, None, SMM_WAIT_CANCEL)
+                    try:
+                        await asyncio.to_thread(set_setting, f"smm_wait_cmt_{_o}", "")
+                    except Exception:
+                        pass
+                    try:
+                        await q.answer(_bi("✅ অর্ডার বাতিল হয়েছে — কোনো টাকা কাটা হয়নি",
+                                           "✅ Order cancelled — nothing was charged",
+                                           _bX), show_alert=True)
+                    except Exception:
+                        pass
+                    return await show_smm_order(q, ctx, _o)
                 if not smm_can_cancel(_oX):       # প্যানেল কাজ শুরু করে দিয়েছে
                     try:
                         await q.answer(_bi("⚠️ কাজ শুরু হয়ে গেছে — এখন আর ক্যানসেল করা যায় না",
@@ -39499,6 +42029,18 @@ async def smm_input(update, ctx, st):
         return await smm_ask_qty(update, ctx, str(st))
     if str(st).startswith("smm_cmt:"):
         return await smm_ask_cmt(update, ctx, str(st))
+    if str(st).startswith("smm_poll:"):
+        return await smm_ask_poll(update, ctx, str(st))
+    if str(st).startswith("smm_drip:"):
+        return await smm_ask_drip(update, ctx, str(st))
+    if str(st).startswith("smm_sub_u:"):
+        return await smm_ask_sub_user(update, ctx, str(st))
+    if str(st).startswith("smm_sub_mm:"):
+        return await smm_ask_sub_range(update, ctx, str(st))
+    if str(st).startswith("smm_sub_o:"):
+        return await smm_ask_sub_opts(update, ctx, str(st))
+    if str(st).startswith("smm_wt:"):
+        return await smm_ask_wt(update, ctx, str(st))
     return False
 
 
