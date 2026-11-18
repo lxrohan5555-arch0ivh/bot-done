@@ -41,6 +41,87 @@ from telegram.ext import (
 from telegram.constants import ChatMemberStatus
 from telegram.error import TelegramError, RetryAfter as TgRetryAfter, BadRequest as TgBadRequest
 
+# ── BTN_STYLE_SHIM_START ─────────────────────────────────────────
+# 🎨 Bot API 9.4: ইনলাইন বাটনের কালার — primary (নীল), success (সবুজ), danger (লাল)।
+# python-telegram-bot 21.10-এ `style` ফিল্ড নেই, তাই এখানে shim:
+#   • to_dict()-এ style যোগ হয় → পুরো বটের ৭০০+ বাটনে একসাথে কাজ করে
+#   • PTB ≥ 22.7 (style নিজেই সাপোর্ট করে) হলে shim নিজে থেকেই নিষ্ক্রিয়
+#   • বন্ধ করতে চাইলে: BTN_STYLE_ON = False
+BTN_STYLE_ON = True
+
+# লাল (বাতিল/বিপজ্জনক)
+_BTN_DANGER_W = (
+    "❌", "🗑", "⛔", "🚫", "cancel", "বাতিল", "close", "বন্ধ", "delete",
+    "ডিলিট", "মুছে", "reject", "রিজেক্ট", "ban", "ব্যান", "refund",
+    "রিফান্ড", "stop", "remove", "রিমুভ", "log out", "লগআউট",
+)
+# সবুজ (নিশ্চিত/ইতিবাচক)
+_BTN_SUCCESS_W = (
+    "confirm", "কনফার্ম", "নিশ্চিত", "approve", "অনুমোদন", "save", "সেভ",
+    "done", "সম্পন্ন", "submit", "সাবমিট", "get number", "নাম্বার নিন",
+    "join", "যোগ দিন", "verify", "যাচাই", "live", "চালু করুন", "active",
+    "আনলক", "unlock", "success", "সফল",
+)
+
+
+def _btn_style_guess(btn):
+    """একটা বাটন-ডিক্ট দেখে কালার ঠিক করে; আগে থেকে style থাকলে ছোঁয় না।"""
+    if not isinstance(btn, dict) or btn.get("style"):
+        return None
+    # callback_data-এর আন্ডারস্কোর/কোলন ফাঁকা করে নিলে _cancel, :close সবই ধরা পড়ে
+    _cb = (btn.get("callback_data") or "").replace("_", " ").replace(":", " ")
+    hay = ((btn.get("text") or "") + " " + _cb).lower()
+    for words, style in ((_BTN_DANGER_W, "danger"), (_BTN_SUCCESS_W, "success")):
+        for w in words:
+            if w.isascii():
+                if re.search(r"\b" + re.escape(w) + r"\b", hay):
+                    return style
+            elif w in hay:
+                return style
+    return "primary"
+
+
+def _patch_markup_style(cls, key):
+    """markup ক্লাসের to_dict()-এ style ঢুকিয়ে দেয় (একবারই)।"""
+    if getattr(cls.to_dict, "_btn_style_shim", False):
+        return False
+    _orig_to_dict = cls.to_dict
+
+    def _to_dict(self, *a, **kw):
+        out = _orig_to_dict(self, *a, **kw)
+        if BTN_STYLE_ON:
+            try:
+                for _row in out.get(key) or []:
+                    for _b in _row:
+                        if isinstance(_b, dict):
+                            _st = _btn_style_guess(_b)
+                            if _st:
+                                _b["style"] = _st
+            except Exception:
+                pass
+        return out
+
+    _to_dict._btn_style_shim = True
+    cls.to_dict = _to_dict
+    return True
+
+
+def _install_btn_style_shim():
+    """ইনলাইন + রিপ্লাই — সব কী-বোর্ডে style (PTB ≥ 22.7 হলে নিজে থেকেই বন্ধ)।"""
+    try:
+        import inspect as _insp
+        if "style" in _insp.signature(InlineKeyboardButton.__init__).parameters:
+            return False                       # নতুন PTB নিজেই পারে
+        ok = _patch_markup_style(InlineKeyboardMarkup, "inline_keyboard")
+        _patch_markup_style(ReplyKeyboardMarkup, "keyboard")
+        return ok
+    except Exception:
+        return False
+
+
+_BTN_STYLE_ACTIVE = _install_btn_style_shim()
+# ── BTN_STYLE_SHIM_END ───────────────────────────────────────────
+
 class _StateFilter(filters.UpdateFilter):
     """সাধারণ ফাংশনকে সত্যিকারের PTB ফিল্টার বানায়।
 
@@ -161,7 +242,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-18b157"
+BUILD_TAG       = "uid-auto-2026-11-18b168"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -259,6 +340,11 @@ BNB_ALERT_THRESHOLD = 0.001   # এর নিচে হলে Admin কে messa
 # ── Scheduled backup channels ────────────────────────────────────
 BACKUP_CHANNELS = [-1003863212399, -1003932547078]
 BACKUP_INTERVAL_HOURS = 6   # প্রতি ৬ ঘণ্টায় একবার auto report + DB backup
+
+# বটের নিজের নিউজ চ্যানেল (OTP কার্ড/নোটিফিকেশনের 📢 বাটনের ডিফল্ট)
+NEWS_CH_URL_DEF = "https://t.me/task_earn_bot_news"
+# পুরোনো পাবলিক/সাপোর্ট চ্যানেল — এগুলো নিউজ চ্যানেল হিসেবে আর ব্যবহার হবে না
+_GN_NEWS_OLD = {"rohanbd0", "backuprohanbd0", "gmail_sell_bot_payment"}
 
 REQUIRED_CHANNELS = [
     {"id": "@rohanbd0",               "link": "https://t.me/rohanbd0",               "name": "📢 Official Channel"},
@@ -358,21 +444,21 @@ MSGS = {
         'cancelled': "❌ *বাতিল করা হয়েছে।*",
         'bot_off': "🔴 *বট এখন বন্ধ আছে।*\n\nকিছুক্ষণ পরে আবার চেষ্টা করুন।",
         'choose_menu': "👇 *নিচের মেনু থেকে অপশন বেছে নিন।*",
-        'profile_title': "👤 *Profile*",
-        'pf_tg_id': "✈️ *Telegram ID:*",
-        'pf_name': "🙍 *Name:*",
-        'balance_label': "💰 *Balance:*",
-        'status_active': "🛡 *Account Status:* Active ✅",
-        'pf_stats_title': "📊 *TASK STATS*",
-        'pf_completed': "✅ Completed:",
-        'pf_pending': "⏳ Pending:",
-        'pf_rejected': "❌ Rejected:",
-        'pf_earned': "💰 Earn (বটের মোট ইনকাম):",
+        'profile_title': "👤 *প্রোফাইল*",
+        'pf_tg_id': "✈️ *টেলিগ্রাম আইডি:*",
+        'pf_name': "🙍 *নাম:*",
+        'balance_label': "💰 *ব্যালেন্স:*",
+        'status_active': "🛡 *অ্যাকাউন্ট স্টেটাস:* অ্যাক্টিভ ✅",
+        'pf_stats_title': "📊 *টাস্ক পরিসংখ্যান*",
+        'pf_completed': "✅ সম্পন্ন:",
+        'pf_pending': "⏳ পেন্ডিং:",
+        'pf_rejected': "❌ রিজেক্টেড:",
+        'pf_earned': "💰 আয় (মোট ইনকাম):",
         'pf_earned_note': "",
-        'pf_withdrawn': "📤 Withdrawn:",
-        'pf_available': "✅ Available:",
-        'pf_on_hold': "🔒 On hold:",
-        'balance_title': "💰 *BALANCE*",
+        'pf_withdrawn': "📤 উত্তোলন:",
+        'pf_available': "✅ ব্যবহারযোগ্য:",
+        'pf_on_hold': "🔒 হোল্ডে:",
+        'balance_title': "💰 *ব্যালেন্স*",
         'balance_greet': "✅ *আসসালামু আলাইকুম ভাই/আপু*",
         'your_balance': "💰 *আপনার ব্যালান্স:*",
         'tasks_title': "📋 *Tasks*",
@@ -8185,8 +8271,9 @@ GETNUM_LIST_DEF = "https://api.zenexnetwork.com/v1/active-ranges"
 GETNUM_FEED_DEF = "https://www.zenexnetwork.com/api/v1/global-broadcast"
 GETNUM_CH_DEF   = "-1003728636195"
 GN_WAIT_MIN = 20          # নাম্বার কত মিনিট লাইভ
-GN_MAX_SERVICES = 12
-GN_MAX_ITEMS = 60
+GN_MAX_SERVICES = 20      # লাইভ ফিড থেকে নতুন সার্ভিসও শেখা যায়
+GN_MAX_ITEMS = 150        # প্রতি সার্ভিসে রেঞ্জ (আগে ৬০ — নতুন দেশ আর ঢুকত না)
+_GN_MAX_SHOWN = 90        # এক স্ক্রিনে সর্বোচ্চ বাটন (Telegram-এর সীমার নিচে)
 GN_MAX_OPEN = 3           # একসাথে কতগুলো নাম্বার চলতে পারে
 GN_FEED_POST_MAX = 10     # প্রতি চেকে সর্বোচ্চ কতটি লাইভ OTP চ্যানেলে যাবে
 GN_SMS_TTL = 3            # OTP লিস্ট ক্যাশ (সেকেন্ড)
@@ -8343,6 +8430,38 @@ def _gn_parse_services(raw):
             if isinstance(_j, list) and _j:
                 return _j
     return []
+
+
+_GN_SVC_JSON_MAX = 200000     # settings-এ সার্ভিস-লিস্টের সর্বোচ্চ দৈর্ঘ্য
+
+
+def _gn_dump_services(svcs):
+    """সার্ভিস-লিস্ট → JSON (কখনোই মাঝখানে কাটা পড়ে না)।
+
+    আগে `_json.dumps(...)[:30000]` করে কাটা হতো — লিস্ট বড় হলে JSON ভেঙে
+    যেত আর লাইভ ফিডে শেখা রেঞ্জ/দেশগুলো হারিয়ে যেত। এখন বড় হলে পুরোনো
+    আইটেম বাদ দিয়ে বৈধ JSON-ই সেভ হয়।
+    """
+    svcs = svcs or []
+    for _ in range(5000):
+        try:
+            _s = _json.dumps(svcs, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            return ""
+        if len(_s) <= _GN_SVC_JSON_MAX:
+            return _s
+        _big = None
+        for _sv in svcs:
+            _n = len(_sv.get("items") or [])
+            if _n and (_big is None or _n > len(_big.get("items") or [])):
+                _big = _sv
+        if _big is None:
+            break                       # আর ছোট করার উপায় নেই
+        _big["items"].pop(0)            # পুরোনোটা বাদ, নতুন শেখা রেঞ্জ থাকে
+    try:
+        return _json.dumps(svcs, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return ""
 
 
 def getnum_services():
@@ -9040,6 +9159,65 @@ def _gn_live_text(en=False):
     return _gn_live_traffic(10, en)
 
 
+_GN_LIVE_CACHE = {"ts": 0.0, "rows": [], "n": {}}
+_GN_LIVE_CNT_TTL = 20          # সেকেন্ড — নাম্বার পেজ বারবার খুললেও DB চাপ নেই
+
+
+def _gn_live_reset():
+    """ক্যাশে খালি — পরের কলে ফিড আবার পড়া হবে।"""
+    _GN_LIVE_CACHE.update({"ts": 0.0, "rows": [], "n": {}})
+
+
+def _gn_live_rows(mins=10):
+    """শেষ N মিনিটের ফিড (ক্যাশে)। ১০ মিনিটে কিছু না থাকলে সদ্য যা আছে তাই।"""
+    _t = _time.time()
+    try:
+        if _t - float(_GN_LIVE_CACHE.get("ts") or 0) < _GN_LIVE_CNT_TTL:
+            return _GN_LIVE_CACHE.get("rows") or []
+    except Exception:
+        pass
+    try:
+        rows = getnum_feed_recent(mins, 800)
+    except Exception:
+        rows = []
+    if not rows:
+        rows = getnum_feed_rows(200)     # ফিড নতুন/কম — শূন্য দেখিয়ে ভুল বোঝাব না
+    _GN_LIVE_CACHE.update({"ts": _t, "rows": rows, "n": {}})
+    return rows
+
+
+def _gn_live_counts(mins=10, service=None):
+    """শেষ N মিনিটে দেশ/রেঞ্জপ্রতি কত OTP কোড — রেঞ্জ বাটনের পাশে দেখানোর জন্য।
+
+    কী: দেশের নাম (lower) আর রেঞ্জ-কী (`_gn_rng_key`) — দুটোই রাখি, তাই
+    "🇨🇲 Cameroon" আর "237688XXX" দুই লেবেলেই সংখ্যা মিলবে।
+    `service` দিলে শুধু ওই সার্ভিসের কোড গুনবে।
+    """
+    _rows = _gn_live_rows(mins)
+    _want = _gn_svc_label(service) if service else ""
+    _ck = _want or "*"
+    _cache = _GN_LIVE_CACHE.get("n") or {}
+    if _ck in _cache:
+        return _cache[_ck]
+    cnt = {}
+    for r in _rows:
+        if _want and _gn_svc_label(r.get("service")) != _want:
+            continue
+        rng = str(r.get("range_val") or "").strip()
+        _f, _c = _gn_country_of(rng)
+        if not _c:
+            _f, _c = _gn_flag_of_name(r.get("country"))
+        _k = str(_c or "").strip().lower()
+        if _k:
+            cnt[_k] = cnt.get(_k, 0) + 1
+        _rk = _gn_rng_key(rng)
+        if _rk:
+            cnt[_rk] = cnt.get(_rk, 0) + 1
+    _cache[_ck] = cnt
+    _GN_LIVE_CACHE["n"] = _cache
+    return cnt
+
+
 def gn_open_orders(uid):
     """এই ইউজারের এখনো OTP না আসা সব নাম্বার (সর্বোচ্চ GN_MAX_OPEN, নতুন আগে)।"""
     try:
@@ -9133,19 +9311,25 @@ def _gn_bot_link():
 
 
 def _gn_news_link():
-    """📢 নিউজ/অফিশিয়াল চ্যানেলের লিংক।"""
+    """📢 নিউজ/অফিশিয়াল চ্যানেলের লিংক।
+
+    ডিফল্ট এখন বটের নিজের নিউজ চ্যানেল (@task_earn_bot_news)।
+    পুরোনো সেটিং/ফলব্যাক (@rohanbd0 ইত্যাদি) থাকলে সেটা আর ব্যবহার হবে না —
+    নাহলে OTP চ্যানেলের কার্ডে ভুল চ্যানেলে নিয়ে যেত।
+    """
     try:
         _v = str(get_setting("news_channel_url") or get_setting("official_channel") or "").strip()
     except Exception:
         _v = ""
     if _v:
         if _v.lower().startswith(("http://", "https://")):
-            return _v
-        return "https://t.me/" + _v.lstrip("@/")
-    try:
-        return str(REQUIRED_CHANNELS[0]["link"])
-    except Exception:
-        return ""
+            _u = _v
+        else:
+            _u = "https://t.me/" + _v.lstrip("@/")
+        _slug = _u.rstrip("/").rsplit("/", 1)[-1].strip().lower()
+        if _slug and _slug not in _GN_NEWS_OLD:
+            return _u
+    return NEWS_CH_URL_DEF
 
 
 def _gn_ch_send(text, parse_mode="HTML"):
@@ -9159,9 +9343,9 @@ def _gn_ch_send(text, parse_mode="HTML"):
     _btns = []
     _bl, _nl = _gn_bot_link(), _gn_news_link()
     if _bl:
-        _btns.append({"text": "🤖 Bot", "url": _bl})
+        _btns.append({"text": "🤖 Bot", "url": _bl, "style": "success"})
     if _nl:
-        _btns.append({"text": "📢 News Channel", "url": _nl})
+        _btns.append({"text": "📢 News Channel", "url": _nl, "style": "primary"})
     _tries = [parse_mode, None] if parse_mode else [None]
     for _pm in _tries:
         try:
@@ -9194,8 +9378,9 @@ def _gn_ch_text(o):
     _num = str(o.get("number") or "").strip()
     _code = str(o.get("otp") or "").strip() or "—"
     _svc = str(o.get("service") or "").strip() or "OTP"
-    _rate = getnum_money2(o.get("price") or getnum_rate())
+    _rate = getnum_money2(o.get("price") or getnum_rate())   # 🏷 প্যানেলের দাম (নাহলে ডিফল্ট রেট)
     _paid = float(o.get("paid_usd") or 0)
+    _pay_s = ("  ·  💰 <b>Paid:</b> " + _e(getnum_money2(_paid))) if _paid > 0 else ""
     _meta = " · ".join(x for x in (_svc, _loc, ("🔢 " + _rng) if _rng else "") if x)
     _head = ("♻️ <b>New Otp receive (Resend)</b>" if o.get("resend")
              else "🆕 <b>New Otp receive</b>")
@@ -9205,6 +9390,7 @@ def _gn_ch_text(o):
         f"📱 <b>Service :</b> {_e(_svc)}\n"
         f"🌍 <b>Range :</b> {_e((_flag + ' ' + _rng).strip() or '—')}\n"
         f"🔑 <b>Otp :</b> <b>{_e(_code)}</b>\n"
+        f"💵 <b>Rate :</b> {_e(_rate)}{_pay_s}\n"
         f"💬 <b>Full Message :</b>\n"
         f"<blockquote>{_e(str(o.get('sms') or '')[:600])}</blockquote>"
     )
@@ -9250,7 +9436,7 @@ def _gn_group_text(rows, en=False):
         "━━━━━━━━━━━━━━━━\n"
         f"📱 <b>Service:</b> {html.escape(_svc)}\n"
         f"🌍 <b>Country:</b> {html.escape(_loc)}\n"
-        f"💵 <b>Rate:</b> {_rate:.2f} BDT  |  ⏰ {_lft}m"
+        f"💵 <b>Rate:</b> {getnum_money2(_rate)}  |  ⏰ {_lft}m"
     )
 
 
@@ -9462,21 +9648,42 @@ async def _gn_show_items(update, ctx, si):
     if si < 0 or si >= len(svcs):
         return await show_getnum(update, ctx)
     sv = svcs[si]
+    _lc = await asyncio.to_thread(_gn_live_counts, 10, sv["name"])   # 🔥 লাইভ ট্রাফিক (ক্যাশে)
     # রেঞ্জ → দেশ + পতাকা; একই দেশ একবারই (Fb Clone/New Fb ডুপ্লিকেট বাদ)
-    _one, _seen = [], set()
+    _one, _seen, _cand = [], set(), []
     for ii, it in enumerate(sv["items"]):
         _lab, _key = _gn_range_label(it)
         if not _key or _key in _seen:
             continue
         _seen.add(_key)
+        # রেঞ্জের পাশে শেষ ১০ মিনিটের লাইভ কোড-সংখ্যা
+        try:
+            _n = int(_lc.get(_key) or _lc.get(_gn_rng_key(it.get("range"))) or 0)
+        except Exception:
+            _n = 0
+        _lab2 = f"{_lab} · {_n}🔥" if _n > 0 else f"{_lab} · 0"
         # দাম এখানে দেখাই না — নাম্বার নেওয়ার পরে (কার্ডে) OTP রেট দেখাবে
-        _one.append(InlineKeyboardButton(_lab, callback_data=f"gn:r:{si}:{ii}"))
+        _cand.append((_n, ii, _lab2))
+    # 🔥 যেখানে বেশি কোড আসছে সেগুলো আগে — লাইভ ফিডে নতুন শেখা দেশও উপরে উঠে আসে
+    _cand.sort(key=lambda x: (-x[0], x[1]))
+    _more = 0
+    for _n, ii, _lab2 in _cand:
+        if len(_one) >= _GN_MAX_SHOWN:      # Telegram-এর বাটন-সীমা পেরোবে না
+            _more += 1
+            continue
+        _one.append(InlineKeyboardButton(_lab2, callback_data=f"gn:r:{si}:{ii}"))
     rows = _pair_rows(_one)          # দুটো করে পাশাপাশি — লিস্ট লম্বা হয় না
     rows.append([InlineKeyboardButton(_bi("🔙 সার্ভিস", "🔙 Services", en),
                                       callback_data="gn:home")])
+    _more_txt = _bi(f"\n\n➕ আরও {_more}টি দেশ আছে — উপরের যেগুলোতে 🔥 বেশি সেগুলো দেখানো হলো।",
+                    f"\n\n➕ {_more} more countries — the ones with more 🔥 are shown first.",
+                    en) if _more else ""
     return await _gn_say(update,
-                         _bi(f"{sv['name']}\n\n🌍 *কোন দেশের নাম্বার নিতে চান?*",
-                             f"{sv['name']}\n\n🌍 *Which country number do you want?*", en),
+                         _bi(f"{sv['name']}\n\n🌍 *কোন দেশের নাম্বার নিতে চান?*\n\n"
+                             "🔥 পাশের সংখ্যা = শেষ ১০ মিনিটে ওই দেশে আসা কোড।",
+                             f"{sv['name']}\n\n🌍 *Which country number do you want?*\n\n"
+                             "🔥 The number beside = codes received there in the last 10 min.", en)
+                         + _more_txt,
                          InlineKeyboardMarkup(rows))
 
 
@@ -9607,7 +9814,7 @@ def _gn_learn_many(pairs):
         added += 1
         changed = True
     if changed:
-        set_setting("getnum_services", _json.dumps(svcs, ensure_ascii=False)[:30000])
+        set_setting("getnum_services", _gn_dump_services(svcs))
         try:
             _GN_SVC_CACHE["ts"] = 0.0        # ক্যাশ রিফ্রেশ — নতুন রেঞ্জ সাথে সাথে দেখা যাবে
         except Exception:
@@ -9783,12 +9990,20 @@ def _gn_feed_once():
     _fresh = []          # নতুন OTP → OTP চ্যানেলে (একই id আবার যাবে না)
     # ফিডের মাস্ক-নাম্বার → লিস্টে থাকা রেঞ্জ প্যাটার্ন (থাকলে সেটাই ব্যবহার)
     _have = {}
+    _prices = {}       # রেঞ্জ → প্যানেলের দাম (৳), OTP চ্যানেলের রেট এখান থেকেই
     try:
         for sv in getnum_services():
             for it in sv["items"]:
-                _have.setdefault(_gn_rng_key(it["range"]), it["range"])
+                _k10 = _gn_rng_key(it["range"])
+                _have.setdefault(_k10, it["range"])
+                try:
+                    _p10 = round(float(it.get("price") or 0), 4)
+                except Exception:
+                    _p10 = 0.0
+                if _p10 > 0:
+                    _prices.setdefault(_k10, _p10)
     except Exception:
-        _have = {}
+        _have, _prices = {}, {}
     try:
         with _c() as c:
             for it in rows[:80]:
@@ -9838,7 +10053,9 @@ def _gn_feed_once():
                             _fresh.append({"service": svc, "range_val": rng,
                                            "country": _c3 or cty, "flag": _f3,
                                            "otp": _cd3, "sms": msg,
-                                           "number": "", "price": 0,
+                                           "number": "",
+                                           # 🏷 প্যানেলের দাম (রেঞ্জ মিললে) — নাহলে ০ → ডিফল্ট রেট
+                                           "price": _prices.get(_gn_rng_key(rng), 0),
                                            "paid_usd": 0, "resend": 0})
                     except Exception:
                         pass
@@ -9884,7 +10101,7 @@ def _gn_feed_once():
                         it["name"] = cty
                         changed = True
         if changed:
-            set_setting("getnum_services", _json.dumps(svcs, ensure_ascii=False)[:30000])
+            set_setting("getnum_services", _gn_dump_services(svcs))
         _gn_learn_many(pairs)
     return len(pairs)
 
@@ -20697,12 +20914,12 @@ async def show_profile(update, ctx):
         f"{T(uid,'pf_completed')} `{st['completed']}`\n"
         f"{T(uid,'pf_pending')} `{st['pending']}`\n"
         f"{T(uid,'pf_rejected')} `{st['rejected']}`\n\n"
-        f"{T(uid,'pf_earned')} `${st['earned']:.2f}`\n"
-        f"{T(uid,'pf_withdrawn')} `${st['withdrawn']:.2f}`\n"
+        f"{T(uid,'pf_earned')} `{_shop_money(float(st['earned'] or 0) * _rate)}`\n"
+        f"{T(uid,'pf_withdrawn')} `{_shop_money(float(st['withdrawn'] or 0) * _rate)}`\n"
         f"💳 {('ডিপোজিট ব্যালেন্স' if str(_lang or 'bn') != 'en' else 'Deposit balance')}: "
         f"`{_shop_money(_dep_bal)}`\n"
         f"{T(uid,'pf_available')} `{_shop_money(_total_usd * _rate)}`\n"
-        f"{T(uid,'pf_on_hold')} `${st['hold']:.2f}`\n\n"
+        f"{T(uid,'pf_on_hold')} `{_shop_money(float(st['hold'] or 0) * _rate)}`\n\n"
         f"{T(uid,'status_active')}",
         parse_mode="Markdown"
     )
@@ -20723,10 +20940,14 @@ async def show_balance(update, ctx):
     owner = owner or '@gmail4gg'
     owner_e = _md_esc(owner)
     task_promo = await asyncio.to_thread(task_promo_block, lang, owner_e, True)
+    try:                       # ব্যালেন্সও $ · ৳ দুটোতেই (প্রোফাইলের মতো)
+        _br = float(dep_rate() or 125) or 125.0
+    except Exception:
+        _br = 125.0
     await update.message.reply_text(
         f"{T(uid,'balance_title')}\n\n"
         f"{T(uid,'balance_greet')}\n\n"
-        f"{T(uid,'your_balance')} `{bal}$ USDT`"
+        f"{T(uid,'your_balance')} `{_shop_money(float(bal or 0) * _br)}`"
         f"{task_promo}",
         parse_mode="Markdown"
     )
@@ -22500,12 +22721,16 @@ async def show_withdraw(update, ctx):
         asyncio.to_thread(get_lang, uid),
     )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("💎 USDT-BEP20 (BSC)", callback_data="wd_go")]])
+    try:                       # ব্যালেন্স $ · ৳ দুটোতেই
+        _wr = float(dep_rate() or 125) or 125.0
+    except Exception:
+        _wr = 125.0
     if lang == 'en':
         txt = (
             f"{T(uid,'withdraw_title')}\n\n"
             f"{T(uid,'withdraw_only_usdt')}\n\n"
             f"⚡ *Auto Withdraw — within 2 minutes*\n\n"
-            f"💰 *Balance:* `{bal}$ USDT`\n"
+            f"💰 *Balance:* `{_shop_money(float(bal or 0) * _wr)}`\n"
             f"⚠️ *Minimum withdrawal:* `{min_w}$ USDT`\n"
             f"📉 *Fee:* `{fee}$` (deducted from your amount)\n\n"
             f"*Example:* withdraw `$0.05` → fee `${fee}` → you receive `${round(0.05-fee,4)}`\n\n"
@@ -22516,7 +22741,7 @@ async def show_withdraw(update, ctx):
             f"{T(uid,'withdraw_title')}\n\n"
             f"{T(uid,'withdraw_only_usdt')}\n\n"
             f"⚡ *অটো Withdraw — ২ মিনিটের মধ্যে পাবেন*\n\n"
-            f"💰 *ব্যালান্স:* `{bal}$ USDT`\n"
+            f"💰 *ব্যালান্স:* `{_shop_money(float(bal or 0) * _wr)}`\n"
             f"⚠️ *মিনিমাম উইথড্র:* `{min_w}$ USDT`\n"
             f"📉 *ফি:* `{fee}$` (পরিমাণ থেকে কাটা যাবে)\n\n"
             f"*উদাহরণ:* `$0.05` তুললে → ফি `${fee}` → পাবেন `${round(0.05-fee,4)}`\n\n"
@@ -32698,7 +32923,8 @@ async def _run_health_check_and_fix(bot, skip_admin_ping=False) -> tuple:
     ✅ = ঠিক আছে | ❌ = সমস্যা পেয়েছে | 🔧 = ঠিক করা হয়েছে
     Returns: (report_str, problems_count, fixes_count)
     """
-    lines = ["🔍 *Bot Health Check Report*", f"🕐 `{now()}`", ""]
+    lines = ["🔍 *Bot Health Check Report*", f"🕐 `{now()}`",
+             f"🎨 বাটন কালার: {'✅ চালু' if _BTN_STYLE_ACTIVE else '⚠️ বন্ধ'} · বিল্ড `{BUILD_TAG}`", ""]
     fixes = 0
     problems = 0
 

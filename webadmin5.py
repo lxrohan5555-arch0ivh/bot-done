@@ -358,7 +358,11 @@ def shop_getnum_save():
     }
     # হাতে লেখার বক্স আর নেই — ফিল্ড না এলে আগের লিস্টটাই অক্ষত থাকে
     if form.get("getnum_services_text") is not None:
-        vals["getnum_services"] = _json.dumps(groups, ensure_ascii=False)[:30000]
+        try:                       # বটের হেল্পার — JSON মাঝখানে কাটা পড়ে না
+            import bot as _bsd
+            vals["getnum_services"] = _bsd._gn_dump_services(groups)
+        except Exception:
+            vals["getnum_services"] = _json.dumps(groups, ensure_ascii=False)
     # কী-তে লুকানো স্পেস/নিউলাইন/ZWSP থাকলে API গ্রহণ করে না — পরিষ্কার করি
     _k = "".join((form.get("getnum_key") or "").split())[:300]
     # বক্সে আগের কী-এর মাস্ক করা লেখা (ZNX_G7N…TJWO) থাকলে সেটা সেভ হবে না
@@ -372,6 +376,13 @@ def shop_getnum_save():
         for k, v in vals.items():
             _x("INSERT INTO settings (key,value) VALUES (%s,%s) "
                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k, v))
+    # 🔄 সেভের সাথে সাথেই বটের ক্যাশ ফাঁকা — নতুন রেঞ্জ/দাম ও রেট সাথে সাথে দেখা যাবে
+    try:
+        import bot as _bs
+        _bs._GN_SVC_CACHE["ts"] = 0.0
+        _bs._GN_SVC_CACHE["val"] = None
+    except Exception:
+        pass
     log_admin("shop_getnum", 0, str(len(groups)))
     return redirect("/admin/shop?ok=" + _q("📱 নাম্বার সার্ভিস সেভ হয়েছে"))
 
