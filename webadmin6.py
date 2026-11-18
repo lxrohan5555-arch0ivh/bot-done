@@ -301,15 +301,15 @@ def _form(m=None):
         "placeholder='Binance USDT (BEP-20)' required></div>"
         "<div class='field'><label>ধরন</label>"
         + "<select name='kind'>"
-        + (f"<option value='uid' selected>🆔 অটো — Binance Pay (পুরোনো মেথড)</option>"
-           if kind == "uid" else "")
-        + (f"<option value='auto' selected>⚡ অটো — BEP-20 (পুরোনো মেথড)</option>"
-           if kind == "auto" else "")
+        + (f"<option value='uid' selected>🆔 অটো — Binance Pay (UID)</option>"
+           if kind == "uid" else "<option value='uid'>🆔 অটো — Binance Pay (UID)</option>")
+        + (f"<option value='auto' selected>⚡ অটো — BEP-20</option>"
+           if kind == "auto" else "<option value='auto'>⚡ অটো — BEP-20</option>")
         + f"<option value='manual'{' selected' if kind == 'manual' else ''}>✍️ ম্যানুয়াল — আমি ✅ করব</option>"
         + f"<option value='qr'{' selected' if kind == 'qr' else ''}>🇧🇩 Bangla QR পেমেন্ট (QR স্ক্যান)</option>"
         + "</select>"
-        "<p class='mut' style='font-size:11px;margin:6px 0 0'>এখন QR আর ম্যানুয়াল — "
-        "এই দুইটাই সবচেয়ে নিরাপদ। Binance-ভিত্তিক পুরোনো মেথড আর নতুন করে বানানো যাবে না।"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>⚡ অটো / 🆔 Binance UID — "
+        "Binance-এ ডলার সরাসরি জমা হয়। 🇧🇩 QR — টাকা পাঠালে রেট হিসাবে ডলার জমে।"
         "</p></div>"
         "<div class='field'><label>USDT BEP-20 অ্যাড্রেস / Binance Pay ID</label>"
         f"<input name='address' value='{esc(m.get('address') or '')}' placeholder='0x… অথবা Binance UID'></div>"
