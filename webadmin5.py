@@ -116,17 +116,43 @@ def _cur():
     return v or "$"
 
 
-def _fmt(v):
-    """ছোট দামও পুরো দেখাবে (0.0001 → `0.0001`, 0 নয়)।"""
+def _shop_rate():
+    """১$ = কত ৳ — বটের `dep_rate()` (QR রেট), ক্যাশে করা।"""
     try:
-        n = float(v or 0)
+        import bot as _b
+        return float(_b.dep_rate() or 125) or 125.0
     except Exception:
-        n = 0.0
-    if n == int(n):
-        s = str(int(n))
+        return 125.0
+
+
+def _usd_str(n, r=None):
+    """৳ → $ — বট যেভাবে দেখায় ঠিক সেভাবেই (0.01$, 0.658$)।"""
+    try:
+        import bot as _b
+        return _b._usd_exact(n, r or _shop_rate())
+    except Exception:
+        _r = float(r or 125.0) or 125.0
+        return (f"{float(n or 0) / _r:.6f}".rstrip("0").rstrip(".") or "0")
+
+
+def _taka_str(n):
+    """৳ — ছোট অঙ্কও পুরো (0.0125 → `0.0125`)।"""
+    try:
+        _n = float(n or 0)
+    except Exception:
+        _n = 0.0
+    if abs(_n) >= 1 or _n == 0:
+        _s = f"{_n:,.2f}".rstrip("0").rstrip(".")
+    elif abs(_n) >= 0.01:
+        _s = f"{_n:.4f}".rstrip("0").rstrip(".")
     else:
-        s = f"{n:.8f}".rstrip("0").rstrip(".")
-    return f"{s or '0'} {_cur()}"
+        _s = f"{_n:.6f}".rstrip("0").rstrip(".")
+    return _s or "0"
+
+
+def _fmt(v):
+    """দাম/টাকা — আগে ডলার, পাশে টাকা: `0.01$ · 1.25 ৳`।"""
+    return f"{_usd_str(v)}$ · {_taka_str(v)} ৳"
 
 
 def _stock_n(pid):
@@ -662,6 +688,14 @@ def shop_home():
 
     # ক্যাটাগরি তৈরি + ক্রেন্সি
     cur = esc(_cur())
+    # 💵 ডলার↔টাকা রেট — এই রেটেই বটের সব দাম/ডিপোজিট হিসাব হয়
+    try:
+        _rate_now = float(str((one("SELECT value FROM settings WHERE key='qr_rate'") or {})
+                             .get("value") or "125").replace(",", "."))
+    except Exception:
+        _rate_now = 125.0
+    if _rate_now <= 0:
+        _rate_now = 125.0
     # 📦 প্যাকের তালিকা — এখান থেকেই নাম বদলানো / ডিলিট করা যাবে
     plan_rows = []
     for pl in _plans():
@@ -704,12 +738,14 @@ def shop_home():
         + "<div class='mut' style='font-size:12px;margin-top:6px'>"
           "প্যাকের নাম বদলাতে ✏️, বাদ দিতে 🗑 চাপুন।</div></div>"
         "<div class='card'>" + _user_preview(cats, prods) + "</div>"
-        "<div class='card'><b>💱 মুদ্রা</b>"
-        "<form method='post' action='/admin/shop/currency' class='row' style='gap:8px;margin-top:8px'>"
-        f"<input name='currency' value='{cur}' placeholder='$' style='max-width:120px'>"
-        "<button class='btn sm' type='submit'>সেভ</button>"
-        "<span class='mut' style='font-size:12px'>বটে দাম এভাবেই দেখাবে (যেমন 0.78 $)</span>"
-        "</form></div>"
+        "<div class='card'><b>💱 মুদ্রা ও রেট</b>"
+        "<div class='mut' style='font-size:12px;margin:6px 0'>"
+        "পণ্যের দাম ডলারে লিখুন — বটে দেখাবে ডলার + পাশে টাকা "
+        "(যেমন 0.78$ · 97.5 ৳)। "
+        f"এখন <b>১$ = {_rate_now:g} ৳</b> — এই রেট দিয়েই সব দাম, ডিপোজিট ও ব্যালেন্স "
+        "হিসাব হয়। রেট বদলালে সাথে সাথে বটের সব দাম বদলে যাবে।</div>"
+        "<a class='btn gray sm' href='/admin/deposits'>🇧🇩 রেট বদলান (QR সেটিং)</a>"
+        "</div>"
     )
 
     cat_rows = []
@@ -1183,7 +1219,11 @@ def _form(p=None):
         _rate_now = 125.0
     name = esc(p.get("name") or "")
     desc = esc(p.get("description") or "")
-    price = esc(str(p.get("price") or ""))
+    try:
+        _pv = float(p.get("price") or 0)
+    except Exception:
+        _pv = 0.0
+    price = esc(_usd_str(_pv, _rate_now) if _pv else "")
     typ = p.get("deliver_type") or "auto"
     act = int(p.get("is_active") or (1 if not p else 0))
     pid = int(p.get("id") or 0)
@@ -1209,14 +1249,12 @@ def _form(p=None):
         f"<select name='plan_id'>{_plan_options(p.get('plan_id') or 0)}</select>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>প্যাক বানাবেন উপরে "
         "“➕ নতুন প্যাক” থেকে। প্যাক না বাছলে পণ্যটা ক্যাটাগরিতে সবার আগে দেখাবে।</p></div>"
-        "<div class='field'><label>দাম (ব্যালেন্স থেকে কাটা হবে)</label>"
-        f"<input name='price' value='{price}' placeholder='25' required>"
-        "<select name='price_cur' style='margin-top:6px'>"
-        "<option value='৳' selected>৳ — টাকায় লিখেছি</option>"
-        "<option value='$'>$ — ডলারে লিখেছি</option></select>"
-        f"<p class='mut' style='font-size:11px;margin:6px 0 0'>ডলারে লিখলে বট নিজেই "
-        f"রেট দিয়ে টাকায় বদলে নেবে (এখন 1$ = {_rate_now:g} ৳)। "
-        "বটে দাম সবসময় ডলার + টাকা দুটোই দেখাবে।</p></div>"
+        "<div class='field'><label>💵 এক পিসের দাম ($ ডলারে)</label>"
+        f"<input name='price' value='{price}' placeholder='0.01' required inputmode='decimal'>"
+        f"<p class='mut' style='font-size:11px;margin:6px 0 0'>ডলারে লিখুন (যেমন <b>0.01</b>)। "
+        f"এখন 1$ = {_rate_now:g} ৳ — তাই বটে দেখাবে "
+        f"<b>0.01$ · {_taka_str(0.01 * _rate_now)} ৳</b>। "
+        "কেনার সময় এই টাকাই ইউজারের ডিপোজিট/Earn ব্যালেন্স থেকে কাটা হবে।</p></div>"
         "<div class='field'><label>🛍 রেফার কমিশন (%) — না দিলে Settings-এর %</label>"
         f"<input name='ref_pct' value='{_rp}' placeholder='খালি = Settings-এর %, 0 = কমিশন নেই'>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>এই পণ্যের জন্য আলাদা % চাইলে "
@@ -1256,20 +1294,13 @@ def _save(pid=0):
     name = (request.form.get("name") or "").strip()[:120]
     if not name:
         return 0
+    # 💵 অ্যাডমিন ডলারে লেখেন — ভিতরে সব হিসাব ৳-তে (পেমেন্ট/হোল্ড/রিফান্ড)
     try:
-        price = float((request.form.get("price") or "0").replace(",", "."))
+        _price_usd = float((request.form.get("price") or "0").replace(",", ".").strip() or 0)
     except Exception:
-        price = 0.0
-    # 💵 দাম ডলারে দিলে অ্যাডমিনের রেটে টাকায় বদলে রাখো
-    if (request.form.get("price_cur") or "").strip().startswith("$"):
-        try:
-            _rs = one("SELECT value FROM settings WHERE key='qr_rate'")
-            _rate = float(str((_rs or {}).get("value") or "125").replace(",", "."))
-        except Exception:
-            _rate = 125.0
-        if _rate <= 0:
-            _rate = 125.0
-        price = round(price * _rate, 2)
+        _price_usd = 0.0
+    _rate = _shop_rate()
+    price = round(_price_usd * _rate, 4)
     cid = request.form.get("category_id") or 0
     try:
         cid = int(cid)

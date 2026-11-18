@@ -161,7 +161,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-18b151"
+BUILD_TAG       = "uid-auto-2026-11-18b157"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -4305,6 +4305,56 @@ def add_dep_bal(uid, amt, method="", txid="", oid=0):
     return add_bal(uid, amt)
 
 
+SHOP_PRICE_USD_FIX_MAX = 5.0   # এর কম দাম = পুরোনো ডলারের অঙ্ক (× রেট হবে)
+
+
+def shop_price_usd_migrate():
+    """দোকানের পুরোনো দামগুলো ডলারের অঙ্ক হিসেবে ধরা হয়েছিল (৳ লেখা হলেও)।
+
+    একবার × রেট করে সঠিক ৳-তে নিয়ে আসা হয় — যেমন 0.01 (মানে $0.01) →
+    1.25 ৳, তখন বটে 0.01$ · 1.25 ৳ দেখাবে। `shop_price_usd_v1` সেট হলে
+    আর কিছুই করে না। Returns (count, rate)।
+    """
+    try:
+        if (get_setting("shop_price_usd_v1") or "").strip():
+            return 0, 0.0
+    except Exception:
+        return 0, 0.0
+    try:
+        _rate = float(dep_rate() or 125)
+    except Exception:
+        _rate = 125.0
+    if _rate <= 0:
+        _rate = 125.0
+    n = 0
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT id, price FROM shop_products WHERE COALESCE(price,0) > 0"
+            ).fetchall()
+            for r in rows or []:
+                try:
+                    _id = int(r["id"])
+                    _p = float(r["price"] or 0)
+                except Exception:
+                    continue
+                # ⚠️ শুধু স্পষ্টতই ডলার-সংখ্যাগুলো — ৫৳ বা তার বেশি দাম
+                #    অ্যাডমিন নিজে টাকাতেই দিয়েছেন ধরে হাত দেওয়া হয় না
+                if _p >= SHOP_PRICE_USD_FIX_MAX:
+                    continue
+                c.execute("UPDATE shop_products SET price=%s WHERE id=%s",
+                          (round(_p * _rate, 4), _id))
+                n += 1
+        set_setting("shop_price_usd_v1", "done")
+        if n:
+            log.info(f"[SHOP-PRICE] {n}টি পণ্যের দাম ডলার থেকে ৳-তে ঠিক হলো "
+                     f"({_rate:g}৳ = 1$)")
+    except Exception as e:
+        log.warning(f"[SHOP-PRICE] migrate ব্যর্থ: {str(e)[:120]}")
+        return 0, _rate
+    return n, _rate
+
+
 def get_dep_balance(uid):
     """ব্যালেন্সের ভেতরে কতটা ডিপোজিটের টাকা আছে।"""
     try:
@@ -4335,12 +4385,21 @@ def usd_to_taka(usd):
 
 
 def taka_txt(amt, sym=True):
-    """৳ দেখানোর হেল্পার — 1234.5 → `1,234.5 ৳`।"""
+    """৳ দেখানোর হেল্পার — 1234.5 → `1,234.5 ৳`, 0.0125 → `0.0125 ৳`।
+
+    ⚠️ আগে সবসময় ২ ঘর হতো, তাই ছোট দাম (0.0001$ = 0.0125৳) `0.01 ৳`
+    হয়ে ডলারের সাথে মিলত না — এখন ছোট অঙ্কে ঘর বাড়ে।
+    """
     try:
         n = float(amt or 0)
     except Exception:
         n = 0.0
-    s2 = f"{n:,.2f}".rstrip("0").rstrip(".")
+    if abs(n) >= 1 or n == 0:
+        s2 = f"{n:,.2f}".rstrip("0").rstrip(".")
+    elif abs(n) >= 0.01:
+        s2 = f"{n:.4f}".rstrip("0").rstrip(".")
+    else:
+        s2 = f"{n:.6f}".rstrip("0").rstrip(".")
     return (s2 + " ৳") if sym else s2
 
 
@@ -6964,7 +7023,7 @@ def _usd_exact(n, r=None):
     হয়ে দাম মিলত না। এখন যত ঘর লাগে তত ঘর নেওয়া হয় (0.3954$)।
     """
     try:
-        n = round(float(n or 0), 2)
+        n = round(float(n or 0), 4)      # ছোট দাম নষ্ট না হয় (0.0125৳)
     except Exception:
         n = 0.0
     try:
@@ -6974,14 +7033,14 @@ def _usd_exact(n, r=None):
     if r <= 0:
         r = 125.0
     v = n / r
-    for _d in (2, 3, 4, 6):
+    for _d in (2, 3, 4, 6, 8):
         _s = f"{v:,.{_d}f}"
         try:
-            if abs(round(float(_s.replace(",", "")) * r, 2) - n) < 0.01:
+            if abs(float(_s.replace(",", "")) * r - n) < 0.005:
                 return _s.rstrip("0").rstrip(".") or "0"
         except Exception:
             pass
-    return (f"{v:,.6f}".rstrip("0").rstrip(".") or "0")
+    return (f"{v:,.8f}".rstrip("0").rstrip(".") or "0")
 
 
 def _shop_money(v):
@@ -8866,6 +8925,8 @@ def getnum_feed_rows(limit=15):
 _GN_FLAG_NAMES = None
 _GN_FLAG_SORTED = None
 _GN_FEED_TS = {"ts": 0.0}      # শেষবার ওয়েব ফিড কখন পড়া হয়েছে
+_GN_FEED_DIAG = {"ts": 0.0, "err": "", "rows": 0, "fresh": 0, "sent": 0}
+# /otpdiag-এ দেখা যায় — ফিড কেন আসছে না বোঝার জন্য
 _GN_FEED_TRIM = [0]            # ফিড ছাঁটার কাউন্টার
 _GN_FEED_SEEN = {}             # ext_id → সময় (মেমরিতেই; DB write/RU বাঁচায়)
 _GN_POST_RL = {}               # (সার্ভিস|দেশ) → [সময়...] — চ্যানেলে ৫ মিনিটে ২টির বেশি নয়
@@ -9088,33 +9149,41 @@ def _gn_news_link():
 
 
 def _gn_ch_send(text, parse_mode="HTML"):
-    """OTP চ্যানেলে পোস্ট — নিচে 🤖 Bot ও 📢 News Channel বাটন।"""
+    """OTP চ্যানেলে পোস্ট — নিচে 🤖 Bot ও 📢 News Channel বাটন।
+    HTML সিনট্যাক্স ভুল হলে (parse error) প্লেইন টেক্সটে আবার চেষ্টা হয় —
+    নাহলে একটা কোডের কারণে পুরো পোস্টটাই চুপচাপ আটকে যেত।"""
     tok = (os.environ.get("BOT_TOKEN") or "").strip()
     cid = getnum_ch_id()
     if not (tok and cid):
         return False
-    try:
-        _pl = {"chat_id": cid, "text": str(text)[:3900],
-               "disable_web_page_preview": True}
-        if parse_mode:
-            _pl["parse_mode"] = parse_mode
-        _btns = []
-        _bl, _nl = _gn_bot_link(), _gn_news_link()
-        if _bl:
-            _btns.append({"text": "🤖 Bot", "url": _bl})
-        if _nl:
-            _btns.append({"text": "📢 News Channel", "url": _nl})
-        if _btns:
-            _pl["reply_markup"] = {"inline_keyboard": [_btns]}
-        body = _json.dumps(_pl).encode("utf-8")
-        req = urllib.request.Request(
-            "https://api.telegram.org/bot" + tok + "/sendMessage",
-            data=body, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=8).read()
-        return True
-    except Exception as e:
-        log.warning(f"[GETNUM-CH] চ্যানেলে পাঠানো যায়নি: {str(e)[:120]}")
-        return False
+    _btns = []
+    _bl, _nl = _gn_bot_link(), _gn_news_link()
+    if _bl:
+        _btns.append({"text": "🤖 Bot", "url": _bl})
+    if _nl:
+        _btns.append({"text": "📢 News Channel", "url": _nl})
+    _tries = [parse_mode, None] if parse_mode else [None]
+    for _pm in _tries:
+        try:
+            _pl = {"chat_id": cid, "text": str(text)[:3900],
+                   "disable_web_page_preview": True}
+            if _pm:
+                _pl["parse_mode"] = _pm
+            else:
+                _pl["text"] = html.unescape(
+                    _re.sub(r"<[^>]{1,40}>", "", _pl["text"]))
+            if _btns:
+                _pl["reply_markup"] = {"inline_keyboard": [_btns]}
+            body = _json.dumps(_pl).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.telegram.org/bot" + tok + "/sendMessage",
+                data=body, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=8).read()
+            return True
+        except Exception as e:
+            log.warning(f"[GETNUM-CH] চ্যানেলে পাঠানো যায়নি"
+                        f"{' (প্লেইন)' if not _pm else ''}: {str(e)[:120]}")
+    return False
 
 
 def _gn_ch_text(o):
@@ -9141,24 +9210,108 @@ def _gn_ch_text(o):
     )
     return _out
 
-async def _gn_say(update, text, kb=None):
-    """কার্ড পাঠানো/এডিট করা — message বা callback, দুইভাবেই।"""
+_GN_SVC_ICON = {"facebook": "📘", "whatsapp": "💬", "instagram": "📸",
+                "telegram": "✈️", "tiktok": "🎵", "twitter": "🐦",
+                "google": "🔎", "gmail": "🔎", "manus": "🛒", "verify": "✅"}
+
+
+def _gn_svc_icon(name):
+    _s = str(name or "").lower()
+    for _k0, _v0 in _GN_SVC_ICON.items():
+        if _k0 in _s:
+            return _v0
+    return "📱"
+
+
+def _gn_group_text(rows, en=False):
+    """একই সার্ভিস/দেশের একাধিক নাম্বার — প্রথম ছবির মতো এক কার্ডে।"""
+    if not rows:
+        return ""
+    o = rows[0]
+    _cty = str(o.get("country") or "").strip()
+    _fl = _gn_flag(o.get("iso"))
+    if not _fl and _cty:
+        try:
+            _fl = _gn_flag_of_name(_cty)[0]
+        except Exception:
+            _fl = ""
+    _loc = (_fl + " " + _cty).strip() or "—"
+    try:
+        _rate = float(o.get("price") or getnum_rate() or 0)
+    except Exception:
+        _rate = 0.0
+    try:
+        _lft = int(_gn_left_min(o))
+    except Exception:
+        _lft = 0
+    _svc = str(o.get("service") or "").strip() or "OTP"
+    return (
+        "⚡ <b>VERIFICATION ACTIVE</b>\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"📱 <b>Service:</b> {html.escape(_svc)}\n"
+        f"🌍 <b>Country:</b> {html.escape(_loc)}\n"
+        f"💵 <b>Rate:</b> {_rate:.2f} BDT  |  ⏰ {_lft}m"
+    )
+
+
+def _gn_group_kb(rows, en=False):
+    """নাম্বারগুলো কপি-বাটন হিসেবে পাশাপাশি + OTP Group + Change Num/Country।"""
+    _nums = []
+    for o in rows:
+        _num = str(o.get("number") or "").strip()
+        _code = str(o.get("otp") or "").strip()
+        _ic = _gn_svc_icon(o.get("service"))
+        try:
+            if _code:
+                _nums.append(InlineKeyboardButton(
+                    f"{_ic} 🔑 {_code}", copy_text=CopyTextButton(text=_code)))
+            elif _num:
+                _nums.append(InlineKeyboardButton(
+                    f"{_ic} ⧉ {_num}", copy_text=CopyTextButton(text=_num)))
+        except Exception:
+            pass
+    _b = _pair_rows(_nums)
+    _u = getnum_group_url()
+    if _u:
+        if _u.startswith("@"):
+            _u = "https://t.me/" + _u[1:]
+        elif not _u.lower().startswith(("http://", "https://")):
+            _u = "https://t.me/" + _u.lstrip("/")
+        try:
+            _b.append([InlineKeyboardButton("📢 OTP Group", url=_u)])
+        except Exception:
+            pass
+    _id = int(rows[0].get("id") or 0) if rows else 0
+    _b.append([
+        InlineKeyboardButton(_bi("📍 নাম্বার বদলান", "📍 Change Num", en),
+                             callback_data=(f"gn:n:{_id}" if _id else "gn:home")),
+        InlineKeyboardButton(_bi("🛂 দেশ বদলান", "🛂 Change Country", en),
+                             callback_data=(f"gn:cc:{_id}" if _id else "gn:home")),
+    ])
+    return InlineKeyboardMarkup(_b)
+
+
+async def _gn_say(update, text, kb=None, parse_mode="Markdown"):
+    """কার্ড পাঠানো/এডিট করা — message বা callback, দুইভাবেই।
+    parse_mode=None দিলে প্লেইন টেক্সট (HTML-এর ফলব্যাকেও কাজে লাগে)।"""
     q = getattr(update, "callback_query", None)
+    _pm = {"parse_mode": parse_mode} if parse_mode else {}
     if q:
         try:
-            return await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+            return await q.edit_message_text(text, reply_markup=kb, **_pm)
         except Exception:
             try:
-                return await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+                return await q.message.reply_text(text, reply_markup=kb, **_pm)
             except Exception:
                 pass
     _msg = getattr(update, "message", None) or getattr(update, "effective_message", None)
     if _msg:
         try:
-            return await _msg.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+            return await _msg.reply_text(text, reply_markup=kb, **_pm)
         except Exception:
             try:
-                return await _msg.reply_text(text, reply_markup=kb)
+                return await _msg.reply_text(
+                    _re.sub(r"<[^>]{1,40}>|[*_`]", "", text), reply_markup=kb)
             except Exception:
                 pass
     return None
@@ -9279,7 +9432,7 @@ async def show_getnum(update, ctx=None):
             "The admin needs to add the API key and the service list.\n\n"
             "Help: @gmail4gg", en))
     # Get Number চাপলেই সবসময় সার্ভিস-লিস্ট — নতুন নাম্বার আনা হবে।
-    # আগের চলমান নাম্বার আলাদা বাটনে (নিচে) থাকবে, হারাবে না।
+    # (আগের নম্বরের আলাদা "current" বাটন রাখা হয়নি — নিজের অনুরোধ)
     _one, _sv_seen = [], set()
     for i, sv in enumerate(svcs):
         _nm = _gn_svc_label(sv["name"])
@@ -9291,14 +9444,6 @@ async def show_getnum(update, ctx=None):
     rows = _pair_rows(_one)
     rows.append([InlineKeyboardButton(_bi("🔢 নিজের রেঞ্জ দিন", "🔢 Use my range", en),
                                       callback_data="gn:rx")])
-    _open = await asyncio.to_thread(gn_open_orders, uid)
-    if _open:
-        _lft = _gn_left_min(_open[0])
-        _n = len(_open)
-        rows.append([InlineKeyboardButton(
-            _bi(f"📱 চলমান নাম্বার ({_n}) · {_lft} মিনিট",
-                f"📱 Current numbers ({_n}) · {_lft} min", en),
-            callback_data="gn:cur")])
     rows.append([InlineKeyboardButton(_bi("❌ বন্ধ", "❌ Close", en), callback_data="gn:close")])
     return await _gn_say(update, _bi(
         "📱 *নাম্বার নিন*\n\nসার্ভিস বেছে নিন — নতুন নাম্বার এনে দেওয়া হবে:",
@@ -9409,7 +9554,23 @@ async def _gn_place(update, ctx, service, item, en=False, retry_cb="gn:home"):
                "country": (info or {}).get("country") or "",
                "iso": (info or {}).get("iso") or "",
                "operator": (info or {}).get("operator") or ""}
-    return await _gn_say(update, _gn_order_text(row, en), _gn_order_kb(row, en))
+    # একসাথে ২টি নাম্বার (প্রথম ছবির মতো) — জায়গা/লিমিট থাকলে
+    _rows_g = [dict(row)]
+    try:
+        if oid and (_active + 1) < GN_MAX_OPEN:
+            _ok2, _val2, _info2, _raw2 = await asyncio.to_thread(
+                getnum_fetch, it["range"])
+            if _ok2 and _val2:
+                _oid2 = await asyncio.to_thread(gn_order_new, uid, service, it,
+                                                _val2, rate, _info2)
+                _row2 = (await asyncio.to_thread(gn_order_get, _oid2))
+                if _row2:
+                    _rows_g.append(dict(_row2))
+                    await asyncio.to_thread(_gn_log, uid, it, _val2, "ok", "")
+    except Exception as _e2:
+        log.debug(f"[GETNUM] ২য় নাম্বার: {str(_e2)[:100]}")
+    return await _gn_say(update, _gn_group_text(_rows_g, en),
+                         _gn_group_kb(_rows_g, en), parse_mode="HTML")
 
 
 def _gn_learn_many(pairs):
@@ -9590,15 +9751,33 @@ def _gn_feed_once():
     """সবার লাইভ OTP ফিড (পাবলিক) → প্যানেলে দেখাও + দেশ/রেঞ্জ শিখে নাও।"""
     url = getnum_feed_api()
     if not url:
+        _GN_FEED_DIAG["err"] = "ফিড URL খালি (সেটিংসে getnum_feed_api দিন)"
         return 0
-    try:
-        j = _gn_http_json(url, key=False, timeout=15)
-    except Exception as e:
-        log.debug(f"[GETNUM-FEED] {str(e)[:120]}")
+    # ⚠️ এই এন্ডপয়েন্টে API Key ছাড়া "Access Denied" আসে — তাই কী দিয়ে আগে
+    _j = None
+    _err = ""
+    for _uk in (True, False):
+        try:
+            _j = _gn_http_json(url, key=_uk, timeout=15)
+            _err = ""
+            break
+        except Exception as e:
+            _err = ("কী সহ: " if _uk else "কী ছাড়া: ") + str(e)[:140]
+    _GN_FEED_DIAG.update({"ts": _time.time(), "err": _err})
+    if _j is None:
+        log.warning(f"[GETNUM-FEED] {_err}")
         return 0
+    j = _j
     rows = j.get("data") if isinstance(j, dict) else (j if isinstance(j, list) else None)
+    if rows is None and isinstance(j, dict):
+        for _k6 in ("items", "rows", "list", "result"):
+            if isinstance(j.get(_k6), list):
+                rows = j[_k6]
+                break
     if not isinstance(rows, list):
+        _GN_FEED_DIAG["err"] = "ফিডে data লিস্ট নেই: " + str(list(j)[:6] if isinstance(j, dict) else j)[:120]
         return 0
+    _GN_FEED_DIAG["rows"] = len(rows)
     _GN_FEED_TS["ts"] = _time.time()
     pairs = []
     _fresh = []          # নতুন OTP → OTP চ্যানেলে (একই id আবার যাবে না)
@@ -9615,7 +9794,12 @@ def _gn_feed_once():
             for it in rows[:80]:
                 if not isinstance(it, dict):
                     continue
-                ext = str(it.get("id") or "")[:80]
+                ext = str(it.get("id") or "").strip()[:80]
+                if not ext:
+                    # ফিডে id না থাকলে সার্ভিস+নাম্বার+মেসেজের হ্যাশই চাবি
+                    _raw9 = "|".join(str(it.get(_k5) or "") for _k5 in
+                                     ("service", "number", "message", "otp", "sms"))
+                    ext = "h" + hashlib.md5(_raw9.encode("utf-8", "replace")).hexdigest()[:26]
                 if ext and ext in _GN_FEED_SEEN:
                     continue             # আগেই প্রসেস হয়েছে — DB ছোঁও না
                 svc = _gn_svc_label(it.get("service"))
@@ -9671,6 +9855,7 @@ def _gn_feed_once():
     except Exception as e:
         log.debug(f"[GETNUM-FEED] save: {str(e)[:120]}")
     # 📢 নতুন কোডগুলো OTP চ্যানেলে (আগে যাওয়া id আবার নয়, ঘণ্টায় ক্যাপ)
+    _GN_FEED_DIAG["fresh"] = len(_fresh)
     if _fresh:
         _sent_ch = 0
         for _it in _fresh[:GN_FEED_POST_MAX]:
@@ -9683,6 +9868,7 @@ def _gn_feed_once():
                     _sent_ch += 1
             except Exception as _ce:
                 log.debug(f"[GETNUM-FEED] চ্যানেল পোস্ট ব্যর্থ: {str(_ce)[:90]}")
+        _GN_FEED_DIAG["sent"] = _sent_ch
         if _sent_ch:
             log.info(f"[GETNUM-FEED] {_sent_ch}টি OTP চ্যানেলে গেছে")
     if pairs:
@@ -9787,12 +9973,22 @@ async def _gn_check_and_notify(bot_obj, o, quiet=False, rows=None):
         log.debug(f"[GETNUM] learn: {_le}")
     await asyncio.to_thread(_gn_ch_send, _gn_ch_text(row))
     if bot_obj:
+        # Markdown-এ কোনো অচেনা অক্ষর থাকলে Telegram পুরো মেসেজটাই
+        # ফেলে দেয় (ইনবক্সে OTP আসত না) — তাই ব্যর্থ হলে প্লেইন আবার
+        _txt_u = _gn_order_text(row, False)
+        _uid_u = int(row.get("user_id") or 0)
         try:
             await bot_obj.send_message(
-                int(row.get("user_id") or 0), _gn_order_text(row, False),
-                parse_mode="Markdown", reply_markup=_gn_order_kb(row, False))
+                _uid_u, _txt_u, parse_mode="Markdown",
+                reply_markup=_gn_order_kb(row, False))
         except Exception as e:
-            log.debug(f"[GETNUM] ইউজারকে OTP পাঠানো যায়নি: {e}")
+            log.warning(f"[GETNUM] Markdown পাঠানো যায়নি, প্লেইন চেষ্টা: {str(e)[:110]}")
+            try:
+                await bot_obj.send_message(
+                    _uid_u, _re.sub(r"[*_`]", "", _txt_u),
+                    reply_markup=_gn_order_kb(row, False))
+            except Exception as e2:
+                log.warning(f"[GETNUM] ইউজারকে OTP পাঠানো যায়নি: {str(e2)[:110]}")
     return True
 
 async def getnum_callback(update, ctx):
@@ -9917,7 +10113,17 @@ async def job_getnum_otp(context):
         log.warning(f"[GETNUM] job ব্যর্থ: {str(e)[:150]}")
 
 async def _shop_is_en(uid):
-    """ইউজারের ভাষা ইংরেজি কি না — ব্যর্থ হলে বাংলা ধরে নেয়।"""
+    """ইউজারের ভাষা ইংরেজি কি না — ব্যর্থ হলে বাংলা ধরে নেয়।
+
+    ⚡ ক্যাশে থাকলে thread hop ছাড়াই সাথে সাথে উত্তর — ইংরেজি/বাংলা
+    দুটোতেই একই গতি, বারবার একই ক্লিকে দেরি হয় না।
+    """
+    try:
+        _fast = _get_lang_fast(int(uid or 0))
+        if _fast is not None:
+            return _fast == "en"
+    except Exception:
+        pass
     try:
         return (await asyncio.to_thread(get_lang, uid)) == "en"
     except Exception:
@@ -10661,19 +10867,23 @@ def _shop_item_html(p, line):
     return f"<pre>{html.escape(str(line)[:1500])}</pre>"
 
 
-def _shop_deliver_body(p, content, qty=1, total=None):
+def _shop_deliver_body(p, content, qty=1, total=None, en=False):
+    """ডেলিভারির মেসেজ — ভাষা অনুযায়ী বাংলা/ইংরেজি।"""
     qty = int(qty or 1)
     show = total if total is not None else (float(p["price"] or 0) * qty)
-    head = html.escape(str(p["name"] or "")) + (f" × {qty} পিস" if qty > 1 else "")
+    head = html.escape(str(p["name"] or "")) + (
+        (f" × {qty} pcs" if en else f" × {qty} পিস") if qty > 1 else "")
     _lines = [ln for ln in str(content or "").splitlines() if ln.strip()] or [""]
     _body = "\n\n".join(_shop_item_html(p, ln) for ln in _lines)[:3500]
     _hint = ""
-    return (f"✅ <b>অর্ডার সম্পন্ন!</b>\n\n"
-            f"🛍 পণ্য: <b>{head}</b>\n"
-            f"💵 মূল্য: <b>{html.escape(_shop_money(show))}</b>\n\n"
-            f"📦 <b>আপনার প্রোডাক্ট:</b>{_hint}\n"
+    return (f"✅ <b>{'Order complete!' if en else 'অর্ডার সম্পন্ন!'}</b>\n\n"
+            f"🛍 {'Product' if en else 'পণ্য'}: <b>{head}</b>\n"
+            f"💵 {'Price' if en else 'মূল্য'}: <b>{html.escape(_shop_money(show))}</b>\n\n"
+            f"📦 <b>{'Your product' if en else 'আপনার প্রোডাক্ট'}:</b>{_hint}\n"
             f"{_body}\n\n"
-            f"⚠️ এই তথ্য কারও সাথে শেয়ার করবেন না। সমস্যা হলে সাপোর্টে মেসেজ দিন।")
+            + ("⚠️ Do not share this information with anyone. "
+               "Message support if there is any problem." if en else
+               "⚠️ এই তথ্য কারও সাথে শেয়ার করবেন না। সমস্যা হলে সাপোর্টে মেসেজ দিন।"))
 
 
 _SHOP_REMINDED = set()
@@ -10941,7 +11151,7 @@ async def _shop_buy_core(ctx, q, pid, count, note=""):
     except Exception:
         pass
     try:
-        await ctx.bot.send_message(uid, _shop_deliver_body(p, content, count, total),
+        await ctx.bot.send_message(uid, _shop_deliver_body(p, content, count, total, _en),
                                    parse_mode="HTML")
     except Exception as e:
         log.warning(f"[SHOP] ডেলিভারি মেসেজ ব্যর্থ uid={uid} pid={pid}: {e}")
@@ -11701,22 +11911,28 @@ async def shop_admin_input(update, ctx, st):
         ctx.user_data["state"] = "shopa_pprice"
         await update.message.reply_text(
             f"💵 *ধাপ ২/৩ — দাম*\n\n`{_md_esc(txt)}` এর দাম লিখুন — "
-            f"*টাকায়* (যেমন `25`), অথবা `$5` লিখলে ডলার ধরে নেবে।\n"
+            f"*ডলারে* (যেমন `0.01`), অথবা `25৳` লিখলে টাকা ধরে নেবে।\n"
             f"📊 রেট: 1$ = `{dep_rate():g}` ৳ — বট দাম ডলার আগে, পাশে টাকা দেখাবে।\n\n"
             "/cancel — বাতিল",
             parse_mode="Markdown")
         return True
 
     if st == "shopa_pprice":
-        _usd_in = txt.strip().startswith("$")
+        # 💵 ডিফল্ট ডলার (যেমন 0.01) — `25৳` লিখলে টাকা ধরা হয়
+        _raw = txt.strip().replace(",", ".")
+        _taka_in = ("৳" in _raw) or _raw.lower().endswith("bdt") \
+            or _raw.lower().startswith("bdt")
+        _num = (_raw.replace("৳", "").replace("$", "")
+                .replace("BDT", "").replace("bdt", "").strip())
         try:
-            price = float(txt.replace(",", ".").replace(_shop_cur(), "")
-                          .replace("$", "").strip())
-            if _usd_in:                       # `$5` → রেট ধরে টাকায়
-                price = round(price * dep_rate(), 2)
+            _v = float(_num)
+            if _taka_in:                      # `25৳` → টাকা
+                price = round(_v, 4)
+            else:                             # ডলার → রেটে টাকা
+                price = round(_v * float(dep_rate() or 125), 4)
         except Exception:
             await update.message.reply_text(
-                "❌ শুধু সংখ্যা লিখুন (যেমন `25` অথবা `$0.2`)।", parse_mode="Markdown")
+                "❌ শুধু সংখ্যা লিখুন (যেমন `0.01` অথবা `25৳`)।", parse_mode="Markdown")
             return True
         if price < 0:
             await update.message.reply_text("❌ দাম ঋণাত্মক হতে পারে না।")
@@ -11824,7 +12040,10 @@ async def shop_admin_input(update, ctx, st):
             return True
         p = {"name": o["product_name"], "price": o["price"]}
         try:
-            await ctx.bot.send_message(int(o["user_id"]), _shop_deliver_body(p, txt), parse_mode="HTML")
+            _en_u = await _shop_is_en(int(o["user_id"]))
+            await ctx.bot.send_message(int(o["user_id"]),
+                                       _shop_deliver_body(p, txt, en=_en_u),
+                                       parse_mode="HTML")
         except Exception as e:
             await update.message.reply_text(f"❌ ইউজারকে পাঠানো যায়নি: {e}")
             return True
@@ -20480,7 +20699,9 @@ async def show_profile(update, ctx):
         f"{T(uid,'pf_rejected')} `{st['rejected']}`\n\n"
         f"{T(uid,'pf_earned')} `${st['earned']:.2f}`\n"
         f"{T(uid,'pf_withdrawn')} `${st['withdrawn']:.2f}`\n"
-        f"{T(uid,'pf_available')} `${_total_usd:.2f}`\n"
+        f"💳 {('ডিপোজিট ব্যালেন্স' if str(_lang or 'bn') != 'en' else 'Deposit balance')}: "
+        f"`{_shop_money(_dep_bal)}`\n"
+        f"{T(uid,'pf_available')} `{_shop_money(_total_usd * _rate)}`\n"
         f"{T(uid,'pf_on_hold')} `${st['hold']:.2f}`\n\n"
         f"{T(uid,'status_active')}",
         parse_mode="Markdown"
@@ -24242,6 +24463,50 @@ async def cmd_testleaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ *Leaderboard পাঠানো হচ্ছে...*", parse_mode="Markdown")
     await job_post_leaderboard(ctx, force=True)
     await update.message.reply_text("✅ *Leaderboard পাঠানো হয়েছে।*", parse_mode="Markdown")
+
+
+async def cmd_otpdiag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """🩺 `/otpdiag` — OTP কী/API/চ্যানেল এক নজরে। `/otpdiag send` = টেস্ট পোস্ট।"""
+    uid = update.effective_user.id
+    if not await asyncio.to_thread(is_admin, uid):
+        await update.message.reply_text(
+            "❌ *এই command শুধু Admin ব্যবহার করতে পারবে।*", parse_mode="Markdown")
+        return
+    _a = " ".join(str(x) for x in (getattr(ctx, "args", None) or [])).strip().lower()
+    _key = getnum_key()
+    _out = ["🩺 *OTP ডায়াগনস্টিক*"]
+    _out.append("সেটিং চালু: " + ("✅" if getnum_on() else "❌ বন্ধ"))
+    _out.append("API কী: " + (f"✅ {len(_key)} অক্ষর" if _key else "❌ নেই (ওয়েবে দিন)"))
+    _out.append("`header`: `" + getnum_header() + "`")
+    _out.append("SMS API: `" + getnum_sms_api()[:70] + "`")
+    _out.append("ফিড API: " + (("`" + getnum_feed_api()[:70] + "`")
+                              if getnum_feed_api() else "❌ খালি"))
+    _out.append("OTP চ্যানেল: `" + str(getnum_ch_id()) + "`")
+    _out.append("বট লিংক: " + (_gn_bot_link() or "❌ নেই"))
+    try:
+        _rows = await asyncio.to_thread(getnum_sms_all)
+    except Exception as _e:
+        _rows = []
+        _out.append("SMS কল ব্যর্থ: " + str(_e)[:160])
+    _out.append("SMS rows: " + str(len(_rows)))
+    if _rows:
+        _out.append("প্রথম row-এর ফিল্ড: " + ", ".join(list(_rows[0])[:8]))
+    try:
+        await asyncio.to_thread(_gn_feed_once)
+    except Exception as _e:
+        _out.append("ফিড কল ব্যর্থ: " + str(_e)[:160])
+    _d = _GN_FEED_DIAG
+    _out.append("ফিড rows: %s · নতুন: %s · চ্যানেলে: %s"
+                % (_d.get("rows"), _d.get("fresh"), _d.get("sent")))
+    if _d.get("err"):
+        _out.append("ফিড error: `" + str(_d["err"])[:220] + "`")
+    if _a == "send":
+        _ok = await asyncio.to_thread(_gn_ch_send, _gn_ch_text({
+            "service": "OTP Test", "range_val": "23767XXX", "country": "CAMEROON",
+            "iso": "CM", "otp": "123456", "sms": "<#> 123456 is your test code"}))
+        _out.append("টেস্ট পোস্ট: " + ("✅ গেছে" if _ok else "❌ যায়নি (চ্যানেল/বট এডমিন চেক করুন)"))
+    _out.append("\n💡 টেস্ট পোস্ট: `/otpdiag send`")
+    await update.message.reply_text("\n".join(_out), parse_mode="Markdown")
 
 
 async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -39218,6 +39483,21 @@ def main():
                 await asyncio.to_thread(_perf_indexes)        # hot-path ইনডেক্স
                 await asyncio.to_thread(_backfill_devices)    # পুরোনো হ্যাশ → devices
                 await asyncio.to_thread(_dep_backfill)        # পুরোনো ডিপোজিট-হিসাব
+                try:
+                    _sp_n, _sp_r = await asyncio.to_thread(shop_price_usd_migrate)
+                    if _sp_n:
+                        try:
+                            await application.bot.send_message(
+                                ADMIN_ID,
+                                "💵 *দোকানের দাম ঠিক করা হলো*\n\n"
+                                f"📦 `{_sp_n}`টি পণ্যের দাম ডলার হিসেবে ধরে ৳-তে বদলানো হলো "
+                                f"(রেট `{_sp_r:g}`৳ = ১$)।\n"
+                                "এখন বটে দেখাবে যেমন: `0.01$ · 1.25 ৳`।",
+                                parse_mode="Markdown")
+                        except Exception:
+                            pass
+                except Exception as _spe:
+                    log.warning(f"[SHOP-PRICE] startup: {_spe}")
                 _mg_n, _mg_r = await asyncio.to_thread(dep_bal_taka_auto_migrate)
                 if _mg_n:
                     try:
@@ -39708,6 +39988,7 @@ def main():
 
     app.add_handler(CommandHandler("start",       _gate(cmd_start)))
     app.add_handler(CommandHandler("depchk",      cmd_depchk))
+    app.add_handler(CommandHandler("otpdiag",     cmd_otpdiag))
     app.add_handler(CommandHandler("earnchk",     cmd_earnchk))
     app.add_handler(CommandHandler("mail",        cmd_mail))
     app.add_handler(CommandHandler("setproxy",    cmd_setproxy))
