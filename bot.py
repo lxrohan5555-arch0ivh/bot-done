@@ -161,7 +161,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-18b128"
+BUILD_TAG       = "uid-auto-2026-11-18b134"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -6922,11 +6922,39 @@ def smm_channel_claim(oid):
         return False
 
 
+def _usd_exact(n, r=None):
+    """৳ → $ এমনভাবে লেখো যে রেট দিয়ে গুণ করলে আবার ঠিক ওই ৳-ই আসে।
+
+    আগে সব সময় ২ ঘর হতো (49.42৳ ÷ 125 = 0.40$), তাই 0.40$ × 125 = 50৳
+    হয়ে দাম মিলত না। এখন যত ঘর লাগে তত ঘর নেওয়া হয় (0.3954$)।
+    """
+    try:
+        n = round(float(n or 0), 2)
+    except Exception:
+        n = 0.0
+    try:
+        r = float(r or dep_rate() or 125)
+    except Exception:
+        r = 125.0
+    if r <= 0:
+        r = 125.0
+    v = n / r
+    for _d in (2, 3, 4, 6):
+        _s = f"{v:,.{_d}f}"
+        try:
+            if abs(round(float(_s.replace(",", "")) * r, 2) - n) < 0.01:
+                return _s.rstrip("0").rstrip(".") or "0"
+        except Exception:
+            pass
+    return (f"{v:,.6f}".rstrip("0").rstrip(".") or "0")
+
+
 def _shop_money(v):
     """দাম/ব্যালেন্স — আগে ডলার, পাশে অ্যাডমিনের রেটে টাকা: `$0.2 · 25 ৳`।
 
     ভিতরে সব অঙ্ক টাকায় থাকে (ডিপোজিট/ডাটাবেস), শুধু দেখানোর সময়
-    ডলার আগে বসে।
+    ডলার আগে বসে। ডলারটা এমন ঘরে দেখানো হয় যাতে রেট দিয়ে গুণ করলে
+    ঠিক ওই টাকার অঙ্কই ফেরত আসে।
     """
     try:
         n = float(v or 0)
@@ -6938,7 +6966,7 @@ def _shop_money(v):
         _r = 125.0
     if _r <= 0:
         _r = 125.0
-    out = _usd_txt(n / _r)
+    out = _usd_exact(n, _r) + "$"
     try:
         out += " · " + taka_txt(n)
     except Exception:
@@ -8169,7 +8197,7 @@ def getnum_header():
 
 def getnum_key():
     try:
-        return str(get_setting("getnum_key") or "").strip()
+        return _re.sub(r"\s+", "", str(get_setting("getnum_key") or ""))
     except Exception:
         return ""
 
@@ -8394,7 +8422,15 @@ def _gn_parse(raw):
         j = _json.loads(txt)
     except Exception:
         got = _gn_phone(txt)
-        return (got, "", {}) if got else (None, txt[:250], {})
+        if got:
+            return got, "", {}
+        # প্লেইন টেক্সটে লেবেল থাকতে পারে — "Number: +8801712345678"
+        _m = _re.fullmatch(r"\D{0,14}\+?\d{7,16}\D{0,4}", txt.strip())
+        if _m:
+            _num = _re.search(r"\+?\d{7,16}", txt)
+            if _num:
+                return _num.group(0), "", {}
+        return None, txt[:250], {}
     info = {}
     if isinstance(j, dict) and isinstance(j.get("data"), dict):
         d = j["data"]
@@ -8543,14 +8579,28 @@ def gn_find_otp(o, rows=None):
     if not mine or not rows:
         return None
     last = str(o.get("last_nid") or "")
-    for it in rows:
-        if str(it.get("nid") or "") and str(it.get("nid")) == last:
+    _seen_txt = str(o.get("otp") or "").strip()
+    # ⚠️ শুধু নয়-নতুন nid বাদ দিলে পুরোনো কোড আবার "নতুন" হয়ে চলে যেত।
+    #    তাই শেষ দেওয়া nid-এর *পরের* সারিগুলোই দেখা হয়; nid লিস্টে না
+    #    থাকলে একই কোড-লেখা আবার পাঠানো হয় না।
+    _start = 0
+    if last:
+        for _i, _it in enumerate(rows):
+            if str(_it.get("nid") or "") == last:
+                _start = _i + 1
+                break
+    for it in rows[_start:]:
+        if last and not _start and str(it.get("nid") or "") == last:
             continue
         otn = _gn_norm_num(it.get("number"))
         if not otn or len(otn) < 7:
             continue
-        if otn == mine or otn.endswith(mine) or mine.endswith(otn):
-            return it
+        if not (otn == mine or otn.endswith(mine) or mine.endswith(otn)):
+            continue
+        _otp_txt = str(it.get("otp") or "").strip()
+        if _seen_txt and _otp_txt and _otp_txt == _seen_txt:
+            continue                     # একই কোড আবার নয়
+        return it
     return None
 
 def _gn_log(uid, rng, number, status, detail=""):
@@ -8569,7 +8619,7 @@ def _gn_log(uid, rng, number, status, detail=""):
 def gn_order_new(uid, service, item, number, price, info=None):
     info = info or {}
     with _c() as c:
-        r = c.execute(
+        cur = c.execute(
             "INSERT INTO getnum_orders (user_id,service,range_name,range_val,number,"
             "price,status,country,iso,operator,ts,created_at,updated_at) "
             "VALUES (%s,%s,%s,%s,%s,%s,'waiting',%s,%s,%s,%s,%s,%s) RETURNING id",
@@ -8577,8 +8627,16 @@ def gn_order_new(uid, service, item, number, price, info=None):
              str(item.get("range") or "")[:40], str(number)[:32], float(price or 0),
              str(info.get("country") or "")[:40], str(info.get("iso") or "")[:8],
              str(info.get("operator") or "")[:40],
-             _time.time(), now(), now())).fetchone()
-    return int(r["id"])
+             _time.time(), now(), now()))
+        r = cur.fetchone()
+        if r:
+            return int(r["id"])
+        # RETURNING সাপোর্ট না করলে (SQLite/পুরোনো ড্রাইভার) এই সারিটাই খুঁজি
+        row = c.execute(
+            "SELECT id FROM getnum_orders WHERE user_id=%s AND number=%s "
+            "ORDER BY id DESC LIMIT 1",
+            (int(uid), str(number)[:32])).fetchone()
+        return int(row["id"]) if row else 0
 
 def gn_order_get(oid):
     try:
@@ -9004,13 +9062,28 @@ async def getnum_range_input(update, ctx):
 
 
 def _gn_http_json(url, key=True, timeout=20):
+    """Zenex/Dongvan কল — কী header-এ না চললে query/Bearer-েও চেষ্টা।"""
     headers = {"Accept": "application/json", "User-Agent": "TaskEarnBot/1.0"}
-    _k = getnum_key()
-    if key and _k:
-        headers[getnum_header()] = _k
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return _json.loads(r.read().decode("utf-8", "replace"))
+    _k = getnum_key() if key else ""
+    _hdr = getnum_header() or "mapikey"
+    _tries = [("header", _k), ("query", _k), ("bearer", _k)] if _k else [(None, "")]
+    _last = None
+    for _mode, _val in _tries:
+        _u = url
+        _h = dict(headers)
+        if _mode == "header":
+            _h[_hdr] = _val
+        elif _mode == "query":
+            _u = url + ("&" if "?" in url else "?") + _hdr + "=" + urllib.parse.quote(_val)
+        elif _mode == "bearer":
+            _h["Authorization"] = "Bearer " + _val
+        try:
+            req = urllib.request.Request(_u, headers=_h, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return _json.loads(r.read().decode("utf-8", "replace"))
+        except Exception as _e:
+            _last = _e
+    raise _last
 
 
 def _gn_sync_once():
@@ -14264,7 +14337,11 @@ def dep_watch_sec():
 
 
 def _mail_win_min():
-    """চেকের কত মিনিট আগে/পরে আসা মেইল ধরা হবে (ডিফল্ট ৩ মিনিট)।"""
+    """চেকের কত মিনিট আগে/পরে আসা মেইল ধরা হবে (ডিফল্ট ৩ মিনিট)।
+
+    মালিকের পছন্দ: ৩ মিনিটই থাক — নতুন মেইল এলে আলাদা নোটিফিকেশন
+    সিস্টেম আছে, তাই দেরিতে চেক করলেও পেমেন্ট হারায় না।
+    """
     try:
         return max(1, min(1440, int(str(get_setting("mail_win_min") or "3"))))
     except Exception:
@@ -14417,6 +14494,9 @@ _MAIL_IN_WORDS = (
     "incoming transfer", "received a payment", "you received", "you've received",
     "you have received", "payment received", "received an incoming",
     "incoming payment", "received your transfer", "পেমেন্ট পেয়েছেন",
+    # Binance-এর আসল সাবজেক্ট: "[Binance] Payment Receive Successful" —
+    # বডিতে "you received" না থাকলেও এটা যেন বাদ না পড়ে
+    "payment receive", "receive successful", "receive payment",
 )
 
 # টাকা পাঠানো/উত্তোলনের মেইল — ভুল করে ডিপোজিট গোনা যাবে না
@@ -15256,8 +15336,13 @@ def dep_set_pay(oid, pay_key, pay_ts=0):
         return False
 
 
-def _mail_pick_deposit(pay, pendings, max_age_min=0, early_min=180, late_min=10):
-    """এই পেমেন্টের সাথে কোন পেন্ডিং ডিপোজিট মেলে — (ডিপোজিট বা None)।"""
+def _mail_pick_deposit(pay, pendings, max_age_min=0, early_min=None, late_min=None):
+    """এই পেমেন্টের সাথে কোন পেন্ডিং ডিপোজিট মেলে — (ডিপোজিট বা None)।
+
+    early_min/late_min না দিলে অ্যাডমিনের চেক-উইন্ডো (`mail_win_min`) ব্যবহৃত
+    হয় — আগে এখানে ১৮০/১০ মিনিট হার্ডকোড ছিল, তাই উইন্ডো ৩ মিনিট হলেও
+    ৩ ঘণ্টা আগের মেইল অটো-ক্রেডিট হয়ে যেত।
+    """
     amt = float(pay.get("amount") or 0)
     sender = str(pay.get("sender") or "").strip().casefold()
     if amt <= 0:
@@ -16999,11 +17084,11 @@ async def dep_callback(update, ctx):
                     _w = await ctx.bot.send_message(
                         uid,
                         (f"🔎 *Checking your payment…*\n"
-                         f"⏱ Looking at payments within ±{_wn0} minutes — "
+                         f"⏱ Do everything within {_wn0} minutes — "
                          "if it matches, the balance is added automatically."
                          if _lb else
                          f"🔎 *আপনার পেমেন্ট চেক করা হচ্ছে…*\n"
-                         f"⏱ ±{_wn0} মিনিটের পেমেন্ট দেখা হচ্ছে — "
+                         f"⏱ {_wn0} মিনিটের মধ্যে সব করতে হবে — "
                          "মিললে ব্যালেন্স অটো এড হবে।"),
                         parse_mode="Markdown")
                 except Exception:
@@ -39382,11 +39467,14 @@ def smm_price(rate, qty):
     ডলারে হলে USD→৳ রেট দিয়ে গুণ করা হয়।
     """
     cfg = smm_cfg()
-    base = (float(rate) / 1000.0) * int(qty)
+    unit = float(rate) / 1000.0            # প্রতি ইউনিটের প্যানেল দাম
     if cfg.get("cur_eff") == "usd":
-        base *= float(cfg["usd"])
+        unit *= float(cfg["usd"])
+    base = unit * int(qty)
+    # ধাপের % সবসময় "প্রতি ১০০০"-এর দামে ঠিক হয় — তাই ১০০-এর দাম
+    # ১০০০-এর ঠিক ১/১০ হয় (আগে অর্ডারের মোট অঙ্কে হতো, তাই দাম এলোমেলো লাগত)।
     try:
-        _pct = smm_markup_pct(base)
+        _pct = smm_markup_pct(unit * 1000.0)
     except Exception:
         _pct = float(cfg["markup"])
     return round(base * (1.0 + _pct / 100.0), 2)
@@ -39407,8 +39495,12 @@ def smm_price_for(s, qty):
     return smm_price(s["rate"], qty)
 
 
-def smm_price_from_charge(charge):
-    """প্যানেলের `charge` (প্যানেলের মুদ্রায়) → ইউজারের ৳ (markup সহ)।"""
+def smm_price_from_charge(charge, qty=0):
+    """প্যানেলের `charge` (প্যানেলের মুদ্রায়) → ইউজারের ৳ (markup সহ)।
+
+    qty দিলে ধাপের % প্রতি-১০০০ দামে হিসাব হয় — কার্ডে দেখানো দামের সাথে
+    মিলে যায় (নাহলে ছোট অর্ডারে বেশি কাটা পড়ত)।
+    """
     try:
         base = float(str(charge).replace(",", "").replace("$", "").strip())
     except Exception:
@@ -39418,8 +39510,14 @@ def smm_price_from_charge(charge):
     cfg = smm_cfg()
     if cfg.get("cur_eff") == "usd":
         base *= float(cfg["usd"])
+    _q = 0
     try:
-        _pct = smm_markup_pct(base)
+        _q = int(qty or 0)
+    except Exception:
+        _q = 0
+    _ref = (base * 1000.0 / _q) if _q > 0 else base
+    try:
+        _pct = smm_markup_pct(_ref)
     except Exception:
         _pct = float(cfg["markup"])
     return round(base * (1.0 + _pct / 100.0), 2)
@@ -39445,7 +39543,15 @@ def _smm_settle_once(uid, oid, api_id, taken):
         return taken, "", False
     if not isinstance(js, dict):
         return taken, "", False
-    real = smm_price_from_charge(js.get("charge"))
+    _qty = 0
+    try:
+        with _c() as _c1:
+            _orow = _c1.execute("SELECT qty FROM smm_orders WHERE id=%s",
+                                (int(oid),)).fetchone()
+        _qty = int(_orow["qty"] or 0) if _orow else 0
+    except Exception:
+        _qty = 0
+    real = smm_price_from_charge(js.get("charge"), _qty)
     if real is None or real <= 0:
         return taken, "", False
     diff = round(real - taken, 2)
@@ -40623,7 +40729,7 @@ def _smm_dual(v):
         r = 125.0
     if r <= 0:
         r = 125.0
-    s = _usd_txt(n / r) + "/"
+    s = _usd_exact(n, r) + "$/"
     s += f"{n:g}৳" if abs(n) >= 1 else f"{n:.2f}৳"
     return s
 
