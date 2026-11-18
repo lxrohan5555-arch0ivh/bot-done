@@ -329,11 +329,14 @@ def shop_getnum_save():
         "getnum_group_url": (form.get("getnum_group_url") or "").strip()[:300],
         "getnum_list_api": (form.get("getnum_list_api") or "").strip()[:400],
         "getnum_feed_api": (form.get("getnum_feed_api") or "").strip()[:400],
-        "getnum_services": _json.dumps(groups, ensure_ascii=False)[:6000],
     }
+    # হাতে লেখার বক্স আর নেই — ফিল্ড না এলে আগের লিস্টটাই অক্ষত থাকে
+    if form.get("getnum_services_text") is not None:
+        vals["getnum_services"] = _json.dumps(groups, ensure_ascii=False)[:30000]
     # কী-তে লুকানো স্পেস/নিউলাইন/ZWSP থাকলে API গ্রহণ করে না — পরিষ্কার করি
     _k = "".join((form.get("getnum_key") or "").split())[:300]
-    if _k:
+    # বক্সে আগের কী-এর মাস্ক করা লেখা (ZNX_G7N…TJWO) থাকলে সেটা সেভ হবে না
+    if _k and "…" not in _k and "*" not in _k:
         vals["getnum_key"] = _k
     try:
         import bot as _bs
@@ -496,8 +499,9 @@ def _gn_page_html():
         num(sum(len(sv.get("items") or []) for sv in _gn_svcs)) + "টি</div>",
         "<form method='post' action='/admin/shop/getnum'>",
         "<div class='field'><label>অপশন</label><select name='getnum_on'>" + _gn_sel + "</select></div>",
-        "<div class='field'><label>API Key (mapikey) — খালি রাখলে আগেরটাই থেকে যাবে</label>"
-        "<input name='getnum_key' placeholder='এখানে API Key পেস্ট করুন' autocomplete='off'></div>",
+        "<div class='field'><label>API Key (mapikey) — সেভ আছে; বদলাতে চাইলে পুরোটা মুছে নতুনটা দিন</label>"
+        f"<input name='getnum_key' value='{esc(_gn_key_mask)}' autocomplete='off' "
+        "placeholder='এখানে API Key পেস্ট করুন'></div>",
         "<div class='field'><label>নাম্বার আনার API URL</label>"
         f"<input name='getnum_api' value='{esc(_gn_api)}'></div>",
         "<div class='field'><label>OTP চেক করার API URL — "
@@ -518,15 +522,9 @@ def _gn_page_html():
         f"<input name='getnum_feed_api' value='{esc(_gn_feedapi)}'></div>",
         "<div class='field'><label>Key যে হেডারে যাবে</label>"
         f"<input name='getnum_header' value='{esc(_gn_hdr)}'></div>",
-        "<div class='field'><label>সার্ভিস | দেশ | range | রেট ৳/OTP (০ = উপরের রেট) — প্রতি লাইনে একটা, "
-        f"এখন {num(sum(len(sv.get('items') or []) for sv in _gn_svcs))}টি</label>",
-        "<textarea name='getnum_services_text' rows='10' style='width:100%' ",
-        "placeholder='📘 Facebook | 🇨🇲 Cameroon | 23769XXXX | 0.25&#10;"
-        "📘 Facebook | 🇬🇧 UK | 4473845XXX | 0.30&#10;"
-        "📸 Instagram | 🇨🇲 Cameroon | 23769XXXX | 0.28'>" + _gn_txt + "</textarea>",
-        "<div class='mut' style='font-size:11px;margin-top:4px'>⬆️ ধূসর লেখা শুধু উদাহরণ। "
-        "দাম 0 দিলে ইউজারের কাছ থেকে টাকা কাটবে না। একই সার্ভিসের অনেক দেশ একই নাম দিয়ে "
-        "লিখলে বটে এক বাটনের ভিতরে সব দেশ দেখাবে।</div></div>",
+        "<div class='mut' style='font-size:12px;margin:4px 0 10px'>✅ সার্ভিস/দেশ/রেঞ্জ "
+        f"({num(sum(len(sv.get('items') or []) for sv in _gn_svcs))}টি) বট নিজেই লাইভ ফিড থেকে "
+        "যোগ করে — এখানে হাতে কিছু করতে হবে না।</div>",
         "<button class='ok sm' type='submit'>💾 সেভ করুন</button>",
         " <a class='btn gray sm' href='/admin/shop/getnum/test'>🧪 টেস্ট (প্রথম নাম্বার)</a>",
         "</form>",

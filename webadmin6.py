@@ -468,11 +468,18 @@ def deposit_approve(did):
         except Exception:
             pass
         return redirect("/admin/deposits?err=এটি আগেই প্রসেস হয়েছে")
-    amt = float(d["amount"] or 0)
+    amt = float(d["amount"] or 0)          # deposits.amount ডলারে থাকে
     # 💳 ডিপোজিটের টাকা ডিপোজিট ওয়ালেটে (৳) — earn ব্যালেন্স আলাদা থাকে
+    try:
+        import bot as _brate
+        _bdt = _brate.usd_to_taka(amt)     # $ → ৳ (QR রেট)
+        _bdt_txt = _brate.taka_txt(_bdt)
+    except Exception:
+        _bdt = amt
+        _bdt_txt = f"{_bdt:g} ৳"
     _x("UPDATE users SET dep_balance=COALESCE(dep_balance,0)+%s, "
        "dep_total=COALESCE(dep_total,0)+%s WHERE user_id=%s",
-       (amt, amt, int(d["user_id"] or 0)))
+       (_bdt, _bdt, int(d["user_id"] or 0)))
     try:
         import bot as _bcache
         _bcache._invalidate_user_cache(int(d["user_id"] or 0))   # বটের ক্যাশে পুরোনো ব্যালেন্স না থাকে
@@ -487,12 +494,12 @@ def deposit_approve(did):
     # ডিপোজিট আইডি দিয়ে ডুপ্লিকেট আটকে যায়, Deposit ID উপরে + বাটন থাকে)
     try:
         import bot as _bch2
-        _bch2.dep_ch_notify(int(did), int(d["user_id"] or 0), amt,
+        _bch2.dep_ch_notify(int(did), int(d["user_id"] or 0), _bdt,
                             str(d["method_name"] or ""), str(d["txid"] or ""))
     except Exception:
         pass
     queue_user_msg(int(d["user_id"]),
-                   f"✅ ডিপোজিট অনুমোদিত!\n\n💵 {_fmt(amt)} যোগ হয়েছে\n🧾 #{did}")
+                   f"✅ ডিপোজিট অনুমোদিত!\n\n💵 {_bdt_txt} যোগ হয়েছে\n🧾 #{did}")
     log_admin("deposit_approve", did, f"uid={d['user_id']} amount={amt}")
     try:
         tg_admin_notify(f"💳 <b>Deposit approved (web)</b>\n\n🧾 #{did}"
