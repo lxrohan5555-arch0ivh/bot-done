@@ -545,8 +545,8 @@ def _gn_page_html():
                       + _feed_html + "</div>")
     else:
         _diag_html = ("<div class='mut' style='font-size:12px;margin-top:12px'>"
-                      "⛔ লাইভ OTP ফিড বন্ধ — কোনো ফিড API কল বা ডাটাবেজ সেভ হচ্ছে না, "
-                      "তাই খরচ নেই।</div>")
+                      "⛔ লাইভ OTP ফিড সেকশন বন্ধ — কোনো ডাটাবেজ সেভ বা চ্যানেলে পোস্ট হচ্ছে না। "
+                      "শুধু বটের দেশের পাশের কাউন্টের জন্য ফিডটা পড়া হয় (কোনো সেভ নেই)।</div>")
     getnumcard = "".join([
         "<div class='card'><b>📱 নাম্বার নিন (OTP)</b>",
         "<div class='mut' style='font-size:12px;margin:6px 0'>বটের কীবোর্ডে “📱 নাম্বার নিন” → "

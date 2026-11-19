@@ -51,6 +51,7 @@ BTN_STYLE_ON = True
 
 # লাল (বাতিল/বিপজ্জনক)
 _BTN_DANGER_W = (
+    "🔙", "back", "ফিরে", "পিছনে",
     "❌", "🗑", "⛔", "🚫", "cancel", "বাতিল", "close", "বন্ধ", "delete",
     "ডিলিট", "মুছে", "reject", "রিজেক্ট", "ban", "ব্যান", "refund",
     "রিফান্ড", "stop", "remove", "রিমুভ", "log out", "লগআউট",
@@ -62,6 +63,12 @@ _BTN_SUCCESS_W = (
     "join", "যোগ দিন", "verify", "যাচাই", "live", "চালু করুন", "active",
     "আনলক", "unlock", "success", "সফল",
     "otp group", "otp গ্রুপ",
+)
+# নীল (কাজ/নেভিগেশন: Change, Refresh, Shop, Admin, Panel, Settings)
+_BTN_PRIMARY_W = (
+    "change", "পরিবর্ত", "বদলান", "refresh", "রিফ্রেশ", "shop", "শপ", "দোকান",
+    "পণ্য কিনুন", "buy product", "admin", "অ্যাডমিন", "panel", "প্যানেল",
+    "settings", "সেটিং", "webadmin",
 )
 
 
@@ -75,15 +82,32 @@ def _btn_style_guess(btn):
         return "success"
     # callback_data-এর আন্ডারস্কোর/কোলন ফাঁকা করে নিলে _cancel, :close সবই ধরা পড়ে
     _cb = _cbraw.replace("_", " ").replace(":", " ")
-    hay = ((btn.get("text") or "") + " " + _cb).lower()
-    for words, style in ((_BTN_DANGER_W, "danger"), (_BTN_SUCCESS_W, "success")):
+    _txt = (btn.get("text") or "").lower()
+    hay = (_txt + " " + _cb).lower()
+
+    def _hit(words, src):
         for w in words:
             if w.isascii():
-                if re.search(r"\b" + re.escape(w) + r"\b", hay):
-                    return style
-            elif w in hay:
-                return style
-    return "primary"
+                if re.search(r"\b" + re.escape(w) + r"\b", src):
+                    return True
+            elif w in src:
+                return True
+        return False
+
+    # 🔴 লাল: Back / বাতিল / ডিলিট — সবার আগে, সব মেনুতেই একই নিয়ম
+    if _hit(_BTN_DANGER_W, hay):
+        return "danger"
+    # 🟢 সবুজ (Save / Done / Approve / চালু) — অ্যাডমিন প্যানেলেও কাজের বাটন সবুজ
+    if _hit(_BTN_SUCCESS_W, _txt):
+        return "success"
+    # 🔵 নীল: Change / Refresh / Shop / Admin / Panel / Settings
+    #    ⚠️ শুধু বাটনের লেখায় মিলবে — callback_data-য় নয়।
+    #    না হলে "smm:..." কলব্যাকের কারণে SMM-এর সব বাটনই নীল হয়ে যেত।
+    if (_hit(_BTN_PRIMARY_W, _txt)
+            or _cbraw.lower().startswith(("adm_", "adm:", "admin", "webadmin"))):
+        return "primary"
+    # 🟢 সবুজ: আইটেম/লিস্ট (Task-এর ভিতরের সব বাটনসহ) — ডিফল্ট
+    return "success"
 
 
 def _patch_markup_style(cls, key):
@@ -9195,37 +9219,154 @@ def _gn_live_rows(mins=10):
     return rows
 
 
-def _gn_live_counts(mins=10, service=None):
-    """শেষ N মিনিটে দেশ/রেঞ্জপ্রতি কত OTP কোড — রেঞ্জ বাটনের পাশে দেখানোর জন্য।
+_GN_FEED_MEM = {"ts": 0.0, "rows": []}   # পাবলিক ফিড (শুধু মেমরি — DB সেভ নেই)
+_GN_FEED_MEM_TTL = 60                     # সেকেন্ড — ফিড কতক্ষণে আবার পড়া হবে
+_GN_CNT_TTL = 60                          # কাউন্ট ক্যাশ
 
+
+def _gn_feed_item_ts(r):
+    """ফিডের একটা আইটেমের সময় (epoch) — না পেলে 0।"""
+    for _k in ("created_at", "time", "date", "timestamp", "ts",
+               "received_at", "updated_at"):
+        v = (r or {}).get(_k)
+        if v in (None, "", 0):
+            continue
+        try:
+            f = float(v)
+            if f > 1e12:
+                f /= 1000.0          # মিলিসেকেন্ড
+            if f > 1e9:
+                return f
+        except Exception:
+            pass
+        s = str(v).strip().replace("T", " ")[:19]
+        for _fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                     "%d/%m/%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S"):
+            try:
+                return datetime.strptime(s, _fmt).replace(
+                    tzinfo=pytz.timezone("Asia/Dhaka")).timestamp()
+            except Exception:
+                pass
+    return 0.0
+
+
+def _gn_feed_mem(force=False):
+    """প্যানেলের পাবলিক লাইভ ফিড (সব ইউজারের OTP) — শুধু পড়া, মেমরিতে রাখা।
+
+    ⛔ GN_FEED_ON বন্ধ থাকলেও এখানে কিছু সেভ/পোস্ট হয় না — শুধু সংখ্যা গুনতেই
+    পড়া হয়। কল ব্যর্থ হলে আগের ডেটাই ফেরত দেয় (তাই হঠাৎ ০ হয় না)।
+    """
+    _t = _time.time()
+    _hit = _GN_FEED_MEM.get("rows") or []
+    if (not force and _hit
+            and (_t - float(_GN_FEED_MEM.get("ts") or 0)) < _GN_FEED_MEM_TTL):
+        return _hit
+    try:
+        _url = getnum_feed_api()
+    except Exception:
+        _url = ""
+    if not _url:
+        return _hit
+    _js = None
+    for _uk in (True, False):
+        try:
+            _js = _gn_http_json(_url, key=_uk, timeout=10)
+            break
+        except Exception:
+            _js = None
+    if _js is None:
+        return _hit                  # কল ব্যর্থ → আগের সংখ্যাই থাক
+    _rows = _js.get("data") if isinstance(_js, dict) else _js
+    if _rows is None and isinstance(_js, dict):
+        for _k12 in ("items", "rows", "list", "result"):
+            if isinstance(_js.get(_k12), list):
+                _rows = _js[_k12]
+                break
+    if not isinstance(_rows, list):
+        return _hit
+    _rows = [x for x in _rows[:300] if isinstance(x, dict)]
+    if not _rows:
+        return _hit
+    _GN_FEED_MEM.update({"ts": _t, "rows": _rows})
+    return _rows
+
+
+_GN_CNT_CACHE = {}          # সার্ভিস-লেবেল → (সময়, {দেশ/রেঞ্জ: সংখ্যা})
+
+
+def _gn_live_counts(mins=10, service=None):
+    """শেষ N মিনিটে দেশ/রেঞ্জপ্রতি কত OTP এসেছে — রেঞ্জ বাটনের পাশে দেখানোর জন্য।
+
+    ⏱ রোলিং উইন্ডো: এখন থেকে পিছনে N মিনিট (ফিক্সড ব্লক নয়, তাই রিসেট হয় না)।
+    🌍 দুটো সোর্স যোগ হয় — (১) প্যানেলের পাবলিক লাইভ ফিড (সব ইউজার),
+       (২) নিজের বটে আসা OTP (`getnum_orders`)। তাই একা নিজের বটে
+       OTP না এলেও সংখ্যা ০ দেখাবে না।
+    ⛔ ফিড এখানে শুধু পড়া হয় — DB-তে সেভ/চ্যানেলে পোস্ট কিছুই হয় না।
     কী: দেশের নাম (lower) আর রেঞ্জ-কী (`_gn_rng_key`) — দুটোই রাখি, তাই
     "🇨🇲 Cameroon" আর "237688XXX" দুই লেবেলেই সংখ্যা মিলবে।
     `service` দিলে শুধু ওই সার্ভিসের কোড গুনবে।
     """
-    if not GN_FEED_ON:
-        return {}
-    _rows = _gn_live_rows(mins)
     _want = _gn_svc_label(service) if service else ""
     _ck = _want or "*"
-    _cache = _GN_LIVE_CACHE.get("n") or {}
-    if _ck in _cache:
-        return _cache[_ck]
+    _t = _time.time()
+    _hit = _GN_CNT_CACHE.get(_ck)
+    if _hit and (_t - float(_hit[0] or 0)) < _GN_CNT_TTL:
+        return _hit[1] or {}
+    _cut = (datetime.now(pytz.timezone("Asia/Dhaka"))
+            - timedelta(minutes=max(1, int(mins)))).strftime("%Y-%m-%d %H:%M")
+    try:
+        with _c() as c:
+            _rows = c.execute(
+                "SELECT service, range_val, country FROM getnum_orders "
+                "WHERE status='received' AND updated_at >= %s", (_cut,)).fetchall() or []
+    except Exception:
+        _rows = []
     cnt = {}
     for r in _rows:
         if _want and _gn_svc_label(r.get("service")) != _want:
             continue
         rng = str(r.get("range_val") or "").strip()
-        _f, _c = _gn_country_of(rng)
-        if not _c:
-            _f, _c = _gn_flag_of_name(r.get("country"))
-        _k = str(_c or "").strip().lower()
+        _k = str(r.get("country") or "").strip().lower()
+        if not _k:
+            # ⚠️ এখানে `_c` নাম ব্যবহার করা যাবে না — ওটা গ্লোবাল DB হেল্পার
+            _f6, _c6 = _gn_country_of(rng)
+            if not _c6:
+                _f6, _c6 = _gn_flag_of_name(r.get("country"))
+            _k = str(_c6 or "").strip().lower()
         if _k:
             cnt[_k] = cnt.get(_k, 0) + 1
         _rk = _gn_rng_key(rng)
         if _rk:
             cnt[_rk] = cnt.get(_rk, 0) + 1
-    _cache[_ck] = cnt
-    _GN_LIVE_CACHE["n"] = _cache
+    # 🌍 প্যানেলের লাইভ ফিড (সব ইউজার) — নিজের বটের OTP-র সাথে যোগ
+    _cut_ts = _t - max(1, int(mins)) * 60
+    try:
+        _frows = _gn_feed_mem()
+    except Exception:
+        _frows = []
+    for r in _frows:
+        _rts = _gn_feed_item_ts(r)
+        if _rts and _rts < _cut_ts:
+            continue
+        if _want and _gn_svc_label(r.get("service")) != _want:
+            continue
+        _frng = str(r.get("number") or r.get("range_val") or r.get("range") or "").strip()
+        _fk = str(r.get("country") or "").strip().lower()
+        if not _fk:
+            _f5, _c5 = _gn_country_of(_frng)
+            if not _c5:
+                _f5, _c5 = _gn_flag_of_name(r.get("country"))
+            _fk = str(_c5 or "").strip().lower()
+        if _fk:
+            cnt[_fk] = cnt.get(_fk, 0) + 1
+        _frk = _gn_rng_key(_frng)
+        if _frk:
+            cnt[_frk] = cnt.get(_frk, 0) + 1
+    _GN_CNT_CACHE[_ck] = (_t, cnt)
+    if len(_GN_CNT_CACHE) > 200:            # পুরোনো এন্ট্রি সরাও
+        for _k11 in [k for k, v in _GN_CNT_CACHE.items()
+                     if _t - float(v[0] or 0) > 600][:100]:
+            _GN_CNT_CACHE.pop(_k11, None)
     return cnt
 
 
@@ -9357,8 +9498,11 @@ def _gn_ch_send(text, parse_mode="HTML"):
         _btns.append({"text": "🤖 Bot", "url": _bl, "style": "success"})
     if _nl:
         _btns.append({"text": "📢 News Channel", "url": _nl, "style": "primary"})
-    _tries = [parse_mode, None] if parse_mode else [None]
-    for _pm in _tries:
+    # ১) HTML + বাটন  ২) প্লেইন + বাটন  ৩) প্লেইন + বাটন ছাড়া
+    #    শেষ ধাপটা না থাকলে বাটন/markup-এ সমস্যা হলে পোস্টটাই আটকে যেত
+    _tries = [(parse_mode, True)] if parse_mode else []
+    _tries += [(None, True), (None, False)]
+    for _pm, _use_btns in _tries:
         try:
             _pl = {"chat_id": cid, "text": str(text)[:3900],
                    "disable_web_page_preview": True}
@@ -9367,7 +9511,7 @@ def _gn_ch_send(text, parse_mode="HTML"):
             else:
                 _pl["text"] = html.unescape(
                     _re.sub(r"<[^>]{1,40}>", "", _pl["text"]))
-            if _btns:
+            if _btns and _use_btns:
                 _pl["reply_markup"] = {"inline_keyboard": [_btns]}
             body = _json.dumps(_pl).encode("utf-8")
             req = urllib.request.Request(
@@ -9377,7 +9521,8 @@ def _gn_ch_send(text, parse_mode="HTML"):
             return True
         except Exception as e:
             log.warning(f"[GETNUM-CH] চ্যানেলে পাঠানো যায়নি"
-                        f"{' (প্লেইন)' if not _pm else ''}: {str(e)[:120]}")
+                        f"{' (বাটন ছাড়া)' if not _use_btns else (' (প্লেইন)' if not _pm else '')}"
+                        f": {str(e)[:160]}")
     return False
 
 
@@ -9389,9 +9534,8 @@ def _gn_ch_text(o):
     _num = str(o.get("number") or "").strip()
     _code = str(o.get("otp") or "").strip() or "—"
     _svc = str(o.get("service") or "").strip() or "OTP"
-    _rate = getnum_money2(o.get("price") or getnum_rate())   # 🏷 প্যানেলের দাম (নাহলে ডিফল্ট রেট)
     _paid = float(o.get("paid_usd") or 0)
-    _pay_s = ("  ·  💰 <b>Paid:</b> " + _e(getnum_money2(_paid))) if _paid > 0 else ""
+    _pay_s = (f"💰 <b>Paid :</b> {_e(getnum_money2(_paid))}\n") if _paid > 0 else ""
     _meta = " · ".join(x for x in (_svc, _loc, ("🔢 " + _rng) if _rng else "") if x)
     _head = ("♻️ <b>New Otp receive (Resend)</b>" if o.get("resend")
              else "🆕 <b>New Otp receive</b>")
@@ -9401,7 +9545,7 @@ def _gn_ch_text(o):
         f"📱 <b>Service :</b> {_e(_svc)}\n"
         f"🌍 <b>Range :</b> {_e((_flag + ' ' + _rng).strip() or '—')}\n"
         f"🔑 <b>Otp :</b> <b>{_e(_code)}</b>\n"
-        f"💵 <b>Rate :</b> {_e(_rate)}{_pay_s}\n"
+        f"{_pay_s}"
         f"💬 <b>Full Message :</b>\n"
         f"<blockquote>{_e(str(o.get('sms') or '')[:600])}</blockquote>"
     )
@@ -9549,11 +9693,13 @@ def _gn_order_kb(o, en=False):
         _n = gn_active_count(int(o.get("user_id") or 0))
     except Exception:
         _n = 1
-    if _n < GN_MAX_OPEN:
-        _b.append([InlineKeyboardButton(
-            _bi(f"➕ আরেকটা নাম্বার ({_n}/{GN_MAX_OPEN})",
-                f"➕ Another number ({_n}/{GN_MAX_OPEN})", en),
-            callback_data="gn:home")])
+    # 🔙 মেনুতে ফেরার পথ সবসময় থাকবে — নাম্বার লিমিট পূরণ হলেও,
+    #    না হলে ইউজারকে /start চাপতে হতো (মেনু হারিয়ে যেত)
+    _b.append([InlineKeyboardButton(
+        _bi(f"➕ আরেকটা নাম্বার ({_n}/{GN_MAX_OPEN})",
+            f"➕ Another number ({_n}/{GN_MAX_OPEN})", en)
+        if _n < GN_MAX_OPEN else _bi("📱 নাম্বার নিন", "📱 Get Number", en),
+        callback_data="gn:home")])
     _u = getnum_group_url()
     if _u:
         if _u.startswith("@"):
@@ -9672,8 +9818,7 @@ async def _gn_show_items(update, ctx, si):
             _n = int(_lc.get(_key) or _lc.get(_gn_rng_key(it.get("range"))) or 0)
         except Exception:
             _n = 0
-        _lab2 = ((f"{_lab} · {_n}🔥" if _n > 0 else f"{_lab} · 0")
-                 if GN_FEED_ON else _lab)
+        _lab2 = (f"{_lab} · {_n}🔥" if _n > 0 else f"{_lab} · 0")
         # দাম এখানে দেখাই না — নাম্বার নেওয়ার পরে (কার্ডে) OTP রেট দেখাবে
         _cand.append((_n, ii, _lab2))
     # 🔥 যেখানে বেশি কোড আসছে সেগুলো আগে — লাইভ ফিডে নতুন শেখা দেশও উপরে উঠে আসে
@@ -9689,11 +9834,9 @@ async def _gn_show_items(update, ctx, si):
                                       callback_data="gn:home")])
     _more_txt = _bi(f"\n\n➕ আরও {_more}টি দেশ আছে — উপরের যেগুলোতে 🔥 বেশি সেগুলো দেখানো হলো।",
                     f"\n\n➕ {_more} more countries — the ones with more 🔥 are shown first.",
-                    en) if (_more and GN_FEED_ON) else ""
-    _fire_hint = ("\n\n🔥 পাশের সংখ্যা = শেষ ১০ মিনিটে ওই দেশে আসা কোড।"
-                  if GN_FEED_ON else "")
-    _fire_hint_en = ("\n\n🔥 The number beside = codes received there in the last 10 min."
-                     if GN_FEED_ON else "")
+                    en) if _more else ""
+    _fire_hint = "\n\n🔥 পাশের সংখ্যা = শেষ ১০ মিনিটে সব ইউজারে ওই দেশে আসা OTP (আপনারটাও যোগ হয়)।"
+    _fire_hint_en = "\n\n🔥 The number beside = OTP received there in the last 10 min (all users, including yours)."
     return await _gn_say(update,
                          _bi(f"{sv['name']}\n\n🌍 *কোন দেশের নাম্বার নিতে চান?*" + _fire_hint,
                              f"{sv['name']}\n\n🌍 *Which country number do you want?*" + _fire_hint_en,
@@ -10156,14 +10299,9 @@ async def _gn_check_and_notify(bot_obj, o, quiet=False, rows=None):
         return False
     if _gn_left_min(o) <= 0:
         if st == "waiting":
+            # 🔇 ইউজারকে কোনো "সময় শেষ" মেসেজ যাবে না — শুধু DB-তে expired হবে।
+            #    (আগে প্রতি ২০ সেকেন্ডের চেকে একবার করে যেত)
             await asyncio.to_thread(gn_order_set, oid, "expired")
-            if not quiet and bot_obj:
-                try:
-                    await bot_obj.send_message(
-                        int(o.get("user_id") or 0),
-                        "⌛ নাম্বারটির সময় শেষ। নতুন নাম্বার নিতে 📱 নাম্বার নিন চাপুন।")
-                except Exception:
-                    pass
         return False
     hit = await asyncio.to_thread(gn_find_otp, o, rows)
     if not hit:
@@ -40728,6 +40866,7 @@ def smm_check_balance(notify_bot=None, force=False):
         b = float(str(bal or 0).replace(",", "").strip())
     except Exception:
         b = 0.0
+    _b_taka = smm_bal_to_taka(b, cur)      # 🔴 আগে হিসাব — না হলে NameError-এ সেটিংস সেভ হতো না
     try:
         set_setting("smm_bal_last", f"{bal}")
         set_setting("smm_bal_taka", f"{_b_taka:.4f}")
@@ -40735,7 +40874,6 @@ def smm_check_balance(notify_bot=None, force=False):
         set_setting("smm_bal_at", now())
     except Exception:
         pass
-    _b_taka = smm_bal_to_taka(b, cur)
     low = _b_taka < _smm_min_bal()
     alerted = False
     if low and notify_bot is not None:
@@ -42236,8 +42374,36 @@ async def show_smm_service(q, ctx, sid):
     if _notes:
         _ntxt = "\n".join("• " + _md_esc(x[:200]) for x in _notes[:12])
         _ntxt = _smm_cut_md(_ntxt, 900)
-    _read_bn = ("\n⚠️ *পড়ে নিন*\n" + _ntxt + "\n") if _ntxt else ""
-    _read_en = ("\n⚠️ *Please read before ordering*\n" + _ntxt + "\n") if _ntxt else ""
+    # 🧾 সারসংক্ষেপ — রিফিল / নো রিফিল / টাকার হিসাব সব এক জায়গায়,
+    #    যাতে ইউজার ভুল না করে (ফিডের বর্ণনায় কিছু না থাকলেও এটা থাকবে)
+    _ref = ""
+    for _k2, _v2 in _fields:
+        if _k2 == "refill":
+            _ref = str(_v2 or "").strip()
+            break
+    if not _ref:
+        _rv = str(_ex.get("refill") or "").strip()
+        if _rv.lower() in ("true", "yes"):
+            _ref = _bi("হ্যাঁ", "Yes", _en)
+        elif _rv and _rv.lower() not in ("0", "none", "no", "false"):
+            _ref = _rv
+    _sum_rows = []
+    if _ref and _ref.lower() not in ("no", "none", "false", "না", "0"):
+        _sum_rows.append("• ♻️ " + _bi("রিফিল", "Refill", _en) + ": " + _md_esc(_ref[:60]))
+    else:
+        _sum_rows.append("• ⛔ " + _bi("নো রিফিল — এই সার্ভিসে রিফিল নেই",
+                                       "No refill — this service has no refill", _en))
+    _sum_rows.append("• 💵 " + _bi(
+        f"দাম {_shop_money(p1000)} প্রতি ১০০০ — সর্বনিম্ন অর্ডারে ~{_shop_money(pmin)}",
+        f"Price {_shop_money(p1000)} per 1000 — min order ~{_shop_money(pmin)}", _en))
+    _sum_rows.append("• 💳 " + _bi(
+        "টাকা অর্ডার কনফার্ম করার সময়ই কাটা হয়; ভুল লিংক/ইউজারনেম দিলে অর্ডার ফেল হতে পারে, টাকা ফেরত নাও আসতে পারে।",
+        "Money is charged when you confirm the order; a wrong link/username can fail the order and the money may not be refunded.", _en))
+    _sum_txt = "\n".join(_sum_rows)
+    _read_bn = ("\n⚠️ *পড়ে নিন*\n" + _sum_txt
+                + (("\n" + _ntxt) if _ntxt else "") + "\n")
+    _read_en = ("\n⚠️ *Please read before ordering*\n" + _sum_txt
+                + (("\n" + _ntxt) if _ntxt else "") + "\n")
     txt = _bi(
         f"🌐 *{_md_esc(s['name'])}*\n"
         f"━━━━━━━━━━━━━━\n"
