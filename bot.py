@@ -61,6 +61,7 @@ _BTN_SUCCESS_W = (
     "done", "সম্পন্ন", "submit", "সাবমিট", "get number", "নাম্বার নিন",
     "join", "যোগ দিন", "verify", "যাচাই", "live", "চালু করুন", "active",
     "আনলক", "unlock", "success", "সফল",
+    "otp group", "otp গ্রুপ",
 )
 
 
@@ -68,8 +69,12 @@ def _btn_style_guess(btn):
     """একটা বাটন-ডিক্ট দেখে কালার ঠিক করে; আগে থেকে style থাকলে ছোঁয় না।"""
     if not isinstance(btn, dict) or btn.get("style"):
         return None
+    # 🟢 সবুজ: নাম্বার/কোড কপি-বাটন, দেশ/রেঞ্জ লিস্ট, OTP গ্রুপ — ছবির মতো
+    _cbraw = btn.get("callback_data") or ""
+    if btn.get("copy_text") or _cbraw.startswith(("gn:r:", "gn:c:", "gn:co:")):
+        return "success"
     # callback_data-এর আন্ডারস্কোর/কোলন ফাঁকা করে নিলে _cancel, :close সবই ধরা পড়ে
-    _cb = (btn.get("callback_data") or "").replace("_", " ").replace(":", " ")
+    _cb = _cbraw.replace("_", " ").replace(":", " ")
     hay = ((btn.get("text") or "") + " " + _cb).lower()
     for words, style in ((_BTN_DANGER_W, "danger"), (_BTN_SUCCESS_W, "success")):
         for w in words:
@@ -242,7 +247,7 @@ TASK_DONE_NOTIFY_CH  = -1004251213683
 WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 
 # ── BEP-20 Auto Withdraw Config ──────────────────────────────────
-BUILD_TAG       = "uid-auto-2026-11-18b168"
+BUILD_TAG       = "uid-auto-2026-11-19b170"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
 
@@ -8274,6 +8279,8 @@ GN_WAIT_MIN = 20          # নাম্বার কত মিনিট লা�
 GN_MAX_SERVICES = 20      # লাইভ ফিড থেকে নতুন সার্ভিসও শেখা যায়
 GN_MAX_ITEMS = 150        # প্রতি সার্ভিসে রেঞ্জ (আগে ৬০ — নতুন দেশ আর ঢুকত না)
 _GN_MAX_SHOWN = 90        # এক স্ক্রিনে সর্বোচ্চ বাটন (Telegram-এর সীমার নিচে)
+GN_FEED_ON = False        # ⛔ লাইভ OTP ফিড (🔥 ট্রাফিক + নতুন দেশ শেখা) বন্ধ —
+                          #    কোনো ফিড API কল হবে না, DB-তেও কিছু জমবে না
 GN_MAX_OPEN = 3           # একসাথে কতগুলো নাম্বার চলতে পারে
 GN_FEED_POST_MAX = 10     # প্রতি চেকে সর্বোচ্চ কতটি লাইভ OTP চ্যানেলে যাবে
 GN_SMS_TTL = 3            # OTP লিস্ট ক্যাশ (সেকেন্ড)
@@ -9170,6 +9177,8 @@ def _gn_live_reset():
 
 def _gn_live_rows(mins=10):
     """শেষ N মিনিটের ফিড (ক্যাশে)। ১০ মিনিটে কিছু না থাকলে সদ্য যা আছে তাই।"""
+    if not GN_FEED_ON:                 # ফিড বন্ধ → কোনো DB পড়া/গণনা নেই
+        return []
     _t = _time.time()
     try:
         if _t - float(_GN_LIVE_CACHE.get("ts") or 0) < _GN_LIVE_CNT_TTL:
@@ -9193,6 +9202,8 @@ def _gn_live_counts(mins=10, service=None):
     "🇨🇲 Cameroon" আর "237688XXX" দুই লেবেলেই সংখ্যা মিলবে।
     `service` দিলে শুধু ওই সার্ভিসের কোড গুনবে।
     """
+    if not GN_FEED_ON:
+        return {}
     _rows = _gn_live_rows(mins)
     _want = _gn_svc_label(service) if service else ""
     _ck = _want or "*"
@@ -9661,7 +9672,8 @@ async def _gn_show_items(update, ctx, si):
             _n = int(_lc.get(_key) or _lc.get(_gn_rng_key(it.get("range"))) or 0)
         except Exception:
             _n = 0
-        _lab2 = f"{_lab} · {_n}🔥" if _n > 0 else f"{_lab} · 0"
+        _lab2 = ((f"{_lab} · {_n}🔥" if _n > 0 else f"{_lab} · 0")
+                 if GN_FEED_ON else _lab)
         # দাম এখানে দেখাই না — নাম্বার নেওয়ার পরে (কার্ডে) OTP রেট দেখাবে
         _cand.append((_n, ii, _lab2))
     # 🔥 যেখানে বেশি কোড আসছে সেগুলো আগে — লাইভ ফিডে নতুন শেখা দেশও উপরে উঠে আসে
@@ -9677,13 +9689,15 @@ async def _gn_show_items(update, ctx, si):
                                       callback_data="gn:home")])
     _more_txt = _bi(f"\n\n➕ আরও {_more}টি দেশ আছে — উপরের যেগুলোতে 🔥 বেশি সেগুলো দেখানো হলো।",
                     f"\n\n➕ {_more} more countries — the ones with more 🔥 are shown first.",
-                    en) if _more else ""
+                    en) if (_more and GN_FEED_ON) else ""
+    _fire_hint = ("\n\n🔥 পাশের সংখ্যা = শেষ ১০ মিনিটে ওই দেশে আসা কোড।"
+                  if GN_FEED_ON else "")
+    _fire_hint_en = ("\n\n🔥 The number beside = codes received there in the last 10 min."
+                     if GN_FEED_ON else "")
     return await _gn_say(update,
-                         _bi(f"{sv['name']}\n\n🌍 *কোন দেশের নাম্বার নিতে চান?*\n\n"
-                             "🔥 পাশের সংখ্যা = শেষ ১০ মিনিটে ওই দেশে আসা কোড।",
-                             f"{sv['name']}\n\n🌍 *Which country number do you want?*\n\n"
-                             "🔥 The number beside = codes received there in the last 10 min.", en)
-                         + _more_txt,
+                         _bi(f"{sv['name']}\n\n🌍 *কোন দেশের নাম্বার নিতে চান?*" + _fire_hint,
+                             f"{sv['name']}\n\n🌍 *Which country number do you want?*" + _fire_hint_en,
+                             en) + _more_txt,
                          InlineKeyboardMarkup(rows))
 
 
@@ -9956,6 +9970,8 @@ def _gn_sync_once():
 
 def _gn_feed_once():
     """সবার লাইভ OTP ফিড (পাবলিক) → প্যানেলে দেখাও + দেশ/রেঞ্জ শিখে নাও।"""
+    if not GN_FEED_ON:                 # ⛔ বন্ধ: কোনো রিকোয়েস্ট/DB সেভ নেই
+        return 0
     url = getnum_feed_api()
     if not url:
         _GN_FEED_DIAG["err"] = "ফিড URL খালি (সেটিংসে getnum_feed_api দিন)"
@@ -10120,6 +10136,8 @@ async def job_getnum_sync(context):
 
 async def job_getnum_feed(context):
     """প্রতি ৪৫ সেকেন্ডে সবার লাইভ OTP ফিড (প্যানেল + অটো দেশ শেখা)।"""
+    if not GN_FEED_ON:
+        return
     try:
         if not getnum_on():
             return

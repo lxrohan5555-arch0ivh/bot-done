@@ -453,6 +453,7 @@ def shop_dep_lock():
 def _gn_page_html():
     """📱 নাম্বার নিন (OTP) পেজের ভিতর — API key, সার্ভিস, চ্যানেল, লাইভ ডেটা."""
     # ── 📱 নাম্বার নিন (Zenex Network) ──
+    _gn_feed_on = False
     try:
         import bot as _gnt
         _gn_on = bool(_gnt.getnum_on())
@@ -466,6 +467,7 @@ def _gn_page_html():
         _gn_group = _gnt.getnum_group_url()
         _gn_list = _gnt.getnum_list_api()
         _gn_feedapi = _gnt.getnum_feed_api()
+        _gn_feed_on = bool(getattr(_gnt, "GN_FEED_ON", False))
     except Exception:
         _gn_on, _gn_svcs, _gn_key_ok = True, [], False
         _gn_api, _gn_hdr = "https://api.zenexnetwork.com/v1/getnum", "mapikey"
@@ -486,13 +488,15 @@ def _gn_page_html():
         f"{sv.get('name') or ''} | {it.get('name') or ''} | {it.get('range') or ''} | "
         f"{(float(it.get('price') or 0)):g}"
         for sv in _gn_svcs for it in (sv.get("items") or [])))
-    try:
-        _gn_live = many("SELECT service, range_name, range_val, COUNT(*) AS n, "
-                        "MAX(updated_at) AS last, SUM(price) AS paid "
-                        "FROM getnum_orders WHERE status='received' "
-                        "GROUP BY service, range_name, range_val ORDER BY n DESC LIMIT 30")
-    except Exception:
-        _gn_live = []
+    _gn_live = []
+    if _gn_feed_on:        # ⛔ লাইভ ফিড বন্ধ থাকলে কোনো কোয়েরি নয়
+        try:
+            _gn_live = many("SELECT service, range_name, range_val, COUNT(*) AS n, "
+                            "MAX(updated_at) AS last, SUM(price) AS paid "
+                            "FROM getnum_orders WHERE status='received' "
+                            "GROUP BY service, range_name, range_val ORDER BY n DESC LIMIT 30")
+        except Exception:
+            _gn_live = []
     if _gn_live:
         _live_html = table(
             ["সার্ভিস", "দেশ", "রেঞ্জ", "কোড এসেছে", "দেওয়া হয়েছে", "শেষ কোড"],
@@ -508,11 +512,13 @@ def _gn_page_html():
                       "এখনো কোনো OTP আসেনি — আসলে এখানে সার্ভিস/দেশ/রেঞ্জসহ দেখা যাবে "
                       "(সব ইউজারের, শুধু আপনার না)।</div>")
 
-    try:
-        _gn_feed_rows = many("SELECT service, range_val, country, msg, created_at "
-                             "FROM getnum_feed ORDER BY id DESC LIMIT 25")
-    except Exception:
-        _gn_feed_rows = []
+    _gn_feed_rows = []
+    if _gn_feed_on:
+        try:
+            _gn_feed_rows = many("SELECT service, range_val, country, msg, created_at "
+                                 "FROM getnum_feed ORDER BY id DESC LIMIT 25")
+        except Exception:
+            _gn_feed_rows = []
     if _gn_feed_rows:
         _feed_html = table(
             ["সময়", "সার্ভিস", "রেঞ্জ", "দেশ", "কোডের মেসেজ"],
@@ -526,6 +532,21 @@ def _gn_page_html():
         _feed_html = ("<div class='mut' style='font-size:12px;margin-top:6px'>"
                       "জেনেক্সের পাবলিক ফিড এখনো আসেনি — কয়েক সেকেন্ড পরে রিফ্রেশ করুন।</div>")
 
+    if _gn_feed_on:
+        _diag_html = ("<div style='margin-top:14px;padding-top:10px;border-top:1px solid #ddd'>"
+                      "<b>📊 কোথায় কোড আসছে (সব ইউজার)</b>"
+                      "<div class='mut' style='font-size:11.5px;margin:4px 0'>"
+                      "যে সার্ভিস/দেশে OTP এসেছে সেগুলো এখানে জমা হয়।</div>"
+                      + _live_html + "</div>"
+                      "<div style='margin-top:14px;padding-top:10px;border-top:1px solid #ddd'>"
+                      "<b>🌍 জেনেক্স নেটওয়ার্কে সবার কোড (লাইভ)</b>"
+                      "<div class='mut' style='font-size:11.5px;margin:4px 0'>"
+                      "পাবলিক ফিড — সব ইউজারের কোড, নাম্বার মাস্ক করা।</div>"
+                      + _feed_html + "</div>")
+    else:
+        _diag_html = ("<div class='mut' style='font-size:12px;margin-top:12px'>"
+                      "⛔ লাইভ OTP ফিড বন্ধ — কোনো ফিড API কল বা ডাটাবেজ সেভ হচ্ছে না, "
+                      "তাই খরচ নেই।</div>")
     getnumcard = "".join([
         "<div class='card'><b>📱 নাম্বার নিন (OTP)</b>",
         "<div class='mut' style='font-size:12px;margin:6px 0'>বটের কীবোর্ডে “📱 নাম্বার নিন” → "
@@ -565,16 +586,7 @@ def _gn_page_html():
         "<button class='ok sm' type='submit'>💾 সেভ করুন</button>",
         " <a class='btn gray sm' href='/admin/shop/getnum/test'>🧪 টেস্ট (প্রথম নাম্বার)</a>",
         "</form>",
-        "<div style='margin-top:14px;padding-top:10px;border-top:1px solid #ddd'>"
-        "<b>📊 কোথায় কোড আসছে (সব ইউজার)</b>"
-        "<div class='mut' style='font-size:11.5px;margin:4px 0'>"
-        "যে সার্ভিস/দেশে OTP এসেছে সেগুলো এখানে জমা হয়, আর ওগুলোই বট নিজে থেকে "
-        "লিস্টে যোগ করে দেয়।</div>" + _live_html + "</div>",
-        "<div style='margin-top:14px;padding-top:10px;border-top:1px solid #ddd'>"
-        "<b>🌍 জেনেক্স নেটওয়ার্কে সবার কোড (লাইভ)</b>"
-        "<div class='mut' style='font-size:11.5px;margin:4px 0'>"
-        "পাবলিক ফিড — সব ইউজারের কোড, নাম্বার মাস্ক করা। এখান থেকেই নতুন দেশ/রেঞ্জ "
-        "নিজে থেকে লিস্টে যোগ হয়।</div>" + _feed_html + "</div>",
+        _diag_html,
         "</div>",
     ])
     return getnumcard
