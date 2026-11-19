@@ -299,6 +299,21 @@ def shop_mailcode_save():
         "🎫 মেইল কোড সেটিংস সেভ হয়েছে"))
 
 
+def _ml_map_norm(txt):
+    """আইটেম-ভিত্তিক লাভের লাইন — service | domain | লাভ (আবর্জনা বাদ)।"""
+    _out = []
+    for _ln in str(txt or "").replace("\r", "").split("\n")[:300]:
+        _p = [x.strip() for x in
+              _ln.replace("—", "|").replace("\t", "|").split("|")]
+        _p = [x for x in _p if x]
+        if len(_p) < 2:
+            continue
+        _out.append(" | ".join(x[:60] for x in _p[:3]))
+        if len(_out) >= 200:
+            break
+    return "\n".join(_out)[:6000]
+
+
 @wadm.route("/admin/shop/getnum", methods=["POST"])
 def shop_getnum_save():
     """📱 নাম্বার নিন (Zenex) — API key, সার্ভিস/দেশ/দাম, OTP সেটিং।"""
@@ -356,6 +371,35 @@ def shop_getnum_save():
         "getnum_list_api": (form.get("getnum_list_api") or "").strip()[:400],
         "getnum_feed_api": (form.get("getnum_feed_api") or "").strip()[:400],
     }
+    # ✉️ মেইল কিনুন (SmsBower) — পুরোনো/ক্যাশ করা পেজ থেকে সাবমিট হলে ফিল্ডগুলো
+    #    থাকে না; তখন আগের মেইল সেটিং অপরিবর্তিত থাকবে (হঠাৎ বন্ধ/৩০% হবে না)।
+    if "mail_on" in form:
+        vals["mail_on"] = ("off" if (form.get("mail_on") or "off").strip().lower() == "off"
+                           else "on")
+    if "mail_api" in form:
+        vals["mail_api"] = (form.get("mail_api") or "").strip()[:300]
+    if "mail_markup" in form:
+        vals["mail_markup"] = ((form.get("mail_markup") or "30")
+                               .replace(",", ".").strip()[:8])
+    # পুরোনো/ক্যাশ-করা পেজ থেকে সাবমিট হলে ফিল্ডটা নেই — তখন আগের লিস্ট মুছে যাবে না
+    if "mail_markup_map" in form:
+        vals["mail_markup_map"] = _ml_map_norm(form.get("mail_markup_map") or "")
+    # 🔢 সার্ভিস-ভিত্তিক কোড-সংখ্যা (ইউজার কেনার আগে দেখে)
+    if "mail_limits" in form:
+        _liml = []
+        for _ln in (form.get("mail_limits") or "").replace("\r", "").split("\n")[:200]:
+            _ln = _ln.strip()
+            if not _ln or _ln.startswith("#"):
+                continue
+            _p = [x.strip() for x in _ln.replace("—", "|").split("|") if x.strip()]
+            if len(_p) < 2:
+                continue
+            try:
+                _n = max(0, min(50, int(float(_p[-1].replace(",", ".")))))
+            except Exception:
+                continue
+            _liml.append(f"{_p[0][:40]} | {_n}")
+        vals["mail_limits"] = "\n".join(_liml)[:6000]
     # হাতে লেখার বক্স আর নেই — ফিল্ড না এলে আগের লিস্টটাই অক্ষত থাকে
     if form.get("getnum_services_text") is not None:
         try:                       # বটের হেল্পার — JSON মাঝখানে কাটা পড়ে না
@@ -368,6 +412,9 @@ def shop_getnum_save():
     # বক্সে আগের কী-এর মাস্ক করা লেখা (ZNX_G7N…TJWO) থাকলে সেটা সেভ হবে না
     if _k and "…" not in _k and "*" not in _k:
         vals["getnum_key"] = _k
+    _mk = "".join((form.get("mail_key") or "").split())[:300]
+    if _mk and "…" not in _mk and "*" not in _mk:
+        vals["mail_key"] = _mk
     try:
         import bot as _bs
         for k, v in vals.items():
@@ -381,6 +428,11 @@ def shop_getnum_save():
         import bot as _bs
         _bs._GN_SVC_CACHE["ts"] = 0.0
         _bs._GN_SVC_CACHE["val"] = None
+        _bs._MAIL_MK_CACHE["ts"] = 0.0
+        _bs._MAIL_MK_CACHE["val"] = None
+        _bs._MAIL_CACHE["ts"] = 0.0
+        _bs._MAIL_LIM_CACHE["ts"] = 0.0
+        _bs._MAIL_LIM_CACHE["val"] = None
     except Exception:
         pass
     log_admin("shop_getnum", 0, str(len(groups)))
@@ -454,6 +506,11 @@ def _gn_page_html():
     """📱 নাম্বার নিন (OTP) পেজের ভিতর — API key, সার্ভিস, চ্যানেল, লাইভ ডেটা."""
     # ── 📱 নাম্বার নিন (Zenex Network) ──
     _gn_feed_on = False
+    # ✉️ মেইল (SmsBower mails API) — ডিফল্ট
+    _ml_on, _ml_api, _ml_markup, _ml_raw = False, "https://smsbower.online", 30.0, ""
+    _ml_map_raw = ""
+    _ml_lim_raw = ""
+    _ml_live = ""
     try:
         import bot as _gnt
         _gn_on = bool(_gnt.getnum_on())
@@ -468,6 +525,36 @@ def _gn_page_html():
         _gn_list = _gnt.getnum_list_api()
         _gn_feedapi = _gnt.getnum_feed_api()
         _gn_feed_on = bool(getattr(_gnt, "GN_FEED_ON", False))
+        _ml_on = bool(getattr(_gnt, "mail_on", lambda: False)())
+        _ml_api = str(getattr(_gnt, "mail_base", lambda: "")() or "")
+        _ml_markup = float(getattr(_gnt, "mail_markup", lambda: 30)() or 30)
+        _ml_raw = str(getattr(_gnt, "mail_key", lambda: "")() or "")
+        _ml_map_raw = str(_gnt.get_setting("mail_markup_map") or "")
+        _ml_lim_raw = str(_gnt.get_setting("mail_limits") or "")
+        # 🔗 ওয়েবে/প্রোভাইডারে এখন যে সার্ভিসগুলো আছে (ক্যাশে থাকলে) + বটের লিমিট
+        try:
+            _cache = getattr(_gnt, "_MAIL_CACHE", {}) or {}
+            _seen = {}
+            for _r in (_cache.get("rows") or []):
+                _sv = str(_r.get("service") or "").lower()
+                if _sv and _sv not in _seen:
+                    _seen[_sv] = _gnt.mail_limit(_sv)
+            if _seen:
+                _parts = []
+                for _k, _v in sorted(_seen.items()):
+                    if _gnt.mail_service_known(_k):
+                        _parts.append(f"<span class='mono'>{esc(_k)}</span>={int(_v)}")
+                    else:
+                        _parts.append(f"<span class='mono'>{esc(_k)}</span>="
+                                      "<b style='color:#c00'>🆕 নতুন (বন্ধ)</b>")
+                _ml_live = ("<div class='mut' style='font-size:12px;margin:6px 0 2px'>"
+                            "<b>ওয়েবে এখন যে সার্ভিসগুলো আছে</b> "
+                            "(কোড = বটের দেখানো কোড-সংখ্যা):<br>"
+                            + " · ".join(_parts)
+                            + "<br>🆕 নতুন সার্ভিস বটে এখনো বন্ধ — উপরে লাইন "
+                              "লিখলেই চালু হবে।</div>")
+        except Exception:
+            _ml_live = ""
     except Exception:
         _gn_on, _gn_svcs, _gn_key_ok = True, [], False
         _gn_api, _gn_hdr = "https://api.zenexnetwork.com/v1/getnum", "mapikey"
@@ -484,6 +571,11 @@ def _gn_page_html():
     _gn_sel = ("<option value='on' selected>চালু</option><option value='off'>বন্ধ</option>"
                if _gn_on else
                "<option value='on'>চালু</option><option value='off' selected>বন্ধ</option>")
+    _ml_sel = ("<option value='on' selected>চালু</option><option value='off'>বন্ধ</option>"
+               if _ml_on else
+               "<option value='on'>চালু</option><option value='off' selected>বন্ধ</option>")
+    _ml_mask = ((_ml_raw[:7] + "…" + _ml_raw[-4:])
+                if len(_ml_raw) > 14 else _ml_raw)
     _gn_txt = esc("\n".join(
         f"{sv.get('name') or ''} | {it.get('name') or ''} | {it.get('range') or ''} | "
         f"{(float(it.get('price') or 0)):g}"
@@ -583,6 +675,48 @@ def _gn_page_html():
         "<div class='mut' style='font-size:12px;margin:4px 0 10px'>✅ সার্ভিস/দেশ/রেঞ্জ "
         f"({num(sum(len(sv.get('items') or []) for sv in _gn_svcs))}টি) বট নিজেই লাইভ ফিড থেকে "
         "যোগ করে — এখানে হাতে কিছু করতে হবে না।</div>",
+        "<div style='margin-top:16px;padding-top:12px;border-top:1px solid #ddd'>"
+        "<b>✉️ মেইল কিনুন (SmsBower mails API)</b>"
+        "<div class='mut' style='font-size:12px;margin:4px 0 8px'>"
+        "বটের 🔑 OTP Buy → ✉️ Mail Account — মেইল কেনা, কোড পড়া (প্রোভাইডারে নাম্বার "
+        "২৫ মিনিট থাকে, বটও ততক্ষণ কোড দেখে)। ২৫ মিনিটে কোড না এলে অর্ডার "
+        "অটো বাতিল হয় — প্রোভাইডারের রিফান্ড নিশ্চিত হওয়ার পরেই ইউজারের "
+        "ব্যালেন্সে টাকা ফেরত যায়। চাইলে ২৫ মিনিটের আগেই ইউজার নিজে Cancel "
+        "করতে পারে। দাম = প্রোভাইডারের লাইভ $ দাম × ৳ রেট + লাভ।</div>"
+        "<div class='field'><label>অপশন</label><select name='mail_on'>" + _ml_sel + "</select></div>"
+        "<div class='field'><label>API Key — সেভ আছে; বদলাতে চাইলে পুরোটা মুছে নতুনটা দিন</label>"
+        f"<input name='mail_key' value='{esc(_ml_mask)}' autocomplete='off' "
+        "placeholder='এখানে mail API Key পেস্ট করুন'></div>"
+        "<div class='field'><label>API Base URL</label>"
+        f"<input name='mail_api' value='{esc(_ml_api)}'></div>"
+        "<div class='field'><label>ডিফল্ট লাভ (%) — ডলার দামের উপর %, যে আইটেমের আলাদা লাইন নেই</label>"
+        f"<input name='mail_markup' value='{_ml_markup:g}'></div>"
+        "<div class='field'><label>আইটেম-ভিত্তিক লাভ (প্রতি লাইনে: service | domain | লাভ)</label>"
+        "<textarea name='mail_markup_map' rows='6' style='width:100%' "
+        "placeholder='gmail.com | 40&#10;outlook.com | +20&#10;"
+        "whatsapp | gmail.com | 50'>" + esc(_ml_map_raw) + "</textarea>"
+        "<div class='mut' style='font-size:12px;margin:4px 0 8px'>"
+        "<b>40</b> বা <b>40%</b> = ৪০% লাভ · <b>+20</b> = ২০৳ নির্দিষ্ট লাভ (দামের উপর যোগ) · "
+        "প্রথম ঘর খালি রাখলে (gmail.com | 40) সব সার্ভিসের ওই ডোমেইনে কাজ করবে।<br>"
+        "💵 প্রোভাইডারের দাম <b>ডলারে</b> — % লাভ বসে ওই ডলার দামের উপরেই, তারপর "
+        "ডলার-রেটে ৳ হয় (যেমন $0.1 + ৩০% → ১.৩× → ৳)। তাই ওয়েবে দাম বাড়লে "
+        "বটের দামও একই %ে সাথে সাথে বাড়ে; কেনার মুহূর্তে দাম আবার লাইভ চেক হয়।</div></div>"
+        "<div class='field' style='margin-top:10px'>"
+        "<label>🔢 সার্ভিস-ভিত্তিক কোড সংখ্যা (প্রতি লাইনে: service | কয়টি)</label>"
+        "<textarea name='mail_limits' rows='6' style='width:100%' "
+        "placeholder='instagram | 6&#10;facebook | 10&#10;telegram | 3'>"
+        + esc(_ml_lim_raw) + "</textarea>"
+        "<div class='mut' style='font-size:12px;margin:4px 0 8px'>"
+        "ইউজার মেইল কেনার আগে/পরে দেখবে এই সার্ভিসে কয়টি রেজিস্ট্রেশন-কোড "
+        "পাওয়া যাবে (লগইন অ্যালার্ট বা অন্য মেইল গোনা হয় না)। খালি রাখলে "
+        "বটের ডিফল্ট লিস্ট (Instagram 6, Facebook 10, Telegram 3 …) ব্যবহার হবে।<br>"
+        "• বাম দিকে <b>প্রোভাইডারের আসল সার্ভিস কোড</b> লিখুন (যেমন <b>ig</b>, <b>fb</b>, "
+        "<b>telegram</b>) — বট ছোট কোড/পুরো নাম দুটোই মিলিয়ে নেয়।<br>"
+        "• যে সার্ভিসের লাইন এখানে নেই সেটি <b>বটে বন্ধ</b> থাকে — ওয়েবে নতুন সার্ভিস "
+        "এলে আপনাকে বটে মেসেজ আসবে, আপনি লাইন লিখলেই ইউজার দেখতে পাবে।</div>"
+        + _ml_live +
+        "</div></div>"
+        "</div>",
         "<button class='ok sm' type='submit'>💾 সেভ করুন</button>",
         " <a class='btn gray sm' href='/admin/shop/getnum/test'>🧪 টেস্ট (প্রথম নাম্বার)</a>",
         "</form>",
@@ -600,6 +734,177 @@ def shop_number():
         return g
     _init()
     return page("📱 নাম্বার নিন (OTP)", _gn_page_html(), "shopnum")
+
+
+def _px_admin_html():
+    """🔍 Proxy Checker — আলাদা সেটিং কার্ড (SMM/Number-এর মতোই)।
+
+    এক জায়গায় সব প্রোভাইডারের নিজের API: প্রতি লাইন `provider | key/URL`।
+    """
+    _on, _map, _names = True, "", ()
+    try:
+        import bot as _b
+        _on = bool(getattr(_b, "px_on", lambda: True)())
+        _map = str(_b.get_setting("px_usage_map") or "")
+        _names = tuple(getattr(_b, "PX_USAGE_NAMES", ()))
+    except Exception:
+        pass
+    _sel = ("<option value='on' selected>চালু</option><option value='off'>বন্ধ</option>" if _on
+            else "<option value='on'>চালু</option><option value='off' selected>বন্ধ</option>")
+    # বর্তমান লাইন → প্রতি প্রোভাইডারের নিজের ভ্যালু
+    _cur, _dn = {}, ""
+    for _ln in _map.replace("\r", "").split("\n"):
+        _p = [x.strip() for x in _ln.replace("—", "|").split("|") if x.strip()]
+        if len(_p) < 2:
+            continue
+        if _p[0].lower() == "*":
+            _dn = "|".join(_p[1:]).strip()
+        else:
+            _cur[_p[0].lower()] = "|".join(_p[1:]).strip()
+    _rows = []
+    for _i, _n in enumerate(_names):
+        _v = _cur.get(_n.lower(), "")
+        _rows.append(
+            "<div class='field'><label>" + esc(_n) + (
+                " <span class='mut' style='font-weight:400'>✅ দেওয়া আছে</span>"
+                if _v else "") + "</label>"
+            "<input name='pxp_" + str(_i) + "' value='" + esc(_v) + "' "
+            "placeholder='API key · https://…{user}… · manual:1024/800' "
+            "style='width:100%'></div>")
+    return (
+        "<div class='card'><a class='btn gray sm' href='/admin/shop'>‹ Shop</a>"
+        "<h3 style='margin:8px 0 4px'>🔍 Proxy Checker</h3>"
+        "<div class='mut' style='font-size:12px;margin:0 0 10px'>"
+        "বটের 🔌 Proxy-IP পেজে “CHECK PROXY” বাটন। ইউজার "
+        "<b>IP:PORT:USERNAME:PASSWORD</b> পাঠালে Provider · Status (LIVE/DEAD) · IP · "
+        "MB/GB দেখায় (শুধু ইউজারনেম গ্রহণ করা হয় না)।</div>"
+        "<form method='post' action='/admin/shop/proxy/save'>"
+        "<div class='field'><label>অপশন</label><select name='px_on'>" + _sel + "</select></div>"
+        "<div class='mut' style='font-size:12px;margin:0 0 8px'>"
+        "প্রত্যেক প্রোভাইডারের <b>নিজের আলাদা API</b> — যে লাইনে যেটা দিবেন বট শুধু সেই "
+        "প্রোভাইডারেই ব্যবহার করবে (711-এর key 9proxy-তে যাবে না)। ”না দেওয়া“ মানে ওই "
+        "প্রোভাইডারে MB/GB দেখাবে না, শুধু LIVE/DEAD।</div>"
+        "<div class='mut' style='font-size:12px;margin:0 0 10px'>"
+        "• <b>9Proxy</b> → শুধু API key পেস্ট করুন, ঠিকানা বট নিজেই জানে।<br>"
+        "• অন্য প্রোভাইডারে URL-এ <b>{user}</b> / <b>{pass}</b> / <b>{host}</b> / "
+        "<b>{port}</b> বসাতে পারেন।<br>"
+        "• API না থাকলে নিজের কোটা: <span class='mono'>manual:1024/800</span> "
+        "(মোট/বাকি, MB) — ইউজার কার্ডে এটাই দেখাবে।</div>"
+        + "".join(_rows) +
+        "<div class='field'><label>* বাকি সব প্রোভাইডারের ডিফল্ট (ঐচ্ছিক)</label>"
+        "<input name='pxp_def' value='" + esc(_dn) + "' placeholder='API key বা URL' "
+        "style='width:100%'></div>"
+        "<button class='ok sm' type='submit'>💾 সেভ করুন</button>"
+        "<a class='btn gray sm' href='/admin/shop/proxy/test' "
+        "style='margin-left:6px'>🔎 সব প্রোভাইডারের MB/GB</a>"
+        "</form></div>")
+
+
+@wadm.route("/admin/shop/proxy", methods=["GET"])
+def shop_proxy_page():
+    """🔍 Proxy Checker — আলাদা পেজ (নাম্বার/মেইল কার্ডের বাইরে)।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    return page("🔍 Proxy Checker", _px_admin_html(), "shopproxy")
+
+
+@wadm.route("/admin/shop/proxy/test", methods=["GET"])
+def shop_proxy_test():
+    """🔎 অ্যাডমিনের জন্য — প্রতিটি প্রোভাইডারের API থেকে ব্যবহার/মোট MB।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    _rows, _ok = [], 0
+    try:
+        import bot as _bx
+        _cfg = dict(_bx._px_usage_cfg())
+        for _n in tuple(getattr(_bx, "PX_USAGE_NAMES", ())):
+            _key = _n.lower()
+            _v = _cfg.get(_key, "")
+            if not _v:
+                for _k, _vv in _cfg.items():
+                    if _k not in ("*", "all", "default") and (
+                            _k in _key or _key in _k):
+                        _v = _vv
+                        break
+            if not _v:
+                _v = _cfg.get("*", "")
+            if not _v:
+                _got = ("<span style='color:#c00'>API লাইন নেই</span>")
+            else:
+                _u = _bx._px_usage({}, _n)
+                _tag = (" <span class='mut'>(অ্যাডমিন-সেট)</span>"
+                        if _v.lower().startswith("manual:") else "")
+                if _u:
+                    _ok += 1
+                    _got = ("<b>" + _bx._px_mb(_u[0]) + "</b> ব্যবহূত · মোট "
+                            + _bx._px_mb(_u[1]) + _tag)
+                else:
+                    _got = ("<span style='color:#c00'>ডেটা আসেনি</span> "
+                            "<span class='mut'>— key/URL ঠিক আছে কি না দেখুন</span>")
+            _rows.append("<tr><td style='padding:6px 4px;border-bottom:1px solid #2a2a2a'>"
+                         + esc(_n) + "</td><td style='padding:6px 4px;"
+                         "border-bottom:1px solid #2a2a2a'>" + _got + "</td></tr>")
+    except Exception as e:
+        _rows = ["<tr><td colspan='2'>ত্রুটি: " + esc(str(e)[:140]) + "</td></tr>"]
+    _body = ("<div class='card'><a class='btn gray sm' href='/admin/shop/proxy'>"
+             "‹ Proxy Checker</a>"
+             "<h3 style='margin:8px 0 4px'>🔎 সব প্রোভাইডারের MB/GB</h3>"
+             "<div class='mut' style='font-size:12px;margin:0 0 8px'>"
+             "এই পেজ শুধু আপনিই দেখেন (ইউজার নয়)। সফল: " + str(_ok) + "টি। "
+             "প্রতিটা প্রোভাইডারে আলাদা API লাইন লাগবে।"
+             "</div><table style='width:100%;font-size:13px;border-collapse:collapse'>"
+             "<tr><th align='left'>প্রোভাইডার</th><th align='left'>ব্যবহার / মোট</th></tr>"
+             + "".join(_rows) + "</table></div>")
+    return page("🔎 Proxy MB/GB", _body, "shopproxy")
+
+
+@wadm.route("/admin/shop/proxy/save", methods=["POST"])
+def shop_proxy_save():
+    """Proxy Checker সেটিং — চালু/বন্ধ + প্রোভাইডার-ভিত্তিক API লিস্ট।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    form = request.form
+    try:
+        import bot as _bs0
+        _names = tuple(getattr(_bs0, "PX_USAGE_NAMES", ()))
+        _old = str(_bs0.get_setting("px_usage_map") or "")
+    except Exception:
+        _names, _old = (), (form.get("px_usage_map") or "")
+    _pxl = []
+    for _i, _n in enumerate(_names):
+        _v = (form.get("pxp_" + str(_i)) or "").strip().replace("\n", " ")
+        if _v:
+            _pxl.append((_n[:40] + " | " + _v[:360]).strip())
+    _dv = (form.get("pxp_def") or "").strip().replace("\n", " ")
+    if _dv:
+        _pxl.append("* | " + _dv[:360])
+    # চেনা প্রোভাইডারের বাইরে অ্যাডমিনের নিজের লেখা লাইনগুলো রেখে দিই
+    _known = {n.lower() for n in _names} | {"*"}
+    for _ln in _old.replace("\r", "").split("\n")[:40]:
+        _p = [x.strip() for x in _ln.replace("—", "|").split("|") if x.strip()]
+        if len(_p) < 2 or _p[0].lower() in _known:
+            continue
+        _pxl.append((_p[0][:40] + " | " + "|".join(_p[1:])[:360]).strip())
+    vals = {
+        "px_on": "off" if (form.get("px_on") or "on").strip().lower() == "off" else "on",
+        "px_usage_map": "\n".join(_pxl)[:4000],
+    }
+    try:
+        import bot as _bs
+        for k, v in vals.items():
+            _bs.set_setting(k, v)
+    except Exception:
+        for k, v in vals.items():
+            _x("INSERT INTO settings (key,value) VALUES (%s,%s) "
+               "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k, v))
+    log_admin("shop_proxy", 0, "saved")
+    return redirect("/admin/shop/proxy?ok=" + _q("🔍 Proxy Checker সেভ হয়েছে"))
 
 
 @wadm.route("/admin/shop", methods=["GET"])
@@ -813,9 +1118,16 @@ def shop_home():
         + _btn("⚙️ সেটিং খুলুন", "/admin/shop/number", "btn ok sm")
         + "</div><div class='mut' style='font-size:12px;margin-top:6px'>"
         "API key · সার্ভিস/দেশ/রেট · OTP চ্যানেল/ফিড — সব আলাদা পেজে।</div></div>")
+    # 🔍 Proxy Checker — আলাদা কার্ড/পেজ (নাম্বার কার্ডের ভিতরে নয়)
+    proxy_link = (
+        "<div class='card'><div class='row' style='justify-content:space-between;"
+        "align-items:center'><b>🔍 Proxy Checker (LIVE/DEAD + MB/GB)</b>"
+        + _btn("⚙️ সেটিং খুলুন", "/admin/shop/proxy", "btn ok sm")
+        + "</div><div class='mut' style='font-size:12px;margin-top:6px'>"
+        "প্রতি প্রোভাইডারের নিজের API এক জায়গায় · চালু/বন্ধ।</div></div>")
 
     body = (
-        head + switch_card + msg_card + mailcard + getnum_link + tools
+        head + switch_card + msg_card + mailcard + getnum_link + proxy_link + tools
         + "<div class='card'><div class='row' style='justify-content:space-between;align-items:center'>"
           "<b>📁 ক্যাটাগরি</b>" + _btn("🛒 অর্ডার দেখুন", "/admin/shop/orders", "btn gray sm")
         + "</div>" + table(["ক্যাটাগরি", "পণ্য", "স্ট্যাটাস", "অন/অফ", ""], cat_rows,

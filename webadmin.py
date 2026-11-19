@@ -1319,6 +1319,7 @@ MENU = [
     ("history", "/admin/history", "Task History", "task", ""),
     ("shop", "/admin/shop", "Shop / দোকান", "money", ""),
     ("shopnum", "/admin/shop/number", "Number / OTP", "device", ""),
+    ("shopproxy", "/admin/shop/proxy", "Proxy Checker", "globe", ""),
     ("smm", "/admin/smm", "SMM Panel", "globe", ""),
     ("deposits", "/admin/deposits", "Deposits", "wallet", ""),
     ("earnings", "/admin/earnings", "Earnings", "money", ""),

@@ -72,13 +72,20 @@ _BTN_PRIMARY_W = (
 )
 
 
-def _btn_style_guess(btn):
-    """একটা বাটন-ডিক্ট দেখে কালার ঠিক করে; আগে থেকে style থাকলে ছোঁয় না।"""
+def _btn_style_guess(btn, pos=0, n=1):
+    """একটা বাটন-ডিক্ট দেখে কালার ঠিক করে; আগে থেকে style থাকলে ছোঁয় না।
+
+    নিয়ম (ছবির মতো সুন্দর দেখায়):
+      🔴 লাল  — Back / Cancel / Delete / Refund (সব সেকশনে, সবার আগে)
+      🟢 সবুজ — নাম্বার/কোড কপি বাটন
+      🎨 পাশাপাশি বাটনের সারি — বাম = সবুজ, ডান = নীল, পরেরটায় আবার সবুজ…
+      ➕ একলা বাটন — Shop/Admin/Change/Refresh নীল, বাকি কাজের বাটন সবুজ
+    """
     if not isinstance(btn, dict) or btn.get("style"):
         return None
-    # 🟢 সবুজ: নাম্বার/কোড কপি-বাটন, দেশ/রেঞ্জ লিস্ট, OTP গ্রুপ — ছবির মতো
+    # 🟢 সবুজ: নাম্বার/কোড কপি-বাটন — ছবির মতো
     _cbraw = btn.get("callback_data") or ""
-    if btn.get("copy_text") or _cbraw.startswith(("gn:r:", "gn:c:", "gn:co:")):
+    if btn.get("copy_text"):
         return "success"
     # callback_data-এর আন্ডারস্কোর/কোলন ফাঁকা করে নিলে _cancel, :close সবই ধরা পড়ে
     _cb = _cbraw.replace("_", " ").replace(":", " ")
@@ -95,8 +102,12 @@ def _btn_style_guess(btn):
         return False
 
     # 🔴 লাল: Back / বাতিল / ডিলিট — সবার আগে, সব মেনুতেই একই নিয়ম
+    #    (নাম্বার সেকশনের Cancel/Back-ও আগের মতোই লাল থাকবে)
     if _hit(_BTN_DANGER_W, hay):
         return "danger"
+    # 🎨 পাশাপাশি দুই/তিনটা বাটনের সারি: বাম সবুজ → ডান নীল (পরপর বদল)
+    if n >= 2:
+        return "success" if pos % 2 == 0 else "primary"
     # 🟢 সবুজ (Save / Done / Approve / চালু) — অ্যাডমিন প্যানেলেও কাজের বাটন সবুজ
     if _hit(_BTN_SUCCESS_W, _txt):
         return "success"
@@ -121,9 +132,10 @@ def _patch_markup_style(cls, key):
         if BTN_STYLE_ON:
             try:
                 for _row in out.get(key) or []:
-                    for _b in _row:
+                    _n = len(_row)
+                    for _i, _b in enumerate(_row):
                         if isinstance(_b, dict):
-                            _st = _btn_style_guess(_b)
+                            _st = _btn_style_guess(_b, _i, _n)
                             if _st:
                                 _b["style"] = _st
             except Exception:
@@ -3940,6 +3952,10 @@ def init_db():
             _getnum_ddl()
         except Exception as _ge:
             log.warning(f"[GETNUM] DDL ব্যর্থ: {_ge}")
+        try:
+            _mail_ddl()
+        except Exception as _mdl:
+            log.warning(f"[MAIL] টেবিল তৈরি ব্যর্থ: {str(_mdl)[:120]}")
         # ── এককালীন: ডিপোজিটের সময়-লক (কুলডাউন) বন্ধ + ৫ মিনিট চেক-উইন্ডো ──
         #    (ইউজারের চাহিদা: সময় লক থাকলে নতুন ডিপোজিট আটকে যায়, তাই অফ)
         try:
@@ -10605,6 +10621,21 @@ async def show_shop(update, ctx=None):
             kb = InlineKeyboardMarkup(_rows)
         except Exception:
             pass
+    # 🔑 OTP কিনুন (Gmail/নাম্বার ও রেন্ট নাম্বার) — SMM-এর ঠিক উপরে বড় বাটন
+    try:
+        _rows = [list(_r) for _r in kb.inline_keyboard]
+        _obtn = InlineKeyboardButton(
+            "🔑 OTP Buy — Gmail/Number & Rent",   # সব ইউজার সবসময় ইংরেজিতে দেখবে
+            callback_data="otpbuy")
+        _at = len(_rows)
+        for _i, _r in enumerate(_rows):
+            if any(str(getattr(_bb, "callback_data", "") or "") == "smm" for _bb in _r):
+                _at = _i
+                break
+        _rows.insert(_at, [_obtn])
+        kb = InlineKeyboardMarkup(_rows)
+    except Exception:
+        pass
     msg = update.effective_message
     if update.callback_query:
         try:
@@ -10684,6 +10715,8 @@ async def _shop_show_cat(q, cid, plan_id=None):
         if _loose:
             _rows.append([InlineKeyboardButton(_bi("📦 অন্যান্য পণ্য", "📦 Other Products", _en),
                                                callback_data=f"shop:pl:{int(cid)}:0")])
+        if _proxy_cat(cat) and px_on():   # 🔌 Proxy-IP — Back-এর ঠিক উপরে চেকার
+            _rows.append([InlineKeyboardButton("🔍 CHECK PROXY", callback_data="pxchk")])
         _rows.append([InlineKeyboardButton(_bi("🔙 ফিরে যান", "🔙 Back", _en), callback_data="shop:list")])
         try:
             await q.edit_message_text(
@@ -10719,12 +10752,19 @@ async def _shop_show_cat(q, cid, plan_id=None):
            + "━━━━━━━━━━━━━━\n"
            + _bi("👇 পণ্য বেছে নিন — বাটনে দাম ও স্টক দেখা যাচ্ছে।",
                  "👇 Choose a product — price and stock are on the buttons.", _en))
+    _pkb = _shop_prods_kb(cid, prods, _back, en=_en)
+    if _proxy_cat(cat) and px_on():   # 🔌 Proxy-IP — Back-এর ঠিক উপরে চেকার
+        try:
+            _prows = [list(_r) for _r in _pkb.inline_keyboard]
+            _prows.insert(max(0, len(_prows) - 1),
+                          [InlineKeyboardButton("🔍 CHECK PROXY", callback_data="pxchk")])
+            _pkb = InlineKeyboardMarkup(_prows)
+        except Exception:
+            pass
     try:
-        await q.edit_message_text(txt, parse_mode="Markdown",
-                                  reply_markup=_shop_prods_kb(cid, prods, _back, en=_en))
+        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=_pkb)
     except Exception:
-        await q.message.reply_text(txt, parse_mode="Markdown",
-                                   reply_markup=_shop_prods_kb(cid, prods, _back, en=_en))
+        await q.message.reply_text(txt, parse_mode="Markdown", reply_markup=_pkb)
 
 
 async def _shop_show_product(q, pid):
@@ -11794,6 +11834,1429 @@ async def _shop_show_order(q, oid):
         await q.message.reply_text(txt, parse_mode="HTML", reply_markup=kb)
 
 
+# ═════════════════ ✉️ মেইল কিনুন (SmsBower mails API) ═════════════════
+# ডক: https://documenter.getpostman.com/view/16514200/2sAXxLCEma
+#   getPriceRests → getActivation → getCode → setStatus / requestRefund
+MAIL_API_DEF = "https://smsbower.online"
+MAIL_WAIT_SEC = 1500         # ২৫ মিনিট — কোড না এলে অটো বাতিল + প্রোভাইডার রিফান্ড নিশ্চিত হলেই ওয়ালেটে টাকা
+_MAIL_CACHE = {"ts": 0.0, "rows": []}
+_MAIL_CACHE_TTL = 60.0
+
+
+def mail_on():
+    try:
+        return (get_setting("mail_on") or "off") != "off"
+    except Exception:
+        return False
+
+
+def mail_key():
+    try:
+        return _re.sub(r"\s+", "", str(get_setting("mail_key") or ""))
+    except Exception:
+        return ""
+
+
+def mail_base():
+    try:
+        return (str(get_setting("mail_api") or "").strip().rstrip("/")) or MAIL_API_DEF
+    except Exception:
+        return MAIL_API_DEF
+
+
+def mail_markup():
+    """প্রোভাইডারের দামের উপর ডিফল্ট লাভ % (যে আইটেমের আলাদা সেট নেই)।"""
+    try:
+        return float(str(get_setting("mail_markup") or "30").replace(",", "."))
+    except Exception:
+        return 30.0
+
+
+_MAIL_MK_CACHE = {"ts": 0.0, "val": None}
+
+
+def _mail_mk_parse(val):
+    """'30' বা '30%' → % লাভ ; '+15' বা '15৳' বা 'tk15' → নির্দিষ্ট ৳ লাভ।"""
+    _v = str(val or "").strip()
+    _flat = False
+    for _x in ("৳", "টাকা", "taka", "TAKA", "Tk"):
+        if _x in _v:
+            _flat = True              # ৳ চিহ্ন থাকলে = নির্দিষ্ট টাকা, % নয়
+        _v = _v.replace(_x, "")
+    _v = _v.replace(",", ".").replace(" ", "")
+    if not _v:
+        return None
+    try:
+        if _v.startswith("+"):
+            return (0.0, abs(float(_v[1:])))
+        _low = _v.lower()
+        if _low.endswith("%"):
+            return (float(_low[:-1]), 0.0)
+        if _low.startswith("tk"):
+            return (0.0, abs(float(_low[2:])))
+        if _flat:
+            return (0.0, abs(float(_low)))
+        return (float(_low), 0.0)
+    except Exception:
+        return None
+
+
+def mail_markup_map(force=False):
+    """আইটেম-ভিত্তিক লাভ — {(service, domain): (pct, flat)} ; ৩০ সে. ক্যাশে।
+
+    অ্যাডমিনের লাইন: service | domain | লাভ   (service খালি হলে সব সার্ভিসে সেই ডোমেইন)
+    """
+    _t = _time.time()
+    if (not force and _MAIL_MK_CACHE.get("val") is not None
+            and _t - float(_MAIL_MK_CACHE.get("ts") or 0) < 30):
+        return _MAIL_MK_CACHE["val"]
+    _out = {}
+    try:
+        _raw = str(get_setting("mail_markup_map") or "")
+    except Exception:
+        _raw = ""
+    for _ln in _raw.splitlines():
+        _ln = _ln.strip()
+        if not _ln or _ln.startswith("#"):
+            continue
+        _p = [x.strip() for x in _ln.replace("—", "|").replace("\t", "|").split("|")]
+        _p = [x for x in _p if x]
+        if len(_p) == 2:
+            _svc, _dom, _val = "", _p[0], _p[1]
+        elif len(_p) >= 3:
+            _svc, _dom, _val = _p[0].lower(), _p[1], _p[2]
+        else:
+            continue
+        _mk = _mail_mk_parse(_val)
+        if not _mk or not _dom:
+            continue
+        _out[(_svc, _dom.lower())] = _mk
+    _MAIL_MK_CACHE["ts"] = _t
+    _MAIL_MK_CACHE["val"] = _out
+    return _out
+
+
+def mail_markup_item(service="", domain=""):
+    """(pct, flat) — আইটেমের নিজের লাভ, না থাকলে ডিফল্ট %।"""
+    _m = mail_markup_map()
+    _svc, _dom = str(service or "").lower(), str(domain or "").lower()
+    _hit = _m.get((_svc, _dom))
+    if _hit is None:
+        _hit = _m.get(("", _dom))
+    if _hit is None and _dom:
+        for (_s, _d), _v in _m.items():
+            if _d == _dom:
+                _hit = _v
+                break
+    return _hit if _hit else (mail_markup(), 0.0)
+
+
+def mail_price(usd, service="", domain=""):
+    """প্রোভাইডারের *লাইভ* দাম ($) → ইউজারের ৳ (ডলার রেট + আইটেম-ভিত্তিক লাভ)।
+
+    দাম সবসময় প্রোভাইডারের সদ্য পাওয়া দাম থেকেই হিসাব হয় — ওয়েবে দাম বাড়লে
+    বটের দামও লাভ সহ বেড়ে যায়।
+    """
+    try:
+        _r = float(dep_rate() or 125.0)
+        _pct, _flat = mail_markup_item(service, domain)
+        return round(float(usd or 0) * _r * (1.0 + _pct / 100.0) + _flat, 2)
+    except Exception:
+        return 0.0
+
+
+def _mail_api(path, **params):
+    """GET + api_key → JSON dict (ব্যর্থ হলে {'status':0,'error':...})।"""
+    _k = mail_key()
+    if not _k:
+        return {"status": 0, "error": "API key নেই"}
+    _qq = dict(params)
+    _qq["api_key"] = _k
+    _url = mail_base() + "/" + str(path).lstrip("/") + "?" + urllib.parse.urlencode(_qq)
+    try:
+        _rq = urllib.request.Request(
+            _url, headers={"Accept": "application/json",
+                           "User-Agent": "TaskEarnBot/1.0"})
+        with urllib.request.urlopen(_rq, timeout=25) as _r:
+            _txt = _r.read().decode("utf-8", "replace")
+        _d = _json.loads(_txt)
+        return _d if isinstance(_d, dict) else {"status": 0, "error": "bad response"}
+    except Exception as e:
+        return {"status": 0, "error": str(e)[:150]}
+
+
+# 🔢 প্রতি সার্ভিসে কতটি *রেজিস্ট্রেশন-কোড* আসে (লগইন অ্যালার্ট নয়) — শুধু ইউজারকে
+# কেনার আগে দেখানোর জন্য। অ্যাডমিন প্যানেল থেকে `service | N` লাইনে বদলানো যায়।
+MAIL_LIMIT_DEF = {
+    "kakaotalk": 1, "tinder": 1, "instagram": 6, "telegram": 3, "facebook": 10,
+    "steam": 1, "twitter": 3, "microsoft": 1, "amazon": 2, "craigslist": 1,
+    "tiktok": 2, "shopee": 2, "discord": 1, "wechat": 1, "biglion": 1,
+    "twitch": 1, "tokopedia": 1, "yandex": 1, "apple": 5, "vinted": 2,
+    "snapchat": 1, "hinge": 1, "openai": 3, "chatgpt": 3, "leboncoin": 2,
+    "fiverr": 1, "yemeksepeti": 1, "kleinanzeigen": 1, "flovaai": 1,
+    "badoo": 1, "reddit": 1, "ashleymadison": 5, "walmart": 1, "wallapop": 1,
+    "chamet": 2, "github": 1, "aws": 1,
+}
+_MAIL_LIM_CACHE = {"ts": 0.0, "val": None}
+
+
+def mail_limits(force=False):
+    """{service: কোড-সংখ্যা} — ডিফল্ট উপরে, অ্যাডমিনের লাইন (`service | N`) আগে।"""
+    _t = _time.time()
+    if (not force and _MAIL_LIM_CACHE.get("val") is not None
+            and _t - float(_MAIL_LIM_CACHE.get("ts") or 0) < 30):
+        return _MAIL_LIM_CACHE["val"]
+    _out = dict(MAIL_LIMIT_DEF)
+    try:
+        _raw = str(get_setting("mail_limits") or "")
+    except Exception:
+        _raw = ""
+    for _ln in _raw.splitlines():
+        _ln = _ln.strip()
+        if not _ln or _ln.startswith("#"):
+            continue
+        _p = [x.strip() for x in
+              _ln.replace("—", "|").replace("\t", "|").split("|")]
+        _p = [x for x in _p if x]
+        if len(_p) < 2:
+            continue
+        try:
+            _n = max(0, min(50, int(float(_p[-1].replace(",", ".")))))
+        except Exception:
+            continue
+        _k = _re.sub(r"[^a-z0-9]", "", _p[0].lower())
+        if _k:
+            _out[_k] = _n
+            # ছোট কোড লিখলেও পুরো নামের লিমিটও সেট হোক (IG → instagram)
+            try:
+                _canon = MAIL_LIMIT_ALIAS.get(_k)
+            except Exception:
+                _canon = None
+            if _canon:
+                _out[_canon] = _n
+    _MAIL_LIM_CACHE["ts"] = _t
+    _MAIL_LIM_CACHE["val"] = _out
+    return _out
+
+
+# প্রোভাইডার ছোট কোড দিলেও (ig/fb/tg/kt…) সঠিক সার্ভিসে মিলবে
+MAIL_LIMIT_ALIAS = {
+    "ig": "instagram", "insta": "instagram", "fb": "facebook",
+    "tg": "telegram", "telega": "telegram", "kt": "kakaotalk",
+    "kakao": "kakaotalk", "tw": "twitter", "xcom": "twitter",
+    "ms": "microsoft", "outlook": "microsoft", "amz": "amazon",
+    "tt": "tiktok", "gh": "github", "rd": "reddit", "sc": "snapchat",
+    "ap": "apple", "st": "steam", "dc": "discord", "wa": "wechat",
+    "ai": "openai", "gpt": "openai", "chatgpt": "openai",
+    "am": "ashleymadison", "wm": "walmart", "awsamazon": "aws",
+}
+
+
+def mail_limit(service):
+    """এই সার্ভিসে কয়টি কোড পাওয়া যাবে (না মিললে `default`, না থাকলে ১)।"""
+    _s = _re.sub(r"[^a-z0-9]", "", str(service or "").lower())
+    _m = mail_limits()
+    if not _s:
+        return 1
+    if _s in _m:
+        return int(_m[_s])
+    _al = MAIL_LIMIT_ALIAS.get(_s)
+    if _al and _al in _m:
+        return int(_m[_al])
+    # ⚠️ শুধু substring মিলালে ভুল হয় (যেমন "somethingelse"-এ "hinge") — তাই
+    #    পুরো মিল / শুরু-মিল / অ্যালিয়াস দিয়েই মেলানো হয়
+    for _k, _v in _m.items():
+        if not _k or _k == "default":
+            continue
+        if _k == _s:
+            return int(_v)
+        if len(_k) >= 4 and (_s.startswith(_k) or _k.startswith(_s)):
+            return int(_v)
+        if _al and (_k == _al or _al.startswith(_k) or _k.startswith(_al)):
+            return int(_v)
+    if "default" in _m:
+        return int(_m["default"])
+    return 1
+
+
+def mail_service_known(service):
+    """এই সার্ভিসটি বটে চালু কি না — শুধু ডিফল্ট/অ্যাডমিন-লেখা সার্ভিস চলে।
+
+    ওয়েবে নতুন সার্ভিস এলে নিজে থেকে চালু হয় না (অ্যাডমিনকে মেসেজ যায়)।
+    """
+    _s = _re.sub(r"[^a-z0-9]", "", str(service or "").lower())
+    if not _s:
+        return False
+    _m = mail_limits()
+    if _s in _m or _s in MAIL_LIMIT_ALIAS:
+        return True
+    _al = MAIL_LIMIT_ALIAS.get(_s)
+    if _al and _al in _m:
+        return True
+    for _k in _m:
+        if not _k or _k == "default":
+            continue
+        if len(_k) >= 4 and (_s.startswith(_k) or _k.startswith(_s)):
+            return True
+    return False
+
+
+def mail_catalog(force=False):
+    """দাম + স্টক: [{'service','domain','price','count'}] — ৬০ সেকেন্ড ক্যাশে।"""
+    _now = _time.time()
+    if (not force and _MAIL_CACHE.get("rows")
+            and _now - float(_MAIL_CACHE.get("ts") or 0) < _MAIL_CACHE_TTL):
+        return _MAIL_CACHE["rows"]
+    _rows = []
+    for _prm in ({}, {"domain": "gmail.com"}):
+        _d = _mail_api("/api/mail/getPriceRests", **_prm)
+        if str(_d.get("status")) != "1":
+            continue
+        _data = _d.get("data") or {}
+        if not isinstance(_data, dict):
+            continue
+        for _sv, _doms in _data.items():
+            if not isinstance(_doms, dict):
+                continue
+            for _dm, _inf in _doms.items():
+                if not isinstance(_inf, dict):
+                    continue
+                try:
+                    _p = float(_inf.get("price") or 0)
+                    _cnt = int(_inf.get("count") or 0)
+                except Exception:
+                    continue
+                if _p <= 0:
+                    continue
+                _rows.append({"service": str(_sv), "domain": str(_dm),
+                              "price": _p, "count": _cnt})
+        if _rows:
+            break
+    if _rows:
+        _MAIL_CACHE["ts"] = _now
+        _MAIL_CACHE["rows"] = _rows
+    return _rows
+
+
+def _mail_svc_label(code):
+    _c0 = str(code or "").strip()
+    return _GN_SVC.get(_c0.lower()) or _GN_SVC.get(_c0) or ("✉️ " + _c0 if _c0 else "✉️ Mail")
+
+
+def _mail_ddl():
+    with _c() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS mail_orders (
+            id          BIGSERIAL PRIMARY KEY,
+            user_id     BIGINT DEFAULT 0,
+            mail        TEXT DEFAULT '',
+            mail_id     TEXT DEFAULT '',
+            service     TEXT DEFAULT '',
+            domain      TEXT DEFAULT '',
+            code        TEXT DEFAULT '',
+            status      TEXT DEFAULT 'waiting',
+            price       REAL DEFAULT 0,
+            usd         REAL DEFAULT 0,
+            ts          REAL DEFAULT 0,
+            created_at  TEXT DEFAULT '',
+            updated_at  TEXT DEFAULT ''
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS mail_orders_user ON mail_orders (user_id, id)")
+        c.execute("CREATE INDEX IF NOT EXISTS mail_orders_status ON mail_orders (status, ts)")
+
+
+def mail_order_get(oid):
+    try:
+        with _c() as c:
+            return c.execute("SELECT * FROM mail_orders WHERE id=%s", (int(oid),)).fetchone()
+    except Exception:
+        return None
+
+
+def mail_order_new(uid, mail, mail_id, service, domain, usd, tk):
+    with _c() as c:
+        r = c.execute(
+            "INSERT INTO mail_orders(user_id,mail,mail_id,service,domain,status,"
+            "price,usd,ts,created_at) VALUES(%s,%s,%s,%s,%s,'waiting',%s,%s,%s,%s) "
+            "RETURNING id",
+            (uid, str(mail)[:120], str(mail_id)[:40], str(service)[:40],
+             str(domain)[:80], round(float(tk), 4), round(float(usd), 4),
+             _time.time(), now())).fetchone()
+    return int(r["id"])
+
+
+def mail_order_set(oid, **kv):
+    if not kv:
+        return
+    _cols = ", ".join(f"{k}=%s" for k in kv)
+    with _c() as c:
+        c.execute(f"UPDATE mail_orders SET {_cols}, updated_at=%s WHERE id=%s",
+                  tuple(list(kv.values()) + [now(), int(oid)]))
+
+
+def mail_order_claim(oid, statuses=("waiting", "expired")):
+    """অর্ডারটা একবারই কেউ নিতে পারবে — ডাবল-ট্যাপে দুইবার রিফান্ড ঠেকায়।
+
+    atomic: শুধু অনুমোদিত স্টেটাস থেকে 'refunding'-এ যায়, না পারলে False।
+    """
+    _st = [str(x) for x in (statuses or ())]
+    if not _st:
+        return False
+    try:
+        with _c() as c:
+            r = c.execute(
+                "UPDATE mail_orders SET status='refunding', updated_at=%s "
+                "WHERE id=%s AND status IN (" + ", ".join(["%s"] * len(_st)) + ") "
+                "RETURNING id",
+                tuple([now(), int(oid)] + _st)).fetchone()
+        return bool(r)
+    except Exception:
+        return False
+
+
+def _mail_waiting():
+    """চালু/বাতিল-প্রসেসিং অর্ডারগুলো — প্রতি ২০ সেকেন্ডে জব এগুলো দেখে।"""
+    try:
+        with _c() as c:
+            return c.execute(
+                "SELECT * FROM mail_orders WHERE status IN "
+                "('waiting','expired','refunding') ORDER BY id ASC LIMIT 60"
+            ).fetchall() or []
+    except Exception:
+        return []
+
+
+def _mail_provider_cancel(mail_id):
+    """প্রোভাইডারে মেইল বাতিল — সফল হলে True (টাকা প্রোভাইডার ব্যালেন্সে ফেরত)।
+
+    ⚠️ ডকের স্ট্যাটাস: 2 = Cancel (রিফান্ড) · 3 = কোড পেয়ে ক্লোজ · 5 = পরের কোডের অপেক্ষা
+    (আগে ভুলে 5 পাঠানো হচ্ছিল — তাই প্রোভাইডারে বাতিলই হচ্ছিল না)
+    """
+    _mid = str(mail_id or "").strip()
+    if not _mid:
+        return False
+    _d = _mail_api("/api/mail/setStatus", id=_mid, status=2)
+    _err = str(_d.get("error") or _d.get("message") or "").strip().lower()
+    if str(_d.get("status")) == "1":
+        return True                       # বাতিল + রিফান্ড হয়ে গেছে
+    if "cancel" in _err or "refund" in _err:
+        return True                       # আগেই বাতিল/রিফান্ড হয়ে গেছে
+    if "no activation found" in _err or "not found" in _err:
+        # অ্যাক্টিভেশন আর নেই (প্রোভাইডারে মেয়াদ শেষ/বাতিল) — বাতিল ধরেই নিই
+        log.info(f"[MAIL] activation নেই id={_mid} — বাতিল/রিফান্ড ধরা হলো")
+        return True
+    if "bad actual activation" in _err:
+        # অ্যাক্টিভেশন ইতিমধ্যে ক্লোজ/কোড পেয়ে গেছে — আলাদা রিফান্ড চেষ্টা
+        _r = _mail_api("/api/mail/requestRefund", id=_mid, sign="",
+                       reason="no code in 25 min")
+        if str(_r.get("status")) == "1":
+            return True
+        _e2 = str(_r.get("error") or _r.get("message") or "").lower()
+        if "cancel" in _e2 or "refund" in _e2 or "already" in _e2:
+            return True
+    log.warning(f"[MAIL] প্রোভাইডার বাতিল হয়নি id={_mid}: {_err[:80]}")
+    return False
+
+
+def mail_refund_commit(oid, uid, tk):
+    """রিফান্ড একবারই: refunding→refunded + ওয়ালেটে টাকা — একই DB ট্রানজ্যাকশনে।
+
+    True = এই কলেই টাকা ফেরত দেওয়া হলো (আগে হয়ে থাকলে False → ডাবল রিফান্ড নেই)।
+    """
+    _tk = round(float(tk or 0), 4)
+    try:
+        with _c() as c:
+            _r = c.execute(
+                "UPDATE mail_orders SET status='refunded', updated_at=%s "
+                "WHERE id=%s AND status='refunding' RETURNING id",
+                (now(), int(oid))).fetchone()
+            if not _r:
+                return False
+            if _tk > 0:
+                c.execute("UPDATE users SET dep_balance=dep_balance+%s WHERE user_id=%s",
+                          (_tk, int(uid)))
+    except Exception as e:
+        log.warning(f"[MAIL] রিফান্ড কমিট ব্যর্থ oid={oid}: {str(e)[:110]}")
+        return False
+    try:
+        _invalidate_user_cache(int(uid))
+    except Exception:
+        pass
+    return True
+
+
+def _mail_order_text(o, en=False):
+    _num = str(o.get("mail") or "")
+    _code = str(o.get("code") or "")
+    _tk = float(o.get("price") or 0)
+    _min = 0
+    try:
+        _left = max(0.0, MAIL_WAIT_SEC - (_time.time() - float(o.get("ts") or 0)))
+        _min = max(1, int((_left + 59) // 60))       # বাকি সময়, উপরের দিকে রাউন্ড
+    except Exception:
+        _min = max(1, int(MAIL_WAIT_SEC // 60))
+    if _code:
+        _lim = mail_limit(o.get("service"))
+        return _bi(f"✅ *মেইল রেডি — কোড এসেছে*\n\n📧 `{_num}`\n🔑 কোড: `{_code}`\n\n"
+                   f"🔢 এই সার্ভিসে মোট *{_lim}টি* রেজিস্ট্রেশন কোড পাওয়া যায়।\n"
+                   f"💵 {_tk:g}৳ কাটা হয়েছে।",
+                   f"✅ *Mail ready — code received*\n\n📧 `{_num}`\n🔑 Code: `{_code}`\n\n"
+                   f"🔢 This service gives *{_lim}* registration code(s) in total.\n"
+                   f"💵 {_tk:g}৳ charged.", en)
+    _st = str(o.get("status") or "")
+    if _st == "refunded":
+        return _bi(f"❌ *অর্ডার বাতিল — টাকা ফেরত হয়েছে*\n\n📧 `{_num}`\n\n"
+                   f"💵 {_tk:g}৳ আপনার ডিপোজিট ব্যালেন্সে ফেরত দেওয়া হয়েছে।",
+                   f"❌ *Order canceled — refunded*\n\n📧 `{_num}`\n\n"
+                   f"💵 {_tk:g}৳ has been returned to your deposit balance.", en)
+    if _st == "refunding":
+        return _bi(f"⏳ *বাতিল প্রসেস হচ্ছে*\n\n📧 `{_num}`\n\n"
+                   f"প্রোভাইডারের রিফান্ড নিশ্চিত হওয়ার সাথে সাথে {_tk:g}৳ আপনার "
+                   "ডিপোজিট ব্যালেন্সে ফেরত যাবে — কিছুক্ষণ পর দেখুন।",
+                   f"⏳ *Cancellation in progress*\n\n📧 `{_num}`\n\n"
+                   f"{_tk:g}৳ will be returned to your deposit balance as soon as the "
+                   "provider confirms the refund — check again shortly.", en)
+    if _st == "expired":
+        return _bi(f"⌛ *২৫ মিনিটে কোড আসেনি*\n\n📧 `{_num}`\n🌐 {o.get('domain') or ''}\n\n"
+                   f"অর্ডার অটো বাতিল হচ্ছে — প্রোভাইডারের রিফান্ড নিশ্চিত হলে "
+                   f"{_tk:g}৳ আপনার ব্যালেন্সে ফেরত যাবে।",
+                   f"⌛ *No code in 25 minutes*\n\n📧 `{_num}`\n🌐 {o.get('domain') or ''}\n\n"
+                   f"The order is being canceled automatically — {_tk:g}৳ goes back to "
+                   "your balance once the provider confirms the refund.", en)
+    _lim = mail_limit(o.get("service"))
+    return _bi(f"📧 *মেইল নেওয়া হয়েছে*\n\n`{_num}`\n🌐 {o.get('domain') or ''} · "
+               f"{o.get('service') or ''}\n\n🔑 কোড এলে এখানেই দেখাবে (অটো চেক)।\n"
+               f"🔢 এই সার্ভিসে *{_lim}টি* রেজিস্ট্রেশন কোড পাওয়া যাবে "
+               "(লগইন অ্যালার্ট/অন্য মেইল গোনা হয় না)।\n"
+               f"⏳ সময়: ~{_min} মিনিট\n💵 {_tk:g}৳",
+               f"📧 *Mail issued*\n\n`{_num}`\n🌐 {o.get('domain') or ''} · "
+               f"{o.get('service') or ''}\n\n🔑 The code will appear here (auto-check).\n"
+               f"🔢 You get *{_lim}* registration code(s) for this service "
+               "(login alerts / other emails are not counted).\n"
+               f"⏳ Time: ~{_min} min\n💵 {_tk:g}৳", en)
+
+
+def _mail_order_kb(o, en=False):
+    _id = int(o.get("id") or 0)
+    _num = str(o.get("mail") or "")
+    _code = str(o.get("code") or "")
+    _b = []
+    try:
+        if _code:
+            _b.append([InlineKeyboardButton(_bi(f"🔑 {_code}", f"🔑 {_code}", en),
+                                            copy_text=CopyTextButton(text=_code))])
+        if _num:
+            _b.append([InlineKeyboardButton(_bi(f"📧 {_num}", f"📧 {_num}", en),
+                                            copy_text=CopyTextButton(text=_num))])
+    except Exception:
+        pass
+    _rows = []
+    _st = str(o.get("status") or "")
+    if _st == "waiting":
+        _rows.append([InlineKeyboardButton(_bi("❌ বাতিল (টাকা ফেরত)",
+                                               "❌ Cancel (refund)", en),
+                                           callback_data=f"mailb:x:{_id}")])
+    elif _st in ("expired", "refunding"):
+        # অটো রিফান্ড চলছে — তবুও বাটন রাখি (পুরোনো আটকে থাকা অর্ডারের জন্য)
+        _rows.append([InlineKeyboardButton(_bi("💰 আবার চেষ্টা করুন",
+                                               "💰 Retry refund", en),
+                                           callback_data=f"mailb:x:{_id}")])
+    _rows.append([InlineKeyboardButton(_bi("🔁 আরেকটা মেইল", "🔁 Another mail", en),
+                                       callback_data="mailb")])
+    _rows.append([InlineKeyboardButton(_bi("🔙 Back", "🔙 Back", en),
+                                       callback_data="otpbuy")])
+    return InlineKeyboardMarkup(_b + _rows)
+
+
+def _mail_auto_refund_text(o, en=False):
+    """২৫ মিনিটে কোড না আসায় অটো বাতিলের মেসেজ।"""
+    _num = str(o.get("mail") or "")
+    _tk = float(o.get("price") or 0)
+    return _bi(
+        f"⌛ *২৫ মিনিটে কোড আসেনি — অর্ডার বাতিল হয়েছে*\n\n📧 `{_num}`\n🌐 {o.get('domain') or ''}\n\n"
+        f"💵 {_tk:g}৳ আপনার ডিপোজিট ব্যালেন্সে ফেরত দেওয়া হয়েছে।",
+        f"⌛ *No code in 25 minutes — order canceled*\n\n📧 `{_num}`\n🌐 {o.get('domain') or ''}\n\n"
+        f"💵 {_tk:g}৳ has been returned to your deposit balance.", en)
+
+
+async def _mail_finish_refund(o, en=False, auto=False, notify=False):
+    """প্রোভাইডারে বাতিল নিশ্চিত (setStatus=2) হলেই ওয়ালেটে টাকা — ১০০% গ্যারান্টি পথ।
+
+    অর্ডার 'refunding' অবস্থায় থাকে; প্রোভাইডার সফল না জানালে টাকা দেওয়া হয় না
+    (পরে জব আবার চেষ্টা করে)। True = এই ধাপে রিফান্ড কমিট হয়েছে।
+    """
+    _oid = int(o.get("id") or 0)
+    _uid = int(o.get("user_id") or 0)
+    _tk = float(o.get("price") or 0)
+    try:
+        _ok = await asyncio.to_thread(_mail_provider_cancel, o.get("mail_id"))
+    except Exception as e:
+        log.warning(f"[MAIL] provider cancel ব্যর্থ oid={_oid}: {str(e)[:100]}")
+        _ok = False
+    if not _ok:
+        return False
+    if not await asyncio.to_thread(mail_refund_commit, _oid, _uid, _tk):
+        return False
+    if notify:
+        try:
+            _o = await asyncio.to_thread(mail_order_get, _oid) or dict(o)
+        except Exception:
+            _o = dict(o)
+        _o["status"] = "refunded"
+        try:
+            await bot_obj.send_message(
+                _uid,
+                _mail_auto_refund_text(_o, en) if auto else _mail_order_text(_o, en),
+                parse_mode="Markdown", reply_markup=_mail_order_kb(_o, en))
+        except Exception as e:
+            log.warning(f"[MAIL] রিফান্ড মেসেজ যায়নি uid={_uid}: {str(e)[:110]}")
+    return True
+
+
+async def _mailb_home(update, force=False):
+    uid = _gn_uid(update)
+    en = await _shop_is_en(uid)
+    if not await asyncio.to_thread(mail_on):
+        return await _gn_say(update, _bi(
+            "🔒 *মেইল সার্ভিস এখন বন্ধ আছে*\n\nপরে আবার চেষ্টা করুন।",
+            "🔒 *Mail service is off right now*\n\nPlease try again later.", en))
+    if not await asyncio.to_thread(mail_key):
+        return await _gn_say(update, _bi(
+            "⚠️ *মেইল সার্ভিস এখনো সেট করা হয়নি*\n\n"
+            "অ্যাডমিন প্যানেল → দোকান → নাম্বার সার্ভিস কার্ডে গিয়ে "
+            "মেইল API Key + চালু করুন।",
+            "⚠️ *Mail service is not set up yet*\n\n"
+            "Admin → Shop → Number service card: add the mail API key and turn it on.", en))
+    rows = await asyncio.to_thread(mail_catalog, force)
+    if not rows:
+        return await _gn_say(update, _bi(
+            "⚠️ *মেইলের লিস্ট পাওয়া যাচ্ছে না*\n\nAPI Key ভুল বা সার্ভার ব্যস্ত — "
+            "কিছুক্ষণ পরে আবার চেষ্টা করুন।",
+            "⚠️ *Could not load the mail list*\n\nWrong API key or server busy — "
+            "please try again shortly.", en))
+    _sv = {}
+    _hidden = set()
+    for r in rows:
+        _s = str(r.get("service") or "").lower()
+        if not _s:
+            continue
+        if not mail_service_known(_s):      # 🆕 নতুন সার্ভিস — অ্যাডমিনের অনুমোদন ছাড়া বন্ধ
+            _hidden.add(_s)
+            continue
+        _p = mail_price(r.get("price") or 0, _s, r.get("domain") or "")
+        _e = _sv.setdefault(_s, {"min": _p, "cnt": 0, "dom": 0})
+        if _p < _e["min"]:
+            _e["min"] = _p
+        _e["cnt"] += max(int(r.get("count") or 0), 0)
+        _e["dom"] += 1
+    _one = []
+    _all_sv = list(_sv.items())
+    for _s, _e in _all_sv[:30]:           # ওয়েবে যত সার্ভিস চালু, সবই দেখানো হয়
+        _cb = f"mailb:s:{_s}"
+        if len(_cb.encode("utf-8")) > 60:      # Telegram-এর ৬৪ বাইট সীমা
+            continue
+        _one.append(InlineKeyboardButton(
+            f"{_mail_svc_label(_s)} · ৳{_e['min']:g} · 🔑{mail_limit(_s)} · {_e['cnt']}",
+            callback_data=_cb))
+    _kb_rows = _pair_rows(_one) if _one else []
+    _kb_rows.append([InlineKeyboardButton(_bi("🔙 Back", "🔙 Back", en),
+                                          callback_data="otpbuy")])
+    if not _one:
+        return await _gn_say(update, _bi(
+            "✉️ *মেইল কিনুন*\n\nএখনো কোনো সার্ভিস চালু হয়নি — "
+            "অ্যাডমিন চালু করলে এখানে দেখা যাবে।",
+            "✉️ *Buy Mail*\n\nNo service is enabled yet — "
+            "it will show up once the admin enables one.", en),
+            InlineKeyboardMarkup(_kb_rows))
+    _more = f"\n\n…আরও {len(_all_sv) - 30}টি সার্ভিস আছে" if len(_all_sv) > 30 else ""
+    if _hidden:
+        _more += f"\n🆕 {len(_hidden)}টি নতুন সার্ভিস অ্যাডমিনের অনুমোদনের অপেক্ষায়"
+    return await _gn_say(update, _bi(
+        "✉️ *মেইল কিনুন*\n\nকোন সার্ভিসের মেইল লাগবে বেছে নিন:\n"
+        "(৳ = আপনার দাম · 🔑 = কয়টি রেজিস্ট্রেশন কোড পাবেন · শেষেরটা = স্টক)" + _more,
+        "✉️ *Buy Mail*\n\nPick the service you need:\n"
+        "(৳ = your price · 🔑 = how many registration codes you get · last = stock)" + _more, en),
+        InlineKeyboardMarkup(_kb_rows))
+
+
+async def _mailb_domains(update, svc):
+    uid = _gn_uid(update)
+    en = await _shop_is_en(uid)
+    svc = str(svc or "").lower()
+    if not await asyncio.to_thread(mail_service_known, svc):
+        return await _mailb_home(update, True)
+    rows = [r for r in await asyncio.to_thread(mail_catalog, False)
+            if str(r.get("service") or "").lower() == svc]
+    if not rows:
+        return await _mailb_home(update, True)
+    rows.sort(key=lambda r: (int(r.get("count") or 0) <= 0,
+                             mail_price(r.get("price") or 0, svc,
+                                        r.get("domain") or "")))
+    _one = []
+    for r in rows[:16]:
+        _p = mail_price(r.get("price") or 0, svc, r.get("domain") or "")
+        _cnt = max(int(r.get("count") or 0), 0)
+        _cb = (f"mailb:b:{svc}:{r.get('domain')}" if _cnt > 0 else "mailb:none")
+        if len(_cb.encode("utf-8")) > 60:      # Telegram-এর ৬৪ বাইট সীমা
+            continue
+        _one.append(InlineKeyboardButton(
+            f"{r.get('domain')} · ৳{_p:g}" + ("" if _cnt > 0 else " · 0"),
+            callback_data=_cb))
+    _kb_rows = _pair_rows(_one)
+    _kb_rows.append([InlineKeyboardButton(_bi("🔙 Back", "🔙 Back", en),
+                                          callback_data="mailb")])
+    return await _gn_say(update, _bi(
+        f"✉️ *{_mail_svc_label(svc)} — মেইল*\n\nকোন ডোমেইনের মেইল নেবেন?",
+        f"✉️ *{_mail_svc_label(svc)} — Mail*\n\nWhich domain do you want?", en),
+        InlineKeyboardMarkup(_kb_rows))
+
+
+_MAIL_BUYING = set()          # একই ইউজারের ডাবল-ট্যাপে দুইবার টাকা কাটা ঠেকায়
+
+
+async def _mailb_buy(update, svc, domain):
+    uid = _gn_uid(update)
+    en = await _shop_is_en(uid)
+    svc, domain = str(svc or "").lower(), str(domain or "")
+    if uid in _MAIL_BUYING:
+        return await _gn_say(update, _bi(
+            "⏳ *আপনার আগের অর্ডার এখনো চলছে*\n\nএকটু পরে আবার চেষ্টা করুন।",
+            "⏳ *Your previous order is still processing*\n\n"
+            "Please try again shortly.", en))
+    _MAIL_BUYING.add(uid)
+    try:
+        return await _mailb_buy_do(update, uid, en, svc, domain)
+    finally:
+        _MAIL_BUYING.discard(uid)
+
+
+async def _mailb_buy_do(update, uid, en, svc, domain):
+    if not await asyncio.to_thread(mail_service_known, svc):
+        return await _mailb_home(update, True)   # নতুন/অচেনা সার্ভিস এখনো বন্ধ
+    # 💲 কেনার সময় প্রোভাইডারের সদ্য দাম — ওয়েবে দাম বাড়লে ইউজারের দামও বাড়বে
+    rows = await asyncio.to_thread(mail_catalog, True)
+    _row = None
+    for r in rows:
+        if (str(r.get("service") or "").lower() == svc
+                and str(r.get("domain") or "") == domain):
+            _row = r
+            break
+    if not _row or int(_row.get("count") or 0) <= 0:
+        return await _mailb_domains(update, svc)
+    # প্রোভাইডারের আসল সার্ভিস কোড (case-sensitive হতে পারে) — lowercase পাঠালে ভুল হতে পারে
+    _svc_raw = str(_row.get("service") or svc)
+    _usd = float(_row.get("price") or 0)
+    _tk = mail_price(_usd, svc, domain)
+    _bal = float(await asyncio.to_thread(get_dep_balance, uid) or 0)
+    if _bal + 0.001 < _tk:
+        return await _gn_say(update, _bi(
+            f"💳 *ব্যালেন্স কম*\n\nদরকার: {_tk:g}৳\nআপনার ডিপোজিট ব্যালেন্স: {_bal:g}৳",
+            f"💳 *Low balance*\n\nNeeded: {_tk:g}৳\nYour deposit balance: {_bal:g}৳", en))
+    if not await asyncio.to_thread(smm_dep_deduct, uid, _tk):
+        return await _gn_say(update, _bi("💳 ব্যালেন্স কাটা যায়নি — আবার চেষ্টা করুন।",
+                                         "💳 Could not debit balance — try again.", en))
+    _d = await asyncio.to_thread(_mail_api, "/api/mail/getActivation",
+                                service=_svc_raw, domain=domain, ref="", maxPrice="")
+    _mail = str(_d.get("mail") or "").strip()
+    _mid = str(_d.get("mailId") or "").strip()
+    if str(_d.get("status")) != "1" or not _mail or not _mid:
+        try:
+            await asyncio.to_thread(smm_dep_refund, uid, _tk)
+        except Exception as e:
+            log.warning(f"[MAIL] রিফান্ড ব্যর্থ uid={uid}: {str(e)[:110]}")
+        _err = str(_d.get("error") or _d.get("message") or "")[:120]
+        return await _gn_say(update, _bi(
+            f"⚠️ *মেইল পাওয়া যায়নি* — {_tk:g}৳ ফেরত দেওয়া হয়েছে।\n\n`{_err}`",
+            f"⚠️ *No mail available* — {_tk:g}৳ refunded.\n\n`{_err}`", en))
+    try:
+        _oid = await asyncio.to_thread(mail_order_new, uid, _mail, _mid, _svc_raw,
+                                       domain, _usd, _tk)
+    except Exception as e:
+        # মেইলটা প্রোভাইডারে নেওয়া হয়ে গেছে — অর্ডার সেভ না হলে সেটাও বাতিল করি
+        try:
+            await asyncio.to_thread(_mail_provider_cancel, _mid)
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(smm_dep_refund, uid, _tk)
+        except Exception as e2:
+            log.warning(f"[MAIL] রিফান্ড ব্যর্থ uid={uid}: {str(e2)[:110]}")
+        log.warning(f"[MAIL] অর্ডার সেভ হয়নি: {str(e)[:120]}")
+        return await _gn_say(update, _bi("⚠️ সমস্যা হয়েছে — টাকা ফেরত দেওয়া হয়েছে।",
+                                         "⚠️ Something went wrong — refunded.", en))
+    _o = await asyncio.to_thread(mail_order_get, _oid) or {
+        "id": _oid, "mail": _mail, "domain": domain, "service": svc,
+        "price": _tk, "status": "waiting", "ts": _time.time()}
+    return await _gn_say(update, _mail_order_text(_o, en), _mail_order_kb(_o, en))
+
+
+async def _mailb_cancel(update, oid):
+    uid = _gn_uid(update)
+    en = await _shop_is_en(uid)
+    _o = await asyncio.to_thread(mail_order_get, oid)
+    if not _o or int(_o.get("user_id") or 0) != int(uid):
+        return await _mailb_home(update)
+    _st = str(_o.get("status") or "")
+    _tk = float(_o.get("price") or 0)
+    # ⏳ আগেই (অটো বা অন্য ট্যাপে) বাতিল প্রসেসে — শেষ করার চেষ্টা করি
+    if _st == "refunding":
+        if not await _mail_finish_refund(_o, en):
+            return await _gn_say(update, _bi(
+                "⏳ *বাতিল প্রসেস হচ্ছে* — প্রোভাইডারের রিফান্ড নিশ্চিত হলে টাকা ফেরত যাবে।",
+                "⏳ *Cancellation in progress* — the money lands once the provider "
+                "confirms the refund.", en))
+        _o2 = await asyncio.to_thread(mail_order_get, oid) or dict(_o)
+        _o2["status"] = "refunded"
+        return await _gn_say(update, _mail_order_text(_o2, en), _mail_order_kb(_o2, en))
+    if _st not in ("waiting", "expired"):
+        return await _gn_say(update, _mail_order_text(_o, en), _mail_order_kb(_o, en))
+    # 🔑 কোড এসে গেলে আর বাতিল নয় — আগে কোডটাই ইউজারকে দিই
+    #    (একটাও OTP এলে Cancel বাটন চলে যায়; এই গার্ডটা ঠিক ওই মুহূর্তের জন্য)
+    try:
+        _dc = await asyncio.to_thread(_mail_api, "/api/mail/getCode",
+                                      mailId=_o.get("mail_id"))
+    except Exception:
+        _dc = {}
+    _cd = str(_dc.get("code") or "").strip() if str(_dc.get("status")) == "1" else ""
+    if _cd:
+        try:
+            await asyncio.to_thread(mail_order_set, oid, code=_cd, status="code")
+            await asyncio.to_thread(_mail_api, "/api/mail/setStatus",
+                                    id=_o.get("mail_id"), status=3)
+        except Exception:
+            pass
+        _o3 = await asyncio.to_thread(mail_order_get, oid) or dict(_o)
+        _o3["code"] = _cd
+        _o3["status"] = "code"
+        return await _gn_say(update, _mail_order_text(_o3, en), _mail_order_kb(_o3, en))
+    # 🔒 অর্ডারটা একবারই নেওয়া যাবে — ডাবল-ট্যাপে দুইবার রিফান্ড হবে না
+    if not await asyncio.to_thread(mail_order_claim, oid):
+        _o2 = await asyncio.to_thread(mail_order_get, oid) or _o
+        return await _gn_say(update, _mail_order_text(_o2, en), _mail_order_kb(_o2, en))
+    # 🔙 প্রোভাইডারে বাতিল (status=2) → রিফান্ড নিশ্চিত হলে তবেই ওয়ালেটে টাকা
+    if await _mail_finish_refund(_o, en):
+        return await _gn_say(update, _bi(
+            f"❌ বাতিল হয়েছে — {_tk:g}৳ আপনার ডিপোজিট ব্যালেন্সে ফেরত দেওয়া হয়েছে।",
+            f"❌ Canceled — {_tk:g}৳ returned to your deposit balance.", en),
+            _mail_order_kb(dict(_o, status="refunded"), en))
+    # প্রোভাইডার বাতিল দেয়নি → অর্ডার আগের অবস্থায় ফেরত (ইউজারের টাকা তো আটকে নেই)
+    try:
+        await asyncio.to_thread(mail_order_set, oid, status=_st)
+    except Exception:
+        pass
+    return await _gn_say(update, _bi(
+        "⚠️ প্রোভাইডারে বাতিল হয়নি — একটু পরে আবার চাপুন।\n"
+        "(প্রোভাইডার রিফান্ড নিশ্চিত না হলে ব্যালেন্সে টাকা দেওয়া হয় না)",
+        "⚠️ Provider cancel failed — please tap again shortly.\n"
+        "(No refund is credited until the provider confirms it.)", en))
+
+
+async def mail_callback(update, ctx):
+    """✉️ মেইল কিনুন — ইনলাইন বাটন।"""
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    d = q.data or ""
+    uid = q.from_user.id
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    try:
+        if not await _bot_accessible(uid):
+            return
+    except Exception:
+        pass
+    if d == "mailb" or d == "mailb:home":
+        return await _mailb_home(update)
+    if d == "mailb:none":
+        return
+    _p = d.split(":")
+    if len(_p) >= 3 and _p[1] == "s":
+        return await _mailb_domains(update, _p[2])
+    if len(_p) >= 4 and _p[1] == "b":
+        return await _mailb_buy(update, _p[2], ":".join(_p[3:]))
+    if len(_p) >= 3 and _p[1] == "x":
+        try:
+            return await _mailb_cancel(update, int(_p[2]))
+        except Exception:
+            return await _mailb_home(update)
+    return await _mailb_home(update)
+
+
+async def _mail_alert_new():
+    """🆕 ওয়েবে নতুন মেইল সার্ভিস এলে শুধু অ্যাডমিন/মালিককে একবার মেসেজ যায়।
+
+    বটে নিজে থেকে চালু হয় না — অ্যাডমিন লাইন লিখলেই ইউজার দেখতে পায়।
+    """
+    try:
+        rows = await asyncio.to_thread(mail_catalog, False)
+    except Exception:
+        return
+    if not rows:
+        return
+    try:
+        _seen = {x for x in str(get_setting("mail_seen_svc") or "").split(",") if x}
+    except Exception:
+        _seen = set()
+    _new = []
+    for r in rows:
+        _sv = str(r.get("service") or "").strip().lower()
+        if not _sv or _sv in _seen:
+            continue
+        if await asyncio.to_thread(mail_service_known, _sv):
+            _seen.add(_sv)               # অলরেডি চালু — শুধু মনে রাখি
+            continue
+        if _sv not in _new:
+            _new.append(_sv)
+    try:
+        set_setting("mail_seen_svc", ",".join(sorted(_seen | set(_new)))[:4000])
+    except Exception:
+        pass
+    if not _new:
+        return
+    _owner = int(globals().get("ADMIN_ID") or 0)
+    log.info(f"[MAIL] নতুন সার্ভিস: {', '.join(_new[:10])}")
+    if not _owner:
+        return
+    _txt = ("🆕 *নতুন মেইল সার্ভিস এসেছে (ওয়েবে আছে, বটে বন্ধ)*\n\n"
+            + "\n".join(f"• `{_s}`" for _s in _new[:20])
+            + "\n\nচালু করতে অ্যাডমিন → দোকান → নাম্বার সার্ভিস কার্ড → "
+            "🔢 সার্ভিস-ভিত্তিক কোড সংখ্যা ঘরে লিখুন:\n"
+            + "\n".join(f"`{_s} | 1`" for _s in _new[:5])
+            + "\n\nনা লিখলে ইউজাররা এই সার্ভিস দেখবে না।")
+    try:
+        await bot_obj.send_message(_owner, _txt, parse_mode="Markdown")
+    except Exception as e:
+        log.warning(f"[MAIL] নতুন সার্ভিস নোটিফিকেশন যায়নি: {str(e)[:110]}")
+
+
+async def job_mail_otp(context):
+    """✉️ প্রতি ২০ সেকেন্ডে: কোড চেক + ২৫ মিনিটে অটো বাতিল/রিফান্ড + আটকে থাকা রিফান্ডের পুনঃচেষ্টা।
+
+    ⏰ ২৫ মিনিটে কোড না এলে অটোমেটিক অর্ডার বাতিল হয়; প্রোভাইডারের রিফান্ড
+    নিশ্চিত (setStatus=2 সফল) হওয়ার পরেই ইউজারের ব্যালেন্সে টাকা যায়।
+    """
+    try:
+        rows = await asyncio.to_thread(_mail_waiting)
+    except Exception:
+        return
+    for o in rows:
+        _oid = int(o.get("id") or 0)
+        _uid = int(o.get("user_id") or 0)
+        try:
+            _en = (await asyncio.to_thread(get_lang, _uid)) == "en"
+        except Exception:
+            _en = False
+        try:
+            _st = str(o.get("status") or "waiting")
+            # ১) 🔁 বাতিল প্রসেসিং — প্রোভাইডার নিশ্চিত হলেই রিফান্ড কমিট
+            if _st == "refunding":
+                await _mail_finish_refund(o, _en, auto=True, notify=True)
+                continue
+            # ২) 🔑 কোড এসেছে কি না
+            try:
+                _d = await asyncio.to_thread(_mail_api, "/api/mail/getCode",
+                                             mailId=o.get("mail_id"))
+            except Exception:
+                continue
+            _code = (str(_d.get("code") or "").strip()
+                     if str(_d.get("status")) == "1" else "")
+            if _code:
+                try:
+                    await asyncio.to_thread(mail_order_set, _oid, code=_code, status="code")
+                    await asyncio.to_thread(_mail_api, "/api/mail/setStatus",
+                                            id=o.get("mail_id"), status=3)
+                except Exception:
+                    pass
+                _o = await asyncio.to_thread(mail_order_get, _oid) or dict(o)
+                _o["code"] = _code
+                _o["status"] = "code"
+                try:
+                    await bot_obj.send_message(
+                        _uid, _mail_order_text(_o, _en), parse_mode="Markdown",
+                        reply_markup=_mail_order_kb(_o, _en))
+                except Exception as e:
+                    log.warning(f"[MAIL] কোড পাঠানো যায়নি uid={_uid}: {str(e)[:110]}")
+                continue
+            # ৩) ⏳ ২৫ মিনিট পার — অটো বাতিল + রিফান্ড
+            try:
+                _age = _time.time() - float(o.get("ts") or 0)
+            except Exception:
+                _age = 0.0
+            if _age < MAIL_WAIT_SEC:
+                continue
+            if not await asyncio.to_thread(mail_order_claim, _oid, ("waiting", "expired")):
+                continue
+            if not await _mail_finish_refund(o, _en, auto=True, notify=True):
+                log.info(f"[MAIL] ২৫ মিনিটের অটো রিফান্ড এখনো হয়নি oid={_oid} — আবার চেষ্টা হবে")
+        except Exception as e:
+            log.warning(f"[MAIL] job oid={_oid}: {str(e)[:120]}")
+    try:
+        await _mail_alert_new()          # 🆕 ওয়েবে নতুন সার্ভিস এলে শুধু মালিককে
+    except Exception:
+        pass
+    return True
+
+
+# ═════════════════ 🔍 Proxy Checker (LIVE/DEAD + MB/GB) ═════════════════
+PX_PROVIDERS = (
+    ("7-11", "711Proxy"), ("711", "711Proxy"), ("clip", "CliProxy"),
+    ("rapid", "RapidProxy"), ("9prox", "9Proxy"), ("dataimp", "Dataimpulse"),
+    ("owl", "OwlProxy"), ("h143", "H143 Proxy"), ("kafka", "Kafka Proxy"),
+    ("safari", "Safari Proxy"), ("novprox", "Nov Proxy"), ("abcprox", "ABC Proxy"),
+)
+_PX_MAX = 5                 # একবারে সর্বোচ্চ কতগুলো proxy চেক হবে
+
+
+def px_on():
+    """🔍 Proxy Checker চালু কি না (অ্যাডমিন → দোকান → Proxy Checker)।"""
+    try:
+        return (get_setting("px_on") or "on") != "off"
+    except Exception:
+        return True
+
+
+def _proxy_cat(cat):
+    """🔌 Proxy ক্যাটাগরি কি না — নাম/emoji থেকে।"""
+    try:
+        _n = (str(_rget(cat, "name", "") or "") + " "
+              + str(_rget(cat, "emoji", "") or "")).lower()
+    except Exception:
+        return False
+    return ("proxy" in _n or "প্রক্সি" in _n or "prox" in _n)
+
+
+def _px_parse(line):
+    """এক লাইন proxy → dict ; শুধু ইউজারনেম চলবে না — IP:PORT লাগবে।
+
+    সমর্থিত: host:port:user:pass · user:pass@host:port · host:port
+    """
+    s = _re.sub(r"\s+", "", str(line or ""))
+    if not s:
+        return None
+    s = _re.sub(r"^(https?|socks5h?|socks4a?|socks4)://", "", s, flags=_re.I)
+    _m = _re.fullmatch(r"([^@:]+):([^@]*)@([^@:]+):(\d{2,5})", s)     # user:pass@host:port
+    if _m:
+        return {"host": _m.group(3), "port": int(_m.group(4)),
+                "user": _m.group(1), "pw": _m.group(2), "raw": s}
+    _p = s.split(":")
+    if len(_p) >= 4 and _p[1].isdigit():                              # host:port:user:pass
+        return {"host": _p[0], "port": int(_p[1]), "user": _p[2],
+                "pw": ":".join(_p[3:]), "raw": s}
+    if len(_p) == 2 and _p[1].isdigit():                              # host:port
+        return {"host": _p[0], "port": int(_p[1]), "user": "", "pw": "", "raw": s}
+    return None                     # শুধু ইউজারনেম/ভুল ফরম্যাট — গ্রহণ নয়
+
+
+def _px_provider(d):
+    """host/ইউজারনেম/লাইন থেকে প্রোভাইডার — না মিললে Unknown।"""
+    _t = " ".join(str(d.get(_k) or "") for _k in ("host", "user", "raw")).lower()
+    for _k, _nm in PX_PROVIDERS:
+        if _k in _t:
+            return _nm
+    return "Unknown"
+
+
+def _px_tcp(d, timeout=10):
+    import socket
+    try:
+        with socket.create_connection((str(d.get("host") or ""),
+                                       int(d.get("port") or 0)), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _px_live(d, timeout=15):
+    """proxy দিয়ে সত্যিকারের HTTP রিকোয়েস্ট — LIVE হলে বাইরের IP ফেরত দেয়।"""
+    if not d.get("host") or not int(d.get("port") or 0):
+        return {"state": "UNKNOWN", "ip": "", "err": "no host"}
+    if not _px_tcp(d, min(timeout, 10)):
+        return {"state": "DEAD", "ip": "", "err": "TCP connect failed"}
+    _u = urllib.parse.quote(str(d.get("user") or ""), safe="")
+    _pw = urllib.parse.quote(str(d.get("pw") or ""), safe="")
+    _px = "http://" + ((_u + ":" + _pw + "@") if _u else "") + \
+          f"{d['host']}:{int(d['port'])}"
+    try:
+        _op = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": _px, "https": _px}))
+        with _op.open("http://api.ipify.org?format=json", timeout=timeout) as _r:
+            _t = _r.read().decode("utf-8", "replace").strip()
+        try:
+            return {"state": "LIVE", "ip": str(_json.loads(_t).get("ip") or ""), "err": ""}
+        except Exception:
+            return {"state": "LIVE", "ip": _t[:40], "err": ""}
+    except Exception as e:
+        return {"state": "DEAD", "ip": "", "err": str(e)[:90]}
+
+
+PX_USAGE_ADAPTERS = {"9proxy": "https://api.9proxy.com/client/v1/account/get-balance-data"}
+
+# অ্যাডমিন প্যানেলে আলাদা আলাদা ইনপুট — প্রতিটি প্রোভাইডারের নিজের API/কোটা
+PX_USAGE_NAMES = ("9Proxy", "711Proxy", "CliProxy", "RapidProxy", "Dataimpulse",
+                  "OwlProxy", "H143 Proxy", "Kafka Proxy", "Safari Proxy",
+                  "Nov Proxy", "ABC Proxy")
+
+
+def _px_usage_cfg():
+    """একটাই জায়গায় সব প্রোভাইডারের API — প্রতি লাইন `provider | API key বা URL`।
+
+    `*` বা `default` লাইন = বাকি সব প্রোভাইডারের জন্য। API key শুধু দিলে
+    বিল্ট-ইন অ্যাডাপ্টার (9Proxy) নিজেই ঠিকানা বানায়।
+    """
+    _out = []
+    try:
+        _raw = str(get_setting("px_usage_map") or "")
+    except Exception:
+        _raw = ""
+    for _ln in _raw.splitlines():
+        _ln = _ln.strip()
+        if not _ln or _ln.startswith("#"):
+            continue
+        _p = [x.strip() for x in _ln.replace("—", "|").split("|") if x.strip()]
+        if len(_p) < 2:
+            continue
+        _out.append((_p[0].lower(), "|".join(_p[1:]).strip()))
+    try:
+        _def = str(get_setting("px_usage_url") or "").strip()
+    except Exception:
+        _def = ""
+    if _def:
+        _out.append(("*", _def))
+    return _out
+
+
+def _px_usage(d, name=None):
+    """প্রোভাইডারের API → (used_mb, total_mb); কিছু না মিললে None।
+
+    অ্যাডমিন এক জায়গায় লিখবে:  `9proxy | API_KEY`  বা
+    `711proxy | https://...{user}...&token=...` ; `* | URL` = সবাইরে জন্য।
+    API না থাকলে অ্যাডমিন নিজের কোটা দিতে পারে: `711proxy | manual:1024/800`
+    (total/left, MB এককে)।
+    """
+    _cfg = _px_usage_cfg()
+    if not _cfg:
+        return None
+    _prov = str(name or _px_provider(d)).lower()
+    _val = ""
+    for _k, _v in _cfg:
+        if _k in ("*", "all", "default"):
+            continue
+        if _k and (_k in _prov or _prov in _k):
+            _val = _v
+            break
+    if not _val:
+        for _k, _v in _cfg:
+            if _k in ("*", "all", "default"):
+                _val = _v
+                break
+    if not _val:
+        return None
+    _u = _val.strip()
+    if _u.lower().startswith("manual:"):
+        # অ্যাডমিন-সেট কোটা:  manual:total/left   (MB)
+        try:
+            _a, _b2 = (_u.split(":", 1)[1].split("/") + [""])[:2]
+            _tot = float(str(_a).replace(",", "").strip())
+            _left = float(str(_b2).replace(",", "").strip() or _tot)
+        except Exception:
+            return None
+        if _tot <= 0:
+            return None
+        return (max(0.0, _tot - max(0.0, _left)), _tot)
+    if not _u.lower().startswith("http"):
+        # শুধু API key — বিল্ট-ইন অ্যাডাপ্টার
+        if "9proxy" in _prov and PX_USAGE_ADAPTERS.get("9proxy"):
+            _u = (PX_USAGE_ADAPTERS["9proxy"] + "?api-key="
+                  + urllib.parse.quote(_u, safe=""))
+        else:
+            return None
+    else:
+        for _k2, _v2 in (("{user}", d.get("user")), ("{pass}", d.get("pw")),
+                         ("{host}", d.get("host")), ("{port}", d.get("port")),
+                         ("{provider}", _px_provider(d))):
+            _u = _u.replace(_k2, urllib.parse.quote(str(_v2 or ""), safe=""))
+    try:
+        _rq = urllib.request.Request(_u, headers={"Accept": "application/json",
+                                                  "User-Agent": "TaskEarnBot/1.0"})
+        with urllib.request.urlopen(_rq, timeout=15) as _r:
+            _d = _json.loads(_r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        log.warning(f"[PROXY] usage API ব্যর্থ: {str(e)[:90]}")
+        return None
+    # 9Proxy-র অ্যাকাউন্টে একাধিক ট্রাফিক প্ল্যান থাকলে সবগুলো যোগ হয় (bytes)
+    try:
+        _plans = ((_d.get("result") or {}).get("traffic_data")
+                  if isinstance(_d, dict) else None)
+        if isinstance(_plans, list) and _plans:
+            _tot = _rem = 0.0
+            for _it in _plans[:20]:
+                if not isinstance(_it, dict):
+                    continue
+                try:
+                    _t = float(_it.get("original_amount") or 0)
+                    _a = float(_it.get("amount") or 0)
+                except Exception:
+                    continue
+                if _t > 0:
+                    _tot += _t
+                    _rem += _a
+            if _tot > 0:
+                return (max(0.0, _tot - _rem) / 1000000.0, _tot / 1000000.0)
+    except Exception:
+        pass
+    _flat = {}
+
+    def _walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                _k2 = str(k).lower()
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, (int, float)):
+                    _flat.setdefault(_k2, float(v))
+                elif isinstance(v, str):
+                    try:
+                        _flat.setdefault(
+                            _k2, float(v.replace(",", "").replace("%", "")))
+                    except Exception:
+                        pass
+                else:
+                    _walk(v)
+        elif isinstance(o, list):
+            for v in o[:8]:
+                _walk(v)
+
+    _walk(_d)
+
+    def _pick(words, skip=()):
+        for _k3, _v3 in _flat.items():
+            if "unused" in _k3 or any(s in _k3 for s in skip):
+                continue
+            if all(w in _k3 for w in words):
+                return _v3, _k3
+        return None, ""
+
+    def _unit(_k4):
+        if "byte" in _k4 or _k4 in ("amount", "original_amount"):
+            return 1.0 / 1000000.0    # bytes → MB (decimal)
+        if "gb" in _k4:
+            return 1000.0             # GB → MB
+        return 1.0
+
+    _used, _ku = _pick(["used"])
+    if _used is None:
+        _used, _ku = _pick(["usage"])
+    _total, _kt = _pick(["total"])
+    if _total is None:
+        _total, _kt = _pick(["limit"])
+    if _total is None:
+        _total, _kt = _pick(["quota"])
+    if _total is None:
+        _total, _kt = _pick(["original_amount"])
+    _rem, _kr = _pick(["remaining"])
+    if _rem is None:
+        _rem, _kr = _pick(["left"])
+    if _rem is None:
+        _rem, _kr = _pick(["balance"])
+    if _rem is None:
+        _rem, _kr = _pick(["amount"], skip=("original",))
+    if _used is not None:
+        _used = _used * _unit(_ku)
+    if _total is not None:
+        _total = _total * _unit(_kt)
+    if _rem is not None:
+        _rem = _rem * _unit(_kr)
+    # শুধু "remaining" দিলেও (যেমন 9Proxy) used বের করা যায়
+    if _used is None and _rem is not None and _total:
+        _used = max(0.0, float(_total) - float(_rem))
+    if _used is None or not _total:
+        return None
+    return (_used, _total)
+
+
+def _px_mb(n):
+    try:
+        n = float(n)
+    except Exception:
+        return "—"
+    return f"{n:,.2f} MB ({n / 1000:,.3f} GB)"
+
+
+def _px_card(d, res, use):
+    """ছবির মডেলের কার্ড — Provider / Proxy (masked) / Username / Status / MB-GB।"""
+    _e = html.escape
+    _prov = _px_provider(d)
+    _out = ["📊 <b>MB/GB RESULT</b>" if use else "🔌 <b>PROXY CHECK</b>", "",
+            f"🌐 <b>Provider:</b> {_e(_prov)}"]
+    if d.get("host"):
+        _line = f"{d['host']}:{int(d.get('port') or 0)}"
+        if d.get("user"):
+            _line += f":{d['user']}" + (":" + "•" * 8 if d.get("pw") else "")
+        _out.append(f"🔍 <b>Proxy:</b> <code>{_e(_line)}</code>")
+    if d.get("user"):
+        _out.append(f"👤 <b>Username:</b> {_e(str(d['user']))}")
+    _stt = str(res.get("state") or "")
+    if _stt == "LIVE":
+        _out.append("✅ <b>Status:</b> LIVE")
+        if res.get("ip"):
+            _out.append(f"🌍 <b>IP:</b> <code>{_e(str(res['ip']))}</code>")
+    elif _stt == "DEAD":
+        _out.append("❌ <b>Status:</b> DEAD")
+    else:
+        _out.append("⚠️ <b>Status:</b> unknown")
+    if use:
+        _used, _total = use
+        _rem = max(0.0, float(_total) - float(_used))
+        _pct = (float(_used) / float(_total) * 100.0) if float(_total) > 0 else 0.0
+        _out += ["", f"✋ <b>Total Limit:</b> {_px_mb(_total)}",
+                 f"✋ <b>Used:</b> {_px_mb(_used)}",
+                 f"🕐 <b>Remaining:</b> {_px_mb(_rem)}",
+                 f"📊 <b>Usage:</b> {_pct:.2f}%"]
+    else:
+        try:
+            _cfg_on = bool(_px_usage_cfg())
+        except Exception:
+            _cfg_on = False
+        _out += ["", ("ℹ️ <b>MB/GB:</b> provider API থেকে ডেটা পাওয়া যায়নি — শুধু LIVE/DEAD"
+                      if _cfg_on else
+                      "ℹ️ <b>MB/GB:</b> এখনো provider API সেট করা নেই (অ্যাডমিন প্যানেল → দোকান → Proxy Checker)")]
+    return "<blockquote>" + "\n".join(_out) + "</blockquote>"
+
+
+async def _px_checker_page(update, ctx=None):
+    """🖥 Proxy Checker — ফরম্যাট নির্দেশনা + পরের মেসেজ ধরার স্টেট।"""
+    if not await asyncio.to_thread(px_on):
+        return await _gn_say(update, "🔒 <b>Proxy Checker এখন বন্ধ আছে</b>\n\n"
+                                     "পরে আবার চেষ্টা করুন।", parse_mode="HTML")
+    if ctx is not None:
+        try:
+            ctx.user_data["state"] = "pxchk"
+        except Exception:
+            pass
+    txt = (
+        "🖥 <b>Proxy Checker</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "Send proxy/proxies in\n"
+        "<code>IP:PORT:USERNAME:PASSWORD</code> format.\n\n"
+        "<b>MB/GB supported providers:</b>\n"
+        "• CliProxy\n• RapidProxy\n• 711Proxy\n• 9Proxy\n• Dataimpulse\n\n"
+        "• OwlProxy (admin-saved accounts)\n\n"
+        "If a supported proxy's account/data can be found, I return its MB/GB "
+        "usage. If MB/GB data cannot be found, I automatically fall back to a "
+        "normal LIVE/DEAD proxy check.\n\n"
+        "⚠️ Full format is required — only a username won't work.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back", callback_data="shop:list")]])
+    return await _gn_say(update, txt, kb, parse_mode="HTML")
+
+
+async def proxycheck_input(update, ctx):
+    """ইউজারের পাঠানো proxy (IP:PORT:USER:PASS) — লাইন ধরে চেক করে কার্ড পাঠায়।"""
+    _raw = (update.message.text or "").strip()
+    _lines = [x.strip() for x in _re.split(r"[\n,;]+", _raw) if x.strip()][:_PX_MAX]
+    _items, _bad = [], 0
+    for _x in _lines:
+        _d = _px_parse(_x)
+        if _d:
+            _items.append(_d)
+        else:
+            _bad += 1
+    if not _items:
+        # শুধু ইউজারনেম/ভুল ফরম্যাট — স্টেট রেখে দিই যাতে আবার পাঠাতে পারে
+        try:
+            await update.message.reply_text(
+                "❌ <b>ফরম্যাট ঠিক নয়</b>\n\n"
+                "এভাবে পাঠান:\n<code>IP:PORT:USERNAME:PASSWORD</code>\n\n"
+                "উদাহরণ:\n<code>45.12.3.4:8000:usr50uds:mypass</code>",
+                parse_mode="HTML")
+        except Exception:
+            pass
+        try:
+            ctx.user_data["state"] = "pxchk"
+        except Exception:
+            pass
+        return True
+    try:
+        ctx.user_data.pop("state", None)      # এক ব্যাচেই শেষ — পরের মেসেজ আর ধরা হবে না
+    except Exception:
+        pass
+    if _bad:
+        try:
+            await update.message.reply_text(
+                f"⚠️ {_bad}টি লাইন বাদ পড়েছে — ফরম্যাট: "
+                "<code>IP:PORT:USERNAME:PASSWORD</code>", parse_mode="HTML")
+        except Exception:
+            pass
+    try:
+        await update.message.reply_text(
+            "🔍 Checking…" if len(_items) == 1 else f"🔍 Checking {len(_items)} proxies…")
+    except Exception:
+        pass
+    _out = []
+    for _d in _items:
+        _res = await asyncio.to_thread(_px_live, _d)
+        _use = await asyncio.to_thread(_px_usage, _d)
+        _out.append((_d, _res, _use))
+    _live = sum(1 for _x in _out if str(_x[1].get("state")) == "LIVE")
+    _dead = sum(1 for _x in _out if str(_x[1].get("state")) == "DEAD")
+    try:
+        await update.message.reply_text(
+            f"✅ <b>Check complete: {_live} live, {_dead} dead.</b>", parse_mode="HTML")
+    except Exception:
+        pass
+    _kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Check another", callback_data="pxchk"),
+         InlineKeyboardButton("🔙 Shop", callback_data="shop:list")]])
+    for _i, (_d, _res, _use) in enumerate(_out):
+        _card = _px_card(_d, _res, _use)
+        try:
+            await update.message.reply_text(
+                _card, parse_mode="HTML",
+                reply_markup=(_kb if _i == len(_out) - 1 else None))
+        except Exception:
+            try:
+                await update.message.reply_text(
+                    _re.sub(r"<[^>]{1,60}>", "", _card),
+                    reply_markup=(_kb if _i == len(_out) - 1 else None))
+            except Exception:
+                pass
+    return True
+
+
+async def _otpbuy_page(q, ctx, uid, d="otpbuy"):
+    """🔑 OTP কিনুন — বড় বাটনের মেনু (নাম্বার এখনই, Gmail পরে)।"""
+    try:
+        _en = (await asyncio.to_thread(get_lang, uid)) == "en"
+    except Exception:
+        _en = False
+    _txt = _bi(
+        "🔑 *OTP কিনুন*\n\n"
+        "📱 *নাম্বার ও রেন্ট নাম্বার*\n"
+        "✉️ *মেইল একাউন্ট (কিনুন + কোড)*\n\n"
+        "নিচের বাটন থেকে বেছে নিন:",
+        "🔑 *OTP Buy*\n\n"
+        "📱 *Number & Rent number*\n"
+        "✉️ *Mail account (buy + code)*\n\n"
+        "Pick one below:", _en)
+    # 🔤 এই সেকশনের সব বাটন সবার জন্য ইংরেজিতেই (ভাষা যাই হোক)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📱 Buy Number / Rent", callback_data="gn:home")],
+        [InlineKeyboardButton("✉️ Mail Account (Buy + Code)",
+                              callback_data="mailb")],
+        [InlineKeyboardButton("🔙 Back", callback_data="shop:list")]])
+    try:
+        await q.edit_message_text(_txt, parse_mode="Markdown", reply_markup=kb)
+    except Exception:
+        try:
+            await q.message.reply_text(_txt, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            try:
+                await q.message.reply_text(_re.sub(r"[*_`]", "", _txt), reply_markup=kb)
+            except Exception:
+                pass
+
+
 async def shop_callback(update, ctx):
     q = update.callback_query
     if not q or not q.from_user:
@@ -11805,9 +13268,21 @@ async def shop_callback(update, ctx):
     except Exception:
         pass
 
+    # ── 🔍 Proxy চেকার ──
+    if d == "pxchk":
+        return await _px_checker_page(update, ctx)
+
     # ── 🌐 SMM প্যানেল ──
     if d == "smm" or d.startswith("smm:"):
         return await smm_callback(update, ctx)
+
+    # ── 🔑 OTP কিনুন (Gmail/নাম্বার ও রেন্ট নাম্বার) ──
+    if d == "otpbuy" or d.startswith("otpbuy:"):
+        return await _otpbuy_page(q, ctx, uid, d)
+
+    # ── ✉️ মেইল কিনুন (SmsBower) ──
+    if d == "mailb" or d.startswith("mailb:"):
+        return await mail_callback(update, ctx)
 
     # ── অ্যাডমিন সাইড ──
     if d == "adm_shop" or d.startswith("shopa:") or d.startswith("shopaon:") \
@@ -29714,6 +31189,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as _mce:
             log.warning(f"[MAILCODE] input ব্যর্থ: {_mce}")
 
+    # ── 🔍 Proxy চেকার: ইউজারের পাঠানো proxy/ইউজারনেম ──
+    if st == "pxchk":
+        try:
+            if await proxycheck_input(update, ctx):
+                return
+        except Exception as _pce:
+            log.warning(f"[PROXY] input ব্যর্থ: {_pce}")
+
     # ── 🌐 SMM: লিংক / পরিমাণ ইনপুট ──
     if st and str(st).startswith("smm_"):
         try:
@@ -40166,6 +41649,9 @@ def main():
                 job_getnum_sync, interval=600, first=60, name="getnum_sync")
             application.job_queue.run_repeating(
                 job_getnum_feed, interval=90, first=30, name="getnum_feed")
+            # ✉️ মেইলের কোড — প্রতি ২০ সেকেন্ডে চেক (২৫ মিনিট পর্যন্ত; রিফান্ড ইউজার চাইলে)
+            application.job_queue.run_repeating(
+                job_mail_otp, interval=20, first=12, name="mail_otp")
             application.job_queue.run_repeating(
                 job_clean_stuck_states,
                 interval=1800,
@@ -40402,7 +41888,7 @@ def main():
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
     app.add_handler(CallbackQueryHandler(cleanup_callback, pattern=r"^cleanup_(junk|logs7|logs30|close)$"))
     app.add_handler(CallbackQueryHandler(sec_callback, pattern=r"^sec_(unban|ignore)_\d+$"))
-    app.add_handler(CallbackQueryHandler(shop_callback, pattern=r"^(shop:|shopa:|shopao:|shopar:|mail:|adm_shop$|smm)"))
+    app.add_handler(CallbackQueryHandler(shop_callback, pattern=r"^(shop:|shopa:|shopao:|shopar:|mail:|adm_shop$|smm|pxchk$)"))
     app.add_handler(CallbackQueryHandler(dep_callback, pattern=r"^(dep:|depa:|depadm:|depok:|depno:|depname:|depchk|depdiag|adm_dep$)"))
     app.add_handler(CallbackQueryHandler(moneyreq_callback, pattern=r"^mreq:(ok|no):\d+$"))
     app.add_handler(CallbackQueryHandler(on_resetall_cb, pattern=r"^resetall_(yes|no)$"))
