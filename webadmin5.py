@@ -91,6 +91,8 @@ def _init():
         "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS fields TEXT DEFAULT ''",
         "ALTER TABLE shop_orders ADD COLUMN IF NOT EXISTS delivered_at TEXT DEFAULT ''",
         "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS plan_id BIGINT DEFAULT 0",
+        # 💰 কেনা দাম — লাভের হিসাব (বিক্রি − কেনা)
+        "ALTER TABLE shop_products ADD COLUMN IF NOT EXISTS cost REAL DEFAULT 0",
         "ALTER TABLE shop_categories ADD COLUMN IF NOT EXISTS plan_kind TEXT DEFAULT ''",
     ):
         try:
@@ -1720,6 +1722,12 @@ def _form(p=None):
     except Exception:
         _pv = 0.0
     price = esc(_usd_str(_pv, _rate_now) if _pv else "")
+    # 💰 কেনা দাম (আমার খরচ) — লাভের হিসাবের জন্য; ইউজার দেখে না
+    try:
+        _cv = float(p.get("cost") or 0)
+    except Exception:
+        _cv = 0.0
+    cost = esc(_usd_str(_cv, _rate_now) if _cv else "")
     typ = p.get("deliver_type") or "auto"
     act = int(p.get("is_active") or (1 if not p else 0))
     pid = int(p.get("id") or 0)
@@ -1751,6 +1759,11 @@ def _form(p=None):
         f"এখন 1$ = {_rate_now:g} ৳ — তাই বটে দেখাবে "
         f"<b>0.01$ · {_taka_str(0.01 * _rate_now)} ৳</b>। "
         "কেনার সময় এই টাকাই ইউজারের ডিপোজিট/Earn ব্যালেন্স থেকে কাটা হবে।</p></div>"
+        "<div class='field'><label>💰 কেনা দাম ($ ডলারে) — আপনার খরচ</label>"
+        f"<input name='cost' value='{cost}' placeholder='0.005' inputmode='decimal'>"
+        "<p class='mut' style='font-size:11px;margin:6px 0 0'>এই পিসটা আপনার কত পড়ে "
+        "(প্রোভাইডার/সাপ্লায়ারকে যা দেন)। <b>বিক্রি দাম − কেনা দাম = লাভ</b>, "
+        "যেটা রাতের দৈনিক রিপোর্টে যোগ হবে। ইউজার কোথাও এটা দেখে না।</p></div>"
         "<div class='field'><label>🛍 রেফার কমিশন (%) — না দিলে Settings-এর %</label>"
         f"<input name='ref_pct' value='{_rp}' placeholder='খালি = Settings-এর %, 0 = কমিশন নেই'>"
         "<p class='mut' style='font-size:11px;margin:6px 0 0'>এই পণ্যের জন্য আলাদা % চাইলে "
@@ -1797,6 +1810,12 @@ def _save(pid=0):
         _price_usd = 0.0
     _rate = _shop_rate()
     price = round(_price_usd * _rate, 4)
+    # 💰 কেনা দাম (USD ইনপুট → ৳) — লাভের হিসাব
+    try:
+        _cost_usd = float((request.form.get("cost") or "0").replace(",", ".").strip() or 0)
+    except Exception:
+        _cost_usd = 0.0
+    cost = round(max(_cost_usd, 0.0) * _rate, 4)
     cid = request.form.get("category_id") or 0
     try:
         cid = int(cid)
@@ -1833,16 +1852,17 @@ def _save(pid=0):
         plan_id = 0
     if pid:
         _x("UPDATE shop_products SET category_id=%s, name=%s, description=%s, price=%s, "
-           "deliver_type=%s, ref_pct=%s, fields=%s, plan_id=%s, is_active=%s, "
+           "cost=%s, deliver_type=%s, ref_pct=%s, fields=%s, plan_id=%s, is_active=%s, "
            "min_qty=%s, ask_fields=%s WHERE id=%s",
-           (cid, name, desc, price, typ, ref_pct, fields, plan_id, active,
+           (cid, name, desc, price, cost, typ, ref_pct, fields, plan_id, active,
             min_qty, ask_fields, pid))
         return pid
     nxt = (one("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM shop_products") or {}).get("n") or 1
-    r = one("INSERT INTO shop_products (category_id, name, description, price, deliver_type, "
-            "ref_pct, fields, plan_id, is_active, min_qty, ask_fields, sort_order, created_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-            (cid, name, desc, price, typ, ref_pct, fields, plan_id, active,
+    r = one("INSERT INTO shop_products (category_id, name, description, price, cost, "
+            "deliver_type, ref_pct, fields, plan_id, is_active, min_qty, ask_fields, "
+            "sort_order, created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (cid, name, desc, price, cost, typ, ref_pct, fields, plan_id, active,
              min_qty, ask_fields, int(nxt), _now()))
     return int((r or {}).get("id") or 0)
 
@@ -2361,45 +2381,9 @@ def otp_earn_page():
     _earn_on = _otp_s("otp_earn_on", "on") != "off"
     _wd_on = _otp_s("otp_wd_on", "off") == "on"
     _cap = _otp_s("otp_wd_cap", "0")
+    _pool = _otp_s("otp_wd_pool", "0")
     _mn = _otp_s("otp_wd_min", "0.05")
     _total, _stats = _b.otp_stock_stats()
-    try:
-        _def_rate = round(float(_otp_s("otp_lamix_rate", "0.01") or 0.01), 4)
-    except Exception:
-        _def_rate = 0.01
-    # ☎️ Lamix রেঞ্জ-তালিকা + প্রতি রেঞ্জে আলাদা **রেট ($)** — % নয়
-    _rng_rows, _rng_err, _rates_txt = [], "", ""
-    try:
-        import bot as _br
-        if _br.lamix_on():
-            _rates = _br.otp_lamix_rates() or {}
-            # 💵 আমার payout (cost) — হাতে লেখা থাকলে সেটা, নাহলে API-র payoutRate
-            _costs = _br.otp_lamix_costs() or {}
-            for _r0 in (_br.lamix_ranges() or [])[:40]:
-                _nm0 = str(_r0.get("name") or "")
-                _best0 = 0.0
-                for _rt in (_r0.get("rates") or []):
-                    try:
-                        _best0 = max(_best0, float(_rt.get("payoutRate") or 0))
-                    except Exception:
-                        pass
-                _cur0 = round(float(_rates.get(_nm0.strip().lower(), 0) or 0), 4)
-                _my0 = round(float(_costs.get(_nm0.strip().lower(), 0) or 0), 4) or round(_best0, 4)
-                _prof0 = round(_my0 - _cur0, 4)
-                _rng_rows.append([
-                    esc(_nm0 or "—"), esc(f"${_my0:.4f}"),
-                    (esc(f"${_cur0:.4f}") if _cur0 else "—"),
-                    (badge(("+" if _prof0 >= 0 else "") + f"${_prof0:.4f}",
-                           "ok" if _prof0 >= 0 else "err") if _cur0 else "—"),
-                ])
-            _rates_txt = "\n".join(
-                f"{k} | {('' if not _costs.get(k) else round(_costs[k], 4))} | "
-                f"{('' if not _rates.get(k) else round(_rates[k], 4))}"
-                for k in sorted(set(_rates) | set(_costs)))
-        else:
-            _rng_err = "Lamix টোকেন সেট করা নেই (উপরে Lamix API পেজ দেখুন)।"
-    except Exception as _re0:
-        _rng_err = str(_re0)[:120]
     _tot = _b.otp_admin_totals()
     # 💵 আমার লাভ — প্রতিটা OTP-তে (আমার payout − ইউজারকে দেওয়া); শুধু অ্যাডমিন
     try:
@@ -2415,7 +2399,6 @@ def otp_earn_page():
         ])
     _pend = _b.otp_wd_list("pending", 100)
     _done = _b.otp_wd_list("all", 15)
-    _recent = _b.otp_numbers_recent(80)
     _svcs = _b.otp_services()
 
     _svc_opts = "".join(f"<option value='{esc(s)}'>" for s in _svcs)
@@ -2423,37 +2406,23 @@ def otp_earn_page():
                          ("facebook", "whatsapp", "telegram", "instagram",
                           "google", "tiktok", "twitter", "discord"))
 
+    # 🌍 স্টক — দেশ + সার্ভিস ধরে; প্রতিটা গ্রুপের পাশে 🗑 (ডাটাবেজ থেকেও মুছে যায়)
     _stat_rows = []
-    for s in _stats:
+    for s in _b.otp_stock_groups(80):
+        _iso_g = str(s.get("iso") or "")
+        _cty_g = str(s.get("country_raw", s.get("country")) or "")
+        _svc_g = str(s.get("service") or "")
         _stat_rows.append([
-            f"{s['flag']} {esc(s['country'])}" if s["country"] else "🏳 অজানা",
+            f"{s['flag']} {esc(str(s.get('country') or 'অজানা'))}",
+            esc(_svc_g or "—"),
             f"<b class='mono'>{num(s['n'])}</b>",
             esc(f"${s['rate']:.4f}"),
-        ])
-    # 🗂 দেশে এখন কত নাম্বার ফ্রি আছে — প্রতিটা নাম্বারের পাশেই দেখাই
-    _iso_n = {}
-    for _s0 in _stats:
-        try:
-            _iso_n[str(_s0.get("iso") or "")] = int(_s0.get("n") or 0)
-        except Exception:
-            pass
-    _num_rows = []
-    for r in _recent:
-        _nm, _iso, _fl = _b.otp_country(r["number"])
-        _num_rows.append([
-            f"<span class='mono'>{esc(str(r['number']))}</span>",
-            f"{(esc(str(r['country'])) or '—')}",
-            f"<b class='mono'>{num(_iso_n.get(str(r['iso'] or _iso) or '', 0))}</b>",
-            esc(str(r["service"] or "—")),
-            f"${float(r['rate'] or 0):.4f}",
-            badge({"free": "🟢 free", "used": "🔴 used"}.get(
-                str(r["status"] or ""), str(r["status"] or "")),
-                "ok" if str(r["status"]) == "free" else "err"),
-            esc(str(r["added_at"] or "")[:16]),
-            ("" if str(r["status"]) != "free" else
-             f"<form method='post' action='/admin/otp/num/{int(r['id'])}/delete' "
-             f"style='display:inline' onsubmit=\"return confirm('ডিলিট করবেন?')\">"
-             f"<button class='gray sm' type='submit'>🗑</button></form>"),
+            "<form method='post' action='/admin/otp/stock/del' style='display:inline' "
+            "onsubmit=\"return confirm('এই গ্রুপের সব ফ্রি নাম্বার স্টক ও ডাটাবেজ থেকে ডিলিট হবে — ঠিক আছে?')\">"
+            f"<input type='hidden' name='iso' value='{esc(_iso_g)}'>"
+            f"<input type='hidden' name='country' value='{esc(_cty_g)}'>"
+            f"<input type='hidden' name='service' value='{esc(_svc_g)}'>"
+            "<button class='err sm' type='submit'>🗑 ডিলিট</button></form>",
         ])
     _pend_rows = []
     for w in _pend:
@@ -2464,6 +2433,8 @@ def otp_earn_page():
             f"<b>${float(w['amount'] or 0):.4f}</b>",
             f"<span class='mono' style='word-break:break-all'>"
             f"{esc(str(w['address'] or '')[:60])}</span>",
+            badge("⏳ পেমেন্ট চলছে" if str(w["status"]) == "paying" else "পেন্ডিং",
+                  "warn"),
             esc(str(w["requested_at"] or "")[:16]),
             (f"<form method='post' action='/admin/otp/wd/{int(w['id'])}/approve' "
              f"style='display:inline'><button class='ok sm' type='submit'>✅ Approve</button></form> "
@@ -2530,8 +2501,16 @@ def otp_earn_page():
           " <span class='mut'>— 0 = লিমিট নেই। যেমন 1 দিলে একজন ইউজার মোট "
           "সর্বোচ্চ $1 তুলতে পারবে</span></label>"
           f"<input name='otp_wd_cap' value='{esc(str(_cap))}' placeholder='0'></div>"
+          "<div class='field'><label>সব ইউজার মিলিয়ে সর্বোচ্চ OTP withdraw (USD)"
+          " <span class='mut'>— 0 = লিমিট নেই। যেমন 1 দিলে ১ জন হোক বা ১০ জন, "
+          "মোট $1-এর বেশি কেউ তুলতে পারবে না</span></label>"
+          f"<input name='otp_wd_pool' value='{esc(str(_pool))}' placeholder='0'></div>"
           "<div class='field'><label>মিনি withdraw — সর্বনিম্ন OTP withdraw (USD)</label>"
           f"<input name='otp_wd_min' value='{esc(str(_mn))}' placeholder='0.05'></div>"
+          "<div class='field'><label>নরমাল (Zenex) নাম্বারে প্রতি OTP-তে আমি পাই (৳)"
+          " <span class='mut'>— লাভের হিসাবে এটাই আমার আয় ধরা হবে</span></label>"
+          f"<input name='getnum_earn' value='{esc(_otp_s('getnum_earn', '0.65'))}' "
+          "placeholder='0.65'></div>"
           "<button class='ok' type='submit'>💾 সেভ করুন</button></form></div>"
 
         # ── আপলোড ──
@@ -2550,8 +2529,10 @@ def otp_earn_page():
           f"<datalist id='otpsvc'>{_svc_opts}</datalist></div>"
           "<div class='field'><label>প্রতি OTP-তে ইউজার পাবে (USD $)</label>"
           "<input name='rate' type='number' step='0.0001' min='0' value='0.01'></div>"
-          "<div class='field'><label><input type='checkbox' name='auto_service' value='on'> "
-          "Lamix API থেকে সার্ভিস/দেশ অটো নিন (ম্যানুয়াল সার্ভিস না দিলে)</label></div>"
+          "<div class='field'><label>প্রতি OTP-তে আমি পাব (USD $)"
+          " <span class='mut'>— শুধু আপনার লাভের হিসাব, ইউজার দেখে না</span></label>"
+          "<input name='my_cost' type='number' step='0.0001' min='0' value='0' "
+          "placeholder='0'></div>"
           "<div class='field'><label>.txt ফাইল বেছে নিন "
           "<span class='mut'>— প্রতি লাইনে দেশকোড:নাম্বার:দেশ</span></label>"
           "<input type='file' name='txtfile' accept='.txt,text/plain' required></div>"
@@ -2559,43 +2540,17 @@ def otp_earn_page():
           "<span class='mut' style='font-size:12px;margin-left:10px'>"
           "একই নাম্বার দুইবার যোগ হবে না।</span></form></div>"
 
-        # ── Lamix থেকে অটো নাম্বার ──
-        + "<div class='card'><b>☎️ Lamix থেকে নাম্বার নিন (অটো)</b>"
-          "<div class='mut' style='font-size:12px;margin:4px 0 10px'>"
-          "Lamix প্যানেলে আপনার অ্যাকাউন্টে যে নাম্বারগুলো আছে, সেগুলোই স্টকে যোগ হবে "
-          "(<span class='mono'>GET /api/v1/numbers</span>)। নিচে যে **ডলার রেট** লিখবেন, "
-          "ইউজার প্রতি OTP-তে ঠিক ততই পাবে — এখানে কোনো % নেই, আপনার payout কত তা এর "
-          "নাম্বার/রেটে ভূমিকা রাখে না (লাভ/লস আপনার হিসাব)। হাতে আপলোড লাগবে না।</div>"
-          + ("<div class='mut' style='font-size:12px;margin:0 0 8px'>"
-             + esc(_rng_err) + "</div>" if _rng_err and not _rng_rows else "")
-          + table(["Lamix রেঞ্জ", "আমার পাব", "ইউজার পাবে", "লাভ"], _rng_rows,
-                  "রেঞ্জ নেই (Extended API চালু আছে কি?)")
-          + "<form method='post' action='/admin/otp/sync'>"
-          "<div class='field'><label>সাধারণ রেট (USD) — যে রেঞ্জে আলাদা দেবেন না</label>"
-          f"<input name='rate' value='{esc(str(_def_rate))}' placeholder='0.01'> $</div>"
-          "<div class='field'><label>রেঞ্জ অনুযায়ী লিখুন — প্রতি লাইনে: "
-          "<span class='mono'>রেঞ্জের নাম | আমি পাব | ইউজার পাবে</span> "
-          "<span class='mut'>(আমার ঘর খালি রাখলে Lamix-এর payoutRate-ই ধরা হবে; "
-          "শুধু <span class='mono'>নাম | ইউজার পাবে</span> লিখলেও চলবে)</span></label>"
-          f"<textarea name='rate_lines' rows='6' placeholder='UK Mobile | 0.012 | 0.008&#10;Canada |  | 0.012'>"
-          f"{esc(_rates_txt)}</textarea></div>"
-          "<button class='ok' type='submit'>☎️ Lamix থেকে আপডেট করুন</button>"
-          "<span class='mut' style='font-size:12px;margin-left:10px'>"
-          "একই নাম্বার দ্বিতীয়বার যোগ হবে না।</span></form></div>"
-
-        # ── স্টক ──
+        # ── স্টক (দেশ + সার্ভিস, প্রতিটার পাশে ডিলিট) ──
         + "<div class='card'><b>🌍 স্টক — দেশ অনুযায়ী</b>"
-        + table(["দেশ", "ফ্রি নাম্বার", "গড় রেট"], _stat_rows,
+          "<div class='mut' style='font-size:12px;margin:4px 0 10px'>"
+          "ফ্রি নাম্বার এই টেবিলেই দেখা যায়। 🗑 ডিলিট চাপলে ওই দেশ+সার্ভিসের সব ফ্রি "
+          "নাম্বার স্টক ও ডাটাবেজ — দুটো থেকেই মুছে যাবে।</div>"
+        + table(["দেশ", "সার্ভিস", "ফ্রি নাম্বার", "গড় রেট", ""], _stat_rows,
                 "এখনো কোনো নাম্বার আপলোড হয়নি")
         + "</div>"
-        + "<div class='card'><b>📱 সর্বশেষ নাম্বার</b>"
-        + table(["নাম্বার", "দেশ", "দেশে স্টক", "সার্ভিস", "রেট", "স্টেটাস", "সময়", ""],
-                _num_rows, "নাম্বার নেই")
-        + "</div>"
-
         # ── withdraw ──
         + "<div class='card'><b>💸 OTP Withdraw রিকোয়েস্ট (পেন্ডিং)</b>"
-        + table(["ID", "ইউজার", "পরিমাণ", "Wallet", "সময়", "অ্যাকশন"],
+        + table(["ID", "ইউজার", "পরিমাণ", "Wallet", "স্টেটাস", "সময়", "অ্যাকশন"],
                 _pend_rows, "কোনো পেন্ডিং রিকোয়েস্ট নেই")
         + "</div>"
         + "<div class='card'><b>📜 সর্বশেষ সিদ্ধান্ত</b>"
@@ -2623,7 +2578,10 @@ def otp_earn_save():
         "otp_earn_on": "off" if (form.get("otp_earn_on") or "on") == "off" else "on",
         "otp_wd_on": "on" if (form.get("otp_wd_on") or "") == "on" else "off",
         "otp_wd_cap": _fnum("otp_wd_cap", 0),
+        "otp_wd_pool": _fnum("otp_wd_pool", 0),
         "otp_wd_min": _fnum("otp_wd_min", 0.05),
+        # 💵 নরমাল (Zenex) নাম্বারে প্রতি OTP-তে আমার আয় — লাভের হিসাব
+        "getnum_earn": _fnum("getnum_earn", 0.65),
     }
     try:
         import bot as _b
@@ -2663,21 +2621,19 @@ def otp_earn_upload():
         rate = 0.0
     if not (text or "").strip():
         return redirect("/admin/otp?err=" + _q("আগে .txt ফাইল বেছে নিন (দেশকোড:নাম্বার:দেশ)"))
-    meta, _api_err = None, ""
-    if (form.get("auto_service") or "") == "on":
-        try:
-            meta, _api_err = _b.otp_service_auto()
-        except Exception as e:
-            _api_err = str(e)[:120]
+    # 💵 আমার payout — লাভের হিসাব (ইউজার দেখে না); লাইনে আলাদা রেট দিলে সেটাই প্রাধান্য পায়
     try:
-        added, dup, bad = _b.otp_numbers_add(text, service, rate, fname or "upload", meta=meta)
+        _myc = max(float(str(form.get("my_cost") or 0).replace(",", ".")), 0.0)
+    except Exception:
+        _myc = 0.0
+    try:
+        added, dup, bad = _b.otp_numbers_add(text, service, rate, fname or "upload",
+                                             flat_cost=_myc)
     except Exception as e:
         return redirect("/admin/otp?err=" + _q(f"যোগ হয়নি: {e}"))
     if not added:
-        _why = "সব লাইনই আগে থেকে আছে বা ভুল ফরম্যাট"
-        if _api_err:
-            _why += f" · Lamix: {_api_err}"
-        return redirect("/admin/otp?err=" + _q(_why))
+        return redirect("/admin/otp?err=" + _q(
+            "সব লাইনই আগে থেকে আছে বা ভুল ফরম্যাট"))
     log_admin("otp_upload", 0, f"{added} numbers ({dup} dup, {bad} bad) service={service or '-'} rate={rate}")
     _tail = f" · {dup} ডুপ্লিকেট বাদ" if dup else ""
     if bad:
@@ -2738,6 +2694,27 @@ def otp_earn_sync_lamix():
     log_admin("otp_sync_lamix", 0, f"+{_a} numbers rate=${_def_rate}")
     return redirect("/admin/otp?ok=" + _q(
         f"☎️ Lamix থেকে {_a}টি নাম্বার যোগ · {_d} ডুপ্লিকেট · {_bad} বাদ"))
+
+
+@wadm.route("/admin/otp/stock/del", methods=["POST"])
+def otp_earn_stock_delete():
+    """🌍 স্টক টেবিলের 🗑 — ওই দেশ+সার্ভিসের সব ফ্রি নাম্বার ডাটাবেজ থেকেই মুছে যায়।"""
+    g = guard()
+    if g:
+        return g
+    form = request.form
+    _iso = (form.get("iso") or "").strip()[:3]
+    _cty = (form.get("country") or "").strip()[:80]
+    _svc = (form.get("service") or "").strip()[:40]
+    if not (_iso or _cty):
+        return redirect("/admin/otp?err=" + _q("দেশ/সার্ভিস পাওয়া যায়নি"))
+    try:
+        import bot as _b
+        _n = _b.otp_stock_purge(iso=_iso, country=_cty, service=_svc)
+    except Exception as e:
+        return redirect("/admin/otp?err=" + _q(str(e)[:150]))
+    log_admin("otp_stock_del", 0, f"iso={_iso} country={_cty} svc={_svc} removed={_n}")
+    return redirect("/admin/otp?ok=" + _q(f"🗑 {_n} টা ফ্রি নাম্বার ডিলিট হয়েছে"))
 
 
 @wadm.route("/admin/otp/num/<int:nid>/delete", methods=["POST"])

@@ -8885,6 +8885,18 @@ def _gn_rate_of(it):
     return p if p > 0 else getnum_rate()
 
 
+def getnum_earn():
+    """নরমাল (Zenex/ওয়েব) নাম্বারে প্রতি OTP-তে **আমি** পাই কত ৳।
+
+    ডিফল্ট ০.৬৫ — মালিকের হিসাব। লাভ = এই টাকা − ইউজারকে দেওয়া ৳।
+    """
+    try:
+        v = float(str(get_setting("getnum_earn") or "0.65").replace(",", "."))
+        return max(0.0, round(v, 4))
+    except Exception:
+        return 0.65
+
+
 def _gn_usd(bdt):
     """৳ → $ (ডিপোজিট রেট ধরে)।"""
     try:
@@ -9078,9 +9090,23 @@ def _gn_norm_num(v):
 
 
 def _gn_otp_code(msg):
-    """OTP মেসেজ থেকে কোড (৪–৮ ডিজিট)।"""
-    m = _re.search(r"(?<!\d)(\d{4,8})(?!\d)", str(msg or ""))
-    return m.group(1) if m else ""
+    """OTP মেসেজ থেকে কোড (৪–৮ ডিজিট)।
+
+    আগে শুধু একসাথে লেখা কোড ধরত, তাই `134 077 is your Instagram code`
+    জাতীয় মেসেজে কোড বের হতো না (Otp : —)। এখন ফাঁকা/ড্যাশ দিয়ে ভাঙা
+    কোডও জোড়া লাগিয়ে নেয় — ইনবক্স ও চ্যানেলে কোড ১০০% যাবে।
+    """
+    s = str(msg or "")
+    m = _re.search(r"(?<!\d)(\d{4,8})(?!\d)", s)
+    if m:
+        return m.group(1)
+    # `134 077` / `134-077` / `123 456 789` → `134077`
+    m = _re.search(r"(?<!\d)(\d{2,4})[\s\-–]+(\d{2,4})(?:[\s\-–]+(\d{2,4}))?(?!\d)", s)
+    if m:
+        _g = "".join(x for x in m.groups() if x)
+        if 4 <= len(_g) <= 9:
+            return _g
+    return ""
 
 
 def getnum_sms_all():
@@ -9735,8 +9761,15 @@ def _gn_ch_probe():
 def _gn_ch_text(o):
     """OTP চ্যানেলের নোটিশ — বটের ইনবক্স কার্ডের মতোই পরিষ্কার।"""
     _e = lambda v: html.escape(str(v or ""), quote=False)
-    _loc = " ".join(x for x in (_gn_flag(o.get("iso")), str(o.get("country") or "")) if x).strip()
     _rng = str(o.get("range_val") or o.get("range_name") or "").strip()
+    _cty = str(o.get("country") or "").strip()
+    if not _cty and _rng:                    # দেশের নাম না থাকলে রেঞ্জ থেকে বের করি
+        try:
+            _f9, _c9 = _gn_country_of(_rng)
+            _cty = _c9 or ""
+        except Exception:
+            _cty = ""
+    _loc = " ".join(x for x in (_gn_flag(o.get("iso")), _cty) if x).strip()
     _num = str(o.get("number") or "").strip()
     _code = str(o.get("otp") or "").strip() or "—"
     _svc = str(o.get("service") or "").strip() or "OTP"
@@ -9753,7 +9786,8 @@ def _gn_ch_text(o):
         f"{_head}\n\n"
         f"📱 <b>Service :</b> {_e(_svc)}\n"
         f"⚡ <b>Type :</b> {_type_s}\n"
-        f"🌍 <b>Range :</b> {_e((_flag + ' ' + _rng).strip() or '—')}\n"
+        f"🌍 <b>Country :</b> {_e(_loc or (_flag + ' ' + _cty).strip() or '—')}\n"
+        f"🔢 <b>Range :</b> {_e(_rng or '—')}\n"
         f"🔑 <b>Otp :</b> <b>{_e(_code)}</b>\n"
         f"{_pay_s}"
         f"💬 <b>Full Message :</b>\n"
@@ -9796,12 +9830,24 @@ def _gn_group_text(rows, en=False):
     except Exception:
         _lft = 0
     _svc = str(o.get("service") or "").strip() or "OTP"
+    # 💵 ডলারের পাশে টাকা (৳) — হাই রেট (USD) আর লো রেট (৳) দুটোতেই একই দেখায়
+    if str(o.get("src") or "") == "lamix":
+        try:
+            _usd = float(o.get("usd") or o.get("price") or 0)
+        except Exception:
+            _usd = 0.0
+        try:
+            _rate_s = f"{_usd:.4f}$ · {_usd * float(dep_rate() or 125):g}৳"
+        except Exception:
+            _rate_s = f"{_usd:.4f}$"
+    else:
+        _rate_s = getnum_money2(_rate)
     return (
         "⚡ <b>VERIFICATION ACTIVE</b>\n"
         "━━━━━━━━━━━━━━━━\n"
         f"📱 <b>Service:</b> {html.escape(_svc)}\n"
         f"🌍 <b>Country:</b> {html.escape(_loc)}\n"
-        f"💵 <b>Rate:</b> {getnum_money2(_rate)}  |  ⏰ {_lft}m"
+        f"💵 <b>Rate:</b> {_rate_s}  |  ⏰ {_lft}m"
     )
 
 
@@ -9837,12 +9883,21 @@ def _gn_group_kb(rows, en=False):
         except Exception:
             pass
     _id = int(rows[0].get("id") or 0) if rows else 0
-    _b.append([
-        InlineKeyboardButton(_bi("📍 নাম্বার বদলান", "📍 Change Num", en),
-                             callback_data=(f"gn:n:{_id}" if _id else "gn:home")),
-        InlineKeyboardButton(_bi("🛂 দেশ বদলান", "🛂 Change Country", en),
-                             callback_data=(f"gn:cc:{_id}" if _id else "gn:home")),
-    ])
+    if rows and str(rows[0].get("src") or "") == "lamix":
+        # 🔥 হাই রেট (Lamix) — বদলাতে চাইলে স্টক-লিস্টেই ফেরত যাবে
+        try:
+            _b.append([InlineKeyboardButton(
+                _bi("🔁 আরেকটা হাই রেট নাম্বার", "🔁 Another high-rate number", en),
+                callback_data="otp:gn")])
+        except Exception:
+            pass
+    else:
+        _b.append([
+            InlineKeyboardButton(_bi("📍 নাম্বার বদলান", "📍 Change Num", en),
+                                 callback_data=(f"gn:n:{_id}" if _id else "gn:home")),
+            InlineKeyboardButton(_bi("🛂 দেশ বদলান", "🛂 Change Country", en),
+                                 callback_data=(f"gn:cc:{_id}" if _id else "gn:home")),
+        ])
     return InlineKeyboardMarkup(_b)
 
 
@@ -9960,8 +10015,14 @@ def _gn_order_text(o, en=False):
     _loc = " ".join(x for x in (_gn_flag(o.get("iso")), str(o.get("country") or "")) if x).strip()
     _where = _loc or str(o.get("range_name") or "")
     # হাই রেট (Lamix) অর্ডারে রেট সরাসরি USD — BDT-তে ভাঙা হয় না
-    _rate_s = (f"${float(o.get('usd') or _rate or 0):.4f}" if _src == "lamix"
-               else getnum_money2(_rate))
+    if _src == "lamix":
+        _usd0 = float(o.get("usd") or _rate or 0)
+        try:
+            _rate_s = f"${_usd0:.4f} · {_usd0 * float(dep_rate() or 125):g}৳"
+        except Exception:
+            _rate_s = f"${_usd0:.4f}"
+    else:
+        _rate_s = getnum_money2(_rate)
     _meta = (f"{str(o.get('service') or '')} · {_where}\n"
              f"💵 {'OTP রেট' if not en else 'OTP rate'}: {_rate_s}"
              f"{' · প্রতি OTP-তে' if (not en and _src == 'lamix') else (' · per OTP' if _src == 'lamix' else '')}\n")
@@ -10035,15 +10096,7 @@ async def show_getnum_menu(update, ctx=None):
             callback_data="gn:low")],
         [InlineKeyboardButton(_hr, callback_data="otp:gn")],
     ]
-    try:
-        _cur = await asyncio.to_thread(gn_open_orders, uid)
-    except Exception:
-        _cur = []
-    if _cur:
-        _rows.append([InlineKeyboardButton(
-            _bi(f"📱 চলমান নাম্বার ({len(_cur)})",
-                f"📱 Current numbers ({len(_cur)})", en),
-            callback_data="gn:cur")])
+        # (📱 চলমান নাম্বার বাটন এখানে রাখা হয়নি — মালিকের অনুরোধ)
     # 🛡 OTP গ্রুপ বাটন এখানেই — নাম্বার নেওয়ার সাথে সাথেই গ্রুপে ঢুকতে পারবেন
     try:
         _gu = getnum_group_url()
@@ -10171,7 +10224,11 @@ async def otp_gn_issue(update, ctx, idx):
         "usd": _rate, "src": "lamix", "status": "waiting", "ts": _time.time(),
         "otp": "", "sms": "", "otp_n": 0,
         "country": row.get("country") or "", "iso": row.get("iso") or ""}
-    return await _gn_say(update, _gn_order_text(o, en), _gn_order_kb(o, en))
+    # লো রেটের কার্ডের মতোই একই ডিজাইন (VERIFICATION ACTIVE + কপি বাটন)
+    o = dict(o)
+    o.setdefault("src", "lamix")
+    return await _gn_say(update, _gn_group_text([o], en),
+                         _gn_group_kb([o], en), parse_mode="HTML")
 
 
 async def show_getnum(update, ctx=None):
@@ -10770,9 +10827,16 @@ async def _gn_check_and_notify(bot_obj, o, quiet=False, rows=None):
     _uid_r = int(row.get("user_id") or 0)
     _hit_key = str(nid or "").strip() or (
         (str(code or "") + "@" + str(hit.get("created_at") or ""))[:120])
+    # 💵 লাভের হিসাব — নরমাল নাম্বারে আমি পাই ৳ (Zenex), হাই রেটেLamix cost
+    _cost_ovr = None
+    if str(row.get("src") or "").strip().lower() != "lamix":
+        try:
+            _cost_ovr = round(float(getnum_earn()) / float(dep_rate() or 125.0), 6)
+        except Exception:
+            _cost_ovr = None
     _is_new = await asyncio.to_thread(
         otp_hit_new, oid, _hit_key, code, full, max(_usd, 0.0),
-        row.get("number"), _uid_r)
+        row.get("number"), _uid_r, cost=_cost_ovr)
     if not _is_new:
         return False                  # এই SMS আগেই দেওয়া/গোনা হয়েছে
     if not first:
@@ -10806,9 +10870,10 @@ async def _gn_check_and_notify(bot_obj, o, quiet=False, rows=None):
     try:
         _kpost = (str(row.get("service") or "") + "|"
                   + str(row.get("country") or "")).strip().lower()
-        if _gn_post_allowed(_kpost):
-            if await asyncio.to_thread(_gn_ch_send, _gn_ch_text(row)):
-                _gn_post_done(_kpost)
+        # ✅ ইউজারের নিজের OTP সবসময় চ্যানেলে যাবে (রেট-লিমিট এখানে খাটে না) —
+        #    ইনবক্সের সাথে সাথে চ্যানেলেও, নরমাল ও হাই রেট দুটোতেই
+        if await asyncio.to_thread(_gn_ch_send, _gn_ch_text(row)):
+            _gn_post_done(_kpost)
     except Exception as _pc:
         log.debug(f"[GETNUM-FEED] চ্যানেল পোস্ট: {str(_pc)[:90]}")
     if bot_obj:
@@ -12506,13 +12571,15 @@ def otp_service_auto(numbers=None):
     return out, ""
 
 
-def otp_numbers_add(text, service="", rate=0.0, source="", meta=None, costs=None):
+def otp_numbers_add(text, service="", rate=0.0, source="", meta=None, costs=None,
+                    flat_cost=None):
     """লাইনগুলো থেকে নাম্বার যোগ — (যোগ হয়েছে, ডুপ্লিকেট, বাদ)।
 
     Lamix ফাইলের ফরম্যাট: **`দেশকোড:নাম্বার:দেশ`** — যেমন `93:703231343:AF`;
     দেশ ফাইল থেকেই বসে, ডায়ালিং কোড দেখে আন্দাজ করতে হয় না।
     পুরোনো ফরম্যাটও চলে: `নাম্বার` / `নাম্বার|রেট` / `নাম্বার|রেট|সার্ভিস`।
     `costs` = {নাম্বার: আমার payout (USD)} — লাভের হিসাবের জন্য (ইউজার দেখে না)।
+    `flat_cost` = সব নাম্বারে একই payout (কোনোটা আলাদা না দিলে এটাই বসে)।
     """
     _otp_init()
     try:
@@ -12570,6 +12637,11 @@ def otp_numbers_add(text, service="", rate=0.0, source="", meta=None, costs=None
             if costs:
                 try:
                     _cost = max(float(costs.get(num) or 0), 0.0)
+                except Exception:
+                    _cost = 0.0
+            if not _cost and flat_cost:
+                try:
+                    _cost = max(float(flat_cost or 0), 0.0)
                 except Exception:
                     _cost = 0.0
             try:
@@ -12653,11 +12725,41 @@ def otp_numbers_recent(limit=120):
 
 
 def otp_number_delete(nid):
+    """নাম্বার ডাটাবেজ থেকে সত্যিই মুছে দেয় (স্টেটাস যাই হোক)।"""
     _otp_init()
     with _c() as c:
-        c.execute("DELETE FROM otp_numbers WHERE id=%s AND status='free'", (int(nid),))
+        c.execute("DELETE FROM otp_numbers WHERE id=%s", (int(nid),))
     _mark_dirty()
+    try:
+        _OTP_STATS_CACHE["ts"] = 0.0
+    except Exception:
+        pass
     return True
+
+
+def otp_stock_purge(iso="", country="", service=""):
+    """(দেশ, সার্ভিস) গ্রুপের ফ্রি নাম্বার স্টক + ডাটাবেজ থেকে মুছে দেয়।"""
+    _otp_init()
+    _q = "DELETE FROM otp_numbers WHERE status='free'"
+    _a = []
+    if iso:
+        _q += " AND iso=%s"
+        _a.append(str(iso))
+    if country:
+        _q += " AND COALESCE(country,'')=%s"
+        _a.append(str(country))
+    if service:
+        _q += " AND COALESCE(service,'')=%s"
+        _a.append(str(service))
+    with _c() as c:
+        cur = c.execute(_q, tuple(_a))
+        _n = int(getattr(cur, "rowcount", 0) or 0)
+    _mark_dirty()
+    try:
+        _OTP_STATS_CACHE["ts"] = 0.0
+    except Exception:
+        pass
+    return _n
 
 
 # ── হাই রেট OTP: নাম্বার নেওয়া / ফেরত / প্রতি-SMS হিসাব ─────────
@@ -12679,6 +12781,7 @@ def otp_stock_groups(limit=40):
         _iso = str(r["iso"] or "")
         out.append({"iso": _iso,
                     "country": str(r["country"] or "") or "অজানা",
+                    "country_raw": str(r["country"] or ""),
                     "service": str(r["service"] or ""),
                     "n": int(r["n"] or 0),
                     "rate": float(r["r"] or 0),
@@ -12698,8 +12801,10 @@ def otp_take(uid, iso, service=""):
             r = c.execute(_q, _a).fetchone()
             if not r:
                 return None, "empty"
+            # 🟡 'taken' = ইউজার নিয়েছে, কোড এখনো আসেনি (এখনো মৃত নয়)।
+            # 🔴 'used' হয় শুধু কোড এলে (otp_hit_new) — নিজের অনুরোধ।
             cur = c.execute(
-                "UPDATE otp_numbers SET status='used', used_by=%s, used_at=%s "
+                "UPDATE otp_numbers SET status='taken', used_by=%s, used_at=%s "
                 "WHERE id=%s AND status='free'",
                 (int(uid), now(), int(r["id"])))
             if not cur.rowcount:
@@ -12784,8 +12889,11 @@ def otp_release_number(number, uid=0):
     _otp_init()
     try:
         with _c() as c:
+            # শুধু যেগুলোতে এখনো কোড আসেনি — কোড-আসা নাম্বার আর স্টকে ফেরে না
             c.execute("UPDATE otp_numbers SET status='free', used_by=0, used_at='' "
-                      "WHERE number=%s AND status='used'", (str(number or ""),))
+                      "WHERE number=%s AND (status='taken' OR "
+                      "(status='used' AND COALESCE(otp,'')=''))",
+                      (str(number or ""),))
         _mark_dirty()
         try:      # স্টকে ফিরল → "স্টক শেষ" অ্যালার্ট আবার চালু
             _STOCK_ALERT["empty"].clear()
@@ -12809,7 +12917,8 @@ def otp_release_expired(wait_min=None):
                 (_cut,)).fetchall() or []
             for r in rows:
                 c.execute("UPDATE otp_numbers SET status='free', used_by=0, "
-                          "used_at='' WHERE number=%s AND status='used'",
+                          "used_at='' WHERE number=%s AND (status='taken' OR "
+                          "(status='used' AND COALESCE(otp,'')=''))",
                           (str(r["number"] or ""),))
                 c.execute("UPDATE getnum_orders SET status='expired', "
                           "updated_at=%s WHERE id=%s", (now(), int(r["id"])))
@@ -12864,6 +12973,14 @@ def otp_hit_new(oid, nid, code="", sms="", paid=0.0, number="", uid=0, cost=None
                  str(code or "")[:32], str(sms or "")[:1200],
                  float(paid or 0), float(cost or 0), now()))
             _new = bool(cur.rowcount)
+            if _new and number:
+                # 🔴 কোড এলো — তখনই নাম্বারটা সত্যিই "used" (মৃত)
+                try:
+                    c.execute("UPDATE otp_numbers SET status='used', otp=%s "
+                              "WHERE number=%s",
+                              (str(code or "")[:32], str(number or "")))
+                except Exception:
+                    pass
         if _new:
             _mark_dirty()
         return _new
@@ -12943,12 +13060,36 @@ def otp_wd_min():
         return 0.05
 
 
+def otp_wd_pool():
+    """সব ইউজার মিলিয়ে OTP ইনকাম থেকে মোট সর্বোচ্চ কত $ তোলা যাবে।
+
+    0 = লিমিট নেই। যেমন 1 দিলে — 1 জন হোক বা 10 জন, মোট $1-এর বেশি যাবে না।
+    """
+    try:
+        return max(float(str(get_setting("otp_wd_pool") or 0).replace(",", ".")), 0.0)
+    except Exception:
+        return 0.0
+
+
+def otp_wd_used_all():
+    """সব ইউজার মিলিয়ে withdraw (paid + pending/processing) — pool-এর হিসাব।"""
+    _otp_init()
+    try:
+        with _c() as c:
+            r = c.execute("SELECT COALESCE(SUM(amount),0) AS a FROM otp_withdrawals "
+                          "WHERE status IN ('pending','paying','approved')").fetchone()
+        return round(float((r or {}).get("a") or 0), 4)
+    except Exception:
+        return 0.0
+
+
 # ── ইউজারের OTP ওয়ালেট ──────────────────────────────────────────
 def otp_wallet(uid):
     """{bal, earned, withdrawn, pending, cap, avail, wd_on, min} — এক নজরে।"""
     _otp_init()
     z = {"bal": 0.0, "earned": 0.0, "withdrawn": 0.0, "pending": 0.0,
-         "cap": otp_wd_cap(), "wd_on": otp_wd_on(), "min": otp_wd_min()}
+         "cap": otp_wd_cap(), "wd_on": otp_wd_on(), "min": otp_wd_min(),
+         "pool": 0.0, "pool_used": 0.0, "pool_left": 0.0}
     try:
         with _c() as c:
             r = c.execute(
@@ -12957,18 +13098,25 @@ def otp_wallet(uid):
                 (int(uid),)).fetchone()
             p = c.execute(
                 "SELECT COALESCE(SUM(amount),0) AS a FROM otp_withdrawals "
-                "WHERE user_id=%s AND status='pending'", (int(uid),)).fetchone()
+                "WHERE user_id=%s AND status IN ('pending','paying')",
+                (int(uid),)).fetchone()
         z["bal"] = round(float((r or {}).get("b") or 0), 4)
         z["earned"] = round(float((r or {}).get("e") or 0), 4)
         z["withdrawn"] = round(float((r or {}).get("w") or 0), 4)
         z["pending"] = round(float((p or {}).get("a") or 0), 4)
     except Exception as e:
         log.warning(f"[OTP] wallet uid={uid}: {str(e)[:120]}")
+    z["pool"] = otp_wd_pool()
+    if float(z["pool"] or 0) > 0:
+        z["pool_used"] = otp_wd_used_all()
+        z["pool_left"] = round(max(float(z["pool"]) - float(z["pool_used"]), 0.0), 4)
+    _lim = float(z["bal"] or 0)
     _cap = float(z["cap"] or 0)
     if _cap > 0:
-        z["avail"] = round(min(z["bal"], max(_cap - z["withdrawn"], 0.0)), 4)
-    else:
-        z["avail"] = z["bal"]
+        _lim = min(_lim, max(_cap - float(z["withdrawn"] or 0), 0.0))
+    if float(z["pool"] or 0) > 0:
+        _lim = min(_lim, float(z["pool_left"] or 0))
+    z["avail"] = round(max(_lim, 0.0), 4)
     return z
 
 
@@ -13011,10 +13159,11 @@ def otp_wd_new(uid, amt, address):
     if not otp_wd_on():
         return None, "locked"
     _cap = otp_wd_cap()
+    _pool = otp_wd_pool()
     try:
         with _c() as c:
             _p = c.execute("SELECT id FROM otp_withdrawals WHERE user_id=%s "
-                           "AND status='pending'", (int(uid),)).fetchone()
+                           "AND status IN ('pending','paying')", (int(uid),)).fetchone()
             if _p:
                 return None, "pending"
             r = c.execute("SELECT COALESCE(otp_balance,0) AS b, "
@@ -13022,7 +13171,16 @@ def otp_wd_new(uid, amt, address):
                           (int(uid),)).fetchone()
             _b = float((r or {}).get("b") or 0)
             _w = float((r or {}).get("w") or 0)
-            _allowed = min(_b, max(_cap - _w, 0.0)) if _cap > 0 else _b
+            _allowed = _b
+            if _cap > 0:
+                _allowed = min(_allowed, max(_cap - _w, 0.0))
+            if _pool > 0:
+                _pa = c.execute("SELECT COALESCE(SUM(amount),0) AS a FROM otp_withdrawals "
+                                "WHERE status IN ('pending','paying','approved')").fetchone()
+                _pleft = max(_pool - float((_pa or {}).get("a") or 0), 0.0)
+                if amt > _pleft + 1e-9:
+                    return None, ("pool" if amt <= _b + 1e-9 else "low")
+                _allowed = min(_allowed, _pleft)
             if amt > _allowed + 1e-9:
                 return None, "low"
             cur = c.execute(
@@ -13044,8 +13202,46 @@ def otp_wd_new(uid, amt, address):
         return None, "db"
 
 
+def otp_wd_claim(wid):
+    """পেমেন্টের আগে atomic দখল — True মানে শুধু আমি-ই এখন পেমেন্ট করতে পারব।
+
+    status 'pending' → 'paying' এক ধাপে (WHERE status='pending')। একই রিকোয়েস্ট
+    দুইবার claim করা যায় না — তাই এক পেমেন্ট দুইবার যাওয়ার সুযোগ নেই।
+    """
+    _otp_init()
+    try:
+        with _c() as c:
+            cur = c.execute("UPDATE otp_withdrawals SET status='paying' "
+                            "WHERE id=%s AND status='pending'", (int(wid),))
+            _ok = cur.rowcount == 1
+        if _ok:
+            _mark_dirty()
+        return _ok
+    except Exception as e:
+        log.warning(f"[OTP] wd_claim {wid}: {str(e)[:120]}")
+        return False
+
+
+def otp_wd_release(wid):
+    """পেমেন্ট ব্যর্থ → দখল ছেড়ে আবার pending (টাকা কাটাই থাকবে)।"""
+    _otp_init()
+    try:
+        with _c() as c:
+            c.execute("UPDATE otp_withdrawals SET status='pending' "
+                      "WHERE id=%s AND status='paying'", (int(wid),))
+        _mark_dirty()
+        return True
+    except Exception as e:
+        log.warning(f"[OTP] wd_release {wid}: {str(e)[:120]}")
+        return False
+
+
 def otp_wd_decide(wid, ok, note=""):
-    """অ্যাডমিন Approve / Reject — reject হলে টাকা otp_balance-এ ফেরত।"""
+    """অ্যাডমিন Approve / Reject — reject হলে টাকা otp_balance-এ ফেরত।
+
+    শুধু status='pending' হলে কাজ করে (atomic)। পেমেন্ট চলাকালীন ('paying')
+    reject হবে না — তাই টাকা ফেরত + পেমেন্ট দুটোই হওয়ার সুযোগ নেই।
+    """
     _otp_init()
     row = None
     try:
@@ -13054,14 +13250,14 @@ def otp_wd_decide(wid, ok, note=""):
                             (int(wid),)).fetchone()
             if not row or str(row["status"]) != "pending":
                 return None
-            if ok:
-                c.execute("UPDATE otp_withdrawals SET status='approved', decided_at=%s, "
-                          "note=%s WHERE id=%s AND status='pending'",
-                          (now(), str(note or "")[:200], int(wid)))
-            else:
-                c.execute("UPDATE otp_withdrawals SET status='rejected', decided_at=%s, "
-                          "note=%s WHERE id=%s AND status='pending'",
-                          (now(), str(note or "")[:200], int(wid)))
+            cur = c.execute(
+                "UPDATE otp_withdrawals SET status=%s, decided_at=%s, note=%s "
+                "WHERE id=%s AND status='pending'",
+                ("approved" if ok else "rejected", now(),
+                 str(note or "")[:200], int(wid)))
+            if cur.rowcount != 1:
+                return None
+            if not ok:  # টাকা ফেরত — শুধু সত্যিই reject হয়েছে তখনই
                 c.execute("UPDATE users SET otp_balance=COALESCE(otp_balance,0)+%s, "
                           "otp_withdrawn=GREATEST(COALESCE(otp_withdrawn,0)-%s,0) "
                           "WHERE user_id=%s",
@@ -13076,15 +13272,19 @@ def otp_wd_decide(wid, ok, note=""):
 
 
 def otp_wd_paid(wid, tx_hash=""):
-    """অটো পেমেন্ট সফল — approved + tx_hash।"""
+    """পেমেন্ট সফল — 'paying'/'pending' → approved + tx_hash (একবারই)।"""
     _otp_init()
     try:
         with _c() as c:
-            c.execute("UPDATE otp_withdrawals SET status='approved', decided_at=%s, "
-                      "tx_hash=%s WHERE id=%s AND status='pending'",
-                      (now(), str(tx_hash or "")[:120], int(wid)))
-        _mark_dirty()
-        return True
+            cur = c.execute("UPDATE otp_withdrawals SET status='approved', decided_at=%s, "
+                            "tx_hash=%s WHERE id=%s AND status IN ('paying','pending')",
+                            (now(), str(tx_hash or "")[:120], int(wid)))
+            _ok = cur.rowcount == 1
+        if _ok:
+            _mark_dirty()
+        else:
+            log.warning(f"[OTP] wd_paid {wid}: আগেই approved/decided — tx সেভ হয়নি")
+        return _ok
     except Exception as e:
         log.warning(f"[OTP] wd_paid {wid}: {str(e)[:120]}")
         return False
@@ -13097,6 +13297,10 @@ def otp_wd_list(status="pending", limit=100):
             if status == "all":
                 return c.execute("SELECT * FROM otp_withdrawals ORDER BY id DESC "
                                  "LIMIT %s", (int(limit),)).fetchall()
+            if status == "pending":  # 'paying' (পেমেন্ট চলছে) — পেন্ডিং হিসাবেই
+                return c.execute("SELECT * FROM otp_withdrawals "
+                                 "WHERE status IN ('pending','paying') "
+                                 "ORDER BY id DESC LIMIT %s", (int(limit),)).fetchall()
             return c.execute("SELECT * FROM otp_withdrawals WHERE status=%s "
                              "ORDER BY id DESC LIMIT %s", (status, int(limit))).fetchall()
     except Exception:
@@ -13112,7 +13316,7 @@ def otp_admin_totals():
             r = c.execute("SELECT COALESCE(SUM(COALESCE(otp_earned,0)),0) AS e, "
                           "COALESCE(SUM(COALESCE(otp_withdrawn,0)),0) AS w FROM users").fetchone()
             p = c.execute("SELECT COUNT(*) AS n, COALESCE(SUM(amount),0) AS a "
-                          "FROM otp_withdrawals WHERE status='pending'").fetchone()
+                          "FROM otp_withdrawals WHERE status IN ('pending','paying')").fetchone()
         z["earned"] = round(float((r or {}).get("e") or 0), 4)
         z["withdrawn"] = round(float((r or {}).get("w") or 0), 4)
         z["pending_n"] = int((p or {}).get("n") or 0)
@@ -13127,11 +13331,70 @@ def _otp_money(x):
     return f"${float(x or 0):.4f}"
 
 
+def otp_earn_history(uid, limit=5):
+    """OTP Earn হিস্টোরি — শেষ OTP আয় + withdraw (নতুন আগে)।"""
+    _otp_init()
+    out = []
+    try:
+        with _c() as c:
+            for r in (c.execute(
+                    "SELECT number, code, paid, ts FROM otp_hits WHERE user_id=%s "
+                    "ORDER BY id DESC LIMIT %s",
+                    (int(uid), int(limit))).fetchall() or []):
+                out.append({"kind": "earn", "amt": float(r["paid"] or 0),
+                            "number": str(r["number"] or ""),
+                            "status": "done", "ts": str(r["ts"] or "")})
+            for r in (c.execute(
+                    "SELECT amount, status, requested_at FROM otp_withdrawals "
+                    "WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+                    (int(uid), int(limit))).fetchall() or []):
+                out.append({"kind": "wd", "amt": float(r["amount"] or 0),
+                            "number": "", "status": str(r["status"] or ""),
+                            "ts": str(r["requested_at"] or "")})
+    except Exception as e:
+        log.debug(f"[OTP] history uid={uid}: {str(e)[:120]}")
+    out.sort(key=lambda x: str(x.get("ts") or ""), reverse=True)
+    return out[:int(limit)]
+
+
+def _otp_hist_lines(uid, en=False, limit=5):
+    """OTP Earn স্ক্রিনের নিচের হিস্টোরি ব্লক।"""
+    _rows = otp_earn_history(uid, limit)
+    if not _rows:
+        return ("📜 *History*\n_No OTP income yet._" if en else
+                "📜 *হিস্টোরি*\n_এখনো কোনো OTP আয় হয়নি।_")
+    _out = ["📜 *History*" if en else "📜 *হিস্টোরি*"]
+    _st = {"pending": ("⏳", "pending"), "paying": ("⏳", "processing"),
+           "approved": ("✅", "paid"), "rejected": ("❌", "rejected")}
+    for _i, r in enumerate(_rows, 1):
+        _t = str(r.get("ts") or "")[5:16].replace("T", " ")
+        if r["kind"] == "earn":
+            _num = str(r.get("number") or "")
+            _lbl = ("•••• " + _num[-4:]) if len(_num) >= 4 else (_num or "OTP")
+            _out.append(f"{_i}) 📱 `{_lbl}` · `+{_otp_money(r['amt'])}` · {_t}")
+        else:
+            _ico, _lbl = _st.get(str(r.get("status") or ""), ("•", str(r.get("status") or "")))
+            _out.append(f"{_i}) {_ico} withdraw `{_otp_money(r['amt'])}` · {_lbl} · {_t}")
+    return "\n".join(_out)
+
+
 def otp_earn_text(uid, lang="bn"):
+    """OTP Earn কার্ড + নিচে হিস্টোরি।"""
+    _en = (lang == "en")
+    return (_otp_earn_body(uid, lang) + "\n" + _otp_hist_lines(uid, _en))
+
+
+def _otp_earn_body(uid, lang="bn"):
     w = otp_wallet(uid)
     _en = (lang == "en")
     _cap_line = (f"📏 *Limit:* `{_otp_money(w['cap'])}` total\n" if _en
                  else f"📏 *লিমিট:* মোট `{_otp_money(w['cap'])}`\n") if w["cap"] > 0 else ""
+    _pool_line = ""
+    if float(w.get("pool") or 0) > 0:
+        _pool_line = (f"👥 *All users:* `{_otp_money(w['pool_left'])}` left "
+                      f"of `{_otp_money(w['pool'])}`\n" if _en else
+                      f"👥 *সব ইউজার মিলিয়ে বাকি:* `{_otp_money(w['pool_left'])}` "
+                      f"/ `{_otp_money(w['pool'])}`\n")
     _lock = (("🔓 *Withdraw: ON*" if w["wd_on"] else "🔒 *Withdraw: OFF (locked)*")
              if _en else
              ("🔓 *Withdraw: চালু*" if w["wd_on"] else "🔒 *Withdraw: বন্ধ (টাকা লক)*"))
@@ -13145,6 +13408,7 @@ def otp_earn_text(uid, lang="bn"):
             f"📤 *Withdrawn:* `{_otp_money(w['withdrawn'])}`\n"
             f"{_pend}"
             f"{_cap_line}"
+            f"{_pool_line}"
             f"{_lock}\n\n"
             + (f"✅ Withdrawable now: `{_otp_money(w['avail'])}`"
                if w["wd_on"] else
@@ -13159,6 +13423,7 @@ def otp_earn_text(uid, lang="bn"):
         f"📤 *উত্তোলিত:* `{_otp_money(w['withdrawn'])}`\n"
         f"{_pend}"
         f"{_cap_line}"
+        f"{_pool_line}"
         f"{_lock}\n\n"
         + (f"✅ এখন তোলা যাবে: `{_otp_money(w['avail'])}`"
            if w["wd_on"] else
@@ -13331,12 +13596,14 @@ async def do_otp_wd_submit(update, ctx):
         _msg = {
             "min": "❌ Amount is below the minimum.",
             "low": "❌ Not enough withdrawable OTP income (check the limit).",
+            "pool": "❌ All-user OTP withdraw limit reached.",
             "locked": "🔒 OTP withdrawal is locked by admin.",
             "pending": "⚠️ You already have a pending OTP withdrawal.",
             "amt": "❌ Invalid amount.",
         }.get(err, "❌ Failed. Please try again.") if _en else {
             "min": "❌ মিনিমামের চেয়ে কম।",
             "low": "❌ তোলার মতো OTP ইনকাম নেই (লিমিট দেখুন)।",
+            "pool": "❌ সব ইউজার মিলিয়ে OTP withdraw লিমিট শেষ।",
             "locked": "🔒 OTP withdraw এডমিন বন্ধ রেখেছেন।",
             "pending": "⚠️ আপনার একটা OTP withdraw আগেই পেন্ডিং আছে।",
             "amt": "❌ ভুল পরিমাণ।",
@@ -13363,6 +13630,15 @@ async def do_otp_wd_submit(update, ctx):
 async def _otp_pay_bg(bot_obj, uid, wid, addr, amt, en=False):
     """ব্যাকগ্রাউন্ডে অটো পেমেন্ট — সফল হলে approved+tx, না হলে পেন্ডিং রাখে
     এবং অ্যাডমিনকে জানায় (ডাবল-পেমেন্ট রোধে কোনো রিট্রাই নেই)।"""
+    # 🔒 পেমেন্টের আগে atomic দখল — এক রিকোয়েস্ট একবারই পেমেন্ট হবে
+    try:
+        _claimed = await asyncio.to_thread(otp_wd_claim, wid)
+    except Exception as _ce:
+        log.warning(f"[OTP] claim {wid}: {str(_ce)[:120]}")
+        _claimed = False
+    if not _claimed:
+        log.info(f"[OTP] pay skip #{wid} — আগেই পেমেন্ট/সিদ্ধান্ত হয়েছে")
+        return
     _tx, _err = "", ""
     try:
         if not _WEB3_OK:
@@ -13398,14 +13674,36 @@ async def _otp_pay_bg(bot_obj, uid, wid, addr, amt, en=False):
         except Exception as _n:
             log.warning(f"[OTP] pay notify uid={uid}: {str(_n)[:120]}")
         return
-    # অটো ব্যর্থ/সেটআপ নেই → রিকোয়েস্ট পেন্ডিংই থাকে, অ্যাডমিন জানানো হয়
+    # অটো ব্যর্থ/সেটআপ নেই → রিকোয়েস্ট আবার pending, অ্যাডমিনকে একটা একটা করে কার্ড
+    try:
+        await asyncio.to_thread(otp_wd_release, wid)
+    except Exception:
+        pass
+    try:
+        _pend = await asyncio.to_thread(otp_wd_list, "pending", 50)
+        _ids = [int(x["id"]) for x in (_pend or [])]
+        _pos = (_ids.index(int(wid)) + 1) if int(wid) in _ids else 1
+        _tot = max(len(_ids), _pos)
+    except Exception:
+        _pos, _tot = 1, 1
+    try:
+        _u = await asyncio.to_thread(get_user, int(uid))
+    except Exception:
+        _u = {}
+    _uname = str((_u or {}).get("first_name") or (_u or {}).get("username") or "—")[:40]
+    _ustat = str((_u or {}).get("username") or "")
     try:
         await notify_full_admins(
             bot_obj,
-            (f"🎁 *OTP withdraw pending — auto pay ব্যর্থ* `#{wid}`\n\n"
-             f"👤 User: `{uid}`\n💵 `{_otp_money(amt)}`\n👛 `{addr}`\n\n"
-             f"⚠️ কারণ: {(str(_err) or 'unknown')[:140]}\n"
-             "✅ Approve/Reject: web panel → OTP Earn"))
+            (f"🎁 *OTP WITHDRAW*  ·  `{_pos}/{_tot}`\n"
+             "━━━━━━━━━━━━━━━━\n"
+             f"🆔 রিকোয়েস্ট: `#{wid}`\n"
+             f"👤 ইউজার: `{uid}` — {_md_esc(_uname)}"
+             + (f" (@{_md_esc(_ustat)})" if _ustat else "") + "\n"
+             f"💵 পরিমাণ: `{_otp_money(amt)}`\n"
+             f"👛 ঠিকানা:\n`{addr}`\n\n"
+             f"⚠️ অটো পেমেন্ট হয়নি: {(str(_err) or 'unknown')[:140]}\n"
+             "✅ Approve/Reject: প্যানেল → OTP Earn"))
     except Exception:
         pass
     try:
@@ -13938,6 +14236,170 @@ def otp_profit_stats(days=30):
     except Exception:
         pass
     return tot, rows_out
+
+
+# ═══════ 📊 দৈনিক লাভ — OTP + Shop + Mail + SMM (শুধু অ্যাডমিন) ═══════
+def _profit_num(v):
+    try:
+        return float(str(v or 0).replace(",", "."))
+    except Exception:
+        return 0.0
+
+
+def profit_day(day=""):
+    """এক দিনের লাভ — {otp, shop, mail, smm, rows}।
+
+    • OTP  : আমার payout (API cost) − ইউজারকে দেওয়া (paid) — `otp_hits`
+    • Shop : বিক্রি দাম − পণ্যের কেনা দাম (`shop_products.cost`)
+    • Mail : বিক্রি দাম − প্রোভাইডারের দাম (`mail_orders.usd`)
+    • SMM  : বিক্রি দাম − API চার্জ (`smm_orders.charge_usd`)
+    সবই ৳-তে, সাথে $ (ডিপোজিট রেট দিয়ে)।
+    """
+    _otp_init()
+    _day = str(day or "").strip() or now()[:10]
+    try:
+        _r = float(dep_rate() or 125.0)
+    except Exception:
+        _r = 125.0
+    out = {"day": _day, "rate": _r,
+           "otp": {"n": 0, "sell_tk": 0.0, "buy_tk": 0.0, "unknown": 0},
+           "shop": {"n": 0, "sell_tk": 0.0, "buy_tk": 0.0},
+           "mail": {"n": 0, "sell_tk": 0.0, "buy_tk": 0.0, "unknown": 0},
+           "smm": {"n": 0, "sell_tk": 0.0, "buy_tk": 0.0, "unknown": 0},
+           "rows": []}
+    with _c() as c:
+        # 🎁 OTP — paid/cost দুটোই USD
+        try:
+            r = c.execute("SELECT COUNT(*) AS n, COALESCE(SUM(paid),0) AS u, "
+                          "COALESCE(SUM(cost),0) AS m FROM otp_hits "
+                          "WHERE LEFT(ts,10)=%s", (_day,)).fetchone()
+            _u = _profit_num((r or {}).get("u"))
+            _m = _profit_num((r or {}).get("m"))
+            out["otp"].update({"n": int((r or {}).get("n") or 0),
+                               "sell_tk": round(_u * _r, 4),
+                               "buy_tk": round(_m * _r, 4),
+                               "unknown": (0 if _m > 0 else int((r or {}).get("n") or 0))})
+            for _rr in c.execute(
+                    "SELECT country, iso, COUNT(*) AS n, COALESCE(SUM(cost),0) AS m, "
+                    "COALESCE(SUM(paid),0) AS u FROM otp_hits WHERE LEFT(ts,10)=%s "
+                    "GROUP BY country, iso ORDER BY n DESC LIMIT 12", (_day,)).fetchall():
+                out["rows"].append({"name": (str(_rr["country"] or "") or "অজানা"),
+                                    "n": int(_rr["n"] or 0),
+                                    "sell_tk": round(_profit_num(_rr["u"]) * _r, 4),
+                                    "buy_tk": round(_profit_num(_rr["m"]) * _r, 4)})
+        except Exception as _e1:
+            log.debug(f"[PROFIT] otp: {str(_e1)[:120]}")
+        # 🛍 Shop — বিক্রি vs পণ্যের কেনা দাম
+        try:
+            r = c.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(o.price),0) AS sp, "
+                "COALESCE(SUM(COALESCE(p.cost,0)),0) AS bp FROM shop_orders o "
+                "LEFT JOIN shop_products p ON p.id=o.product_id "
+                "WHERE LEFT(o.created_at,10)=%s "
+                "AND COALESCE(o.status,'delivered')='delivered'", (_day,)).fetchone()
+            out["shop"].update({"n": int((r or {}).get("n") or 0),
+                                "sell_tk": round(_profit_num((r or {}).get("sp")), 4),
+                                "buy_tk": round(_profit_num((r or {}).get("bp")), 4)})
+        except Exception as _e2:
+            log.debug(f"[PROFIT] shop: {str(_e2)[:120]}")
+        # 📧 Mail — বিক্রি ৳ vs প্রোভাইডার $ (usd)
+        try:
+            r = c.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(price),0) AS sp, "
+                "COALESCE(SUM(usd),0) AS bu FROM mail_orders "
+                "WHERE LEFT(created_at,10)=%s AND COALESCE(status,'') NOT IN "
+                "('refunded','refunding','cancelled','canceled','failed')",
+                (_day,)).fetchone()
+            _bu = _profit_num((r or {}).get("bu"))
+            out["mail"].update({"n": int((r or {}).get("n") or 0),
+                                "sell_tk": round(_profit_num((r or {}).get("sp")), 4),
+                                "buy_tk": round(_bu * _r, 4),
+                                "unknown": (0 if _bu > 0 else int((r or {}).get("n") or 0))})
+        except Exception as _e3:
+            log.debug(f"[PROFIT] mail: {str(_e3)[:120]}")
+        # 📱 SMM — বিক্রি ৳ vs API চার্জ ($)
+        try:
+            r = c.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(price),0) AS sp, "
+                "COALESCE(SUM(CASE WHEN COALESCE(charge_usd,'') ~ "
+                "'^[0-9]+(\\.[0-9]+)?$' THEN charge_usd::numeric ELSE 0 END),0) AS bu "
+                "FROM smm_orders WHERE LEFT(created_at,10)=%s "
+                "AND COALESCE(status,'') NOT IN ('canceled','cancelled','refunded','refund')",
+                (_day,)).fetchone()
+            _bu = _profit_num((r or {}).get("bu"))
+            out["smm"].update({"n": int((r or {}).get("n") or 0),
+                               "sell_tk": round(_profit_num((r or {}).get("sp")), 4),
+                               "buy_tk": round(_bu * _r, 4),
+                               "unknown": (0 if _bu > 0 else int((r or {}).get("n") or 0))})
+        except Exception as _e4:
+            log.debug(f"[PROFIT] smm: {str(_e4)[:120]}")
+    for _k in ("otp", "shop", "mail", "smm"):
+        out[_k]["profit_tk"] = round(out[_k]["sell_tk"] - out[_k]["buy_tk"], 4)
+    return out
+
+
+def profit_report_text(day=""):
+    """📊 দৈনিক লাভ রিপোর্ট — অ্যাডমিনের টেলিগ্রাম মেসেজ (শুধু মালিকের জন্য)।"""
+    d = profit_day(day)
+    _r = d["rate"] or 125.0
+    _tot = 0.0
+    _ln = ["<b>📊 দৈনিক লাভ রিপোর্ট</b>", f"🗓 {html.escape(d['day'])}",
+           "━━━━━━━━━━━━━━━━"]
+
+    def _sec(title, k, hint=""):
+        nonlocal _tot
+        s = d[k]
+        _tot += s["profit_tk"]
+        _sign = "+" if s["profit_tk"] >= 0 else "−"
+        _ok = "🟢" if s["profit_tk"] >= 0 else "🔴"
+        _ln.append(f"<b>{title}</b> ({s['n']}টি)")
+        _ln.append(f" • ইউজার পেয়েছে: ৳{s['sell_tk']:g} (${s['sell_tk'] / _r:.4f})")
+        if s.get("unknown"):
+            _ln.append(f" • আমার খরচ: <i>অজানা ({s['unknown']}টিতে দাম বসানো নেই)</i>")
+        else:
+            _ln.append(f" • আমার খরচ: ৳{s['buy_tk']:g} (${s['buy_tk'] / _r:.4f})")
+        _ln.append(f" {_ok} লাভ: {_sign}৳{abs(s['profit_tk']):g} "
+                   f"({_sign}${abs(s['profit_tk']) / _r:.4f})"
+                   + (" <i>(খরচ অজানা — আনুমানিক)</i>" if s.get("unknown") else ""))
+        if hint:
+            _ln.append(f" <i>{hint}</i>")
+        _ln.append("")
+
+    _sec("🎁 OTP", "otp")
+    if d["rows"]:
+        _ln.append("<b>দেশ অনুযায়ী OTP</b>")
+        for r0 in d["rows"]:
+            _p0 = r0["sell_tk"] - r0["buy_tk"]
+            _ln.append(f" • {html.escape(r0['name'])}: {r0['n']}টি · "
+                       f"লাভ {'+' if _p0 >= 0 else '−'}৳{abs(_p0):g} "
+                       f"({'+' if _p0 >= 0 else '−'}${abs(_p0) / _r:.4f})")
+        _ln.append("")
+    _sec("🛍 Shop", "shop")
+    _sec("📧 Mail", "mail")
+    _sec("📱 SMM", "smm")
+    _ln.append("━━━━━━━━━━━━━━━━")
+    _ln.append(f"<b>💰 মোট লাভ: ৳{_tot:g} (${_tot / _r:.4f})</b>")
+    _ln.append("<i>এই রিপোর্ট শুধু আপনি পান — কোনো ইউজার নয়।</i>")
+    return "\n".join(_ln)
+
+
+async def job_daily_profit(context):
+    """রাত ১১:৫৮ (BD) — শুধু অ্যাডমিনকে দৈনিক লাভের রিপোর্ট।"""
+    if _jobs_paused():
+        return
+    try:
+        _txt = await asyncio.to_thread(profit_report_text, "")
+    except Exception as e:
+        log.warning(f"[PROFIT] রিপোর্ট তৈরি হয়নি: {str(e)[:140]}")
+        return
+    _b = getattr(context, "bot", None) or bot_now()
+    if not _b:
+        return
+    for _uid in ({int(ADMIN_ID)} if ADMIN_ID else set()):
+        try:
+            await _b.send_message(int(_uid), _txt, parse_mode="HTML")
+        except Exception as e:
+            log.warning(f"[PROFIT] পাঠানো যায়নি uid={_uid}: {str(e)[:120]}")
 
 
 def otp_sync_lamix(max_pages=10, rate=None, rates=None, costs=None):
@@ -24818,7 +25280,7 @@ async def show_profile(update, ctx):
     _name = _md_esc(user.full_name or user.username or "—")
     if user.username and user.full_name:
         _name += f" (@{_md_esc(user.username)})"
-    await update.effective_message.reply_text(
+    _ptxt = (
         f"{T(uid,'profile_title')}\n\n"
         f"{T(uid,'pf_tg_id')} `{uid}`\n"
         f"{T(uid,'pf_name')} {_name}\n\n"
@@ -24833,10 +25295,22 @@ async def show_profile(update, ctx):
         f"{T(uid,'pf_on_hold')} `{_shop_money(float(st['hold'] or 0) * _rate)}`\n"
         f"🎁 OTP Earn: `{_otp_money(_otp_w['bal'])}` "
         f"({'🔒 locked' if not _otp_w['wd_on'] else '✅ withdrawable'})\n\n"
-        f"{T(uid,'status_active')}",
+        f"{T(uid,'status_active')}"
+    )
+    _pkb = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "🎁 OTP Earn", callback_data="otp:home")]])
+    # বাটন থেকে ফিরলে একই মেসেজে এডিট (নতুন মেসেজ হবে না)
+    if getattr(update, "callback_query", None):
+        try:
+            await update.callback_query.edit_message_text(
+                _ptxt, parse_mode="Markdown", reply_markup=_pkb)
+            return
+        except Exception as _pe:
+            log.debug(f"[PROFILE] edit: {str(_pe)[:100]}")
+    await update.effective_message.reply_text(
+        _ptxt,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-            "🎁 OTP Earn", callback_data="otp:home")]])
+        reply_markup=_pkb,
     )
 
 async def show_balance(update, ctx):
@@ -44252,6 +44726,12 @@ def main():
                 job_winback,
                 time=dt_time(hour=21, minute=0, tzinfo=BD_TZ),   # দিনে ১বার — রাত ৯টা BD
                 name="daily_winback"
+            )
+            # 📊 দৈনিক লাভ রিপোর্ট — রাত ১১:৫৮ (BD), শুধু অ্যাডমিন
+            application.job_queue.run_daily(
+                job_daily_profit,
+                time=dt_time(hour=23, minute=58, tzinfo=BD_TZ),
+                name="daily_profit"
             )
             application.job_queue.run_repeating(
                 job_lb_adm_update,
