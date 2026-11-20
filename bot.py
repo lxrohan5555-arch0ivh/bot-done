@@ -286,6 +286,18 @@ WD_DETAIL_CH_ID      = -1003963267867   # Admin withdrawal detail log channel
 BUILD_TAG       = "uid-auto-2026-11-19b170"
 _PERF_START     = {"t": 0.0, "marks": [], "uid": 0}
 
+# ── চালু Bot হ্যান্ডেল — job/ব্যাকগ্রাউন্ড থেকে মেসেজ পাঠানোর জন্য ──
+#    (আগে কয়েক জায়গায় অচেনা `bot_obj` লেখা ছিল → NameError হয়ে মেসেজ চুপচাপ হারাত)
+_BOT_REF = {"bot": None}
+
+
+def bot_now():
+    """চালু Bot অবজেক্ট (এখনো তৈরি না হলে None)।"""
+    try:
+        return _BOT_REF.get("bot")
+    except Exception:
+        return None
+
 
 def _timed(name):
     """হ্যান্ডলার ৩ সেকেন্ডের বেশি নিলে লগে জানাও (কোন বাটন ধীর বোঝা যায়)।"""
@@ -5348,9 +5360,27 @@ def shop_off_dep_on():
         return True
 
 
-def dep_blocked_by_shop():
-    """দোকান বন্ধ + "ডিপোজিটও বন্ধ" চালু থাকলে True (অ্যাডমিন নয় এমন ইউজারের জন্য)।"""
+def dep_on():
+    """💳 ডিপোজিট আলাদাভাবে চালু/বন্ধ (ডিফল্ট: চালু)।"""
     try:
+        return (get_setting("dep_on") or "on") != "off"
+    except Exception:
+        return True
+
+
+def task_on():
+    """📋 টাস্ক সেকশন আলাদাভাবে চালু/বন্ধ (ডিফল্ট: চালু)।"""
+    try:
+        return (get_setting("task_on") or "on") != "off"
+    except Exception:
+        return True
+
+
+def dep_blocked_by_shop():
+    """ডিপোজিট বন্ধ কি না — (১) আলাদা dep_on বন্ধ, বা (২) দোকান বন্ধ + "ডিপোজিটও বন্ধ"।"""
+    try:
+        if not dep_on():
+            return True
         return (not shop_on()) and shop_off_dep_on()
     except Exception:
         return False
@@ -5367,12 +5397,19 @@ DEP_CLOSED_BN = ("🔒 ডিপোজিট এখন বন্ধ\n\n"
 DEP_CLOSED_EN = ("🔒 Deposit is closed right now\n\n"
                  "Deposit is paused while the shop is closed.\n"
                  "You can deposit again once the admin opens it.")
+TASK_CLOSED_BN = ("🔒 টাস্ক সেকশন এখন বন্ধ\n\n"
+                  "বট আপডেট চলছে — একটু পরে আবার চেষ্টা করুন।\n"
+                  "অ্যাডমিন চালু করলে সাথে সাথে কাজ করবে।")
+TASK_CLOSED_EN = ("🔒 Tasks are closed right now\n\n"
+                  "The bot is being updated — please try again later.\n"
+                  "It works again as soon as the admin opens it.")
 
 
 def closed_msg_default(key):
     """এই কী-এর বটের নিজের (ডিফল্ট) বার্তা।"""
     return {"shop_closed_bn": SHOP_CLOSED_BN, "shop_closed_en": SHOP_CLOSED_EN,
-            "dep_closed_bn": DEP_CLOSED_BN, "dep_closed_en": DEP_CLOSED_EN}.get(key, "")
+            "dep_closed_bn": DEP_CLOSED_BN, "dep_closed_en": DEP_CLOSED_EN,
+            "task_closed_bn": TASK_CLOSED_BN, "task_closed_en": TASK_CLOSED_EN}.get(key, "")
 
 
 def closed_msg_custom(key):
@@ -5391,24 +5428,63 @@ async def _shop_closed_msg(q, en=False):
     await _closed_send(q, SHOP_CLOSED_EN if en else SHOP_CLOSED_BN, plain=True)
 
 
+async def _task_closed_msg(update, en=False):
+    """টাস্ক সেকশন বন্ধ — ইউজারকে জানিয়ে দেয় (অ্যাডমিনের নিজের লেখা থাকলে সেটাই)।"""
+    _c = closed_msg_custom("task_closed_en" if en else "task_closed_bn")
+    if _c:
+        return await _closed_send(update, _c, plain=True)
+    await _closed_send(update, TASK_CLOSED_EN if en else TASK_CLOSED_BN, plain=True)
+
+
+async def _dep_closed_msg(update, en=False):
+    """ডিপোজিট বন্ধ — কারণ অনুযায়ী বার্তা (আলাদা সুইচ না দোকানের কারণে)।"""
+    _c = closed_msg_custom("dep_closed_en" if en else "dep_closed_bn")
+    if _c:
+        return await _closed_send(update, _c, plain=True)
+    _txt = DEP_CLOSED_EN if en else DEP_CLOSED_BN
+    try:
+        if not dep_on():
+            _txt = ("🔒 Deposit is closed right now\n\n"
+                    "You can deposit again once the admin opens it." if en else
+                    "🔒 ডিপোজিট এখন বন্ধ\n\n"
+                    "অ্যাডমিন চালু করলে আবার টাকা যোগ করতে পারবেন।")
+    except Exception:
+        pass
+    await _closed_send(update, _txt, plain=True)
+
+
 async def _closed_send(q, txt, plain=False):
-    """বন্ধ-বার্তা পাঠানো — এডিট সম্ভব হলে এডিট, নাহলে নতুন মেসেজ।"""
+    """বন্ধ-বার্তা পাঠানো — callback হোক বা Update (reply-keyboard), দুইভাবেই পৌঁছাবে।
+
+    আগে শুধু callback_query ধরা হতো; তাই ইউজার নিচের "🛍 Shop" বাটনে চাপলে
+    কোনো edit/reply না পেয়ে মেসেজটা চুপচাপ হারিয়ে যেত — কিছুই দেখাত না।
+    """
     _kw = {} if plain else {"parse_mode": "Markdown"}
-    try:
-        await q.edit_message_text(txt, **_kw)
-        return
-    except Exception:
-        pass
-    try:
-        await q.message.edit_text(txt, **_kw)
-        return
-    except Exception:
-        pass
-    try:
-        await q.message.reply_text(txt, **_kw)
-        return
-    except Exception:
-        pass
+    # ১) callback_query — আগের মেসেজ এডিট
+    if hasattr(q, "edit_message_text"):
+        try:
+            await q.edit_message_text(txt, **_kw)
+            return
+        except Exception:
+            pass
+    # ২) Update / Message — reply-keyboard থেকে আসা মেসেজের সবচেয়ে নির্ভরযোগ্য পথ
+    _msg = getattr(q, "effective_message", None) or getattr(q, "message", None)
+    if _msg is not None and hasattr(_msg, "reply_text"):
+        try:
+            await _msg.edit_text(txt, **_kw)
+            return
+        except Exception:
+            pass
+        try:
+            await _msg.reply_text(txt, **_kw)
+            return
+        except Exception:
+            try:
+                await _msg.reply_text(_re.sub(r"<[^>]{1,40}>|[*_`]", "", txt))
+                return
+            except Exception:
+                pass
+    # ৩) শেষ চেষ্টা — bare callback query
     try:
         await q.reply_text(txt, **_kw)
     except Exception:
@@ -9155,13 +9231,21 @@ _GN_FEED_SEEN = {}             # ext_id → সময় (মেমরিতে�
 _GN_POST_RL = {}               # (সার্ভিস|দেশ) → [সময়...] — চ্যানেলে ৫ মিনিটে ২টির বেশি নয়
 _GN_RL_WIN = 300               # সেকেন্ড
 _GN_RL_MAX = 2                 # প্রতি ৫ মিনিটে একই দেশ+সার্ভিসে সর্বোচ্চ
+_GN_RL_GAP = 150               # প্রতি পোস্টের মাঝে কমপক্ষে ২.৫ মিনিট (২টা একসাথে নয়)
 
 
 def _gn_post_allowed(key):
-    """একই দেশ+সার্ভিসে ৫ মিনিটে ২টির বেশি OTP চ্যানেলে যাবে না।"""
+    """একই দেশ+সার্ভিসে ৫ মিনিটে ২টির বেশি OTP চ্যানেলে যাবে না।
+
+    আর দুটো একসাথে নয় — একটা গেলে পরেরটা **২.৫ মিনিট পর** (৫ মিনিটে ২টা,
+    সমান বিরতিতে)। নাহলে ওয়েবে মিনিটে ২টা এলে বটও ২টা একসাথে পাঠিয়ে দিত।
+    """
     _t = _time.time()
     _arr = [x for x in (_GN_POST_RL.get(key) or []) if _t - x < _GN_RL_WIN]
     if len(_arr) >= _GN_RL_MAX:
+        _GN_POST_RL[key] = _arr
+        return False
+    if _arr and (_t - max(_arr)) < _GN_RL_GAP:      # ⏱ শেষটা এখনো ২.৫ মিনিট হয়নি
         _GN_POST_RL[key] = _arr
         return False
     _GN_POST_RL[key] = _arr
@@ -9573,17 +9657,21 @@ def _gn_ch_send(text, parse_mode="HTML"):
         return False
     _btns = []
     _bl, _nl = _gn_bot_link(), _gn_news_link()
-    # ⚠️ বাটনে শুধু text+url — Bot API-তে অজানা ফিল্ড (style) দিলে
-    #    reply_markup রিজেক্ট হতে পারে, তখন OTP চ্যানেলে কিছুই যেত না।
+    # ⚠️ অজানা ফিল্ড (style) দিলে reply_markup রিজেক্ট হতে পারে — তাই নিচের
+    #    লুপ style ছাড়া আবার পাঠায়, চ্যানেলে পোস্ট কখনো আটকাবে না।
+    # 🎨 চ্যানেলেও বাটনের কালার — Bot API 9.4-এর `style` ফিল্ড
+    #    (পুরোনো ক্লায়েন্ট/API রিজেক্ট করলে নিচের লুপ style ছাড়া আবার পাঠায়)
     if _bl:
-        _btns.append({"text": "🤖 Bot", "url": _bl})
+        _btns.append({"text": "🤖 Bot", "url": _bl, "style": "success"})
     if _nl:
-        _btns.append({"text": "📢 News Channel", "url": _nl})
+        _btns.append({"text": "📢 News Channel", "url": _nl, "style": "primary"})
     # ১) HTML + বাটন  ২) প্লেইন + বাটন  ৩) প্লেইন + বাটন ছাড়া
     #    শেষ ধাপটা না থাকলে বাটন/markup-এ সমস্যা হলে পোস্টটাই আটকে যেত
-    _tries = [(parse_mode, True)] if parse_mode else []
-    _tries += [(None, True), (None, False)]
-    for _pm, _use_btns in _tries:
+    # (parse_mode, বাটন দেবে?, style দেবে?) — style রিজেক্ট হলে বাটন রেখেই আবার
+    _tries = ([(parse_mode, True, True), (parse_mode, True, False)]
+              if parse_mode else [])
+    _tries += [(None, True, True), (None, True, False), (None, False, False)]
+    for _pm, _use_btns, _use_style in _tries:
         try:
             _pl = {"chat_id": cid, "text": str(text)[:3900],
                    "disable_web_page_preview": True}
@@ -9593,7 +9681,9 @@ def _gn_ch_send(text, parse_mode="HTML"):
                 _pl["text"] = html.unescape(
                     _re.sub(r"<[^>]{1,40}>", "", _pl["text"]))
             if _btns and _use_btns:
-                _pl["reply_markup"] = {"inline_keyboard": [_btns]}
+                _kbb = ([{_k: _v for _k, _v in _b.items() if _k != "style"}
+                         for _b in _btns] if not _use_style else _btns)
+                _pl["reply_markup"] = {"inline_keyboard": [_kbb]}
             body = _json.dumps(_pl).encode("utf-8")
             req = urllib.request.Request(
                 "https://api.telegram.org/bot" + tok + "/sendMessage",
@@ -9656,9 +9746,13 @@ def _gn_ch_text(o):
     _head = ("♻️ <b>New Otp receive (Resend)</b>" if o.get("resend")
              else "🆕 <b>New Otp receive</b>")
     _flag = str(o.get("flag") or "") or _gn_flag(o.get("iso"))
+    # ⚡ কোন ধরনের OTP — হাই রেট (Lamix) নাকি নরমাল (Zenex/ওয়েব)
+    _is_hr = str(o.get("src") or "").strip().lower() == "lamix"
+    _type_s = "🔥 <b>High rate</b>" if _is_hr else "🟢 <b>Normal (low rate)</b>"
     _out = (
         f"{_head}\n\n"
         f"📱 <b>Service :</b> {_e(_svc)}\n"
+        f"⚡ <b>Type :</b> {_type_s}\n"
         f"🌍 <b>Range :</b> {_e((_flag + ' ' + _rng).strip() or '—')}\n"
         f"🔑 <b>Otp :</b> <b>{_e(_code)}</b>\n"
         f"{_pay_s}"
@@ -9718,6 +9812,7 @@ def _gn_group_kb(rows, en=False):
         _num = str(o.get("number") or "").strip()
         _code = str(o.get("otp") or "").strip()
         _ic = _gn_svc_icon(o.get("service"))
+        _cc_g, _loc_g, _, _ = otp_split_cc(_num)
         try:
             if _code:
                 _nums.append(InlineKeyboardButton(
@@ -9725,6 +9820,9 @@ def _gn_group_kb(rows, en=False):
             elif _num:
                 _nums.append(InlineKeyboardButton(
                     f"{_ic} ⧉ {_num}", copy_text=CopyTextButton(text=_num)))
+                if _cc_g and _loc_g:
+                    _nums.append(InlineKeyboardButton(
+                        f"🔢 {_loc_g}", copy_text=CopyTextButton(text=_loc_g)))
         except Exception:
             pass
     _b = _pair_rows(_nums)
@@ -9785,20 +9883,35 @@ def _gn_uid(update):
         return 0
 
 
+def _gn_num_alt(number, en=False):
+    """নাম্বার দেশ কোডসহ দেওয়া হয়; চাইলে কোড বাদ দিয়ে শুধু বাকিটা কপি।"""
+    _cc, _local, _, _ = otp_split_cc(number)
+    if not _cc or not _local:
+        return ""
+    return _bi(f"🔢 *দেশ কোড:* `+{_cc}` · *কোড ছাড়া:* `{_local}`\n",
+               f"🔢 *Country code:* `+{_cc}` · *Without code:* `{_local}`\n", en)
+
+
 def _gn_order_kb(o, en=False):
     _id = int(o.get("id") or 0)
     # OTP নিজেই অটো আসে — "চেক" বাটন লাগে না; Live Traffic-ও এখানে নয়
     # ছবির মতো কপি বাটন — চাপলেই নাম্বার/কোড ক্লিপবোর্ডে
     _num = str(o.get("number") or "").strip()
     _code = str(o.get("otp") or "").strip()
+    _cc_n, _loc_n, _, _ = otp_split_cc(_num)
     _b = []
     try:
         if _code:
             _b.append([InlineKeyboardButton(_bi(f"🔑 {_code}", f"🔑 {_code}", en),
                                             copy_text=CopyTextButton(text=_code))])
-        elif _num:
+        if _num:
+            # নাম্বার সবসময় থাকবে — দেশ কোডসহ, আর কোড বাদ দিয়ে আলাদাও
             _b.append([InlineKeyboardButton(_bi(f"📱 {_num}", f"📱 {_num}", en),
                                             copy_text=CopyTextButton(text=_num))])
+            if _cc_n and _loc_n:
+                _b.append([InlineKeyboardButton(
+                    _bi(f"🔢 {_loc_n} (কোড ছাড়া)", f"🔢 {_loc_n} (no code)", en),
+                    copy_text=CopyTextButton(text=_loc_n))])
     except Exception:
         pass
     if str(o.get("src") or "") == "lamix":
@@ -9829,8 +9942,10 @@ def _gn_order_kb(o, en=False):
         elif not _u.lower().startswith(("http://", "https://")):
             _u = "https://t.me/" + _u.lstrip("/")
         try:
-            _b.append([InlineKeyboardButton(_bi("🛡 OTP গ্রুপ", "🛡 OTP Group", en),
-                                            url=_u)])
+            # 🛡 OTP গ্রুপ বাটনটা কোড/নাম্বার বাটনের ঠিক নিচে — উপরে লেখাতেই বোঝা যায়
+            #    কোন সার্ভিস/দেশের OTP, নিচে OTP গ্রুপে ঢোকার বাটন।
+            _b.insert(1 if _b else 0, [InlineKeyboardButton(
+                _bi("🛡 OTP গ্রুপ", "🛡 OTP Group", en), url=_u)])
         except Exception:
             pass
     return InlineKeyboardMarkup(_b)
@@ -9839,7 +9954,7 @@ def _gn_order_kb(o, en=False):
 def _gn_order_text(o, en=False):
     _num = str(o.get("number") or "")
     _head = _bi(f"📱 *আপনার নাম্বার*\n\n`{_num}`\n\n",
-                f"📱 *Your number*\n\n`{_num}`\n\n", en)
+                f"📱 *Your number*\n\n`{_num}`\n\n", en) + _gn_num_alt(_num, en)
     _rate = o.get("price") or getnum_rate()
     _src = str(o.get("src") or "")
     _loc = " ".join(x for x in (_gn_flag(o.get("iso")), str(o.get("country") or "")) if x).strip()
@@ -9879,8 +9994,10 @@ def _gn_order_text(o, en=False):
                       f"📨 *OTPs on this number:* `{_cnt}`\n", en)
                   if _cnt > 1 else "")
         return (_head2 + "\n━━━━━━━━━━━━━━\n\n"
-                + f"📱 *Service:* {str(o.get('service') or '')}\n"
+                + f"📱 *Service:* {str(o.get('service') or '')}"
+                + (f" · {_loc}" if _loc else "") + "\n"
                 + f"📞 *Number:* `{_num}`\n"
+                + _gn_num_alt(_num, en)
                 + f"🔑 *OTP:* `{_code}`\n"
                 + _cnt_s
                 + _bal)
@@ -9898,19 +10015,25 @@ async def show_getnum_menu(update, ctx=None):
     """📱 নাম্বার নিন — ২টা অপশন: নরমাল (লো রেট) আর হাই রেট OTP কাজ।"""
     uid = _gn_uid(update)
     en = await _shop_is_en(uid)
+    # ⚡ এখানে কোনো ভারী DB কল নেই — স্টক-কাউন্ট শুধু আগেই পড়া থাকলে দেখাই।
+    #    (প্রথম চাপেই COUNT/GROUP BY + টেবিল-তৈরি চলত → বাটন ১০–৩০s পরে আসত,
+    #     তারপর ক্যাশ গরম হলে পরের সব চাপ সাথে সাথে।)
+    _tot = 0
     try:
-        _tot, _ = await asyncio.to_thread(otp_stock_stats)
+        if _time.time() - float(_OTP_STATS_CACHE.get("ts") or 0) < 300:
+            _tot = int((_OTP_STATS_CACHE.get("val") or (0, []))[0] or 0)
     except Exception:
         _tot = 0
+    _hr = (_bi(f"🔥 হাই রেট OTP / OTP কাজ ({_tot})",
+                f"🔥 High rate OTP / OTP work ({_tot})", en)
+           if _tot else
+           _bi("🔥 হাই রেট OTP / OTP কাজ", "🔥 High rate OTP / OTP work", en))
     _rows = [
         [InlineKeyboardButton(
             _bi("🟢 নাম্বার · নরমাল (লো রেট)",
                 "🟢 Number · Normal (low rate)", en),
             callback_data="gn:low")],
-        [InlineKeyboardButton(
-            _bi(f"🔥 হাই রেট OTP / OTP কাজ ({_tot})",
-                f"🔥 High rate OTP / OTP work ({_tot})", en),
-            callback_data="otp:gn")],
+        [InlineKeyboardButton(_hr, callback_data="otp:gn")],
     ]
     try:
         _cur = await asyncio.to_thread(gn_open_orders, uid)
@@ -9921,15 +10044,29 @@ async def show_getnum_menu(update, ctx=None):
             _bi(f"📱 চলমান নাম্বার ({len(_cur)})",
                 f"📱 Current numbers ({len(_cur)})", en),
             callback_data="gn:cur")])
+    # 🛡 OTP গ্রুপ বাটন এখানেই — নাম্বার নেওয়ার সাথে সাথেই গ্রুপে ঢুকতে পারবেন
+    try:
+        _gu = getnum_group_url()
+        if _gu:
+            if _gu.startswith("@"):
+                _gu = "https://t.me/" + _gu[1:]
+            elif not _gu.lower().startswith(("http://", "https://")):
+                _gu = "https://t.me/" + _gu.lstrip("/")
+            _rows.append([InlineKeyboardButton(
+                _bi("🛡 OTP গ্রুপ", "🛡 OTP Group", en), url=_gu)])
+    except Exception:
+        pass
     _rows.append([InlineKeyboardButton(_bi("❌ বন্ধ", "❌ Close", en),
                                       callback_data="gn:close")])
     return await _gn_say(update, _bi(
         "📱 *নাম্বার নিন*\n\n"
-        "🟢 *নরমাল নাম্বার* — এক রেট, OTP এলে টাকা যোগ হবে।\n"
+        + (f"📦 *স্টকে:* `{_tot}` নাম্বার\n\n" if _tot else "")
+        + "🟢 *নরমাল নাম্বার* — এক রেট, OTP এলে টাকা যোগ হবে।\n"
         "🔥 *হাই রেট OTP / OTP কাজ* — প্রতিটা OTP-তে আলাদা রেট, বেশি আয়।\n\n"
         "কোনটা নিতে চান?",
         "📱 *Get Number*\n\n"
-        "🟢 *Normal number* — one rate, you get paid when an OTP comes.\n"
+        + (f"📦 *In stock:* `{_tot}` numbers\n\n" if _tot else "")
+        + "🟢 *Normal number* — one rate, you get paid when an OTP comes.\n"
         "🔥 *High rate OTP / OTP work* — a separate rate on every OTP, earn more.\n\n"
         "Which one do you want?", en),
         InlineKeyboardMarkup(_rows))
@@ -9959,10 +10096,13 @@ async def otp_gn_show(update, ctx):
     rows = _pair_rows(_one)
     rows.append([InlineKeyboardButton(_bi("🔙 ফিরে যান", "🔙 Back", en),
                                      callback_data="gn:home")])
+    _tg = sum(int(g.get("n") or 0) for g in groups)
     return await _gn_say(update, _bi(
         "🔥 *হাই রেট OTP / OTP কাজ*\n\n"
+        f"📦 *স্টকে:* `{_tg}` নাম্বার · {len(groups)} গ্রুপ\n"
         "প্রতিটা OTP-তে দেখানো রেট যোগ হবে। দেশ/সার্ভিস বেছে নিন:",
         "🔥 *High rate OTP / OTP work*\n\n"
+        f"📦 *In stock:* `{_tg}` numbers · {len(groups)} groups\n"
         "You get the shown rate on every OTP. Pick a country/service:", en),
         InlineKeyboardMarkup(rows))
 
@@ -9991,11 +10131,23 @@ async def otp_gn_issue(update, ctx, idx):
     row, err = await asyncio.to_thread(otp_take, uid, g.get("iso") or "",
                                        g.get("service") or "")
     if not row:
+        try:      # স্টক আগেই খালি — তাও অ্যাডমিনকে একবার জানাই
+            await _otp_stock_alert(ctx.bot, g.get("iso") or "",
+                                   g.get("service") or "", g.get("country") or "")
+        except Exception:
+            pass
         return await _gn_say(update, _bi(
             "❌ *স্টকে নাম্বার নেই*\n\nঅন্য দেশ/সার্ভিস দেখুন।",
             "❌ *No number left in stock*\n\nTry another country/service.", en),
             InlineKeyboardMarkup([[InlineKeyboardButton(
                 _bi("🔙 ফিরে যান", "🔙 Back", en), callback_data="otp:gn")]]))
+    # ⚠️ এই গ্রুপের শেষ নাম্বারটা গেল — অ্যাডমিনকে মেসেজ (৬ ঘণ্টায় একবার)
+    try:
+        await _otp_stock_alert(ctx.bot, row.get("iso") or g.get("iso") or "",
+                               row.get("service") or g.get("service") or "",
+                               row.get("country") or g.get("country") or "")
+    except Exception:
+        pass
     _num = str(row.get("number") or "")
     _rate = float(row.get("rate") or 0)
     it = {"name": str(row.get("country") or g.get("country") or "")[:40],
@@ -10649,7 +10801,16 @@ async def _gn_check_and_notify(bot_obj, o, quiet=False, rows=None):
                                 row.get("range_val"))
     except Exception as _le:
         log.debug(f"[GETNUM] learn: {_le}")
-    await asyncio.to_thread(_gn_ch_send, _gn_ch_text(row))
+    # 📢 চ্যানেলে যাবে — কিন্তু একই দেশ+সার্ভিসে ৫ মিনিটে ২টার বেশি নয়,
+    #    আর একটা করে (২.৫ মিনিট অন্তর)। কোটা শেষ হলে চুপচাপ বাদ।
+    try:
+        _kpost = (str(row.get("service") or "") + "|"
+                  + str(row.get("country") or "")).strip().lower()
+        if _gn_post_allowed(_kpost):
+            if await asyncio.to_thread(_gn_ch_send, _gn_ch_text(row)):
+                _gn_post_done(_kpost)
+    except Exception as _pc:
+        log.debug(f"[GETNUM-FEED] চ্যানেল পোস্ট: {str(_pc)[:90]}")
     if bot_obj:
         # Markdown-এ কোনো অচেনা অক্ষর থাকলে Telegram পুরো মেসেজটাই
         # ফেলে দেয় (ইনবক্সে OTP আসত না) — তাই ব্যর্থ হলে প্লেইন আবার
@@ -10965,7 +11126,10 @@ async def show_shop(update, ctx=None):
 
 
 async def _shop_open_for(update):
-    """(shop_on) — অ্যাডমিন সবসময় ঢুকতে পারে, ইউজার বন্ধ থাকলে না।"""
+    """(shop_on) — ইউজার বন্ধ থাকলে **ভিতরে ঢুকতেই পারে না** (শুরুতেই মেসেজ);
+
+    অ্যাডমিন/ওনার সবসময় ঢুকতে পারে — নাহলে নিজে টেস্ট/ম্যানেজ করা যায় না।
+    """
     try:
         if await asyncio.to_thread(shop_on):
             return True
@@ -10986,12 +11150,18 @@ async def _shop_open_for(update):
 
 async def _shop_show_cat(q, cid, plan_id=None):
     if not await asyncio.to_thread(shop_on):
-        _en = False
+        _uid_c = q.from_user.id if getattr(q, "from_user", None) else 0
         try:
-            _en = (await asyncio.to_thread(get_lang, q.from_user.id)) == "en"
+            _adm_c = bool(_uid_c) and await asyncio.to_thread(is_admin, _uid_c)
         except Exception:
-            pass
-        return await _shop_closed_msg(q, _en)
+            _adm_c = False
+        if not _adm_c:        # অ্যাডমিন/ওনার দোকান বন্ধ থাকলেও ঢুকতে পারে
+            _en = False
+            try:
+                _en = (await asyncio.to_thread(get_lang, _uid_c)) == "en"
+            except Exception:
+                pass
+            return await _shop_closed_msg(q, _en)
     _en = await _shop_is_en(q.from_user.id if getattr(q, "from_user", None) else 0)
     cat = None
     if cid:
@@ -12178,6 +12348,7 @@ def _otp_init():
                 iso        TEXT DEFAULT '',
                 service    TEXT DEFAULT '',
                 rate       REAL DEFAULT 0,
+                cost       REAL DEFAULT 0,
                 status     TEXT DEFAULT 'free',
                 added_at   TEXT DEFAULT '',
                 source     TEXT DEFAULT '',
@@ -12189,6 +12360,12 @@ def _otp_init():
                       "ON otp_numbers (number)")
             c.execute("CREATE INDEX IF NOT EXISTS otp_numbers_stat "
                       "ON otp_numbers (status, iso)")
+            # 💵 আমার payout (cost) — লাভের হিসাব; ইউজারকে কখনোই দেখানো হয় না
+            for _q in ("ALTER TABLE otp_numbers ADD COLUMN IF NOT EXISTS cost REAL DEFAULT 0",):
+                try:
+                    c.execute(_q)
+                except Exception:
+                    pass
             c.execute("""CREATE TABLE IF NOT EXISTS otp_withdrawals (
                 id           BIGSERIAL PRIMARY KEY,
                 user_id      BIGINT DEFAULT 0,
@@ -12219,10 +12396,16 @@ def _otp_init():
                 code     TEXT DEFAULT '',
                 sms      TEXT DEFAULT '',
                 paid     REAL DEFAULT 0,
+                cost     REAL DEFAULT 0,
                 ts       TEXT DEFAULT ''
             )""")
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS otp_hits_uniq "
                       "ON otp_hits (oid, nid)")
+            for _q in ("ALTER TABLE otp_hits ADD COLUMN IF NOT EXISTS cost REAL DEFAULT 0",):
+                try:
+                    c.execute(_q)
+                except Exception:
+                    pass
             # users-এর আলাদা OTP ওয়ালেট — মেইন balance ছোঁবে না
             for _q in ("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_balance REAL DEFAULT 0",
                        "ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_earned REAL DEFAULT 0",
@@ -12267,6 +12450,37 @@ def otp_norm_number(v):
         return ""
 
 
+def otp_iso_name(iso):
+    """'AF' → ('Afghanistan', '93') — ISO কোড থেকে দেশের নাম আর ডায়ালিং কোড।"""
+    _i = str(iso or "").strip().upper()
+    if len(_i) < 2:
+        return "", ""
+    for _cc, _pair0 in _GN_CC.items():
+        if _pair0[0] == _i:
+            return _pair0[1], _cc
+    return "", ""
+
+
+def otp_split_cc(number):
+    """'+93703231343' → ('93', '703231343', 'AF', 'Afghanistan')।
+
+    ইউজারকে নাম্বার **দেশ কোডসহ** দেওয়া হয়; চাইলে কোডটা বাদ দিয়ে বাকি
+    অংশটুকু কপি করা যায় — তাই নাম্বার দুই ভাগে ভেঙে দেখাই।
+    """
+    try:
+        d = re.sub(r"\D", "", str(number or ""))
+        if d.startswith("00"):
+            d = d[2:]
+        for n in (3, 2, 1):
+            cc = d[:n]
+            if cc and cc in _GN_CC:
+                iso, nm = _GN_CC[cc]
+                return cc, d[n:], iso, nm
+        return "", d, "", ""
+    except Exception:
+        return "", "", "", ""
+
+
 def otp_service_auto(numbers=None):
     """Lamix API থেকে নাম্বার → (সার্ভিস/রেঞ্জ, দেশ, ISO) ম্যাপ।
 
@@ -12292,11 +12506,14 @@ def otp_service_auto(numbers=None):
     return out, ""
 
 
-def otp_numbers_add(text, service="", rate=0.0, source="", meta=None):
+def otp_numbers_add(text, service="", rate=0.0, source="", meta=None, costs=None):
     """লাইনগুলো থেকে নাম্বার যোগ — (যোগ হয়েছে, ডুপ্লিকেট, বাদ)।
-    প্রতি লাইনে: `নাম্বার` বা `নাম্বার|রেট` বা `নাম্বার|রেট|সার্ভিস`।
-    রেট/সার্ভিস না দিলে ফর্মের ডিফল্ট। দেশ বট নিজেই বের করে;
-    `meta` (Lamix API ম্যাপ) থাকলে সার্ভিস/দেশ সেখান থেকেও নেয়।"""
+
+    Lamix ফাইলের ফরম্যাট: **`দেশকোড:নাম্বার:দেশ`** — যেমন `93:703231343:AF`;
+    দেশ ফাইল থেকেই বসে, ডায়ালিং কোড দেখে আন্দাজ করতে হয় না।
+    পুরোনো ফরম্যাটও চলে: `নাম্বার` / `নাম্বার|রেট` / `নাম্বার|রেট|সার্ভিস`।
+    `costs` = {নাম্বার: আমার payout (USD)} — লাভের হিসাবের জন্য (ইউজার দেখে না)।
+    """
     _otp_init()
     try:
         _svc_def = str(service or "").strip()[:40]
@@ -12311,8 +12528,28 @@ def otp_numbers_add(text, service="", rate=0.0, source="", meta=None):
             raw = ln.strip()
             if not raw or raw.startswith("#"):
                 continue
-            parts = [p.strip() for p in re.split(r"[|\t,;]+", raw)]
-            num = otp_norm_number(parts[0] if parts else "")
+            num, _rt, _svc = "", _rate_def, _svc_def
+            _iso_f = _nm_f = ""
+            _cp = raw.split(":")
+            if (len(_cp) >= 2 and _cp[0].strip().isdigit()
+                    and _cp[1].strip().isdigit()):
+                # 🆕 Lamix ফাইল: `দেশকোড:নাম্বার:দেশ` (যেমন 93:703231343:AF)
+                num = otp_norm_number("+" + _cp[0].strip() + _cp[1].strip())
+                if len(_cp) > 2:
+                    _iso_f = re.sub(r"[^A-Za-z]", "", _cp[2]).upper()[:3]
+                    _nm_f, _cc_f = otp_iso_name(_iso_f)
+                    if not _cc_f:          # অজানা দেশ → ডায়ালিং কোডেই ভরসা
+                        _iso_f, _nm_f = "", ""
+            else:
+                parts = [p.strip() for p in re.split(r"[|\t,;]+", raw)]
+                num = otp_norm_number(parts[0] if parts else "")
+                if len(parts) > 2 and parts[2]:
+                    _svc = parts[2][:40]
+                try:
+                    if len(parts) > 1 and parts[1]:
+                        _rt = float(parts[1])
+                except Exception:
+                    _rt = _rate_def
             if not num:
                 bad += 1
                 continue
@@ -12320,24 +12557,28 @@ def otp_numbers_add(text, service="", rate=0.0, source="", meta=None):
                 dup += 1
                 continue
             seen.add(num)
-            _svc = (parts[2] if len(parts) > 2 and parts[2] else _svc_def)[:40]
-            try:
-                _rt = float(parts[1]) if len(parts) > 1 and parts[1] else _rate_def
-            except Exception:
-                _rt = _rate_def
             _nm, _iso, _ = otp_country(num)
+            if _nm_f:
+                _nm, _iso = _nm_f, _iso_f
             _m = (meta or {}).get(num) or ()
             if _m:
                 if _m[0] and not _svc:
                     _svc = str(_m[0])[:40]
                 _nm = _m[1] or _nm
                 _iso = _m[2] or _iso
+            _cost = 0.0
+            if costs:
+                try:
+                    _cost = max(float(costs.get(num) or 0), 0.0)
+                except Exception:
+                    _cost = 0.0
             try:
                 c.execute(
-                    "INSERT INTO otp_numbers (number,country,iso,service,rate,status,"
-                    "added_at,source) VALUES (%s,%s,%s,%s,%s,'free',%s,%s) "
+                    "INSERT INTO otp_numbers (number,country,iso,service,rate,cost,"
+                    "status,added_at,source) VALUES (%s,%s,%s,%s,%s,%s,'free',%s,%s) "
                     "ON CONFLICT (number) DO NOTHING",
-                    (num, _nm, _iso, _svc, max(_rt, 0.0), now(), str(source or "")[:80]))
+                    (num, _nm, _iso, _svc, max(_rt, 0.0), round(_cost, 6),
+                     now(), str(source or "")[:80]))
                 if c.rowcount:
                     added += 1
                 else:
@@ -12346,11 +12587,28 @@ def otp_numbers_add(text, service="", rate=0.0, source="", meta=None):
                 bad += 1
     if added:
         _mark_dirty()
+        try:      # নতুন নাম্বার এলো → "স্টক শেষ" অ্যালার্ট আবার চালু
+            _STOCK_ALERT["empty"].clear()
+        except Exception:
+            pass
     return added, dup, bad
 
 
-def otp_stock_stats():
-    """(মোট ফ্রি, [(iso, দেশ, কতটা, গড় রেট, পতাকা)…])"""
+_OTP_STATS_CACHE = {"ts": 0.0, "val": (0, [])}   # নাম্বার-মেনুর স্টক কাউন্ট ক্যাশ
+
+
+def otp_stock_stats(limit=60):
+    """(মোট ফ্রি, [(iso, দেশ, কতটা, গড় রেট, পতাকা)…]) — ২০s ক্যাশ।
+
+    এই লিস্ট নাম্বার-মেনুতে প্রতিবার `COUNT(*) … GROUP BY` চালাত, তাই নাম্বার
+    নিনে চাপ দিলে বট আটকো লাগত। এখন ২০ সেকেন্ডের ক্যাশ — বারবার চাপেও দ্রুত।
+    """
+    _t = _time.time()
+    try:
+        if _t - float(_OTP_STATS_CACHE.get("ts") or 0) < 20:
+            return _OTP_STATS_CACHE.get("val") or (0, [])
+    except Exception:
+        pass
     _otp_init()
     try:
         with _c() as c:
@@ -12358,14 +12616,16 @@ def otp_stock_stats():
             rows = c.execute(
                 "SELECT iso, country, COUNT(*) AS n, COALESCE(AVG(rate),0) AS r "
                 "FROM otp_numbers WHERE status='free' GROUP BY iso, country "
-                "ORDER BY n DESC LIMIT 60").fetchall()
+                "ORDER BY n DESC LIMIT %s", (int(limit),)).fetchall()
         out = []
         for r in rows:
             _iso = str(r["iso"] or "")
             out.append({"iso": _iso, "country": str(r["country"] or "") or "অজানা",
                         "n": int(r["n"] or 0), "rate": float(r["r"] or 0),
                         "flag": _gn_flag(_iso) if _iso else "🏳"})
-        return int((tot or {}).get("n") or 0), out
+        _val = (int((tot or {}).get("n") or 0), out)
+        _OTP_STATS_CACHE.update({"ts": _t, "val": _val})
+        return _val
     except Exception as e:
         log.warning(f"[OTP] stats: {str(e)[:140]}")
         return 0, []
@@ -12453,6 +12713,72 @@ def otp_take(uid, iso, service=""):
         return None, "db"
 
 
+def otp_stock_left(iso="", service=""):
+    """ফ্রি নাম্বার বাকি কত — (iso, service) দিলে ওই গ্রুপে, না দিলে পুরো স্টকে।
+
+    ব্যর্থ হলে -1 (অ্যালার্ট ভুল করে যাবে না)।
+    """
+    _otp_init()
+    try:
+        with _c() as c:
+            _q = "SELECT COUNT(*) AS n FROM otp_numbers WHERE status='free'"
+            _a = []
+            if iso:
+                _q += " AND iso=%s"
+                _a.append(str(iso))
+            if service:
+                _q += " AND service=%s"
+                _a.append(str(service))
+            r = c.execute(_q, tuple(_a)).fetchone()
+        return int((r or {}).get("n") or 0)
+    except Exception:
+        return -1
+
+
+# এখন যেসব দেশ+সার্ভিসে স্টক ০ — আবার নাম্বার যোগ/ফেরত হলে রি-আর্ম
+_STOCK_ALERT = {"empty": set()}
+
+
+async def _otp_stock_alert(bot, iso="", service="", country=""):
+    """স্টক **ঠিক যখন শেষ হয়** তখনই অ্যাডমিনকে একবার মেসেজ।
+
+    কোনো সময়-সীমা নেই: শেষ নাম্বারটা গেলেই মেসেজ; আবার নাম্বার যোগ/ফেরত
+    হলে আবার চালু হয়ে যায় — পরেরবার শেষ হলে আবার মেসেজ যাবে।
+    """
+    try:
+        _left = await asyncio.to_thread(otp_stock_left, iso, service)
+        _tot = await asyncio.to_thread(otp_stock_left)
+    except Exception:
+        return
+    _key = f"{iso}|{service}".lower()
+    if _left != 0:                # -1 = DB এরর, >0 = এখনো আছে → আবার রি-আর্ম
+        try:
+            _STOCK_ALERT["empty"].discard(_key)
+        except Exception:
+            pass
+        return
+    try:
+        if _key in _STOCK_ALERT["empty"]:     # এই ফাঁকায় আগেই জানানো হয়েছে
+            return
+    except Exception:
+        pass
+    _adm = int(globals().get("ADMIN_ID") or 0)
+    if not _adm or not bot:
+        return
+    _who = " ".join(x for x in (_gn_flag(iso), str(country or iso or ""))
+                    if x).strip() or "—"
+    _txt = ("⚠️ OTP স্টক শেষ\n\n"
+            + _who + (f" · {service}" if service else "") + "\n"
+            + "এই গ্রুপে আর কোনো ফ্রি নাম্বার নেই।\n"
+            + f"📦 পুরো স্টক: {_tot}\n\n"
+            + "নতুন ফাইল আপলোড করুন বা ☎️ Lamix থেকে সিঙ্ক করুন।")
+    try:
+        await bot.send_message(_adm, _txt)
+        _STOCK_ALERT["empty"].add(_key)
+    except Exception as e:
+        log.warning(f"[OTP] স্টক-শেষ অ্যালার্ট যায়নি: {str(e)[:110]}")
+
+
 def otp_release_number(number, uid=0):
     """নাম্বার আবার স্টকে ফেরত (মেয়াদ শেষ / অর্ডার হয়নি)।"""
     _otp_init()
@@ -12461,6 +12787,10 @@ def otp_release_number(number, uid=0):
             c.execute("UPDATE otp_numbers SET status='free', used_by=0, used_at='' "
                       "WHERE number=%s AND status='used'", (str(number or ""),))
         _mark_dirty()
+        try:      # স্টকে ফিরল → "স্টক শেষ" অ্যালার্ট আবার চালু
+            _STOCK_ALERT["empty"].clear()
+        except Exception:
+            pass
         return True
     except Exception as e:
         log.debug(f"[OTP] release {number}: {str(e)[:100]}")
@@ -12485,6 +12815,10 @@ def otp_release_expired(wait_min=None):
                           "updated_at=%s WHERE id=%s", (now(), int(r["id"])))
         if rows:
             _mark_dirty()
+            try:  # মেয়াদোত্তীর্ণ নাম্বার স্টকে ফিরল → অ্যালার্ট আবার চালু
+                _STOCK_ALERT["empty"].clear()
+            except Exception:
+                pass
         return len(rows)
     except Exception as e:
         log.debug(f"[OTP] release_expired: {str(e)[:120]}")
@@ -12503,20 +12837,32 @@ def _otp_sweep_maybe():
     return otp_release_expired()
 
 
-def otp_hit_new(oid, nid, code="", sms="", paid=0.0, number="", uid=0):
-    """(oid, nid) ইউনিক — True মানে নতুন SMS (একবারই টাকা + নোটিফিকেশন)।"""
+def otp_hit_new(oid, nid, code="", sms="", paid=0.0, number="", uid=0, cost=None):
+    """(oid, nid) ইউনিক — True মানে নতুন SMS (একবারই টাকা + নোটিফিকেশন)।
+
+    `cost` = ওই নাম্বারে আমার payout (Lamix) — এটাই লাভের হিসাবের ভিত্তি;
+    না দিলে `otp_numbers` থেকে পড়া হয়। ইউজার এই সংখ্যা কখনো দেখে না।
+    """
     _otp_init()
     _k = (str(nid or "").strip()
           or (str(code or "") + "|" + str(sms or "")[:80]))[:120]
+    if cost is None:
+        try:
+            with _c() as c:
+                _r0 = c.execute("SELECT cost FROM otp_numbers WHERE number=%s",
+                                (str(number or ""),)).fetchone()
+            cost = float((_r0 or {}).get("cost") or 0)
+        except Exception:
+            cost = 0.0
     try:
         with _c() as c:
             cur = c.execute(
-                "INSERT INTO otp_hits (oid,user_id,nid,number,code,sms,paid,ts) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+                "INSERT INTO otp_hits (oid,user_id,nid,number,code,sms,paid,cost,ts) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (oid,nid) DO NOTHING",
                 (int(oid), int(uid or 0), _k, str(number or "")[:32],
                  str(code or "")[:32], str(sms or "")[:1200],
-                 float(paid or 0), now()))
+                 float(paid or 0), float(cost or 0), now()))
             _new = bool(cur.rowcount)
         if _new:
             _mark_dirty()
@@ -13089,8 +13435,9 @@ async def cmd_otpadd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📥 *OTP নাম্বার আপলোড*\n\n"
         "১) `.txt` ফাইল পাঠান (প্রতি লাইনে ১টা নাম্বার), অথবা\n"
         "২) নাম্বারগুল চ্যাটে পেস্ট করুন।\n\n"
-        "ফরম্যাট: `নাম্বার` / `নাম্বার|রেট` / `নাম্বার|রেট|সার্ভিস`\n"
-        "দেশ বট নিজেই বের করবে।\n\n"
+        "Lamix ফাইল ফরম্যাট: `দেশকোড:নাম্বার:দেশ` — যেমন `93:703231343:AF`\n"
+        "(দেশ ফাইল থেকেই বসে)। অন্য ফরম্যাটও চলে: `নাম্বার` / "
+        "`নাম্বার|রেট` / `নাম্বার|রেট|সার্ভিস`\n\n"
         "❌ বাতিল: /cancel",
         parse_mode="Markdown")
 
@@ -13129,13 +13476,26 @@ async def _otp_add_finish(update, ctx, rate, lang="bn"):
         _tail.append(f"{dup} ডুপ্লিকেট বাদ")
     if bad:
         _tail.append(f"{bad} লাইন ভুল")
+    # 📦 কোন দেশে এখন কত নাম্বার আছে — যোগ করার সাথেই দেখাই
+    try:
+        _tot, _rows = otp_stock_stats()
+    except Exception:
+        _tot, _rows = 0, []
+    _by = " · ".join(f"{s['flag']} {str(s['country'] or '')[:18]}: {int(s['n'])}"
+                     for s in (_rows or [])[:8])
+    if lang == "en":
+        _msg = (f"✅ *{added} numbers added*"
+                + ("\n♻️ " + " · ".join(_tail) if _tail else "")
+                + f"\n📦 Total free: `{_tot}`"
+                + (f"\n🌍 By country: {_by}" if _by else ""))
+    else:
+        _msg = (f"✅ *{added} টা নাম্বার যোগ হয়েছে*"
+                + ("\n♻️ " + " · ".join(_tail) if _tail else "")
+                + f"\n📦 এখন মোট ফ্রি: `{_tot}`"
+                + (f"\n🌍 দেশ অনুযায়ী: {_by}" if _by else ""))
     await update.message.reply_text(
-        (f"✅ *{added} numbers added*" + ("\n♻️ " + " · ".join(_tail) if _tail else "")
-         + f"\n📦 Total free: `{otp_stock_stats()[0]}`")
-        if lang == "en" else
-        (f"✅ *{added} টা নাম্বার যোগ হয়েছে*" + ("\n♻️ " + " · ".join(_tail) if _tail else "")
-         + f"\n📦 এখন মোট ফ্রি: `{otp_stock_stats()[0]}`"),
-        parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, update.effective_user.id))
+        _msg, parse_mode="Markdown",
+        reply_markup=await asyncio.to_thread(main_kb, update.effective_user.id))
 
 
 LAMIX_API_DEF = "https://panel.lamix.org"
@@ -13155,12 +13515,26 @@ def lamix_key():
 
 
 def lamix_base():
-    """প্যানেলের ঠিকানা — ডিফল্ট https://panel.lamix.org।"""
+    """প্যানেলের ঠিকানা — ডিফল্ট https://panel.lamix.org।
+
+    অ্যাডমিন পুরো API URL (`…/api/v1`) বা `https://` ছাড়া লিখলেও ঠিক হয় —
+    নাহলে `…/api/v1/api/v1/messages` হয়ে প্যানেলের HTML পেজ আসত (bad_json)।
+    """
     try:
-        return ((str(get_setting("lamix_api") or "").strip().rstrip("/"))
-                or LAMIX_API_DEF)
+        _u = str(get_setting("lamix_api") or "").strip().rstrip("/")
     except Exception:
+        _u = ""
+    if not _u:
         return LAMIX_API_DEF
+    if not _u.lower().startswith(("http://", "https://")):
+        _u = "https://" + _u.lstrip("/")
+    _low = _u.lower()
+    for _tail in ("/api/v1/messages", "/api/v1/numbers", "/api/v1/ranges",
+                  "/api/v1", "/api"):
+        if _low.endswith(_tail):
+            _u = _u[: -len(_tail)].rstrip("/")
+            break
+    return _u or LAMIX_API_DEF
 
 
 def lamix_on():
@@ -13304,7 +13678,14 @@ def _lamix_api(path, params=None, method="GET", body=None, timeout=20):
         try:
             _js = _json.loads(_txt) if _txt else {}
         except Exception:
-            _js = {"error": "bad_json", "raw": _txt[:200]}
+            # ডকে সব উত্তরই JSON — তাই এখানে এলে URL/প্যানেল ভুল (HTML পেজ এসেছে)
+            _snip = (_txt or "").strip()[:150].replace("\n", " ").replace("\r", " ")
+            _is_html = ("<" in _snip[:1]) or ("<html" in _snip.lower())
+            _js = {"error": "bad_json", "http": _code, "raw": _snip,
+                   "message": (("প্যানেলের HTML পেজ এসেছে (HTTP %s) — API ঠিকানা ভুল "
+                                "বা এখানে Extended API নেই" % (_code or "?"))
+                               if _is_html else
+                               ("JSON নয় (HTTP %s)" % (_code or "?")))}
         if not isinstance(_js, dict):
             _js = {"data": _js}
         if _code == 429 or str(_js.get("error") or "") == "rate_limited":
@@ -13325,8 +13706,10 @@ def _lamix_api(path, params=None, method="GET", body=None, timeout=20):
                     "message": lamix_err_text("rate_limited")}
         if _code >= 400 or _js.get("error"):
             _er = str(_js.get("error") or ("http_%d" % _code))
-            return {"error": _er, "http": _code,
-                    "message": lamix_err_text(_er)}
+            return {"error": _er, "http": _code, "url": _url,
+                    "raw": str(_js.get("raw") or "")[:150],
+                    # সার্ভারে দেওয়া মেসেজ/বিশেষ কারণ থাকলে সেটাই দেখাও
+                    "message": str(_js.get("message") or lamix_err_text(_er))}
         return _js
     return {"error": "rate_limited", "message": lamix_err_text("rate_limited")}
 
@@ -13467,6 +13850,182 @@ def lamix_ping():
     if "error" in _d:
         return str(_d.get("message") or lamix_err_text(_d.get("error")))
     return ""
+
+
+def otp_lamix_rates():
+    """রেঞ্জ-ভিত্তিক **নির্দিষ্ট রেট** (USD / প্রতি OTP) — {"uk mobile": 0.008, …}।
+
+    এখানে কোনো % নেই: আপনি যত ডলার লিখবেন, ইউজার প্রতি OTP-তে ঠিক তত-ই পাবে
+    (আপনার Lamix payout কত তা এতে কোনো ভূমিকা রাখে না — লাভ/লস আপনার হিসাব)।
+    যে রেঞ্জ এখানে নেই, সেখানে সাধারণ রেট (`otp_lamix_rate`)।
+    """
+    try:
+        _raw = str(get_setting("otp_lamix_rates") or "").strip()
+        if not _raw:
+            return {}
+        _d = _json.loads(_raw)
+        if not isinstance(_d, dict):
+            return {}
+        _out = {}
+        for _k, _v in _d.items():
+            _k2 = str(_k or "").strip().lower()
+            if not _k2:
+                continue
+            try:
+                _p = float(str(_v).replace(",", "."))
+            except Exception:
+                continue
+            _out[_k2] = round(max(0.0, _p), 4)
+        return _out
+    except Exception:
+        return {}
+
+
+# ── 💵 আমার payout (রেঞ্জভিত্তিক) + লাভের হিসাব — শুধু অ্যাডমিন দেখে ─
+def otp_lamix_costs():
+    """রেঞ্জভিত্তিক **আমার payout** (USD) — {"uk mobile": 0.012, …}।
+
+    প্যানেলে হাতে লেখা যায় (`otp_lamix_costs`); না লেখা রেঞ্জে Lamix API-র
+    payoutRate-ই ধরা হয়। এই মান ইউজারের কোনো স্ক্রিনে/মেসেজে যায় না।
+    """
+    try:
+        _raw = str(get_setting("otp_lamix_costs") or "").strip()
+        if not _raw:
+            return {}
+        _d = _json.loads(_raw)
+        if not isinstance(_d, dict):
+            return {}
+        _out = {}
+        for _k, _v in _d.items():
+            _k2 = str(_k or "").strip().lower()
+            if not _k2:
+                continue
+            try:
+                _p = float(str(_v).replace(",", "."))
+            except Exception:
+                continue
+            _out[_k2] = round(max(0.0, _p), 4)
+        return _out
+    except Exception:
+        return {}
+
+
+def otp_profit_stats(days=30):
+    """(মোট লাভ, [(তারিখ, ইউজার পেয়েছে, আমি পেয়েছি, লাভ), …]) — অ্যাডমিন-অনলি।
+
+    লাভ = প্রতি OTP-তে আমার payout (cost) − ইউজারকে দেওয়া টাকা (paid)।
+    """
+    _otp_init()
+    tot = 0.0
+    rows_out = []
+    try:
+        with _c() as c:
+            _t = c.execute("SELECT COALESCE(SUM(cost),0) AS m, "
+                           "COALESCE(SUM(paid),0) AS u FROM otp_hits").fetchone()
+            rows = c.execute(
+                "SELECT LEFT(ts,10) AS d, COALESCE(SUM(paid),0) AS u, "
+                "COALESCE(SUM(cost),0) AS m FROM otp_hits "
+                "GROUP BY LEFT(ts,10) ORDER BY d DESC LIMIT %s",
+                (int(days),)).fetchall()
+        _m0 = float((_t or {}).get("m") or 0)
+        _u0 = float((_t or {}).get("u") or 0)
+        tot = round(_m0 - _u0, 4)
+        for r in rows:
+            _u = float(r["u"] or 0)
+            _m = float(r["m"] or 0)
+            rows_out.append((str(r["d"] or ""), round(_u, 4), round(_m, 4),
+                             round(_m - _u, 4)))
+    except Exception:
+        pass
+    return tot, rows_out
+
+
+def otp_sync_lamix(max_pages=10, rate=None, rates=None, costs=None):
+    """Lamix প্যানেলের নাম্বার স্টকে যোগ — হাতে আপলোডের দরকার নেই।
+
+    GET /api/v1/numbers (keyset paginated) থেকে `number` + `payoutRate`
+    নিয়ে `otp_numbers`-এ রাখি। ইউজার পাবে payoutRate-এর `share` অংশ
+    (ডিফল্ট ৫০% — সেটিং `otp_lamix_share`, না থাকে তো 0.5)।
+
+    → (added, dup, bad, err)
+    """
+    if not lamix_on():
+        return 0, 0, 0, "Lamix টোকেন নেই বা বন্ধ আছে"
+    try:
+        _def_rate = float(str(rate if rate is not None
+                             else (get_setting("otp_lamix_rate") or "0.01"))
+                          .replace(",", "."))
+    except Exception:
+        _def_rate = 0.01
+    _def_rate = round(max(0.0, _def_rate), 4)
+    # 💵 রেঞ্জভেদে নির্দিষ্ট রেট (USD) — % নয়; আপনার payout-এর সাথে সম্পর্ক নেই
+    _norm = {}
+    try:
+        _src_map = rates if isinstance(rates, dict) else otp_lamix_rates()
+        for _k, _v in (_src_map or {}).items():
+            _k2 = str(_k or "").strip().lower()
+            if not _k2:
+                continue
+            try:
+                _p = float(str(_v).replace(",", "."))
+            except Exception:
+                continue
+            _norm[_k2] = round(max(0.0, _p), 4)
+    except Exception:
+        _norm = {}
+    # 💵 আমার payout — হাতে লেখা থাকলে সেটাই, না থাকলে API-র payoutRate
+    _cost_map = {}
+    try:
+        _src_cost = costs if isinstance(costs, dict) else otp_lamix_costs()
+        for _k, _v in (_src_cost or {}).items():
+            _k2 = str(_k or "").strip().lower()
+            if not _k2:
+                continue
+            try:
+                _p = float(str(_v).replace(",", "."))
+            except Exception:
+                continue
+            _cost_map[_k2] = round(max(0.0, _p), 4)
+    except Exception:
+        _cost_map = {}
+    _recs = lamix_numbers_all(limit=500, max_pages=max_pages)
+    if not _recs:
+        return 0, 0, 0, "Lamix থেকে নাম্বার আসেনি (Extended API চালু আছে কি?)"
+    _lines = []
+    _costs = {}
+    for _r in _recs:
+        if not isinstance(_r, dict):
+            continue
+        if str(_r.get("status") or "active").strip().lower() != "active":
+            continue
+        _n = otp_norm_number(_r.get("number") or "")
+        if not _n:
+            continue
+        try:
+            _pay = float(lamix_dec(_r.get("payoutRate") or 0))
+        except Exception:
+            _pay = 0.0
+        _rn = str(_r.get("range") or "").strip()
+        # এই রেঞ্জের নিজের রেট (USD) — না থাকলে সাধারণ রেট
+        _ur = round(float(_norm.get(_rn.lower(), _def_rate) or 0.0), 4)
+        _lines.append(f"{_n}|{_ur}|{_rn[:40]}")
+        _my = round(float(_cost_map.get(_rn.lower(), _pay) or 0.0), 6)
+        if _my > 0:
+            _costs[_n] = _my
+    if not _lines:
+        return 0, 0, 0, "সক্রিয় নাম্বার পাওয়া যায়নি"
+    _a, _d, _b = otp_numbers_add("\n".join(_lines), "", 0.01, "lamix", costs=_costs)
+    # পুরোনো স্টকে থাকা নাম্বারেও আজকের payout বসবে (ডুপ্লিকেট বলে বাদ পড়লেও)
+    if _costs:
+        try:
+            with _c() as c:
+                for _n, _cv in _costs.items():
+                    c.execute("UPDATE otp_numbers SET cost=%s "
+                              "WHERE number=%s AND cost<>%s",
+                              (float(_cv), _n, float(_cv)))
+        except Exception:
+            pass
+    return _a, _d, _b, ""
 
 
 def lamix_msg_code(content):
@@ -14105,11 +14664,13 @@ async def _mail_finish_refund(o, en=False, auto=False, notify=False):
         except Exception:
             _o = dict(o)
         _o["status"] = "refunded"
+        _bt = bot_now()
         try:
-            await bot_obj.send_message(
-                _uid,
-                _mail_auto_refund_text(_o, en) if auto else _mail_order_text(_o, en),
-                parse_mode="Markdown", reply_markup=_mail_order_kb(_o, en))
+            if _bt:
+                await _bt.send_message(
+                    _uid,
+                    _mail_auto_refund_text(_o, en) if auto else _mail_order_text(_o, en),
+                    parse_mode="Markdown", reply_markup=_mail_order_kb(_o, en))
         except Exception as e:
             log.warning(f"[MAIL] রিফান্ড মেসেজ যায়নি uid={_uid}: {str(e)[:110]}")
     return True
@@ -14432,8 +14993,10 @@ async def _mail_alert_new():
             "🔢 সার্ভিস-ভিত্তিক কোড সংখ্যা ঘরে লিখুন:\n"
             + "\n".join(f"`{_s} | 1`" for _s in _new[:5])
             + "\n\nনা লিখলে ইউজাররা এই সার্ভিস দেখবে না।")
+    _bt = bot_now()
     try:
-        await bot_obj.send_message(_owner, _txt, parse_mode="Markdown")
+        if _bt:
+            await _bt.send_message(_owner, _txt, parse_mode="Markdown")
     except Exception as e:
         log.warning(f"[MAIL] নতুন সার্ভিস নোটিফিকেশন যায়নি: {str(e)[:110]}")
 
@@ -14489,10 +15052,12 @@ async def job_mail_otp(context):
                 _o = await asyncio.to_thread(mail_order_get, _oid) or dict(o)
                 _o["code"] = _code
                 _o["status"] = "code"
+                _bt = bot_now()
                 try:
-                    await bot_obj.send_message(
-                        _uid, _mail_order_text(_o, _en), parse_mode="Markdown",
-                        reply_markup=_mail_order_kb(_o, _en))
+                    if _bt:
+                        await _bt.send_message(
+                            _uid, _mail_order_text(_o, _en), parse_mode="Markdown",
+                            reply_markup=_mail_order_kb(_o, _en))
                 except Exception as e:
                     log.warning(f"[MAIL] কোড পাঠানো যায়নি uid={_uid}: {str(e)[:110]}")
                 continue
@@ -20281,6 +20846,7 @@ async def show_deposit(update, ctx=None):
     _u0 = update.effective_user.id if getattr(update, "effective_user", None) else 0
     _en = await _shop_is_en(_u0)
     if _u0:
+        # 🔒 ইউজার বন্ধ থাকলে শুরুতেই মেসেজ; অ্যাডমিন/ওনার ঢুকতে পারে
         try:
             _admin = await asyncio.to_thread(is_admin, _u0)
         except Exception:
@@ -20292,12 +20858,7 @@ async def show_deposit(update, ctx=None):
             except Exception:
                 pass
             _qq = getattr(update, "callback_query", None) or update
-            _c2 = closed_msg_custom("dep_closed_en" if _en else "dep_closed_bn")
-            if _c2:
-                await _closed_send(_qq, _c2, plain=True)
-                return
-            await _closed_send(_qq, DEP_CLOSED_EN if _en else DEP_CLOSED_BN, plain=True)
-            return
+            return await _dep_closed_msg(_qq, _en)
     try:
         await asyncio.to_thread(dep_qr_method)     # QR মেথড না থাকলে বানিয়ে নেয়
     except Exception:
@@ -24941,6 +25502,20 @@ async def _kb_global_router(update, ctx):
 async def show_tasks(update, ctx):
     uid          = update.effective_user.id
     _t_start     = _time.monotonic()
+    # 🔒 অ্যাডমিন টাস্ক সেকশন বন্ধ করলে ইউজার (অ্যাডমিন নয়) শুধু বন্ধের মেসেজ পাবে
+    try:
+        # 🔒 ইউজার বন্ধ থাকলে শুরুতেই মেসেজ; অ্যাডমিন/ওনার ঢুকতে পারে
+        if not await asyncio.to_thread(task_on):
+            if not await asyncio.to_thread(is_admin, uid):
+                _q = getattr(update, "callback_query", None) or update
+                try:
+                    _en0 = (await asyncio.to_thread(get_lang, uid)) == "en"
+                except Exception:
+                    _en0 = False
+                await _task_closed_msg(_q, _en0)
+                return
+    except Exception:
+        pass
     # ── ১৫s ক্যাশ: ইউজার বারবার Task চাপে — DB-তে আবার যাওয়ার দরকার নেই ──
     _vhit = _TASKS_VIEW_CACHE.get(uid)
     if _vhit and (_t_start - _vhit[0]) < 15:
@@ -28689,6 +29264,83 @@ async def cmd_vfrtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_section(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """🔒 শপ / ডিপোজিট / টাস্ক — এক চাপে চালু বা বন্ধ (শুধু অ্যাডমিন)।
+
+    বট আপডেটের সময় একটাকে বন্ধ রাখলেই ইউজার শুধু "এখন বন্ধ" মেসেজ দেখবে;
+    অ্যাডমিন/ওনার কিন্তু সবসময় ঢুকতে পারবেন।
+    """
+    if not update.effective_user:
+        return
+    uid = update.effective_user.id
+    if not await asyncio.to_thread(is_admin, uid):
+        return
+    s, d, t = (bool(await asyncio.to_thread(shop_on)),
+               bool(await asyncio.to_thread(dep_on)),
+               bool(await asyncio.to_thread(task_on)))
+
+    def _btn(k, on, label):
+        return InlineKeyboardButton(
+            f"{'🟢' if on else '🔴'} {label} — {'চালু' if on else 'বন্ধ'}",
+            callback_data=f"secx:{k}:{'off' if on else 'on'}")
+
+    kb = InlineKeyboardMarkup([
+        [_btn("shop", s, "🛍 শপ")],
+        [_btn("dep", d, "💳 ডিপোজিট")],
+        [_btn("task", t, "📋 টাস্ক")],
+    ])
+    txt = ("🔒 *সেকশন চালু / বন্ধ*\n"
+           "━━━━━━━━━━━━━━\n"
+           "বাটনে চাপলেই সাথে সাথে বদলে যাবে।\n\n"
+           "আপডেটের সময় যেটা বন্ধ রাখবেন — ইউজার ওটায় চাপলে শুধু "
+           "“এখন বন্ধ” মেসেজ দেখবে। অ্যাডমিন সবসময় ঢুকতে পারবেন।")
+    q = getattr(update, "callback_query", None)
+    if q:
+        try:
+            await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+        except Exception:
+            pass
+    try:
+        await update.effective_message.reply_text(txt, parse_mode="Markdown",
+                                                  reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def section_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """secx:shop|dep|task:(on|off) — অ্যাডমিনের সেকশন টগল।"""
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    if not await asyncio.to_thread(is_admin, q.from_user.id):
+        return
+    _p = (q.data or "").split(":")
+    if len(_p) != 3:
+        return
+    _key = {"shop": "shop_on", "dep": "dep_on", "task": "task_on"}.get(_p[1])
+    if not _key:
+        return
+    _val = "on" if _p[2] == "on" else "off"
+    try:
+        await asyncio.to_thread(set_setting, _key, _val)
+    except Exception as e:
+        try:
+            await q.answer(f"সেভ হয়নি: {str(e)[:60]}", show_alert=True)
+        except Exception:
+            pass
+        return
+    try:
+        log.info(f"[SECTION] {_p[1]} → {_val} (by {q.from_user.id})")
+    except Exception:
+        pass
+    return await cmd_section(update, ctx)
+
+
 async def cmd_webadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Admin — ওয়েব প্যানেলের লিংক ও key (শুধু অ্যাডমিন)।"""
     u = update.effective_user
@@ -29288,6 +29940,15 @@ def _gate(fn, kind="cmd"):
             if not await _bot_accessible(u.id):
                 await bot_off_reply(update, u.id)
                 return None
+        # 🕒 ইউজারের পাঠানো সময় আর এখনকার ফারাক — বট পিছিয়ে থাকলে লগে ধরা পড়বে
+        try:
+            _md = getattr(update.effective_message, "date", None)
+            if _md is not None:
+                _lag = _time.time() - _md.timestamp()
+                if _lag > 60:
+                    log.warning(f"[LAG] update {int(_lag)}s পুরোনো — বট পিছিয়ে ছিল (uid={u.id if u else 0})")
+        except Exception:
+            pass
         _t0 = _time.monotonic()
         try:
             return await fn(update, ctx)
@@ -35389,12 +36050,35 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     btns = get_all_btns(lang)
 
     if   txt == btns['tasks']:    await show_tasks(update, ctx)
-    elif txt == btns['profile']:  await show_profile(update, ctx)
+    elif txt == btns['profile']:
+        # কোনো ভুল হলে প্রোফাইল আর চুপচাপ খোলে না — কারণ লগে যাবে, ইউজারও জানবে
+        try:
+            await show_profile(update, ctx)
+        except Exception as _pfe:
+            log.warning(f"[PROFILE] uid={uid}: {str(_pfe)[:160]}")
+            try:
+                await update.message.reply_text(
+                    "⚠️ প্রোফাইল লোড হয়নি — আবার চাপুন।\n(সমস্যা থাকলে অ্যাডমিনকে জানান।)",
+                    reply_markup=await asyncio.to_thread(main_kb, uid))
+            except Exception:
+                pass
     elif txt == btns['balance']:  await show_balance(update, ctx)
     elif txt == btns['refer']:    await show_refer(update, ctx)
     elif txt == btns['support']:  await show_support(update, ctx)
     elif txt == btns['withdraw']: await show_withdraw(update, ctx)
-    elif txt == btns['getnum']:    await show_getnum_menu(update, ctx)
+    elif txt == btns['getnum']:
+        # কোনো ভুল হলে চুপচাপ কিছু না দেখানোর বদলে জনানো হবে — আগে বাটনে
+        # চাপলে কিছুই আসত না, কারণটা কোথাও দেখা যেত না।
+        try:
+            await show_getnum_menu(update, ctx)
+        except Exception as _ge:
+            log.warning(f"[GETNUM] menu ব্যর্থ: {str(_ge)[:160]}")
+            try:
+                await update.message.reply_text(
+                    "⚠️ লোড হয়নি — আবার চাপুন।\n(সমস্যা থাকলে অ্যাডমিনকে জানান।)",
+                    reply_markup=await asyncio.to_thread(main_kb, uid))
+            except Exception:
+                pass
     elif txt == btns['shop']:          await show_shop(update, ctx)
     elif txt == btns['language']:      await show_language(update, ctx)
     else:
@@ -43150,6 +43834,25 @@ def main():
         threading.Thread(target=_security_boot, name="sec-boot", daemon=True).start()
     except Exception as _se:
         log.warning(f"[SECURITY-DB] boot thread ব্যর্থ: {_se}")
+
+    # ── 🎁 OTP / নাম্বার টেবিল + স্টক-ক্যাশ বুটেই গরম করুন ───────────
+    #    আগে Get Number-এ চাপ দেওয়ার পরেই প্রথমবার DDL + COUNT/GROUP BY
+    #    চলত — তাই প্রথম চাপে বাটন ১০–৩০ সেকেন্ড পরে আসত, পরে সব ঠিক।
+    def _otp_boot_warm():
+        for _fn in ("_otp_init", "_getnum_ddl"):
+            try:
+                globals()[_fn]()
+            except Exception:
+                pass
+        try:
+            otp_stock_stats()          # ক্যাশ ভরে রাখো
+        except Exception:
+            pass
+
+    try:
+        threading.Thread(target=_otp_boot_warm, name="otp-warm", daemon=True).start()
+    except Exception as _owe:
+        log.debug(f"[OTP-WARM] {_owe}")
     _auto_configure()
     _setup_uptimerobot()  # no-ops if UPTIMEROBOT_API_KEY not set
     async def post_init(application):
@@ -43482,9 +44185,9 @@ def main():
             # 💵 Subscription-এর আনুমানিক দাম আসল দামে মেলানো (৫ মিনিট)
             application.job_queue.run_repeating(
                 job_smm_settle_pending, interval=300, first=150, name="smm_settle_pending")
-            # 📱 নাম্বারের OTP — প্রতি ২০ সেকেন্ডে চেক
+            # 📱 নাম্বারের OTP — প্রতি ১৫ সেকেন্ডে চেক (৫s ছিল, DB/API চাপ বেশি পড়ত)
             application.job_queue.run_repeating(
-                job_getnum_otp, interval=5, first=3, name="getnum_otp")
+                job_getnum_otp, interval=15, first=3, name="getnum_otp")
             # 🔄 লাইভ রেঞ্জ (৫ মিনিট) + সবার OTP ফিড (৯০ সেকেন্ড)
             application.job_queue.run_repeating(
                 job_getnum_sync, interval=600, first=60, name="getnum_sync")
@@ -43675,6 +44378,7 @@ def main():
         .build()
     )
     patch_bot_markdown_fallback(app.bot)  # ── global Markdown parse-error fallback ──
+    _BOT_REF["bot"] = app.bot            # job/ব্যাকগ্রাউন্ড থেকে মেসেজ পাঠানোর জন্য
     # ── User বট block করলে তার data মুছে দাও ────────────────────────
     from telegram.ext import ChatMemberHandler as _CmH
     async def _on_bot_blocked(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -43706,6 +44410,7 @@ def main():
     app.add_handler(CommandHandler("perf",        cmd_perf))
     app.add_handler(CommandHandler("security",    _gate(cmd_security)))
     app.add_handler(CommandHandler("webadmin",    _gate(cmd_webadmin)))
+    app.add_handler(CommandHandler("section",     _gate(cmd_section)))
     app.add_handler(CommandHandler("vfrtest",     _gate(cmd_vfrtest)))
     app.add_handler(CommandHandler("unban_iponly", _gate(cmd_unban_iponly)))
     app.add_handler(CommandHandler("btest",       _gate(cmd_btest)))
@@ -43730,6 +44435,7 @@ def main():
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
     app.add_handler(CallbackQueryHandler(cleanup_callback, pattern=r"^cleanup_(junk|logs7|logs30|close)$"))
     app.add_handler(CallbackQueryHandler(sec_callback, pattern=r"^sec_(unban|ignore)_\d+$"))
+    app.add_handler(CallbackQueryHandler(section_callback, pattern=r"^secx:"))
     app.add_handler(CallbackQueryHandler(shop_callback, pattern=r"^(shop:|shopa:|shopao:|shopar:|mail:|mailb|otpbuy|adm_shop$|smm|pxchk$)"))
     app.add_handler(CallbackQueryHandler(dep_callback, pattern=r"^(dep:|depa:|depadm:|depok:|depno:|depname:|depchk|depdiag|adm_dep$)"))
     app.add_handler(CallbackQueryHandler(moneyreq_callback, pattern=r"^mreq:(ok|no):\d+$"))

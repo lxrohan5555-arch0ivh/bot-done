@@ -467,7 +467,8 @@ def shop_closed_msg_save():
     if g:
         return g
     _init()
-    keys = ("shop_closed_bn", "shop_closed_en", "dep_closed_bn", "dep_closed_en")
+    keys = ("shop_closed_bn", "shop_closed_en", "dep_closed_bn", "dep_closed_en",
+            "task_closed_bn", "task_closed_en")
     _reset = (request.form.get("reset") or "") == "1"
     try:
         import bot as _bs
@@ -481,6 +482,29 @@ def shop_closed_msg_save():
     log_admin("shop_closed_msg", 0, "saved")
     return redirect("/admin/shop?ok=" + __import__("urllib.parse", fromlist=["quote"]).quote(
         "✍️ বন্ধের বার্তা সেভ হয়েছে"))
+
+
+@wadm.route("/admin/section/onoff", methods=["POST"])
+def section_onoff():
+    """🛍 শপ / 💳 ডিপোজিট / 📋 টাস্ক — আলাদা আলাদা চালু/বন্ধ সুইচ।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    _k = (request.form.get("key") or "").strip()
+    _key = {"shop": "shop_on", "dep": "dep_on", "task": "task_on"}.get(_k)
+    if not _key:
+        return redirect("/admin/shop")
+    val = "off" if (request.form.get("val") or "").strip().lower() == "off" else "on"
+    try:
+        import bot as _bs
+        _bs.set_setting(_key, val)
+    except Exception:
+        _x("INSERT INTO settings (key,value) VALUES (%s,%s) "
+           "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (_key, val))
+    log_admin("section_" + _k, 0, val)
+    return redirect("/admin/shop?ok=" + __import__("urllib.parse", fromlist=["quote"]).quote(
+        "🔒 সেকশন সেটিং সেভ হয়েছে"))
 
 
 @wadm.route("/admin/shop/deponoff", methods=["POST"])
@@ -998,6 +1022,12 @@ def shop_lamix_test():
         _rows.append("<tr><td>সংযোগ</td><td>" + (
             "<b style='color:#0a0'>✅ ঠিক আছে</b>" if not _err else
             "<b style='color:#c00'>❌</b> " + esc(_err[:180])) + "</td></tr>")
+        try:
+            _rows.insert(0, "<tr><td>API ঠিকানা</td><td><span class='mono'>"
+                            + esc(str(_bx.lamix_base()) + "/api/v1/messages")
+                            + "</span></td></tr>")
+        except Exception:
+            pass
         _rg = _bx.lamix_ranges(force=True)
         _rows.append("<tr><td>রেঞ্জ</td><td>" + esc(str(len(_rg))) + "টি</td></tr>")
         _nm = _bx.lamix_numbers(limit=1)
@@ -1055,30 +1085,45 @@ def shop_home():
             + _kpi("ডেলিভারি হয়েছে", num((sold or {}).get("n") or 0))
             + "</div>")
 
-    # ── দোকান চালু/বন্ধ + ডিপোজিট লক ──
+    # ── শপ / ডিপোজিট / টাস্ক — তিনটাই আলাদা সুইচ ──
     try:
         import bot as _bs2
         _s_on = bool(_bs2.shop_on())
+        _dep_on = bool(_bs2.dep_on())
+        _task_on = bool(_bs2.task_on())
         _d_lock = bool(_bs2.shop_off_dep_on())
     except Exception:
-        _s_on, _d_lock = True, True
+        _s_on, _dep_on, _task_on, _d_lock = True, True, True, True
+
+    def _sw_card(label, on, key, hint_on, hint_off):
+        _col = "color:#2e7d32" if on else "color:#c62828"
+        _st = "চালু" if on else "বন্ধ"
+        return ("<div style='margin-top:12px;padding-top:10px;border-top:1px solid #ddd'>"
+                f"<b>{label}: <span style='{_col}'>{_st}</span></b>"
+                "<div class='mut' style='font-size:12px;margin:6px 0'>"
+                f"{hint_on if on else hint_off}</div>"
+                "<form method='post' action='/admin/section/onoff' style='display:inline'>"
+                f"<input type='hidden' name='key' value='{key}'>"
+                f"<input type='hidden' name='val' value='{'off' if on else 'on'}'>"
+                f"<button class='{'gray' if on else 'ok'} sm' type='submit'>"
+                f"{'⏸ বন্ধ করুন' if on else '▶️ চালু করুন'}</button></form></div>")
     switch_card = (
         "<div class='card'>"
-        + ("<b>🛍 দোকান: <span style='color:#2e7d32'>চালু</span></b>"
-           if _s_on else
-           "<b>🔒 দোকান: <span style='color:#c62828'>বন্ধ</span></b>")
-        + "<div class='mut' style='font-size:12px;margin:6px 0'>"
-        + ("ইউজার এখন কেনাকাটা করতে পারছে।"
-           if _s_on else
-           "ইউজার এখন '🔒 দোকান এখন বন্ধ' মেসেজ দেখবে — অ্যাডমিন বটে ঢুকতে পারবেন।")
-        + "</div>"
-        + "<form method='post' action='/admin/shop/onoff' style='display:inline'>"
-        + "<input type='hidden' name='val' value='%s'>" % ("off" if _s_on else "on")
-        + "<button class='%s sm' type='submit'>%s</button></form>"
-        % ("gray" if _s_on else "ok",
-           "⏸ দোকান বন্ধ করুন" if _s_on else "▶️ দোকান চালু করুন")
-        + "<div style='margin-top:14px;padding-top:10px;border-top:1px solid #ddd'>"
-        + "<b>💳 ডিপোজিট</b>"
+        "<b>🔒 সেকশন চালু / বন্ধ</b>"
+        "<div class='mut' style='font-size:12px;margin:4px 0 0'>"
+        "যেটা বন্ধ করবেন — ইউজার ওটায় চাপলে শুধু “এখন বন্ধ” মেসেজ দেখবে।"
+        "অ্যাডমিন/ওনার সবসময় ঢুকতে পারবেন।</div>"
+        + _sw_card("🛍 শপ", _s_on, "shop",
+                   "ইউজার এখন কেনাকাটা করতে পারছে।",
+                   "ইউজার '🔒 দোকান এখন বন্ধ' মেসেজ দেখবে।")
+        + _sw_card("💳 ডিপোজিট", _dep_on, "dep",
+                   "ইউজার টাকা যোগ করতে পারছে।",
+                   "ইউজার '🔒 ডিপোজিট এখন বন্ধ' মেসেজ পাবে।")
+        + _sw_card("📋 টাস্ক", _task_on, "task",
+                   "ইউজার টাস্ক করতে পারছে।",
+                   "ইউজার '🔒 টাস্ক সেকশন এখন বন্ধ' মেসেজ পাবে।")
+        + "<div style='margin-top:12px;padding-top:10px;border-top:1px solid #ddd'>"
+        + "<b>💳 দোকানের সাথে ডিপোজিট</b>"
         + "<div class='mut' style='font-size:12px;margin:6px 0'>"
         + ("দোকান বন্ধ থাকলে ডিপোজিটও বন্ধ থাকবে।"
            if _d_lock else
@@ -2318,7 +2363,56 @@ def otp_earn_page():
     _cap = _otp_s("otp_wd_cap", "0")
     _mn = _otp_s("otp_wd_min", "0.05")
     _total, _stats = _b.otp_stock_stats()
+    try:
+        _def_rate = round(float(_otp_s("otp_lamix_rate", "0.01") or 0.01), 4)
+    except Exception:
+        _def_rate = 0.01
+    # ☎️ Lamix রেঞ্জ-তালিকা + প্রতি রেঞ্জে আলাদা **রেট ($)** — % নয়
+    _rng_rows, _rng_err, _rates_txt = [], "", ""
+    try:
+        import bot as _br
+        if _br.lamix_on():
+            _rates = _br.otp_lamix_rates() or {}
+            # 💵 আমার payout (cost) — হাতে লেখা থাকলে সেটা, নাহলে API-র payoutRate
+            _costs = _br.otp_lamix_costs() or {}
+            for _r0 in (_br.lamix_ranges() or [])[:40]:
+                _nm0 = str(_r0.get("name") or "")
+                _best0 = 0.0
+                for _rt in (_r0.get("rates") or []):
+                    try:
+                        _best0 = max(_best0, float(_rt.get("payoutRate") or 0))
+                    except Exception:
+                        pass
+                _cur0 = round(float(_rates.get(_nm0.strip().lower(), 0) or 0), 4)
+                _my0 = round(float(_costs.get(_nm0.strip().lower(), 0) or 0), 4) or round(_best0, 4)
+                _prof0 = round(_my0 - _cur0, 4)
+                _rng_rows.append([
+                    esc(_nm0 or "—"), esc(f"${_my0:.4f}"),
+                    (esc(f"${_cur0:.4f}") if _cur0 else "—"),
+                    (badge(("+" if _prof0 >= 0 else "") + f"${_prof0:.4f}",
+                           "ok" if _prof0 >= 0 else "err") if _cur0 else "—"),
+                ])
+            _rates_txt = "\n".join(
+                f"{k} | {('' if not _costs.get(k) else round(_costs[k], 4))} | "
+                f"{('' if not _rates.get(k) else round(_rates[k], 4))}"
+                for k in sorted(set(_rates) | set(_costs)))
+        else:
+            _rng_err = "Lamix টোকেন সেট করা নেই (উপরে Lamix API পেজ দেখুন)।"
+    except Exception as _re0:
+        _rng_err = str(_re0)[:120]
     _tot = _b.otp_admin_totals()
+    # 💵 আমার লাভ — প্রতিটা OTP-তে (আমার payout − ইউজারকে দেওয়া); শুধু অ্যাডমিন
+    try:
+        _profit_tot, _profit_rows = _b.otp_profit_stats(30)
+    except Exception:
+        _profit_tot, _profit_rows = 0.0, []
+    _prof_rows = []
+    for _d0, _u0, _m0, _p0 in _profit_rows:
+        _prof_rows.append([
+            esc(_d0 or "—"), esc(f"${_u0:.4f}"), esc(f"${_m0:.4f}"),
+            badge(("+" if _p0 >= 0 else "") + f"${_p0:.4f}",
+                  "ok" if _p0 >= 0 else "err"),
+        ])
     _pend = _b.otp_wd_list("pending", 100)
     _done = _b.otp_wd_list("all", 15)
     _recent = _b.otp_numbers_recent(80)
@@ -2336,12 +2430,20 @@ def otp_earn_page():
             f"<b class='mono'>{num(s['n'])}</b>",
             esc(f"${s['rate']:.4f}"),
         ])
+    # 🗂 দেশে এখন কত নাম্বার ফ্রি আছে — প্রতিটা নাম্বারের পাশেই দেখাই
+    _iso_n = {}
+    for _s0 in _stats:
+        try:
+            _iso_n[str(_s0.get("iso") or "")] = int(_s0.get("n") or 0)
+        except Exception:
+            pass
     _num_rows = []
     for r in _recent:
         _nm, _iso, _fl = _b.otp_country(r["number"])
         _num_rows.append([
             f"<span class='mono'>{esc(str(r['number']))}</span>",
             f"{(esc(str(r['country'])) or '—')}",
+            f"<b class='mono'>{num(_iso_n.get(str(r['iso'] or _iso) or '', 0))}</b>",
             esc(str(r["service"] or "—")),
             f"${float(r['rate'] or 0):.4f}",
             badge({"free": "🟢 free", "used": "🔴 used"}.get(
@@ -2388,6 +2490,20 @@ def otp_earn_page():
         + _kpi("পেন্ডিং withdraw", esc(f"${_tot['pending_usd']:.4f}")
                + f" <span class='mut'>({num(_tot['pending_n'])})</span>",
                "warn" if _tot["pending_n"] else "")
+        + _kpi("আমার লাভ", esc(f"${_profit_tot:.4f}"),
+               "" if _profit_tot >= 0 else "warn")
+        + "</div>"
+
+        # ── 💵 আমার লাভ (শুধু অ্যাডমিন) ──
+        + "<div class='card'><b>💵 আমার লাভ</b>"
+          "<div class='mut' style='font-size:12px;margin:4px 0 10px'>"
+          "প্রতিটা OTP-তে <b>আমার payout − ইউজারকে দেওয়া</b> = লাভ। "
+          "এই রেট, payout আর লাভের হিসাব <b>কোনো ইউজার দেখতে পায় না</b> — "
+          "শুধু এই প্যানেলে আপনি দেখেন।</div>"
+          f"<div class='note {'ok' if _profit_tot >= 0 else 'warn'}'>"
+          f"মোট লাভ: <b>${_profit_tot:.4f}</b></div>"
+        + table(["তারিখ", "ইউজার পেয়েছে", "আমি পেয়েছি", "লাভ"], _prof_rows,
+                "এখনো কোনো OTP আসেনি")
         + "</div>"
 
         # ── সেটিংস ──
@@ -2421,10 +2537,13 @@ def otp_earn_page():
         # ── আপলোড ──
         + "<div class='card'><b>📥 নাম্বার আপলোড (.txt)</b>"
           "<div class='mut' style='font-size:12px;margin:4px 0 10px'>"
-          "প্রতি লাইনে একটা নাম্বার। চাইলে <span class='mono'>নাম্বার|রেট</span> "
-          "বা <span class='mono'>নাম্বার|রেট|সার্ভিস</span> দিতে পারেন। "
-          "দেশ বট নিজেই ডায়ালিং কোড দেখে বসিয়ে দেয়। সার্ভিস না দিলে এখানে যা "
-          "লিখবেন সেটাই সব নাম্বারে বসবে (অথবা Lamix API থেকে অটো)।</div>"
+          "ফাইলের প্রতি লাইনে: <span class='mono'>দেশকোড:নাম্বার:দেশ</span> — "
+          "যেমন <span class='mono'>93:703231343:AF</span>। "
+          "<b>দেশ ফাইল থেকেই বসে যায়</b> — আলাদা করে লিখতে হয় না, "
+          "ইউজার নাম্বার + দেশ কোড দুটোই পাবে। "
+          "<b>যে ডলার লিখবেন ইউজার প্রতি OTP-তে ঠিক ততই পাবে</b>; "
+          "আলাদা নাম্বারে আলাদা দিতে চাইলে ওই লাইনে "
+          "<span class='mono'>নাম্বার|ডলার|সার্ভিস</span> ফরম্যাটও চলে।</div>"
           "<form method='post' action='/admin/otp/upload' enctype='multipart/form-data'>"
           "<div class='field'><label>সার্ভিস (কিসের নাম্বার — facebook / whatsapp …)</label>"
           f"<input name='service' list='otpsvc' placeholder='facebook'>"
@@ -2433,13 +2552,36 @@ def otp_earn_page():
           "<input name='rate' type='number' step='0.0001' min='0' value='0.01'></div>"
           "<div class='field'><label><input type='checkbox' name='auto_service' value='on'> "
           "Lamix API থেকে সার্ভিস/দেশ অটো নিন (ম্যানুয়াল সার্ভিস না দিলে)</label></div>"
-          "<div class='field'><label>নাম্বার লিখুন (প্রতি লাইনে ১টা)</label>"
-          "<textarea name='numbers' rows='7' placeholder='+8801XXXXXXXXX&#10;+2348XXXXXXXXX|0.02|whatsapp'></textarea></div>"
-          "<div class='field'><label>অথবা .txt ফাইল</label>"
-          "<input type='file' name='txtfile' accept='.txt,text/plain'></div>"
+          "<div class='field'><label>.txt ফাইল বেছে নিন "
+          "<span class='mut'>— প্রতি লাইনে দেশকোড:নাম্বার:দেশ</span></label>"
+          "<input type='file' name='txtfile' accept='.txt,text/plain' required></div>"
           "<button class='ok' type='submit'>➕ আপলোড করুন</button>"
           "<span class='mut' style='font-size:12px;margin-left:10px'>"
           "একই নাম্বার দুইবার যোগ হবে না।</span></form></div>"
+
+        # ── Lamix থেকে অটো নাম্বার ──
+        + "<div class='card'><b>☎️ Lamix থেকে নাম্বার নিন (অটো)</b>"
+          "<div class='mut' style='font-size:12px;margin:4px 0 10px'>"
+          "Lamix প্যানেলে আপনার অ্যাকাউন্টে যে নাম্বারগুলো আছে, সেগুলোই স্টকে যোগ হবে "
+          "(<span class='mono'>GET /api/v1/numbers</span>)। নিচে যে **ডলার রেট** লিখবেন, "
+          "ইউজার প্রতি OTP-তে ঠিক ততই পাবে — এখানে কোনো % নেই, আপনার payout কত তা এর "
+          "নাম্বার/রেটে ভূমিকা রাখে না (লাভ/লস আপনার হিসাব)। হাতে আপলোড লাগবে না।</div>"
+          + ("<div class='mut' style='font-size:12px;margin:0 0 8px'>"
+             + esc(_rng_err) + "</div>" if _rng_err and not _rng_rows else "")
+          + table(["Lamix রেঞ্জ", "আমার পাব", "ইউজার পাবে", "লাভ"], _rng_rows,
+                  "রেঞ্জ নেই (Extended API চালু আছে কি?)")
+          + "<form method='post' action='/admin/otp/sync'>"
+          "<div class='field'><label>সাধারণ রেট (USD) — যে রেঞ্জে আলাদা দেবেন না</label>"
+          f"<input name='rate' value='{esc(str(_def_rate))}' placeholder='0.01'> $</div>"
+          "<div class='field'><label>রেঞ্জ অনুযায়ী লিখুন — প্রতি লাইনে: "
+          "<span class='mono'>রেঞ্জের নাম | আমি পাব | ইউজার পাবে</span> "
+          "<span class='mut'>(আমার ঘর খালি রাখলে Lamix-এর payoutRate-ই ধরা হবে; "
+          "শুধু <span class='mono'>নাম | ইউজার পাবে</span> লিখলেও চলবে)</span></label>"
+          f"<textarea name='rate_lines' rows='6' placeholder='UK Mobile | 0.012 | 0.008&#10;Canada |  | 0.012'>"
+          f"{esc(_rates_txt)}</textarea></div>"
+          "<button class='ok' type='submit'>☎️ Lamix থেকে আপডেট করুন</button>"
+          "<span class='mut' style='font-size:12px;margin-left:10px'>"
+          "একই নাম্বার দ্বিতীয়বার যোগ হবে না।</span></form></div>"
 
         # ── স্টক ──
         + "<div class='card'><b>🌍 স্টক — দেশ অনুযায়ী</b>"
@@ -2447,7 +2589,7 @@ def otp_earn_page():
                 "এখনো কোনো নাম্বার আপলোড হয়নি")
         + "</div>"
         + "<div class='card'><b>📱 সর্বশেষ নাম্বার</b>"
-        + table(["নাম্বার", "দেশ", "সার্ভিস", "রেট", "স্টেটাস", "সময়", ""],
+        + table(["নাম্বার", "দেশ", "দেশে স্টক", "সার্ভিস", "রেট", "স্টেটাস", "সময়", ""],
                 _num_rows, "নাম্বার নেই")
         + "</div>"
 
@@ -2520,7 +2662,7 @@ def otp_earn_upload():
     except Exception:
         rate = 0.0
     if not (text or "").strip():
-        return redirect("/admin/otp?err=" + _q("নাম্বার বা .txt ফাইল দিন"))
+        return redirect("/admin/otp?err=" + _q("আগে .txt ফাইল বেছে নিন (দেশকোড:নাম্বার:দেশ)"))
     meta, _api_err = None, ""
     if (form.get("auto_service") or "") == "on":
         try:
@@ -2541,6 +2683,61 @@ def otp_earn_upload():
     if bad:
         _tail += f" · {bad} লাইন বাদ"
     return redirect("/admin/otp?ok=" + _q(f"✅ {added} টা নাম্বার যোগ হয়েছে{_tail}"))
+
+
+@wadm.route("/admin/otp/sync", methods=["POST"])
+def otp_earn_sync_lamix():
+    """☎️ Lamix প্যানেল থেকে নাম্বার টেনে স্টকে যোগ (হাতে আপলোড লাগে না)।"""
+    g = guard()
+    if g:
+        return g
+    try:
+        import bot as _b
+    except Exception as e:
+        return redirect("/admin/otp?err=" + _q(f"bot লোড হয়নি: {e}"))
+    try:
+        _def_rate = float(str(request.form.get("rate") or "0.01").replace(",", "."))
+    except Exception:
+        _def_rate = 0.01
+    _def_rate = round(max(0.0, _def_rate), 4)
+    # 💵 রেঞ্জভেদে আলাদা রেট ($) — "নাম | ডলার" লাইন থেকে (কোনো % নেই)
+    # `রেঞ্জ | আমি পাব | ইউজার পাবে` (দুই ঘর হলে শুধু ইউজার রেট)
+    _rmap, _cmap = {}, {}
+    for _ln in (request.form.get("rate_lines") or "").replace("\r", "").split("\n"):
+        _ln = _ln.strip()
+        if not _ln or "|" not in _ln:
+            continue
+        _fld = [x.strip() for x in _ln.split("|")]
+        if len(_fld) >= 3:
+            _nm, _my, _pc = _fld[0], _fld[1], _fld[2]
+        else:
+            _nm, _my, _pc = _fld[0], "", _fld[1]
+        _nm = _nm.strip().lower()
+        if not _nm:
+            continue
+        for _val, _mp in ((_pc, _rmap), (_my, _cmap)):
+            try:
+                _pv = float(str(_val).strip().replace(",", "."))
+            except Exception:
+                continue
+            _mp[_nm] = round(max(0.0, _pv), 4)
+    try:
+        import json as _json2
+        _b.set_setting("otp_lamix_rate", str(_def_rate))
+        _b.set_setting("otp_lamix_rates", _json2.dumps(_rmap, ensure_ascii=False))
+        _b.set_setting("otp_lamix_costs", _json2.dumps(_cmap, ensure_ascii=False))
+    except Exception:
+        pass
+    try:
+        _a, _d, _bad, _err = _b.otp_sync_lamix(rate=_def_rate, rates=_rmap,
+                                              costs=_cmap)
+    except Exception as e:
+        return redirect("/admin/otp?err=" + _q(f"সিঙ্ক ব্যর্থ: {str(e)[:140]}"))
+    if _err:
+        return redirect("/admin/otp?err=" + _q(f"Lamix: {_err}"))
+    log_admin("otp_sync_lamix", 0, f"+{_a} numbers rate=${_def_rate}")
+    return redirect("/admin/otp?ok=" + _q(
+        f"☎️ Lamix থেকে {_a}টি নাম্বার যোগ · {_d} ডুপ্লিকেট · {_bad} বাদ"))
 
 
 @wadm.route("/admin/otp/num/<int:nid>/delete", methods=["POST"])

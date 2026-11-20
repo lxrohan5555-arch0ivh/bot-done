@@ -678,7 +678,8 @@ def settings():
             "task_notify_mode", "task_notify_channel", "task_notify_daily_max",
             "min_withdraw", "wd_fee", "wd_rate", "commission_pct", "shop_ref_pct", "bsc_wallet",
             "support_owner", "support_bot", "task_promo_text", "ch_btn_text", "ch_btn_url",
-            "shop_closed_bn", "shop_closed_en", "dep_closed_bn", "dep_closed_en"]
+            "shop_closed_bn", "shop_closed_en", "dep_closed_bn", "dep_closed_en",
+            "task_closed_bn", "task_closed_en"]
     vals = settings_all(keys)
     body = (
         f"<div class='grid g2'>"
@@ -776,6 +777,12 @@ def settings():
         "<div class='form'><label>💳 Deposit closed (English)</label>"
         f"<textarea name='dep_closed_en' rows='3' style='width:100%'>"
         f"{esc(vals.get('dep_closed_en') or '')}</textarea></div>"
+        "<div class='form'><label>📋 টাস্ক বন্ধ (বাংলা)</label>"
+        f"<textarea name='task_closed_bn' rows='3' style='width:100%'>"
+        f"{esc(vals.get('task_closed_bn') or '')}</textarea></div>"
+        "<div class='form'><label>📋 Tasks closed (English)</label>"
+        f"<textarea name='task_closed_en' rows='3' style='width:100%'>"
+        f"{esc(vals.get('task_closed_en') or '')}</textarea></div>"
         "<button type='submit' style='margin-top:10px'>💾 বন্ধের বার্তা সেভ</button>"
         "</form></div>"
         "<div class='card'><h3>" + icon("user") + " Support</h3>"
