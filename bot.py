@@ -5241,9 +5241,11 @@ def _perms_display(perms_str: str) -> str:
 # ── Settings Cache — প্রতি user action এ DB query কমাতে 60s TTL cache ──
 _settings_cache: "dict[str, tuple]" = {}   # key → (value, timestamp)
 _SETTINGS_TTL = 600.0  # ১০ মিনিট (120→600: admin খুব কম পরিবর্তন করে)
-# বট চালু/বন্ধ ক্যাশে আটকে থাকবে না — প্যানেল থেকে অন/অফ করলেই ৩ সেকেন্ডে বটেও।
-_SETTINGS_TTL_FAST = 3.0
-_SETTINGS_TTL_GN = 3.0     # getnum_* — অ্যাডমিন প্যানেল থেকে সেভ করা সাথে সাথে কাজ করবে
+# বট চালু/বন্ধ ক্যাশে আটকে থাকবে না — প্যানেলে সেভ করলেই hook/`bot_meta` সিগন্যালে
+# সাথে সাথে cache clear হয়, তাই TTL বড় রাখলেও পরিবর্তন দেরিতে পৌঁছায় না।
+# 3s → 15s: প্রতি update-এ bot_status পড়তে গিয়ে DB query হবে না (RU সাশ্রয়)।
+_SETTINGS_TTL_FAST = 15.0
+_SETTINGS_TTL_GN = 20.0    # getnum_* — 3s → 20s; প্যানেল-সেভে hook নিজেই cache মোছে
 
 # ── User Cache — guard() + handler দুইবার DB hit বন্ধ করে ──────────────
 _user_cache: "dict[int, tuple]" = {}   # uid → (user_dict, timestamp)
@@ -5529,6 +5531,42 @@ def bot_is_on():
         return (val or 'on') != 'off'
     except Exception:
         return True  # DB fail হলে safe default: bot চালু থাকুক
+
+def _jobs_paused():
+    """বট বন্ধ (admin-only mode) → ডেটাবেস পোলিং জবগুলো একেবারে বন্ধ।
+
+    আগে বট বন্ধ থাকলেও job গুলো প্রতি ৫-৩০ সেকেন্ডে DB ছুঁত → ২৪ ঘণ্টাই
+    RU খরচ হচ্ছিল, অথচ কেউ কিছু পাচ্ছিল না।`bot_is_on` ক্যাশে পড়ে — কোনো DB কল নেই।
+    """
+    try:
+        return not bot_is_on()
+    except Exception:
+        return False
+
+
+# ── RU Guard — কাজ ফাঁকা থাকলে DB পোল কমাও (বট অন থাকলেও RU একই থাকে) ──
+# প্রতিটি polling job আগে এই মেমরি-চেক করে; কিছু না থাকলে কয়েক টিক বাদে
+# DB ছোঁয়, তাই ৫s/১৫s/৩০s-এর জবগুলো ২৪ ঘণ্টায় হাজার হাজার ফাঁকা query করে না।
+_RU_NEXT: "dict[str, float]" = {}
+
+def _ru_idle_skip(name: str) -> bool:
+    """এই job এখনো idle-cooldown-এ আছে? (কোনো DB কল নয়)"""
+    try:
+        return _time.time() < float(_RU_NEXT.get(name) or 0.0)
+    except Exception:
+        return False
+
+def _ru_mark_idle(name: str, sec: float):
+    """শেষ চেকে কিছু পাওয়া যায়নি → পরের sec সেকেন্ড DB পোল বন্ধ।"""
+    try:
+        _RU_NEXT[name] = _time.time() + float(sec)
+    except Exception:
+        pass
+
+def _ru_mark_active(name: str):
+    """কাজ পাওয়া গেছে → আবার পুরো গতিতে চেক হবে।"""
+    _RU_NEXT.pop(name, None)
+
 
 def get_gmail_ch_id():
     v = get_setting('gmail_ch_id')
@@ -8319,8 +8357,8 @@ GN_WAIT_MIN = 20          # নাম্বার কত মিনিট লা�
 GN_MAX_SERVICES = 20      # লাইভ ফিড থেকে নতুন সার্ভিসও শেখা যায়
 GN_MAX_ITEMS = 150        # প্রতি সার্ভিসে রেঞ্জ (আগে ৬০ — নতুন দেশ আর ঢুকত না)
 _GN_MAX_SHOWN = 90        # এক স্ক্রিনে সর্বোচ্চ বাটন (Telegram-এর সীমার নিচে)
-GN_FEED_ON = False        # ⛔ লাইভ OTP ফিড (🔥 ট্রাফিক + নতুন দেশ শেখা) বন্ধ —
-                          #    কোনো ফিড API কল হবে না, DB-তেও কিছু জমবে না
+GN_FEED_ON = True         # ✅ লাইভ OTP ফিড (নতুন দেশ শেখা + OTP গ্রুপে পোস্ট) চালু —
+                          #    বন্ধ করলে গ্রুপে একটাও OTP যাবে না
 GN_MAX_OPEN = 3           # একসাথে কতগুলো নাম্বার চলতে পারে
 GN_FEED_POST_MAX = 10     # প্রতি চেকে সর্বোচ্চ কতটি লাইভ OTP চ্যানেলে যাবে
 GN_SMS_TTL = 3            # OTP লিস্ট ক্যাশ (সেকেন্ড)
@@ -8375,6 +8413,11 @@ def _getnum_ddl():
             "ALTER TABLE getnum_orders ADD COLUMN IF NOT EXISTS iso TEXT DEFAULT ''",
             "ALTER TABLE getnum_orders ADD COLUMN IF NOT EXISTS operator TEXT DEFAULT ''",
             "ALTER TABLE getnum_orders ADD COLUMN IF NOT EXISTS last_nid TEXT DEFAULT ''",
+            # OTP Earn (হাই রেট) অর্ডার — src='lamix', usd = প্রতি OTP-তে রেট
+            "ALTER TABLE getnum_orders ADD COLUMN IF NOT EXISTS src TEXT DEFAULT ''",
+            "ALTER TABLE getnum_orders ADD COLUMN IF NOT EXISTS usd REAL DEFAULT 0",
+            "ALTER TABLE getnum_orders ADD COLUMN IF NOT EXISTS otp_n INTEGER DEFAULT 0",
+            "ALTER TABLE getnum_orders ADD COLUMN IF NOT EXISTS paid_total REAL DEFAULT 0",
         ):
             try:
                 c.execute(_al)
@@ -9028,8 +9071,12 @@ def gn_find_otp(o, rows=None):
         if not (otn == mine or otn.endswith(mine) or mine.endswith(otn)):
             continue
         _otp_txt = str(it.get("otp") or "").strip()
-        if _seen_txt and _otp_txt and _otp_txt == _seen_txt:
-            continue                     # একই কোড আবার নয়
+        # nid থাকলে ডুপ্লিকেট ছাঁকা হয় otp_hits-এ (nid ইউনিক) — তাই একই কোড
+        # নতুন SMS হিসেবে এলে সেটাও আলাদা OTP, টাকা পাবে। nid না থাকলেই
+        # শুধু একই কোড-লেখা আবার পাঠানো হয় না।
+        if (not str(it.get("nid") or "")) and _seen_txt and _otp_txt \
+                and _otp_txt == _seen_txt:
+            continue
         return it
     return None
 
@@ -9046,27 +9093,37 @@ def _gn_log(uid, rng, number, status, detail=""):
         log.debug(f"[GETNUM] log ব্যর্থ: {e}")
 
 
-def gn_order_new(uid, service, item, number, price, info=None):
+def gn_order_new(uid, service, item, number, price, info=None, src="", usd=None):
     info = info or {}
+    _usd = float(price or 0) if usd is None else float(usd or 0)
     with _c() as c:
         cur = c.execute(
             "INSERT INTO getnum_orders (user_id,service,range_name,range_val,number,"
-            "price,status,country,iso,operator,ts,created_at,updated_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,'waiting',%s,%s,%s,%s,%s,%s) RETURNING id",
+            "price,status,country,iso,operator,ts,created_at,updated_at,src,usd) "
+            "VALUES (%s,%s,%s,%s,%s,%s,'waiting',%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (int(uid), str(service)[:40], str(item.get("name") or "")[:40],
              str(item.get("range") or "")[:40], str(number)[:32], float(price or 0),
              str(info.get("country") or "")[:40], str(info.get("iso") or "")[:8],
              str(info.get("operator") or "")[:40],
-             _time.time(), now(), now()))
+             _time.time(), now(), now(), str(src or "")[:12], _usd))
         r = cur.fetchone()
         if r:
-            return int(r["id"])
-        # RETURNING সাপোর্ট না করলে (SQLite/পুরোনো ড্রাইভার) এই সারিটাই খুঁজি
-        row = c.execute(
-            "SELECT id FROM getnum_orders WHERE user_id=%s AND number=%s "
-            "ORDER BY id DESC LIMIT 1",
-            (int(uid), str(number)[:32])).fetchone()
-        return int(row["id"]) if row else 0
+            _oid = int(r["id"])
+        else:
+            # RETURNING সাপোর্ট না করলে (SQLite/পুরোনো ড্রাইভার) এই সারিটাই খুঁজি
+            row = c.execute(
+                "SELECT id FROM getnum_orders WHERE user_id=%s AND number=%s "
+                "ORDER BY id DESC LIMIT 1",
+                (int(uid), str(number)[:32])).fetchone()
+            _oid = int(row["id"]) if row else 0
+    # 🔔 নতুন অর্ডার তৈরি = কাজ আছে → OTP জবের idle-cooldown সাথে সাথে শেষ,
+    #    তাই idle অনেক লম্বা রাখা যায় (দেরি হয় না)
+    if _oid:
+        try:
+            _ru_mark_active("gn_otp")
+        except Exception:
+            pass
+    return _oid
 
 def gn_order_get(oid):
     try:
@@ -9107,13 +9164,19 @@ def _gn_post_allowed(key):
     if len(_arr) >= _GN_RL_MAX:
         _GN_POST_RL[key] = _arr
         return False
-    _arr.append(_t)
     _GN_POST_RL[key] = _arr
     if len(_GN_POST_RL) > 400:          # পুরোনো কী সরাও
         for _k8 in [k for k, v in _GN_POST_RL.items() if not v
                     or _t - v[-1] > _GN_RL_WIN][:150]:
             _GN_POST_RL.pop(_k8, None)
     return True
+
+
+def _gn_post_done(key):
+    """পোস্ট **সত্যিই** গেলেই সময় লিখি — ফেইল হলে কোটা খরচ হবে না।"""
+    _arr = [x for x in (_GN_POST_RL.get(key) or []) if _time.time() - x < _GN_RL_WIN]
+    _arr.append(_time.time())
+    _GN_POST_RL[key] = _arr
 
 
 def _gn_flag_of_name(name):
@@ -9510,10 +9573,12 @@ def _gn_ch_send(text, parse_mode="HTML"):
         return False
     _btns = []
     _bl, _nl = _gn_bot_link(), _gn_news_link()
+    # ⚠️ বাটনে শুধু text+url — Bot API-তে অজানা ফিল্ড (style) দিলে
+    #    reply_markup রিজেক্ট হতে পারে, তখন OTP চ্যানেলে কিছুই যেত না।
     if _bl:
-        _btns.append({"text": "🤖 Bot", "url": _bl, "style": "success"})
+        _btns.append({"text": "🤖 Bot", "url": _bl})
     if _nl:
-        _btns.append({"text": "📢 News Channel", "url": _nl, "style": "primary"})
+        _btns.append({"text": "📢 News Channel", "url": _nl})
     # ১) HTML + বাটন  ২) প্লেইন + বাটন  ৩) প্লেইন + বাটন ছাড়া
     #    শেষ ধাপটা না থাকলে বাটন/markup-এ সমস্যা হলে পোস্টটাই আটকে যেত
     _tries = [(parse_mode, True)] if parse_mode else []
@@ -9536,10 +9601,45 @@ def _gn_ch_send(text, parse_mode="HTML"):
             urllib.request.urlopen(req, timeout=8).read()
             return True
         except Exception as e:
+            # Telegram-এর আসল কারণ (chat not found / not enough rights …) লগে রাখি
+            _whole = ""
+            try:
+                _whole = e.read().decode("utf-8", "replace")[:220]
+            except Exception:
+                _whole = str(e)[:200]
             log.warning(f"[GETNUM-CH] চ্যানেলে পাঠানো যায়নি"
                         f"{' (বাটন ছাড়া)' if not _use_btns else (' (প্লেইন)' if not _pm else '')}"
-                        f": {str(e)[:160]}")
+                        f": {_whole}")
     return False
+
+
+_GN_CH_REPORT = {"done": False, "err": ""}
+
+
+def _gn_ch_probe():
+    """OTP চ্যানেল প্রস্তুত কি না — Telegram-এর আসল কারণ ফেরত দেয় ('' = ঠিক)।"""
+    tok = (os.environ.get("BOT_TOKEN") or "").strip()
+    if not tok:
+        return "BOT_TOKEN env নেই — চ্যানেলে পাঠানোর উপায় নেই।"
+    try:
+        cid = getnum_ch_id()
+    except Exception:
+        cid = 0
+    if not cid:
+        return "OTP চ্যানেল id সেট করা নেই (Number সেটিংসে getnum_ch_id দিন)।"
+    try:
+        _u = ("https://api.telegram.org/bot" + tok + "/getChat?chat_id="
+              + urllib.parse.quote(str(cid), safe=""))
+        with urllib.request.urlopen(_u, timeout=10) as _r:
+            _j = _json.loads(_r.read().decode("utf-8", "replace"))
+        if not (_j or {}).get("ok"):
+            return ("getChat ব্যর্থ: " + str((_j or {}).get("description") or ""))[:200]
+        return ""
+    except Exception as e:
+        try:
+            return e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            return str(e)[:200]
 
 
 def _gn_ch_text(o):
@@ -9701,10 +9801,16 @@ def _gn_order_kb(o, en=False):
                                             copy_text=CopyTextButton(text=_num))])
     except Exception:
         pass
-    _b.append([InlineKeyboardButton(_bi("🔁 নাম্বার বদলান", "🔁 Change Number", en),
-                                   callback_data=f"gn:n:{_id}")])
-    _b.append([InlineKeyboardButton(_bi("🌐 দেশ বদলান", "🌐 Change Country", en),
-                                    callback_data=(f"gn:cc:{_id}" if _id else "gn:home"))])
+    if str(o.get("src") or "") == "lamix":
+        # হাই রেট নাম্বার — বদলাতে চাইলে স্টক-লিস্টেই ফেরত
+        _b.append([InlineKeyboardButton(
+            _bi("🔁 আরেকটা হাই রেট নাম্বার", "🔁 Another high-rate number", en),
+            callback_data="otp:gn")])
+    else:
+        _b.append([InlineKeyboardButton(_bi("🔁 নাম্বার বদলান", "🔁 Change Number", en),
+                                       callback_data=f"gn:n:{_id}")])
+        _b.append([InlineKeyboardButton(_bi("🌐 দেশ বদলান", "🌐 Change Country", en),
+                                        callback_data=(f"gn:cc:{_id}" if _id else "gn:home"))])
     try:
         _n = gn_active_count(int(o.get("user_id") or 0))
     except Exception:
@@ -9735,10 +9841,15 @@ def _gn_order_text(o, en=False):
     _head = _bi(f"📱 *আপনার নাম্বার*\n\n`{_num}`\n\n",
                 f"📱 *Your number*\n\n`{_num}`\n\n", en)
     _rate = o.get("price") or getnum_rate()
+    _src = str(o.get("src") or "")
     _loc = " ".join(x for x in (_gn_flag(o.get("iso")), str(o.get("country") or "")) if x).strip()
     _where = _loc or str(o.get("range_name") or "")
+    # হাই রেট (Lamix) অর্ডারে রেট সরাসরি USD — BDT-তে ভাঙা হয় না
+    _rate_s = (f"${float(o.get('usd') or _rate or 0):.4f}" if _src == "lamix"
+               else getnum_money2(_rate))
     _meta = (f"{str(o.get('service') or '')} · {_where}\n"
-             f"💵 {'OTP রেট' if not en else 'OTP rate'}: {getnum_money2(_rate)}\n")
+             f"💵 {'OTP রেট' if not en else 'OTP rate'}: {_rate_s}"
+             f"{' · প্রতি OTP-তে' if (not en and _src == 'lamix') else (' · per OTP' if _src == 'lamix' else '')}\n")
     if str(o.get("otp") or "").strip() or str(o.get("sms") or "").strip():
         _paid = 0.0
         try:
@@ -9755,12 +9866,23 @@ def _gn_order_text(o, en=False):
                      "♻️ *OTP (RESEND)*" if o.get("resend") else "🎉 *OTP RECEIVED*", en)
         _bal = ""
         if _paid > 0:
-            _bal = _bi(f"💰 *Balance:* +{_paid:.4f}$ ({float(_rate or 0):g}৳) · Total: ${_tot:.4f}\n",
-                       f"💰 *Balance:* +{_paid:.4f}$ ({float(_rate or 0):g}৳) · Total: ${_tot:.4f}\n", en)
+            _usd_s = f"+{_paid:.4f}$"
+            _extra = ("" if _src == "lamix"
+                      else f" ({float(_rate or 0):g}৳)")
+            _bal = _bi(f"💰 *Balance:* {_usd_s}{_extra} · Total: ${_tot:.4f}\n",
+                       f"💰 *Balance:* {_usd_s}{_extra} · Total: ${_tot:.4f}\n", en)
+        try:
+            _cnt = int(o.get("otp_n") or 0)
+        except Exception:
+            _cnt = 0
+        _cnt_s = (_bi(f"📨 *এই নাম্বারে OTP:* `{_cnt}`\n",
+                      f"📨 *OTPs on this number:* `{_cnt}`\n", en)
+                  if _cnt > 1 else "")
         return (_head2 + "\n━━━━━━━━━━━━━━\n\n"
                 + f"📱 *Service:* {str(o.get('service') or '')}\n"
                 + f"📞 *Number:* `{_num}`\n"
                 + f"🔑 *OTP:* `{_code}`\n"
+                + _cnt_s
                 + _bal)
     _left = _gn_left_min(o)
     if _left <= 0:
@@ -9772,8 +9894,136 @@ def _gn_order_text(o, en=False):
                   f"⏳ No OTP yet · {_left} min left\n\n"
                   "📩 I will send the OTP here as soon as it arrives.", en))
 
+async def show_getnum_menu(update, ctx=None):
+    """📱 নাম্বার নিন — ২টা অপশন: নরমাল (লো রেট) আর হাই রেট OTP কাজ।"""
+    uid = _gn_uid(update)
+    en = await _shop_is_en(uid)
+    try:
+        _tot, _ = await asyncio.to_thread(otp_stock_stats)
+    except Exception:
+        _tot = 0
+    _rows = [
+        [InlineKeyboardButton(
+            _bi("🟢 নাম্বার · নরমাল (লো রেট)",
+                "🟢 Number · Normal (low rate)", en),
+            callback_data="gn:low")],
+        [InlineKeyboardButton(
+            _bi(f"🔥 হাই রেট OTP / OTP কাজ ({_tot})",
+                f"🔥 High rate OTP / OTP work ({_tot})", en),
+            callback_data="otp:gn")],
+    ]
+    try:
+        _cur = await asyncio.to_thread(gn_open_orders, uid)
+    except Exception:
+        _cur = []
+    if _cur:
+        _rows.append([InlineKeyboardButton(
+            _bi(f"📱 চলমান নাম্বার ({len(_cur)})",
+                f"📱 Current numbers ({len(_cur)})", en),
+            callback_data="gn:cur")])
+    _rows.append([InlineKeyboardButton(_bi("❌ বন্ধ", "❌ Close", en),
+                                      callback_data="gn:close")])
+    return await _gn_say(update, _bi(
+        "📱 *নাম্বার নিন*\n\n"
+        "🟢 *নরমাল নাম্বার* — এক রেট, OTP এলে টাকা যোগ হবে।\n"
+        "🔥 *হাই রেট OTP / OTP কাজ* — প্রতিটা OTP-তে আলাদা রেট, বেশি আয়।\n\n"
+        "কোনটা নিতে চান?",
+        "📱 *Get Number*\n\n"
+        "🟢 *Normal number* — one rate, you get paid when an OTP comes.\n"
+        "🔥 *High rate OTP / OTP work* — a separate rate on every OTP, earn more.\n\n"
+        "Which one do you want?", en),
+        InlineKeyboardMarkup(_rows))
+
+
+async def otp_gn_show(update, ctx):
+    """🔥 হাই রেট — OTP Earn স্টক থেকে নাম্বার, প্রতি OTP-তে সেট করা রেট।"""
+    en = await _shop_is_en(_gn_uid(update))
+    if not await asyncio.to_thread(otp_earn_on):
+        return await _gn_say(update, _bi(
+            "🔒 *OTP Earn এখন বন্ধ আছে*\n\nপরে আবার দেখুন।",
+            "🔒 *OTP Earn is off right now*\n\nCheck again later.", en))
+    groups = await asyncio.to_thread(otp_stock_groups)
+    if not groups:
+        return await _gn_say(update, _bi(
+            "📦 *হাই রেট স্টক এখন খালি*\n\nদেশ/সার্ভিস এড হলে এখানে দেখাবে।",
+            "📦 *High-rate stock is empty right now*\n\nIt shows here once it is added.", en),
+            InlineKeyboardMarkup([[InlineKeyboardButton(
+                _bi("🔙 ফিরে যান", "🔙 Back", en), callback_data="gn:home")]]))
+    ctx.user_data["otp_gn_list"] = groups
+    _one = []
+    for i, g in enumerate(groups[:16]):
+        _sv = g["service"] or "OTP"
+        _lbl = (f"{g['flag']} {g['country']} · {_sv} · {g['n']} · "
+                f"${g['rate']:.3f}")
+        _one.append(InlineKeyboardButton(_lbl[:62], callback_data=f"otp:gn:{i}"))
+    rows = _pair_rows(_one)
+    rows.append([InlineKeyboardButton(_bi("🔙 ফিরে যান", "🔙 Back", en),
+                                     callback_data="gn:home")])
+    return await _gn_say(update, _bi(
+        "🔥 *হাই রেট OTP / OTP কাজ*\n\n"
+        "প্রতিটা OTP-তে দেখানো রেট যোগ হবে। দেশ/সার্ভিস বেছে নিন:",
+        "🔥 *High rate OTP / OTP work*\n\n"
+        "You get the shown rate on every OTP. Pick a country/service:", en),
+        InlineKeyboardMarkup(rows))
+
+
+async def otp_gn_issue(update, ctx, idx):
+    """স্টক থেকে ১টা নাম্বার নিয়ে OTP-অর্ডার তৈরি।"""
+    uid = _gn_uid(update)
+    en = await _shop_is_en(uid)
+    groups = ctx.user_data.get("otp_gn_list") or []
+    try:
+        g = dict(groups[int(idx)])
+    except Exception:
+        return await otp_gn_show(update, ctx)
+    _active = await asyncio.to_thread(gn_active_count, uid)
+    if _active >= GN_MAX_OPEN:
+        return await _gn_say(update, _bi(
+            f"📱 *একসাথে সর্বোচ্চ {GN_MAX_OPEN}টি নাম্বার চলতে পারে*\n\n"
+            "আগের কোনওটা OTP পেলে বা সময় শেষ হলে আবার নতুন নিতে পারবেন।",
+            f"📱 *Up to {GN_MAX_OPEN} numbers at a time*\n\n"
+            "Get a new one after an OTP arrives or the time runs out.", en),
+            InlineKeyboardMarkup([[InlineKeyboardButton(
+                _bi("📱 চলমান নাম্বার", "📱 Current numbers", en),
+                callback_data="gn:cur")]]))
+    await _gn_say(update, _bi("⏳ নাম্বার নেওয়া হচ্ছে...",
+                              "⏳ Taking a number...", en))
+    row, err = await asyncio.to_thread(otp_take, uid, g.get("iso") or "",
+                                       g.get("service") or "")
+    if not row:
+        return await _gn_say(update, _bi(
+            "❌ *স্টকে নাম্বার নেই*\n\nঅন্য দেশ/সার্ভিস দেখুন।",
+            "❌ *No number left in stock*\n\nTry another country/service.", en),
+            InlineKeyboardMarkup([[InlineKeyboardButton(
+                _bi("🔙 ফিরে যান", "🔙 Back", en), callback_data="otp:gn")]]))
+    _num = str(row.get("number") or "")
+    _rate = float(row.get("rate") or 0)
+    it = {"name": str(row.get("country") or g.get("country") or "")[:40],
+          "range": str(row.get("service") or g.get("service") or "OTP")[:40],
+          "price": _rate}
+    oid = 0
+    try:
+        oid = await asyncio.to_thread(
+            gn_order_new, uid, it["range"], it, _num, _rate,
+            {"country": row.get("country") or "",
+             "iso": row.get("iso") or "", "operator": ""}, "lamix", _rate)
+    except Exception as e:
+        log.warning(f"[OTP] high-rate order: {str(e)[:140]}")
+    if not oid:
+        await asyncio.to_thread(otp_release_number, _num, uid)
+        return await _gn_say(update, _bi("❌ হয়নি, আবার চেষ্টা করুন।",
+                                         "❌ Failed, please try again.", en))
+    o = await asyncio.to_thread(gn_order_get, oid) or {
+        "id": oid, "user_id": uid, "number": _num, "service": it["range"],
+        "range_name": it["name"], "range_val": it["range"], "price": _rate,
+        "usd": _rate, "src": "lamix", "status": "waiting", "ts": _time.time(),
+        "otp": "", "sms": "", "otp_n": 0,
+        "country": row.get("country") or "", "iso": row.get("iso") or ""}
+    return await _gn_say(update, _gn_order_text(o, en), _gn_order_kb(o, en))
+
+
 async def show_getnum(update, ctx=None):
-    """📱 নাম্বার নিন — আগে সার্ভিস, তারপর দেশ/রেঞ্জ।"""
+    """🟢 নরমাল নাম্বার — আগে সার্ভিস, তারপর দেশ/রেঞ্জ।"""
     uid = _gn_uid(update)
     en = await _shop_is_en(uid)
     if not await asyncio.to_thread(getnum_on):
@@ -9821,7 +10071,6 @@ async def _gn_show_items(update, ctx, si):
     if si < 0 or si >= len(svcs):
         return await show_getnum(update, ctx)
     sv = svcs[si]
-    _lc = await asyncio.to_thread(_gn_live_counts, 10, sv["name"])   # 🔥 লাইভ ট্রাফিক (ক্যাশে)
     # রেঞ্জ → দেশ + পতাকা; একই দেশ একবারই (Fb Clone/New Fb ডুপ্লিকেট বাদ)
     _one, _seen, _cand = [], set(), []
     for ii, it in enumerate(sv["items"]):
@@ -9829,33 +10078,23 @@ async def _gn_show_items(update, ctx, si):
         if not _key or _key in _seen:
             continue
         _seen.add(_key)
-        # রেঞ্জের পাশে শেষ ১০ মিনিটের লাইভ কোড-সংখ্যা
-        try:
-            _n = int(_lc.get(_key) or _lc.get(_gn_rng_key(it.get("range"))) or 0)
-        except Exception:
-            _n = 0
-        _lab2 = (f"{_lab} · {_n}🔥" if _n > 0 else f"{_lab} · 0")
         # দাম এখানে দেখাই না — নাম্বার নেওয়ার পরে (কার্ডে) OTP রেট দেখাবে
-        _cand.append((_n, ii, _lab2))
-    # 🔥 যেখানে বেশি কোড আসছে সেগুলো আগে — লাইভ ফিডে নতুন শেখা দেশও উপরে উঠে আসে
-    _cand.sort(key=lambda x: (-x[0], x[1]))
+        _cand.append((ii, _lab))
     _more = 0
-    for _n, ii, _lab2 in _cand:
+    for ii, _lab2 in _cand:
         if len(_one) >= _GN_MAX_SHOWN:      # Telegram-এর বাটন-সীমা পেরোবে না
             _more += 1
             continue
         _one.append(InlineKeyboardButton(_lab2, callback_data=f"gn:r:{si}:{ii}"))
     rows = _pair_rows(_one)          # দুটো করে পাশাপাশি — লিস্ট লম্বা হয় না
     rows.append([InlineKeyboardButton(_bi("🔙 সার্ভিস", "🔙 Services", en),
-                                      callback_data="gn:home")])
-    _more_txt = _bi(f"\n\n➕ আরও {_more}টি দেশ আছে — উপরের যেগুলোতে 🔥 বেশি সেগুলো দেখানো হলো।",
-                    f"\n\n➕ {_more} more countries — the ones with more 🔥 are shown first.",
+                                      callback_data="gn:low")])
+    _more_txt = _bi(f"\n\n➕ আরও {_more}টি দেশ আছে।",
+                    f"\n\n➕ {_more} more countries.",
                     en) if _more else ""
-    _fire_hint = "\n\n🔥 পাশের সংখ্যা = শেষ ১০ মিনিটে সব ইউজারে ওই দেশে আসা OTP (আপনারটাও যোগ হয়)।"
-    _fire_hint_en = "\n\n🔥 The number beside = OTP received there in the last 10 min (all users, including yours)."
     return await _gn_say(update,
-                         _bi(f"{sv['name']}\n\n🌍 *কোন দেশের নাম্বার নিতে চান?*" + _fire_hint,
-                             f"{sv['name']}\n\n🌍 *Which country number do you want?*" + _fire_hint_en,
+                         _bi(f"{sv['name']}\n\n🌍 *কোন দেশের নাম্বার নিতে চান?*",
+                             f"{sv['name']}\n\n🌍 *Which country number do you want?*",
                              en) + _more_txt,
                          InlineKeyboardMarkup(rows))
 
@@ -9914,7 +10153,7 @@ async def _gn_place(update, ctx, service, item, en=False, retry_cb="gn:home"):
         rows = [[InlineKeyboardButton(_bi("🔄 আবার চেষ্টা", "🔄 Try again", en),
                                       callback_data=retry_cb)],
                 [InlineKeyboardButton(_bi("🔙 সার্ভিস", "🔙 Services", en),
-                                      callback_data="gn:home")]]
+                                      callback_data="gn:low")]]
         return await _gn_say(update, _bi(
             f"❌ *নাম্বার পাওয়া যায়নি*\n\n`{_why}`\n\n"
             "🔁 আবার চেষ্টা করুন, না হলে @gmail4gg এ জানান।",
@@ -10258,6 +10497,7 @@ def _gn_feed_once():
             try:
                 if _gn_ch_send(_gn_ch_text(_it)):
                     _sent_ch += 1
+                    _gn_post_done(_k7)      # গেছে — এখন কোটা গোনা হবে
             except Exception as _ce:
                 log.debug(f"[GETNUM-FEED] চ্যানেল পোস্ট ব্যর্থ: {str(_ce)[:90]}")
         _GN_FEED_DIAG["sent"] = _sent_ch
@@ -10283,6 +10523,8 @@ def _gn_feed_once():
 
 async def job_getnum_sync(context):
     """প্রতি ৫ মিনিটে লাইভ রেঞ্জ আপডেট।"""
+    if _jobs_paused():
+        return
     try:
         if not getnum_on():
             return
@@ -10297,8 +10539,33 @@ async def job_getnum_feed(context):
     """প্রতি ৪৫ সেকেন্ডে সবার লাইভ OTP ফিড (প্যানেল + অটো দেশ শেখা)।"""
     if not GN_FEED_ON:
         return
+    # 🔎 প্রথম চেকেই OTP চ্যানেল ঠিক আছে কি না দেখে অ্যাডমিনকে জানাই —
+    #    ভুল id/অ্যাডমিন না থাকলে OTP চুপচাপ হারাতো, এখন কারণটা দেখতে পাবেন।
+    if not _GN_CH_REPORT["done"]:
+        _GN_CH_REPORT["done"] = True
+        try:
+            _cherr = await asyncio.to_thread(_gn_ch_probe)
+        except Exception:
+            _cherr = ""
+        _GN_CH_REPORT["err"] = _cherr or ""
+        if _cherr:
+            log.warning(f"[GETNUM-CH] OTP চ্যানেল সমস্যা: {_cherr}")
+            try:
+                _b = getattr(context, "bot", None)
+                if _b:
+                    await _b.send_message(
+                        int(ADMIN_ID),
+                        "⚠️ *OTP চ্যানেলে OTP যাচ্ছে না*\n\n"
+                        f"`{str(_cherr)[:250]}`\n\n"
+                        "Number সেটিংসে চ্যানেল id ঠিক করুন, বটকে ওই চ্যানেলে "
+                        "Admin করুন (পোস্ট করার অনুমতি লাগে)।",
+                        parse_mode="Markdown")
+            except Exception:
+                pass
     try:
-        if not getnum_on():
+        # চ্যানেলের জন্য ফিড চলে; নাম্বার সেকশন বন্ধ + চ্যানেল-ইডি সেট না থাকলেই বন্ধ
+        _ch_set = str(get_setting("getnum_ch_id") or "").strip()
+        if not getnum_on() and not _ch_set:
             return
         await asyncio.to_thread(_gn_feed_once)
     except Exception as e:
@@ -10338,21 +10605,43 @@ async def _gn_check_and_notify(bot_obj, o, quiet=False, rows=None):
     row["last_nid"] = nid
     row["country"] = hit.get("country") or row.get("country") or ""
     row["operator"] = hit.get("operator") or row.get("operator") or ""
-    if first:
-        # 💰 OTP রেট ইউজারের Earn (balance) এ যোগ — টাকা ও ডলার দুটোই
+    # 💰 এখন প্রতি OTP-তে টাকা — একই SMS দুইবার গোনা হয় না (otp_hits ইউনিক)
+    try:
+        _usd = float(row.get("usd") or 0)
+    except Exception:
+        _usd = 0.0
+    if _usd <= 0:
         try:
-            _bdt = float(row.get("price") or 0)
+            _usd = _gn_usd(float(row.get("price") or 0))
         except Exception:
-            _bdt = 0.0
-        _usd = _gn_usd(_bdt)
-        if _usd > 0:
-            try:
-                if await asyncio.to_thread(add_bal, int(row.get("user_id") or 0), _usd):
-                    row["paid_usd"] = _usd
-            except Exception as _pe:
-                log.warning(f"[GETNUM] OTP রিওয়ার্ড ব্যর্থ: {str(_pe)[:120]}")
-    else:
+            _usd = 0.0
+    _uid_r = int(row.get("user_id") or 0)
+    _hit_key = str(nid or "").strip() or (
+        (str(code or "") + "@" + str(hit.get("created_at") or ""))[:120])
+    _is_new = await asyncio.to_thread(
+        otp_hit_new, oid, _hit_key, code, full, max(_usd, 0.0),
+        row.get("number"), _uid_r)
+    if not _is_new:
+        return False                  # এই SMS আগেই দেওয়া/গোনা হয়েছে
+    if not first:
         row["resend"] = True
+    try:
+        await asyncio.to_thread(gn_order_otp_add, oid, max(_usd, 0.0))
+        row["otp_n"] = int(row.get("otp_n") or 0) + 1
+    except Exception:
+        pass
+    if _usd > 0:
+        # আলাদা OTP ওয়ালেটে (otp_balance) — মেইন balance-এ নয়।
+        # অ্যাডমিন withdraw চালু না করা পর্যন্ত এটা লক।
+        try:
+            if await asyncio.to_thread(otp_earn_on):
+                _paid = await asyncio.to_thread(otp_earn_credit, _uid_r, _usd)
+            else:      # OTP Earn বন্ধ → আগের মতো মেইন balance-এ
+                _paid = await asyncio.to_thread(add_bal, _uid_r, _usd)
+            if _paid:
+                row["paid_usd"] = _usd
+        except Exception as _pe:
+            log.warning(f"[GETNUM] OTP রিওয়ার্ড ব্যর্থ: {str(_pe)[:120]}")
     # 🤖 যে দেশ/রেঞ্জে কোড এলো সেটা লিস্টে নিজেই যোগ
     try:
         await asyncio.to_thread(_gn_learn, row.get("service"),
@@ -10397,6 +10686,8 @@ async def getnum_callback(update, ctx):
     except Exception:
         pass
     if d in ("gn:home", "gn"):
+        return await show_getnum_menu(update, ctx)
+    if d == "gn:low":
         return await show_getnum(update, ctx)
     if d == "gn:close":
         try:
@@ -10485,19 +10776,46 @@ async def getnum_callback(update, ctx):
 
 async def job_getnum_otp(context):
     """প্রতি ২০ সেকেন্ডে OTP চেক — একবার API, তারপর সব নাম্বার মিলিয়ে।"""
+    if _jobs_paused():          # বট বন্ধ → কোনো DB/API কল নয় (RU সাশ্রয়)
+        return
+    # ⏱ মেয়াদ শেষ হওয়া হাই রেট নাম্বার আবার স্টকে ফেরত (৬০s-এ একবার)
+    #    — idle থাকলেও চলে, নাহলে নাম্বার চিরকাল "used" পড়ে থাকত
     try:
-        if not getnum_on():
+        await asyncio.to_thread(_otp_sweep_maybe)
+    except Exception:
+        pass
+    if _ru_idle_skip("gn_otp"):  # অপেক্ষমাণ অর্ডার নেই → ৫s টিকেই DB ছোঁব না
+        return
+    try:
+        if not (getnum_on() or lamix_on()):
             return
         _orders = await asyncio.to_thread(gn_wait_orders)
         if not _orders:
+            # কাজ নেই → ৬০s DB পোল বন্ধ। নতুন নাম্বার নিলেই
+            # `gn_order_new` idle-Cooldown মুছে দেয়, তাই ওটি দেরিও হয় না
+            _ru_mark_idle("gn_otp", 60)
             return
-        _rows = await asyncio.to_thread(getnum_sms_all)
+        _ru_mark_active("gn_otp")
+        # নরমাল (Zenex) আর হাই রেট (Lamix) — আলাদা সোর্স থেকে OTP
+        _zen = [o for o in _orders if str(o.get("src") or "") != "lamix"]
+        _lam = [o for o in _orders if str(o.get("src") or "") == "lamix"]
+        _rows = []
+        if _zen:
+            _rows = await asyncio.to_thread(getnum_sms_all)
+        _lrows = []
+        if _lam:
+            _lrows = await asyncio.to_thread(otp_lamix_rows)
         _bot = getattr(context, "bot", None)
-        for o in _orders:
+        for o in _zen:
             try:
                 await _gn_check_and_notify(_bot, o, rows=_rows)
             except Exception as e:
                 log.debug(f"[GETNUM] job order #{o.get('id')}: {e}")
+        for o in _lam:
+            try:
+                await _gn_check_and_notify(_bot, o, rows=_lrows)
+            except Exception as e:
+                log.debug(f"[GETNUM] lamix order #{o.get('id')}: {e}")
     except Exception as e:
         log.warning(f"[GETNUM] job ব্যর্থ: {str(e)[:150]}")
 
@@ -11834,6 +12152,1352 @@ async def _shop_show_order(q, oid):
         await q.message.reply_text(txt, parse_mode="HTML", reply_markup=kb)
 
 
+# ═════════════════ ☎️ Lamix SMS API (REST v1) ═════════════════
+# ডক: https://panel.lamix.org/api/v1  ·  Bearer token  ·  Extended API লাগে
+# (`/messages` ছাড়া বাকি সব endpoint-এ)। রেট লিমিট: ১/সেকেন্ড, ৪০/মিনিট —
+# প্রতি endpoint-এ আলাদা, তাই `/messages` পোল করলে `/numbers`-এর কোটা কমে না।
+# ⚠️ এখন শুধু API লেয়ার (client + সেটিংস)। নাম্বার দেখানো/নেওয়ার ফ্লো পরে।
+# ═══════════ OTP EARN — নাম্বার স্টক · আলাদা ইনকাম · আলাদা withdraw ═══════════
+# অ্যাডমিন .txt-এ নাম্বার আপলোড করে → দেশ অটো ধরা পড়ে → প্রতি OTP-তে ইউজার
+# কত পাবে সেট আলাদা রেট। ইনকাম জমা হয় users.otp_balance-এ (মেইন ব্যালেন্স থেকে
+# সম্পূর্ণ আলাদা) এবং অ্যাডমিন withdraw চালু না করা পর্যন্ত ওই টাকা লক থাকে।
+
+_OTP_SCHEMA = {"ok": False}
+
+
+def _otp_init():
+    """otp_numbers / otp_withdrawals + users-এর otp_* কলাম — একবারই।"""
+    if _OTP_SCHEMA["ok"]:
+        return True
+    try:
+        with _c() as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS otp_numbers (
+                id         BIGSERIAL PRIMARY KEY,
+                number     TEXT DEFAULT '',
+                country    TEXT DEFAULT '',
+                iso        TEXT DEFAULT '',
+                service    TEXT DEFAULT '',
+                rate       REAL DEFAULT 0,
+                status     TEXT DEFAULT 'free',
+                added_at   TEXT DEFAULT '',
+                source     TEXT DEFAULT '',
+                used_by    BIGINT DEFAULT 0,
+                used_at    TEXT DEFAULT '',
+                otp        TEXT DEFAULT ''
+            )""")
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS otp_numbers_uniq "
+                      "ON otp_numbers (number)")
+            c.execute("CREATE INDEX IF NOT EXISTS otp_numbers_stat "
+                      "ON otp_numbers (status, iso)")
+            c.execute("""CREATE TABLE IF NOT EXISTS otp_withdrawals (
+                id           BIGSERIAL PRIMARY KEY,
+                user_id      BIGINT DEFAULT 0,
+                amount       REAL DEFAULT 0,
+                address      TEXT DEFAULT '',
+                status       TEXT DEFAULT 'pending',
+                requested_at TEXT DEFAULT '',
+                decided_at   TEXT DEFAULT '',
+                note         TEXT DEFAULT '',
+                tx_hash      TEXT DEFAULT ''
+            )""")
+            for _q in ("ALTER TABLE otp_withdrawals ADD COLUMN IF NOT EXISTS tx_hash TEXT DEFAULT ''",):
+                try:
+                    c.execute(_q)
+                except Exception:
+                    pass
+            c.execute("CREATE INDEX IF NOT EXISTS otp_wd_user "
+                      "ON otp_withdrawals (user_id, id)")
+            c.execute("CREATE INDEX IF NOT EXISTS otp_wd_status "
+                      "ON otp_withdrawals (status, id)")
+            # প্রতিটা OTP আলাদা করে গোনা/দেওয়া — (oid, nid) ইউনিক
+            c.execute("""CREATE TABLE IF NOT EXISTS otp_hits (
+                id       BIGSERIAL PRIMARY KEY,
+                oid      BIGINT DEFAULT 0,
+                user_id  BIGINT DEFAULT 0,
+                nid      TEXT DEFAULT '',
+                number   TEXT DEFAULT '',
+                code     TEXT DEFAULT '',
+                sms      TEXT DEFAULT '',
+                paid     REAL DEFAULT 0,
+                ts       TEXT DEFAULT ''
+            )""")
+            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS otp_hits_uniq "
+                      "ON otp_hits (oid, nid)")
+            # users-এর আলাদা OTP ওয়ালেট — মেইন balance ছোঁবে না
+            for _q in ("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_balance REAL DEFAULT 0",
+                       "ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_earned REAL DEFAULT 0",
+                       "ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_withdrawn REAL DEFAULT 0"):
+                try:
+                    c.execute(_q)
+                except Exception:
+                    pass
+        _OTP_SCHEMA["ok"] = True
+        return True
+    except Exception as e:
+        log.warning(f"[OTP] schema: {str(e)[:160]}")
+        return False
+
+
+def otp_country(number):
+    """(দেশের নাম, ISO, পতাকা) — ডায়ালিং কোডের সবচেয়ে লম্বা মিল।"""
+    try:
+        d = re.sub(r"\D", "", str(number or ""))
+        if d.startswith("00"):
+            d = d[2:]
+        for n in (3, 2, 1):
+            cc = d[:n]
+            if cc and cc in _GN_CC:
+                iso, nm = _GN_CC[cc]
+                return nm, iso, _gn_flag(iso)
+    except Exception:
+        pass
+    return "", "", ""
+
+
+def otp_norm_number(v):
+    """যেকোনো ফরম্যাট → +দেশকোডসহ ডিজিট (ভুল হলে '')"""
+    try:
+        d = re.sub(r"\D", "", str(v or ""))
+        if d.startswith("00"):
+            d = d[2:]
+        if not (7 <= len(d) <= 15):
+            return ""
+        return "+" + d
+    except Exception:
+        return ""
+
+
+def otp_service_auto(numbers=None):
+    """Lamix API থেকে নাম্বার → (সার্ভিস/রেঞ্জ, দেশ, ISO) ম্যাপ।
+
+    ফর্মে সার্ভিস না দিলে এই ম্যাপ দিয়ে অটো ভরা হয়; API বন্ধ/ব্যর্থ হলে
+    খালি dict ফেরে (তখন ম্যানুয়াল সার্ভিস/দেশ-ডিটেকশনই চলে)।
+    """
+    out = {}
+    try:
+        recs = lamix_numbers_all(limit=500, max_pages=10)
+    except Exception as e:
+        return out, str(e)[:120]
+    for r in recs or []:
+        num = otp_norm_number(r.get("number") or r.get("msisdn") or r.get("phone") or "")
+        if not num:
+            continue
+        svc = str(r.get("rangeName") or r.get("range") or r.get("service") or "").strip()
+        nm = str(r.get("country") or "").strip()
+        iso = str(r.get("iso") or r.get("countryIso") or "").strip().upper()[:3]
+        out[num] = (svc[:40], nm, iso)
+    if numbers:
+        want = {otp_norm_number(x) for x in numbers}
+        out = {k: v for k, v in out.items() if k in want}
+    return out, ""
+
+
+def otp_numbers_add(text, service="", rate=0.0, source="", meta=None):
+    """লাইনগুলো থেকে নাম্বার যোগ — (যোগ হয়েছে, ডুপ্লিকেট, বাদ)।
+    প্রতি লাইনে: `নাম্বার` বা `নাম্বার|রেট` বা `নাম্বার|রেট|সার্ভিস`।
+    রেট/সার্ভিস না দিলে ফর্মের ডিফল্ট। দেশ বট নিজেই বের করে;
+    `meta` (Lamix API ম্যাপ) থাকলে সার্ভিস/দেশ সেখান থেকেও নেয়।"""
+    _otp_init()
+    try:
+        _svc_def = str(service or "").strip()[:40]
+        _rate_def = float(rate or 0)
+    except Exception:
+        _rate_def = 0.0
+    added = dup = bad = 0
+    seen = set()
+    _lines = str(text or "").replace("\r", "").split("\n")
+    with _c() as c:
+        for ln in _lines:
+            raw = ln.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            parts = [p.strip() for p in re.split(r"[|\t,;]+", raw)]
+            num = otp_norm_number(parts[0] if parts else "")
+            if not num:
+                bad += 1
+                continue
+            if num in seen:
+                dup += 1
+                continue
+            seen.add(num)
+            _svc = (parts[2] if len(parts) > 2 and parts[2] else _svc_def)[:40]
+            try:
+                _rt = float(parts[1]) if len(parts) > 1 and parts[1] else _rate_def
+            except Exception:
+                _rt = _rate_def
+            _nm, _iso, _ = otp_country(num)
+            _m = (meta or {}).get(num) or ()
+            if _m:
+                if _m[0] and not _svc:
+                    _svc = str(_m[0])[:40]
+                _nm = _m[1] or _nm
+                _iso = _m[2] or _iso
+            try:
+                c.execute(
+                    "INSERT INTO otp_numbers (number,country,iso,service,rate,status,"
+                    "added_at,source) VALUES (%s,%s,%s,%s,%s,'free',%s,%s) "
+                    "ON CONFLICT (number) DO NOTHING",
+                    (num, _nm, _iso, _svc, max(_rt, 0.0), now(), str(source or "")[:80]))
+                if c.rowcount:
+                    added += 1
+                else:
+                    dup += 1
+            except Exception:
+                bad += 1
+    if added:
+        _mark_dirty()
+    return added, dup, bad
+
+
+def otp_stock_stats():
+    """(মোট ফ্রি, [(iso, দেশ, কতটা, গড় রেট, পতাকা)…])"""
+    _otp_init()
+    try:
+        with _c() as c:
+            tot = c.execute("SELECT COUNT(*) AS n FROM otp_numbers WHERE status='free'").fetchone()
+            rows = c.execute(
+                "SELECT iso, country, COUNT(*) AS n, COALESCE(AVG(rate),0) AS r "
+                "FROM otp_numbers WHERE status='free' GROUP BY iso, country "
+                "ORDER BY n DESC LIMIT 60").fetchall()
+        out = []
+        for r in rows:
+            _iso = str(r["iso"] or "")
+            out.append({"iso": _iso, "country": str(r["country"] or "") or "অজানা",
+                        "n": int(r["n"] or 0), "rate": float(r["r"] or 0),
+                        "flag": _gn_flag(_iso) if _iso else "🏳"})
+        return int((tot or {}).get("n") or 0), out
+    except Exception as e:
+        log.warning(f"[OTP] stats: {str(e)[:140]}")
+        return 0, []
+
+
+def otp_services():
+    _otp_init()
+    try:
+        with _c() as c:
+            return [str(r["service"]) for r in c.execute(
+                "SELECT DISTINCT service FROM otp_numbers WHERE service<>'' "
+                "ORDER BY service LIMIT 40").fetchall()]
+    except Exception:
+        return []
+
+
+def otp_numbers_recent(limit=120):
+    _otp_init()
+    try:
+        with _c() as c:
+            return c.execute("SELECT * FROM otp_numbers ORDER BY id DESC LIMIT %s",
+                             (int(limit),)).fetchall()
+    except Exception:
+        return []
+
+
+def otp_number_delete(nid):
+    _otp_init()
+    with _c() as c:
+        c.execute("DELETE FROM otp_numbers WHERE id=%s AND status='free'", (int(nid),))
+    _mark_dirty()
+    return True
+
+
+# ── হাই রেট OTP: নাম্বার নেওয়া / ফেরত / প্রতি-SMS হিসাব ─────────
+def otp_stock_groups(limit=40):
+    """হাই রেট স্টক — (সার্ভিস, দেশ) গ্রুপে কতটা ফ্রি নাম্বার আর গড় রেট।"""
+    _otp_init()
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT iso, country, service, COUNT(*) AS n, "
+                "       COALESCE(AVG(rate),0) AS r FROM otp_numbers "
+                "WHERE status='free' GROUP BY iso, country, service "
+                "ORDER BY n DESC LIMIT %s", (int(limit),)).fetchall()
+    except Exception as e:
+        log.warning(f"[OTP] groups: {str(e)[:140]}")
+        return []
+    out = []
+    for r in rows:
+        _iso = str(r["iso"] or "")
+        out.append({"iso": _iso,
+                    "country": str(r["country"] or "") or "অজানা",
+                    "service": str(r["service"] or ""),
+                    "n": int(r["n"] or 0),
+                    "rate": float(r["r"] or 0),
+                    "flag": _gn_flag(_iso) if _iso else "🏳"})
+    return out
+
+
+def otp_take(uid, iso, service=""):
+    """স্টক থেকে ১টা ফ্রি নাম্বার ইউজারকে → (row, err)।"""
+    _otp_init()
+    try:
+        with _c() as c:
+            _q = ("SELECT * FROM otp_numbers WHERE status='free' AND iso=%s"
+                  + (" AND service=%s" if service else "")
+                  + " ORDER BY id LIMIT 1")
+            _a = (str(iso or ""),) + ((str(service),) if service else ())
+            r = c.execute(_q, _a).fetchone()
+            if not r:
+                return None, "empty"
+            cur = c.execute(
+                "UPDATE otp_numbers SET status='used', used_by=%s, used_at=%s "
+                "WHERE id=%s AND status='free'",
+                (int(uid), now(), int(r["id"])))
+            if not cur.rowcount:
+                return None, "empty"
+            row = c.execute("SELECT * FROM otp_numbers WHERE id=%s",
+                            (int(r["id"]),)).fetchone()
+        _mark_dirty()
+        return (dict(row) if row else None), ""
+    except Exception as e:
+        log.warning(f"[OTP] take uid={uid}: {str(e)[:140]}")
+        return None, "db"
+
+
+def otp_release_number(number, uid=0):
+    """নাম্বার আবার স্টকে ফেরত (মেয়াদ শেষ / অর্ডার হয়নি)।"""
+    _otp_init()
+    try:
+        with _c() as c:
+            c.execute("UPDATE otp_numbers SET status='free', used_by=0, used_at='' "
+                      "WHERE number=%s AND status='used'", (str(number or ""),))
+        _mark_dirty()
+        return True
+    except Exception as e:
+        log.debug(f"[OTP] release {number}: {str(e)[:100]}")
+        return False
+
+
+def otp_release_expired(wait_min=None):
+    """মেয়াদ শেষ — OTP Earn অর্ডারের নাম্বার আবার স্টকে ফেরত।"""
+    _otp_init()
+    _cut = _time.time() - float(wait_min or GN_WAIT_MIN) * 60
+    try:
+        with _c() as c:
+            rows = c.execute(
+                "SELECT id, number FROM getnum_orders WHERE src='lamix' "
+                "AND ts < %s AND status IN ('waiting','received')",
+                (_cut,)).fetchall() or []
+            for r in rows:
+                c.execute("UPDATE otp_numbers SET status='free', used_by=0, "
+                          "used_at='' WHERE number=%s AND status='used'",
+                          (str(r["number"] or ""),))
+                c.execute("UPDATE getnum_orders SET status='expired', "
+                          "updated_at=%s WHERE id=%s", (now(), int(r["id"])))
+        if rows:
+            _mark_dirty()
+        return len(rows)
+    except Exception as e:
+        log.debug(f"[OTP] release_expired: {str(e)[:120]}")
+        return 0
+
+
+_OTP_SWEEP = {"ts": 0.0}
+
+
+def _otp_sweep_maybe():
+    """৬০ সেকেন্ডে একবার মেয়াদোত্তীর্ণ নাম্বার ফেরত দেয়।"""
+    _t = _time.time()
+    if _t - float(_OTP_SWEEP.get("ts") or 0) < 60:
+        return 0
+    _OTP_SWEEP["ts"] = _t
+    return otp_release_expired()
+
+
+def otp_hit_new(oid, nid, code="", sms="", paid=0.0, number="", uid=0):
+    """(oid, nid) ইউনিক — True মানে নতুন SMS (একবারই টাকা + নোটিফিকেশন)।"""
+    _otp_init()
+    _k = (str(nid or "").strip()
+          or (str(code or "") + "|" + str(sms or "")[:80]))[:120]
+    try:
+        with _c() as c:
+            cur = c.execute(
+                "INSERT INTO otp_hits (oid,user_id,nid,number,code,sms,paid,ts) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (oid,nid) DO NOTHING",
+                (int(oid), int(uid or 0), _k, str(number or "")[:32],
+                 str(code or "")[:32], str(sms or "")[:1200],
+                 float(paid or 0), now()))
+            _new = bool(cur.rowcount)
+        if _new:
+            _mark_dirty()
+        return _new
+    except Exception as e:
+        log.warning(f"[OTP] hit #{oid}: {str(e)[:120]}")
+        return False
+
+
+def gn_order_otp_add(oid, usd=0.0):
+    """অর্ডারে OTP-সংখ্যা + মোট দেওয়া রেট যোগ।"""
+    try:
+        with _c() as c:
+            c.execute("UPDATE getnum_orders SET otp_n=COALESCE(otp_n,0)+1, "
+                      "paid_total=COALESCE(paid_total,0)+%s WHERE id=%s",
+                      (float(usd or 0), int(oid)))
+        return True
+    except Exception:
+        return False
+
+
+_OTP_MSG_CACHE = {"ts": 0.0, "rows": []}
+
+
+def otp_lamix_rows():
+    """Lamix `/messages` → OTP-চেকের কমন রো (৫s ক্যাশ, ব্যর্থ হলে আগেরটা)।"""
+    if not lamix_on():
+        return []
+    _t = _time.time()
+    if _OTP_MSG_CACHE["rows"] and _t - float(_OTP_MSG_CACHE["ts"] or 0) < 5:
+        return _OTP_MSG_CACHE["rows"]
+    out = []
+    for m in lamix_messages(limit=100) or []:
+        _num = otp_norm_number(m.get("number") or m.get("msisdn")
+                               or m.get("phone") or "")
+        if not _num:
+            continue
+        _content = str(m.get("content") or "")[:1200]
+        _nid = str(m.get("id") or m.get("messageId") or m.get("uuid") or "")
+        if not _nid:
+            _nid = (_num + "|" + str(m.get("time") or "") + "|" + _content)[:120]
+        out.append({"nid": _nid[:120], "number": _num, "otp": _content,
+                    "country": str(m.get("country") or "")[:40],
+                    "operator": str(m.get("range") or "")[:40],
+                    "created_at": str(m.get("time") or "")[:24]})
+    _OTP_MSG_CACHE.update({"ts": _t, "rows": out})
+    return out
+
+
+# ── সেটিংস ───────────────────────────────────────────────────────
+def otp_earn_on():
+    try:
+        return (get_setting("otp_earn_on") or "on") != "off"
+    except Exception:
+        return True
+
+
+def otp_wd_on():
+    """অ্যাডমিন চালু না করলে OTP ইনকামের টাকা লক।"""
+    try:
+        return (get_setting("otp_wd_on") or "off") == "on"
+    except Exception:
+        return False
+
+
+def otp_wd_cap():
+    """প্রতি ইউজার OTP ইনকাম থেকে মোট সর্বোচ্চ কত $ তুলতে পারবে (0 = লিমিট নেই)।"""
+    try:
+        return max(float(str(get_setting("otp_wd_cap") or 0).replace(",", ".")), 0.0)
+    except Exception:
+        return 0.0
+
+
+def otp_wd_min():
+    try:
+        return max(float(str(get_setting("otp_wd_min") or "0.05").replace(",", ".")), 0.0)
+    except Exception:
+        return 0.05
+
+
+# ── ইউজারের OTP ওয়ালেট ──────────────────────────────────────────
+def otp_wallet(uid):
+    """{bal, earned, withdrawn, pending, cap, avail, wd_on, min} — এক নজরে।"""
+    _otp_init()
+    z = {"bal": 0.0, "earned": 0.0, "withdrawn": 0.0, "pending": 0.0,
+         "cap": otp_wd_cap(), "wd_on": otp_wd_on(), "min": otp_wd_min()}
+    try:
+        with _c() as c:
+            r = c.execute(
+                "SELECT COALESCE(otp_balance,0) AS b, COALESCE(otp_earned,0) AS e, "
+                "       COALESCE(otp_withdrawn,0) AS w FROM users WHERE user_id=%s",
+                (int(uid),)).fetchone()
+            p = c.execute(
+                "SELECT COALESCE(SUM(amount),0) AS a FROM otp_withdrawals "
+                "WHERE user_id=%s AND status='pending'", (int(uid),)).fetchone()
+        z["bal"] = round(float((r or {}).get("b") or 0), 4)
+        z["earned"] = round(float((r or {}).get("e") or 0), 4)
+        z["withdrawn"] = round(float((r or {}).get("w") or 0), 4)
+        z["pending"] = round(float((p or {}).get("a") or 0), 4)
+    except Exception as e:
+        log.warning(f"[OTP] wallet uid={uid}: {str(e)[:120]}")
+    _cap = float(z["cap"] or 0)
+    if _cap > 0:
+        z["avail"] = round(min(z["bal"], max(_cap - z["withdrawn"], 0.0)), 4)
+    else:
+        z["avail"] = z["bal"]
+    return z
+
+
+def otp_earn_credit(uid, usd):
+    """OTP ইনকাম → আলাদা otp_balance-এ (মেইন balance নয়)।"""
+    try:
+        usd = round(float(usd or 0), 4)
+    except Exception:
+        return False
+    if usd <= 0 or not uid:
+        return False
+    _otp_init()
+    try:
+        with _c() as c:
+            cur = c.execute(
+                "UPDATE users SET otp_balance=COALESCE(otp_balance,0)+%s, "
+                "otp_earned=COALESCE(otp_earned,0)+%s WHERE user_id=%s",
+                (usd, usd, int(uid)))
+            ok = cur.rowcount > 0
+        if ok:
+            _invalidate_user_cache(int(uid))
+            _mark_dirty()
+        return ok
+    except Exception as e:
+        log.warning(f"[OTP] credit uid={uid}: {str(e)[:120]}")
+        return False
+
+
+def otp_wd_new(uid, amt, address):
+    """OTP withdraw রিকোয়েস্ট — atomic কাটা + রো। (wid, err) ফেরত।"""
+    _otp_init()
+    try:
+        amt = round(float(amt or 0), 4)
+    except Exception:
+        amt = 0.0
+    if amt <= 0:
+        return None, "amt"
+    if amt < otp_wd_min():
+        return None, "min"
+    if not otp_wd_on():
+        return None, "locked"
+    _cap = otp_wd_cap()
+    try:
+        with _c() as c:
+            _p = c.execute("SELECT id FROM otp_withdrawals WHERE user_id=%s "
+                           "AND status='pending'", (int(uid),)).fetchone()
+            if _p:
+                return None, "pending"
+            r = c.execute("SELECT COALESCE(otp_balance,0) AS b, "
+                          "COALESCE(otp_withdrawn,0) AS w FROM users WHERE user_id=%s",
+                          (int(uid),)).fetchone()
+            _b = float((r or {}).get("b") or 0)
+            _w = float((r or {}).get("w") or 0)
+            _allowed = min(_b, max(_cap - _w, 0.0)) if _cap > 0 else _b
+            if amt > _allowed + 1e-9:
+                return None, "low"
+            cur = c.execute(
+                "UPDATE users SET otp_balance=GREATEST(COALESCE(otp_balance,0)-%s,0), "
+                "otp_withdrawn=COALESCE(otp_withdrawn,0)+%s "
+                "WHERE user_id=%s AND COALESCE(otp_balance,0) >= %s - 0.000001",
+                (amt, amt, int(uid), amt))
+            if cur.rowcount == 0:
+                return None, "low"
+            ins = c.execute(
+                "INSERT INTO otp_withdrawals (user_id,amount,address,status,requested_at) "
+                "VALUES (%s,%s,%s,'pending',%s) RETURNING id",
+                (int(uid), amt, str(address or "")[:200], now())).fetchone()
+        _invalidate_user_cache(int(uid))
+        _mark_dirty()
+        return int((ins or {}).get("id") or 0), "ok"
+    except Exception as e:
+        log.warning(f"[OTP] wd_new uid={uid}: {str(e)[:150]}")
+        return None, "db"
+
+
+def otp_wd_decide(wid, ok, note=""):
+    """অ্যাডমিন Approve / Reject — reject হলে টাকা otp_balance-এ ফেরত।"""
+    _otp_init()
+    row = None
+    try:
+        with _c() as c:
+            row = c.execute("SELECT * FROM otp_withdrawals WHERE id=%s",
+                            (int(wid),)).fetchone()
+            if not row or str(row["status"]) != "pending":
+                return None
+            if ok:
+                c.execute("UPDATE otp_withdrawals SET status='approved', decided_at=%s, "
+                          "note=%s WHERE id=%s AND status='pending'",
+                          (now(), str(note or "")[:200], int(wid)))
+            else:
+                c.execute("UPDATE otp_withdrawals SET status='rejected', decided_at=%s, "
+                          "note=%s WHERE id=%s AND status='pending'",
+                          (now(), str(note or "")[:200], int(wid)))
+                c.execute("UPDATE users SET otp_balance=COALESCE(otp_balance,0)+%s, "
+                          "otp_withdrawn=GREATEST(COALESCE(otp_withdrawn,0)-%s,0) "
+                          "WHERE user_id=%s",
+                          (float(row["amount"] or 0), float(row["amount"] or 0),
+                           int(row["user_id"] or 0)))
+        _invalidate_user_cache(int(row["user_id"] or 0))
+        _mark_dirty()
+        return dict(row)
+    except Exception as e:
+        log.warning(f"[OTP] wd_decide {wid}: {str(e)[:140]}")
+        return None
+
+
+def otp_wd_paid(wid, tx_hash=""):
+    """অটো পেমেন্ট সফল — approved + tx_hash।"""
+    _otp_init()
+    try:
+        with _c() as c:
+            c.execute("UPDATE otp_withdrawals SET status='approved', decided_at=%s, "
+                      "tx_hash=%s WHERE id=%s AND status='pending'",
+                      (now(), str(tx_hash or "")[:120], int(wid)))
+        _mark_dirty()
+        return True
+    except Exception as e:
+        log.warning(f"[OTP] wd_paid {wid}: {str(e)[:120]}")
+        return False
+
+
+def otp_wd_list(status="pending", limit=100):
+    _otp_init()
+    try:
+        with _c() as c:
+            if status == "all":
+                return c.execute("SELECT * FROM otp_withdrawals ORDER BY id DESC "
+                                 "LIMIT %s", (int(limit),)).fetchall()
+            return c.execute("SELECT * FROM otp_withdrawals WHERE status=%s "
+                             "ORDER BY id DESC LIMIT %s", (status, int(limit))).fetchall()
+    except Exception:
+        return []
+
+
+def otp_admin_totals():
+    """প্যানেলের KPI — মোট দেওয়া, মোট উত্তোলন, pending।"""
+    _otp_init()
+    z = {"earned": 0.0, "withdrawn": 0.0, "pending_n": 0, "pending_usd": 0.0}
+    try:
+        with _c() as c:
+            r = c.execute("SELECT COALESCE(SUM(COALESCE(otp_earned,0)),0) AS e, "
+                          "COALESCE(SUM(COALESCE(otp_withdrawn,0)),0) AS w FROM users").fetchone()
+            p = c.execute("SELECT COUNT(*) AS n, COALESCE(SUM(amount),0) AS a "
+                          "FROM otp_withdrawals WHERE status='pending'").fetchone()
+        z["earned"] = round(float((r or {}).get("e") or 0), 4)
+        z["withdrawn"] = round(float((r or {}).get("w") or 0), 4)
+        z["pending_n"] = int((p or {}).get("n") or 0)
+        z["pending_usd"] = round(float((p or {}).get("a") or 0), 4)
+    except Exception:
+        pass
+    return z
+
+
+# ── বট UI: 👤 My Profile → 🎁 OTP Earn ─────────────────────────
+def _otp_money(x):
+    return f"${float(x or 0):.4f}"
+
+
+def otp_earn_text(uid, lang="bn"):
+    w = otp_wallet(uid)
+    _en = (lang == "en")
+    _cap_line = (f"📏 *Limit:* `{_otp_money(w['cap'])}` total\n" if _en
+                 else f"📏 *লিমিট:* মোট `{_otp_money(w['cap'])}`\n") if w["cap"] > 0 else ""
+    _lock = (("🔓 *Withdraw: ON*" if w["wd_on"] else "🔒 *Withdraw: OFF (locked)*")
+             if _en else
+             ("🔓 *Withdraw: চালু*" if w["wd_on"] else "🔒 *Withdraw: বন্ধ (টাকা লক)*"))
+    _pend = (f"⏳ *Pending:* `{_otp_money(w['pending'])}`\n" if w["pending"] > 0 else "")
+    if _en:
+        return (
+            "🎁 *OTP EARN*\n"
+            "━━━━━━━━━━━━━━━━\n"
+            f"💰 *OTP balance:* `{_otp_money(w['bal'])}`\n"
+            f"📈 *Total earned:* `{_otp_money(w['earned'])}`\n"
+            f"📤 *Withdrawn:* `{_otp_money(w['withdrawn'])}`\n"
+            f"{_pend}"
+            f"{_cap_line}"
+            f"{_lock}\n\n"
+            + (f"✅ Withdrawable now: `{_otp_money(w['avail'])}`"
+               if w["wd_on"] else
+               "ℹ️ This income is separate from your main balance. "
+               "It unlocks when admin enables OTP withdrawal.")
+        )
+    return (
+        "🎁 *OTP EARN*\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"💰 *OTP ব্যালেন্স:* `{_otp_money(w['bal'])}`\n"
+        f"📈 *মোট আয়:* `{_otp_money(w['earned'])}`\n"
+        f"📤 *উত্তোলিত:* `{_otp_money(w['withdrawn'])}`\n"
+        f"{_pend}"
+        f"{_cap_line}"
+        f"{_lock}\n\n"
+        + (f"✅ এখন তোলা যাবে: `{_otp_money(w['avail'])}`"
+           if w["wd_on"] else
+           "ℹ️ এই আয় আপনার মেইন ব্যালেন্স থেকে আলাদা। এডমিন OTP withdraw "
+           "চালু করলে তখনই টাকা তোলা যাবে।")
+    )
+
+
+def otp_earn_kb(uid, lang="bn"):
+    w = otp_wallet(uid)
+    _en = (lang == "en")
+    rows = []
+    if w["wd_on"] and w["avail"] >= max(w["min"], 0.0001):
+        rows.append([InlineKeyboardButton(
+            "💸 Withdraw OTP income" if _en else "💸 OTP ইনকাম withdraw",
+            callback_data="otp:wd")])
+    rows.append([InlineKeyboardButton("🔙 Back" if _en else "🔙 ফিরে যান",
+                                      callback_data="otp:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def otp_earn_show(update, ctx):
+    """প্রোফাইল থেকে বা callback থেকে OTP Earn স্ক্রিন।"""
+    uid = update.effective_user.id
+    lang = await asyncio.to_thread(get_lang, uid)
+    _txt = await asyncio.to_thread(otp_earn_text, uid, lang)
+    _kb = await asyncio.to_thread(otp_earn_kb, uid, lang)
+    if getattr(update, "callback_query", None):
+        try:
+            await update.callback_query.edit_message_text(
+                _txt, parse_mode="Markdown", reply_markup=_kb)
+            return
+        except Exception:
+            pass
+        await update.callback_query.message.reply_text(
+            _txt, parse_mode="Markdown", reply_markup=_kb)
+        return
+    await update.message.reply_text(_txt, parse_mode="Markdown", reply_markup=_kb)
+
+
+async def otp_wd_start(update, ctx):
+    """Withdraw শুরু — সেভ করা wallet থাকলে সেটাই, নাহলে নতুন চাই।"""
+    q = update.callback_query
+    uid = q.from_user.id
+    lang = await asyncio.to_thread(get_lang, uid)
+    _en = (lang == "en")
+    w = await asyncio.to_thread(otp_wallet, uid)
+    if not w["wd_on"]:
+        await q.message.reply_text(
+            "🔒 OTP withdrawal is locked by admin." if _en else
+            "🔒 OTP withdraw এখন এডমিন বন্ধ রেখেছেন।", parse_mode="Markdown")
+        return
+    if w["avail"] <= 0:
+        await q.message.reply_text(
+            "❌ No withdrawable OTP income." if _en else
+            "❌ তোলার মতো OTP ইনকাম নেই।", parse_mode="Markdown")
+        return
+    def _saved():
+        with _c() as c:
+            r = c.execute("SELECT saved_wallet FROM users WHERE user_id=%s",
+                          (int(uid),)).fetchone()
+        return str((r or {}).get("saved_wallet") or "").strip()
+    _sw = await asyncio.to_thread(_saved)
+    if _sw:
+        ctx.user_data["otp_wd_addr"] = _sw
+        ctx.user_data["state"] = "otp_wd_amt"
+        await q.message.reply_text(
+            (f"💸 *OTP Withdraw*\n\n👛 Wallet: `{_sw}`\n"
+             f"💰 Available: `{_otp_money(w['avail'])}`\n"
+             f"⚠️ Minimum: `{_otp_money(w['min'])}`\n\n"
+             "How much do you want to withdraw? (numbers only)")
+            if _en else
+            (f"💸 *OTP Withdraw*\n\n👛 Wallet: `{_sw}`\n"
+             f"💰 তোলা যাবে: `{_otp_money(w['avail'])}`\n"
+             f"⚠️ মিনিমাম: `{_otp_money(w['min'])}`\n\n"
+             "কত ডলার তুলবেন? (শুধু সংখ্যা)"),
+            parse_mode="Markdown", reply_markup=cancel_kb(uid))
+        return
+    ctx.user_data["state"] = "otp_wd_addr"
+    await q.message.reply_text(
+        "👛 Send your USDT-BEP20 (BSC) wallet address (`0x...`)" if _en else
+        "👛 আপনার USDT-BEP20 (BSC) wallet address পাঠান (`0x...`)",
+        parse_mode="Markdown", reply_markup=cancel_kb(uid))
+
+
+async def receive_otp_wd_addr(update, ctx):
+    uid = update.effective_user.id
+    addr = (update.message.text or "").strip()
+    lang = await asyncio.to_thread(get_lang, uid)
+    if not re.match(r"^0x[0-9a-fA-F]{40}$", addr):
+        await update.message.reply_text(
+            "❌ Invalid address. Send a USDT-BEP20 (BSC) address starting with `0x`."
+            if lang == "en" else
+            "❌ ভুল address। `0x` দিয়ে শুরু হওয়া USDT-BEP20 (BSC) address পাঠান।",
+            parse_mode="Markdown", reply_markup=cancel_kb(uid))
+        return
+    ctx.user_data["otp_wd_addr"] = addr
+    ctx.user_data["state"] = "otp_wd_amt"
+    w = await asyncio.to_thread(otp_wallet, uid)
+    await update.message.reply_text(
+        (f"💸 *OTP Withdraw*\n\n👛 Wallet: `{addr}`\n"
+         f"💰 Available: `{_otp_money(w['avail'])}`\n"
+         f"⚠️ Minimum: `{_otp_money(w['min'])}`\n\n"
+         "How much do you want to withdraw? (numbers only)")
+        if lang == "en" else
+        (f"💸 *OTP Withdraw*\n\n👛 Wallet: `{addr}`\n"
+         f"💰 তোলা যাবে: `{_otp_money(w['avail'])}`\n"
+         f"⚠️ মিনিমাম: `{_otp_money(w['min'])}`\n\n"
+         "কত ডলার তুলবেন? (শুধু সংখ্যা)"),
+        parse_mode="Markdown", reply_markup=cancel_kb(uid))
+
+
+async def receive_otp_wd_amt(update, ctx):
+    uid = update.effective_user.id
+    lang = await asyncio.to_thread(get_lang, uid)
+    try:
+        amt = float((update.message.text or "").strip().replace("$", "").replace(",", "."))
+    except Exception:
+        await update.message.reply_text(
+            "❌ Send a number only." if lang == "en" else "❌ শুধু সংখ্যা পাঠান।",
+            reply_markup=cancel_kb(uid))
+        return
+    w = await asyncio.to_thread(otp_wallet, uid)
+    if amt < w["min"]:
+        await update.message.reply_text(
+            f"❌ Minimum: `{_otp_money(w['min'])}`" if lang == "en" else
+            f"❌ মিনিমাম: `{_otp_money(w['min'])}`",
+            parse_mode="Markdown", reply_markup=cancel_kb(uid))
+        return
+    if amt > w["avail"] + 1e-9:
+        await update.message.reply_text(
+            (f"❌ Not enough OTP income.\n\n💰 Available: `{_otp_money(w['avail'])}`")
+            if lang == "en" else
+            (f"❌ যথেষ্ট OTP ইনকাম নেই।\n\n💰 আছে: `{_otp_money(w['avail'])}`"),
+            parse_mode="Markdown", reply_markup=cancel_kb(uid))
+        return
+    ctx.user_data["otp_wd_amt"] = round(amt, 4)
+    ctx.user_data["state"] = "otp_wd_confirm"
+    _addr = ctx.user_data.get("otp_wd_addr") or ""
+    await update.message.reply_text(
+        (f"📋 *Confirm OTP withdrawal*\n\n👛 `{_addr}`\n"
+         f"💵 Amount: `{_otp_money(amt)}`\n"
+         f"🏦 You receive: `{_otp_money(amt)}`\n\n"
+         "Admin will review and pay manually.")
+        if lang == "en" else
+        (f"📋 *OTP withdraw নিশ্চিত করুন*\n\n👛 `{_addr}`\n"
+         f"💵 পরিমাণ: `{_otp_money(amt)}`\n"
+         f"🏦 পাবেন: `{_otp_money(amt)}`\n\n"
+         "এডমিন চেক করে ম্যানুয়ালি পেমেন্ট করবেন।"),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm" if lang == "en" else "✅ নিশ্চিত",
+                                  callback_data="otp:wdok")],
+            [InlineKeyboardButton("✖️ Cancel" if lang == "en" else "✖️ বাতিল",
+                                  callback_data="otp:home")],
+        ]))
+
+
+async def do_otp_wd_submit(update, ctx):
+    q = update.callback_query
+    uid = q.from_user.id
+    addr = str(ctx.user_data.get("otp_wd_addr") or "")
+    amt = float(ctx.user_data.get("otp_wd_amt") or 0)
+    for k in ("state", "otp_wd_amt", "otp_wd_addr"):
+        ctx.user_data.pop(k, None)
+    lang = await asyncio.to_thread(get_lang, uid)
+    _en = (lang == "en")
+    wid, err = await asyncio.to_thread(otp_wd_new, uid, amt, addr)
+    if err != "ok":
+        _msg = {
+            "min": "❌ Amount is below the minimum.",
+            "low": "❌ Not enough withdrawable OTP income (check the limit).",
+            "locked": "🔒 OTP withdrawal is locked by admin.",
+            "pending": "⚠️ You already have a pending OTP withdrawal.",
+            "amt": "❌ Invalid amount.",
+        }.get(err, "❌ Failed. Please try again.") if _en else {
+            "min": "❌ মিনিমামের চেয়ে কম।",
+            "low": "❌ তোলার মতো OTP ইনকাম নেই (লিমিট দেখুন)।",
+            "locked": "🔒 OTP withdraw এডমিন বন্ধ রেখেছেন।",
+            "pending": "⚠️ আপনার একটা OTP withdraw আগেই পেন্ডিং আছে।",
+            "amt": "❌ ভুল পরিমাণ।",
+        }.get(err, "❌ হয়নি, আবার চেষ্টা করুন।")
+        await q.message.reply_text(_msg, parse_mode="Markdown")
+        return
+    # ── Withdraw চালু = বট নিজেই অটো পেমেন্ট করে (USDT-BEP20) ──
+    await q.message.reply_text(
+        (f"⏳ *Processing your OTP withdrawal…*\n\n👛 `{addr}`\n"
+         f"💵 `{_otp_money(amt)}`\n\n⚡ Auto payment, a few seconds.")
+        if _en else
+        (f"⏳ *OTP withdraw প্রসেস হচ্ছে…*\n\n👛 `{addr}`\n"
+         f"💵 `{_otp_money(amt)}`\n\n⚡ অটো পেমেন্ট, কয়েক সেকেন্ড।"),
+        parse_mode="Markdown")
+    _task = asyncio.create_task(
+        _otp_pay_bg(ctx.bot, uid, wid, addr, amt, _en))
+    try:
+        _background_tasks.add(_task)
+        _task.add_done_callback(_bg_task_done)
+    except Exception:
+        pass
+
+
+async def _otp_pay_bg(bot_obj, uid, wid, addr, amt, en=False):
+    """ব্যাকগ্রাউন্ডে অটো পেমেন্ট — সফল হলে approved+tx, না হলে পেন্ডিং রাখে
+    এবং অ্যাডমিনকে জানায় (ডাবল-পেমেন্ট রোধে কোনো রিট্রাই নেই)।"""
+    _tx, _err = "", ""
+    try:
+        if not _WEB3_OK:
+            _err = "web3 library নেই"
+        elif not BSC_PRIVATE_KEY:
+            _err = "BSC_PRIVATE_KEY সেট নেই"
+        elif not await asyncio.to_thread(get_bsc_wallet_addr):
+            _err = "BSC_WALLET_ADDRESS সেট নেই"
+        else:
+            _tx, _err, _gas_usd, _gas_bnb = await asyncio.to_thread(
+                send_usdt_bep20, addr, amt)
+    except Exception as _e:
+        _err = str(_e)[:160]
+    if _tx:
+        try:
+            await asyncio.to_thread(otp_wd_paid, wid, _tx)
+        except Exception:
+            pass
+        try:
+            await bot_obj.send_message(
+                int(uid),
+                (f"✅ *OTP withdrawal paid!*\n\n👛 `{addr}`\n"
+                 f"💵 `${float(amt):.4f}` USDT\n🔗 TxHash: `{_tx}`\n\n"
+                 "💎 Auto payment sent.")
+                if en else
+                (f"✅ *OTP withdraw পেমেন্ট সম্পন্ন!*\n\n👛 `{addr}`\n"
+                 f"💵 `${float(amt):.4f}` USDT\n🔗 TxHash: `{_tx}`\n\n"
+                 "💎 অটো পেমেন্ট পাঠানো হয়েছে।"),
+                parse_mode="Markdown", disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "🔍 BSCScan" if en else "🔍 BSCScan এ দেখুন",
+                    url=f"https://bscscan.com/tx/{_tx}")]]))
+        except Exception as _n:
+            log.warning(f"[OTP] pay notify uid={uid}: {str(_n)[:120]}")
+        return
+    # অটো ব্যর্থ/সেটআপ নেই → রিকোয়েস্ট পেন্ডিংই থাকে, অ্যাডমিন জানানো হয়
+    try:
+        await notify_full_admins(
+            bot_obj,
+            (f"🎁 *OTP withdraw pending — auto pay ব্যর্থ* `#{wid}`\n\n"
+             f"👤 User: `{uid}`\n💵 `{_otp_money(amt)}`\n👛 `{addr}`\n\n"
+             f"⚠️ কারণ: {(str(_err) or 'unknown')[:140]}\n"
+             "✅ Approve/Reject: web panel → OTP Earn"))
+    except Exception:
+        pass
+    try:
+        await bot_obj.send_message(
+            int(uid),
+            (f"⏳ *OTP withdrawal `#{wid}` is pending*\n\n"
+             "Auto payment could not be completed — admin will review it.")
+            if en else
+            (f"⏳ *OTP withdraw `#{wid}` পেন্ডিং আছে*\n\n"
+             "অটো পেমেন্ট এখন হয়নি — এডমিন চেক করে দেবেন।"),
+            parse_mode="Markdown")
+    except Exception:
+        pass
+
+
+# ── 📥 অ্যাডমিন: বট থেকেই OTP নাম্বার আপলোড ──────────────────────
+async def cmd_otpadd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/otpadd — .txt ফাইল বা পেস্ট করা নাম্বার দিয়ে OTP স্টক যোগ।"""
+    uid = update.effective_user.id
+    if not await asyncio.to_thread(is_admin, uid):
+        await update.message.reply_text(
+            "❌ *এই command শুধু Admin ব্যবহার করতে পারবে।*", parse_mode="Markdown")
+        return
+    ctx.user_data["state"] = "otp_txt"
+    ctx.user_data.pop("otp_txt_data", None)
+    await update.message.reply_text(
+        "📥 *OTP নাম্বার আপলোড*\n\n"
+        "১) `.txt` ফাইল পাঠান (প্রতি লাইনে ১টা নাম্বার), অথবা\n"
+        "২) নাম্বারগুল চ্যাটে পেস্ট করুন।\n\n"
+        "ফরম্যাট: `নাম্বার` / `নাম্বার|রেট` / `নাম্বার|রেট|সার্ভিস`\n"
+        "দেশ বট নিজেই বের করবে।\n\n"
+        "❌ বাতিল: /cancel",
+        parse_mode="Markdown")
+
+
+async def _otp_add_got_numbers(update, ctx, text):
+    """নাম্বার পেয়ে গেছি → সার্ভিস জিজ্ঞেস করো।"""
+    _t = str(text or "").strip()
+    if not _t:
+        await update.message.reply_text(
+            "❌ কিছু পাওয়া যায়নি। আবার ফাইল/নাম্বার পাঠান বা /cancel।")
+        return
+    ctx.user_data["otp_txt_data"] = _t
+    ctx.user_data["state"] = "otp_svc"
+    _n = len([x for x in _t.splitlines() if x.strip()])
+    await update.message.reply_text(
+        f"✅ `{_n}` লাইন পাওয়া গেছে।\n\n"
+        "এখন *সার্ভিস* লিখুন (যেমন `facebook`, `whatsapp`) — "
+        "খালি রাখতে চাইলে `-` পাঠান।\n\n❌ বাতিল: /cancel",
+        parse_mode="Markdown")
+
+
+async def _otp_add_finish(update, ctx, rate, lang="bn"):
+    """ডেটা + সার্ভিস + রেট নিয়ে স্টকে যোগ।"""
+    _text = ctx.user_data.pop("otp_txt_data", "")
+    _svc = ctx.user_data.pop("otp_service", "")
+    for _k in ("state", "otp_rate"):
+        ctx.user_data.pop(_k, None)
+    try:
+        added, dup, bad = await asyncio.to_thread(
+            otp_numbers_add, _text, _svc, rate, "bot upload")
+    except Exception as e:
+        await update.message.reply_text(f"❌ যোগ হয়নি: {str(e)[:160]}")
+        return
+    _tail = []
+    if dup:
+        _tail.append(f"{dup} ডুপ্লিকেট বাদ")
+    if bad:
+        _tail.append(f"{bad} লাইন ভুল")
+    await update.message.reply_text(
+        (f"✅ *{added} numbers added*" + ("\n♻️ " + " · ".join(_tail) if _tail else "")
+         + f"\n📦 Total free: `{otp_stock_stats()[0]}`")
+        if lang == "en" else
+        (f"✅ *{added} টা নাম্বার যোগ হয়েছে*" + ("\n♻️ " + " · ".join(_tail) if _tail else "")
+         + f"\n📦 এখন মোট ফ্রি: `{otp_stock_stats()[0]}`"),
+        parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, update.effective_user.id))
+
+
+LAMIX_API_DEF = "https://panel.lamix.org"
+LAMIX_RATE_BURST = 1.0        # সেকেন্ডে ১টি (ডকের burst limit)
+LAMIX_RATE_MIN = 40           # মিনিটে ৪০টি (sustained limit)
+_LAMIX_RL = {"times": [], "last": 0.0, "blocked": 0.0}
+_LAMIX_RANGES = {"ts": 0.0, "rows": []}
+_LAMIX_RANGES_TTL = 120.0     # রেঞ্জ/রেট খুব কম বদলায় — ২ মিনিট ক্যাশ
+
+
+def lamix_key():
+    """Lamix REST API টোকেন (প্যানেল → REST API পেজ থেকে)।"""
+    try:
+        return _re.sub(r"\s+", "", str(get_setting("lamix_key") or ""))
+    except Exception:
+        return ""
+
+
+def lamix_base():
+    """প্যানেলের ঠিকানা — ডিফল্ট https://panel.lamix.org।"""
+    try:
+        return ((str(get_setting("lamix_api") or "").strip().rstrip("/"))
+                or LAMIX_API_DEF)
+    except Exception:
+        return LAMIX_API_DEF
+
+
+def lamix_on():
+    """Lamix API চালু কি না — টোকেন আছে এবং `lamix_on` off নয়।"""
+    try:
+        if (str(get_setting("lamix_on") or "on").strip().lower() == "off"):
+            return False
+        return bool(lamix_key())
+    except Exception:
+        return False
+
+
+def lamix_dec(val):
+    """ডকের নিয়ম: টাকা/রেট decimal **স্ট্রিং** — float-এ যোগ করলে ভুল হয়।
+
+    Decimal ফেরত দেয়; ভুল হলে 0।
+    """
+    try:
+        from decimal import Decimal
+        return Decimal(str(val).strip() or "0")
+    except Exception:
+        return 0
+
+
+def lamix_money(val):
+    """'0.0125' → 0.0125 (শুধু দেখানোর জন্য; যোগ-বিয়োগে `lamix_dec` ব্যবহার করুন)।"""
+    try:
+        return float(lamix_dec(val))
+    except Exception:
+        return 0.0
+
+
+_LAMIX_ERR = {
+    "missing_token": ("Lamix টোকেন দেওয়া হয়নি (অ্যাডমিন প্যানেল → দোকান → Lamix API)।",
+                      "No Lamix token configured."),
+    "invalid_token": ("টোকেন ভুল/বাতিল, অথবা অ্যাকাউন্ট বন্ধ।",
+                      "Token is invalid, revoked or the account is disabled."),
+    "module_disabled": ("এই প্যানেলে Extended API চালু নেই — প্রোভাইডারকে বলুন।",
+                        "The Extended API is not enabled on this panel."),
+    "extended_api_disabled": ("আপনার অ্যাকাউন্টে Extended API চালু নেই — অ্যাডমিনকে বলুন।",
+                              "The Extended API is not enabled on your account."),
+    "rate_limited": ("অনেক বেশি রিকোয়েস্ট — একটু পরে আবার চেষ্টা হবে।",
+                     "Too many requests — retrying after a short wait."),
+    "invalid_request": ("প্যারামিটার ভুল বা নেই।", "A parameter is missing or malformed."),
+    "not_your_client": ("এই ইউজারনেম আপনার ক্লায়েন্ট নয়।",
+                        "That username is not one of your clients."),
+    "client_rate_exceeds_agent_rate": ("ক্লায়েন্টের রেট আপনার নিজের রেটের চেয়ে বেশি হতে পারে না।",
+                                      "The client rate is above your own rate."),
+    "too_many_numbers": ("একবারে সর্বোচ্চ ১০০০ নাম্বার।", "Over the 1000-number limit."),
+    "not_found": ("এই endpoint নেই।", "No such endpoint."),
+    "internal_error": ("প্রোভাইডারের সার্ভারে সমস্যা — একটু পরে দেখুন।",
+                       "Something failed on the provider's side."),
+    "network": ("Lamix-এ পৌঁছানো যায়নি (নেটওয়ার্ক/টাইমআউট)।",
+                "Could not reach Lamix (network/timeout)."),
+}
+
+
+def lamix_err_text(code, en=False):
+    """এরর কোড → বোঝার মতো লেখা (ডকে বলা আছে: message নয়, code ধরে মেলাতে)।"""
+    _c = str(code or "").strip().lower()
+    _pair = _LAMIX_ERR.get(_c)
+    if _pair:
+        return _pair[1] if en else _pair[0]
+    return ("Lamix: " + (_c or "unknown"))
+
+
+def _lamix_wait_turn():
+    """রেট লিমিটের পালা — ৪০/মিনিট ও ১/সেকেন্ড মেনে অপেক্ষা (sync, thread-এ চলে)।"""
+    try:
+        _now = _time.time()
+        _blk = float(_LAMIX_RL.get("blocked") or 0.0)
+        if _blk > _now:
+            _time.sleep(min(10.0, _blk - _now))
+        for _ in range(4):
+            _now = _time.time()
+            _ts = [x for x in (_LAMIX_RL.get("times") or [])
+                   if _now - float(x) < 60.0]
+            if len(_ts) >= LAMIX_RATE_MIN:
+                _wait = 60.0 - (_now - float(_ts[0]))
+                _time.sleep(min(10.0, max(0.3, _wait)))
+                continue
+            _gap = LAMIX_RATE_BURST - (_now - float(_LAMIX_RL.get("last") or 0.0))
+            if _gap > 0:
+                _time.sleep(min(1.0, _gap))
+                _now = _time.time()
+            _ts.append(_now)
+            _LAMIX_RL["times"] = _ts[-LAMIX_RATE_MIN:]
+            _LAMIX_RL["last"] = _now
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _lamix_api(path, params=None, method="GET", body=None, timeout=20):
+    """Lamix REST → JSON dict। ব্যর্থ হলে `{'error': code, 'message': ...}`।
+
+    · Bearer token হেডারে (query-তে নয় — লগে টোকেন লিক হয় না)
+    · 429 এলে `Retry-After` মেনে একবার আবার চেষ্টা
+    · কখনো exception ছোড়ে না — কল করা জব/হ্যান্ডলার ভাঙে না
+    """
+    _k = lamix_key()
+    if not _k:
+        return {"error": "missing_token", "message": lamix_err_text("missing_token")}
+    _url = lamix_base().rstrip("/") + "/api/v1/" + str(path or "").lstrip("/")
+    if params:
+        _q = {k: v for k, v in params.items() if v not in (None, "", False)}
+        if _q:
+            _url += "?" + urllib.parse.urlencode(_q)
+    _hdrs = {"Authorization": "Bearer " + _k, "Accept": "application/json",
+             "User-Agent": "TaskEarnBot/1.0"}
+    _data = None
+    if body is not None:
+        try:
+            _data = _json.dumps(body).encode("utf-8")
+        except Exception:
+            _data = None
+        _hdrs["Content-Type"] = "application/json"
+    for _try in range(2):
+        if not _lamix_wait_turn():
+            return {"error": "rate_limited", "message": lamix_err_text("rate_limited")}
+        _code, _txt, _hdr = 0, "", {}
+        try:
+            _rq = urllib.request.Request(_url, data=_data, headers=_hdrs,
+                                         method=str(method or "GET").upper())
+            with urllib.request.urlopen(_rq, timeout=timeout) as _r:
+                _code = int(getattr(_r, "status", 200) or 200)
+                _txt = _r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as _he:
+            _code = int(_he.code or 0)
+            try:
+                _txt = _he.read().decode("utf-8", "replace")
+            except Exception:
+                _txt = ""
+            try:
+                _hdr = {str(k).lower(): v for k, v in (_he.headers or {}).items()}
+            except Exception:
+                _hdr = {}
+        except Exception as _ne:
+            return {"error": "network", "message": str(_ne)[:150]}
+        try:
+            _js = _json.loads(_txt) if _txt else {}
+        except Exception:
+            _js = {"error": "bad_json", "raw": _txt[:200]}
+        if not isinstance(_js, dict):
+            _js = {"data": _js}
+        if _code == 429 or str(_js.get("error") or "") == "rate_limited":
+            _ra = (_hdr.get("retry-after") or _js.get("retryAfterSeconds") or 30)
+            try:
+                _sec = int(float(_ra))
+            except Exception:
+                _sec = 30
+            _sec = max(1, min(60, _sec))
+            try:
+                _LAMIX_RL["blocked"] = _time.time() + _sec
+            except Exception:
+                pass
+            if _try == 0:
+                _time.sleep(_sec)
+                continue
+            return {"error": "rate_limited", "retry": _sec,
+                    "message": lamix_err_text("rate_limited")}
+        if _code >= 400 or _js.get("error"):
+            _er = str(_js.get("error") or ("http_%d" % _code))
+            return {"error": _er, "http": _code,
+                    "message": lamix_err_text(_er)}
+        return _js
+    return {"error": "rate_limited", "message": lamix_err_text("rate_limited")}
+
+
+def lamix_messages(from_ts=None, to_ts=None, number=None, cli=None, limit=50):
+    """সর্বশেষ রিসিভড মেসেজ (নতুন আগে) → list[dict]; ব্যর্থ হলে [].
+
+    ⚠️ ফিল্টার ছাড়া ডিফল্ট ১০টি; আমরা ৫০ চাই। `content`-এ OTP থাকতে পারে।
+    """
+    _d = _lamix_api("messages", {"from": from_ts, "to": to_ts, "number": number,
+                                 "cli": cli, "limit": max(1, min(1000, int(limit or 10)))})
+    if "error" in _d:
+        return []
+    _r = _d.get("records")
+    return [dict(x) for x in _r if isinstance(x, dict)] if isinstance(_r, list) else []
+
+
+def lamix_ranges(force=False):
+    """আপনার নাম্বার-রেঞ্জ + প্রতি প্ল্যানে আপনার payout রেট → list[dict]।
+
+    ২ মিনিট ক্যাশে (রেট লিমিট বাঁচাতে); কল ব্যর্থ হলে আগের লিস্টই ফেরত দেয়।
+    """
+    _t = _time.time()
+    if (not force and (_LAMIX_RANGES.get("rows") or [])
+            and _t - float(_LAMIX_RANGES.get("ts") or 0) < _LAMIX_RANGES_TTL):
+        return _LAMIX_RANGES["rows"]
+    _d = _lamix_api("ranges")
+    if "error" in _d:
+        return _LAMIX_RANGES.get("rows") or []
+    _r = _d.get("ranges")
+    _rows = [dict(x) for x in _r if isinstance(x, dict)] if isinstance(_r, list) else []
+    if _rows:
+        _LAMIX_RANGES.update({"ts": _t, "rows": _rows})
+    return _rows
+
+
+def lamix_numbers(range_id=None, assigned=None, client=None, search=None,
+                  limit=100, after=None):
+    """আপনার নাম্বার (keyset paginated) → {'records': [...], 'nextCursor': ...}।
+
+    `after`-এ আগের পেজের `nextCursor` দিলে পরের পেজ; `None` = শেষ পেজ।
+    """
+    _p = {"rangeId": range_id, "clientId": client, "search": search,
+          "after": after, "limit": max(1, min(500, int(limit or 100)))}
+    if assigned is not None:
+        _p["assigned"] = "true" if assigned else "false"
+    _d = _lamix_api("numbers", _p)
+    if "error" in _d:
+        return {"records": [], "nextCursor": None, "error": _d.get("error"),
+                "message": _d.get("message") or ""}
+    _r = _d.get("records")
+    return {"records": [dict(x) for x in _r if isinstance(x, dict)] if isinstance(_r, list) else [],
+            "nextCursor": _d.get("nextCursor"),
+            "count": _d.get("count"), "limit": _d.get("limit")}
+
+
+def lamix_numbers_all(range_id=None, assigned=None, max_pages=20, limit=500):
+    """সব পেজ ঘুরে পুরো নাম্বার-লিস্ট (সর্বোচ্চ max_pages × limit)।"""
+    _out, _cur, _n = [], None, 0
+    while _n < max(1, int(max_pages or 1)):
+        _p = lamix_numbers(range_id=range_id, assigned=assigned,
+                           limit=limit, after=_cur)
+        _out.extend(_p.get("records") or [])
+        _cur = _p.get("nextCursor")
+        _n += 1
+        if not _cur:
+            break
+    return _out
+
+
+def lamix_cdrs(from_ts=None, to_ts=None, number=None, cli=None,
+               range_id=None, limit=100):
+    """বিলিং/আর্নিং রেকর্ড (messages-এর চেয়ে বিস্তারিত) → list[dict]।"""
+    _d = _lamix_api("cdrs", {"from": from_ts, "to": to_ts, "number": number,
+                             "cli": cli, "rangeId": range_id,
+                             "limit": max(1, min(500, int(limit or 100)))})
+    if "error" in _d:
+        return []
+    _r = _d.get("records")
+    return [dict(x) for x in _r if isinstance(x, dict)] if isinstance(_r, list) else []
+
+
+def lamix_assign(client, numbers, rate):
+    """নাম্বার ক্লায়েন্টকে দেওয়া (এজেন্ট অ্যাকাউন্ট) → {'assigned','reassigned','skipped'}।
+
+    `rate` **আবশ্যক** — "কিছু আয় করবে না" হলে `0` দিতে হবে (বাদ দিলে রিজেক্ট)।
+    """
+    _nums = [str(x).strip() for x in (numbers or []) if str(x).strip()][:1000]
+    if not _nums or not str(client or "").strip():
+        return {"error": "invalid_request", "message": lamix_err_text("invalid_request")}
+    _d = _lamix_api("numbers/assign", method="POST",
+                    body={"client": str(client).strip(), "numbers": _nums,
+                          "clientPayoutRate": str(rate if rate is not None else "0")})
+    return _d
+
+
+def lamix_unassign(numbers):
+    """ক্লায়েন্টের কাছ থেকে নাম্বার ফিরিয়ে নেওয়া → {'assigned','reassigned','skipped'}।"""
+    _nums = [str(x).strip() for x in (numbers or []) if str(x).strip()][:1000]
+    if not _nums:
+        return {"error": "invalid_request", "message": lamix_err_text("invalid_request")}
+    return _lamix_api("numbers/unassign", method="POST", body={"numbers": _nums})
+
+
+def lamix_clients(limit=100):
+    """আপনার ক্লায়েন্ট-লিস্ট (এজেন্ট অ্যাকাউন্ট) → list[dict]।"""
+    _d = _lamix_api("clients", {"limit": max(1, min(500, int(limit or 100)))})
+    if "error" in _d:
+        return []
+    _r = _d.get("clients")
+    return [dict(x) for x in _r if isinstance(x, dict)] if isinstance(_r, list) else []
+
+
+def lamix_client_new(username, password=None, name=None, email=None,
+                     contact=None, can_use_api=None, can_view_ranges=None,
+                     can_use_extended_api=None):
+    """নতুন ক্লায়েন্ট (এজেন্ট অ্যাকাউন্ট) — পাসওয়ার্ড না দিলে একবারই ফেরত আসে।"""
+    _b = {"username": str(username or "").strip()}
+    if not _b["username"]:
+        return {"error": "invalid_request", "message": lamix_err_text("invalid_request")}
+    for _k, _v in (("password", password), ("name", name), ("email", email),
+                   ("contact", contact), ("canUseApi", can_use_api),
+                   ("canViewRanges", can_view_ranges),
+                   ("canUseExtendedApi", can_use_extended_api)):
+        if _v not in (None, ""):
+            _b[_k] = _v
+    return _lamix_api("clients", method="POST", body=_b)
+
+
+def lamix_ping():
+    """সংযোগ/টোকেন ঠিক কি না → '' (ঠিক) নয়তো বোঝার মতো এরর-লেখা।
+
+    `/messages?limit=1` সব টোকেনে কাজ করে — তাই এটাই সবচেয়ে সস্তা পরীক্ষা।
+    """
+    if not lamix_key():
+        return lamix_err_text("missing_token")
+    _d = _lamix_api("messages", {"limit": 1})
+    if "error" in _d:
+        return str(_d.get("message") or lamix_err_text(_d.get("error")))
+    return ""
+
+
+def lamix_msg_code(content):
+    """মেসেজের টেক্সট থেকে কোড বের করা (OTP হলে)।"""
+    try:
+        return _gn_otp_code(content) or ""
+    except Exception:
+        return ""
+
+
+def lamix_msg_row(r, service=""):
+    """Lamix মেসেজ → বটের ভেতরের কমন রো (পরে নাম্বার ফ্লো এটাই ব্যবহার করবে)।
+
+    ⚠️ এখানে কিছুই DB-তে সেভ হয় না — শুধু নরমালাইজ।
+    """
+    _r = dict(r or {})
+    _content = str(_r.get("content") or "")
+    return {
+        "time": str(_r.get("time") or ""),
+        "cli": str(_r.get("cli") or ""),
+        "number": str(_r.get("number") or ""),
+        "content": _content,
+        "otp": lamix_msg_code(_content),
+        "range": str(_r.get("range") or ""),
+        "payout": lamix_money(_r.get("payout")),
+        "payout_raw": str(_r.get("payout") or ""),
+        "status": str(_r.get("status") or ""),
+        "service": str(service or ""),
+    }
+
+
 # ═════════════════ ✉️ মেইল কিনুন (SmsBower mails API) ═════════════════
 # ডক: https://documenter.getpostman.com/view/16514200/2sAXxLCEma
 #   getPriceRests → getActivation → getCode → setStatus / requestRefund
@@ -12179,9 +13843,15 @@ def mail_order_new(uid, mail, mail_id, service, domain, usd, tk):
             "price,usd,ts,created_at) VALUES(%s,%s,%s,%s,%s,'waiting',%s,%s,%s,%s) "
             "RETURNING id",
             (uid, str(mail)[:120], str(mail_id)[:40], str(service)[:40],
-             str(domain)[:80], round(float(tk), 4), round(float(usd), 4),
+             str(domain)[:80],             round(float(tk), 4), round(float(usd), 4),
              _time.time(), now())).fetchone()
-    return int(r["id"])
+    _oid = int(r["id"])
+    # 🔔 নতুন মেইল অর্ডার = কাজ আছে → জবের idle-cooldown শেষ (দেরি হবে না)
+    try:
+        _ru_mark_active("mail_otp")
+    except Exception:
+        pass
+    return _oid
 
 
 def mail_order_set(oid, **kv):
@@ -12191,6 +13861,39 @@ def mail_order_set(oid, **kv):
     with _c() as c:
         c.execute(f"UPDATE mail_orders SET {_cols}, updated_at=%s WHERE id=%s",
                   tuple(list(kv.values()) + [now(), int(oid)]))
+
+
+def mail_order_set_code(oid, code):
+    """কোড সেভ — শুধু অর্ডার বাতিল/রিফান্ড না হলে (রিফান্ডের পরে আর বদলাবে না)।
+
+    True = কোড সেভ হয়েছে; False = অর্ডার ইতিমধ্যে refunding/refunded/code।
+    """
+    try:
+        with _c() as c:
+            r = c.execute(
+                "UPDATE mail_orders SET code=%s, status='code', updated_at=%s "
+                "WHERE id=%s AND status IN ('waiting','expired')",
+                (str(code)[:40], now(), int(oid)))
+        return bool(getattr(r, "rowcount", 0))
+    except Exception:
+        return False
+
+
+def mail_order_unclaim(oid, back="waiting"):
+    """প্রোভাইডার বাতিল না দিলে refunding → আগের অবস্থায় ফেরত (শুধু তখনই)।
+
+    ⚠️ শর্ত ছাড়া status লেখা যাবে না — ততক্ষণে অন্য পথে রিফান্ড কমিট হয়ে
+    গেলে অর্ডার আবার 'waiting' হয়ে গিয়ে দ্বিতীয়বার টাকা ফেরত যেত।
+    """
+    try:
+        with _c() as c:
+            c.execute(
+                "UPDATE mail_orders SET status=%s, updated_at=%s "
+                "WHERE id=%s AND status='refunding'",
+                (str(back or "waiting"), now(), int(oid)))
+        return True
+    except Exception:
+        return False
 
 
 def mail_order_claim(oid, statuses=("waiting", "expired")):
@@ -12618,8 +14321,12 @@ async def _mailb_cancel(update, oid):
         _dc = {}
     _cd = str(_dc.get("code") or "").strip() if str(_dc.get("status")) == "1" else ""
     if _cd:
+        # ⚠️ ততক্ষণে অটো-রিফান্ড হয়ে থাকলে কোড সেট করব না (নাহলে অর্ডার
+        #    'code' হয়ে রিফান্ডের রেকর্ড ঢেকে যেত)
+        if not await asyncio.to_thread(mail_order_set_code, oid, _cd):
+            _o4 = await asyncio.to_thread(mail_order_get, oid) or dict(_o)
+            return await _gn_say(update, _mail_order_text(_o4, en), _mail_order_kb(_o4, en))
         try:
-            await asyncio.to_thread(mail_order_set, oid, code=_cd, status="code")
             await asyncio.to_thread(_mail_api, "/api/mail/setStatus",
                                     id=_o.get("mail_id"), status=3)
         except Exception:
@@ -12638,11 +14345,12 @@ async def _mailb_cancel(update, oid):
             f"❌ বাতিল হয়েছে — {_tk:g}৳ আপনার ডিপোজিট ব্যালেন্সে ফেরত দেওয়া হয়েছে।",
             f"❌ Canceled — {_tk:g}৳ returned to your deposit balance.", en),
             _mail_order_kb(dict(_o, status="refunded"), en))
-    # প্রোভাইডার বাতিল দেয়নি → অর্ডার আগের অবস্থায় ফেরত (ইউজারের টাকা তো আটকে নেই)
-    try:
-        await asyncio.to_thread(mail_order_set, oid, status=_st)
-    except Exception:
-        pass
+    # 🧭 এদিকে অটো-জব রিফান্ড কমিট করে ফেলতে পারে — আগে সত্যিকারের অবস্থা দেখি
+    _o5 = await asyncio.to_thread(mail_order_get, oid) or dict(_o)
+    if str(_o5.get("status") or "") == "refunded":
+        return await _gn_say(update, _mail_order_text(_o5, en), _mail_order_kb(_o5, en))
+    # প্রোভাইডার বাতিল দেয়নি → অর্ডার আগের অবস্থায় ফেরত (শুধু 'refunding' থেকে)
+    await asyncio.to_thread(mail_order_unclaim, oid, _st)
     return await _gn_say(update, _bi(
         "⚠️ প্রোভাইডারে বাতিল হয়নি — একটু পরে আবার চাপুন।\n"
         "(প্রোভাইডার রিফান্ড নিশ্চিত না হলে ব্যালেন্সে টাকা দেওয়া হয় না)",
@@ -12736,10 +14444,18 @@ async def job_mail_otp(context):
     ⏰ ২৫ মিনিটে কোড না এলে অটোমেটিক অর্ডার বাতিল হয়; প্রোভাইডারের রিফান্ড
     নিশ্চিত (setStatus=2 সফল) হওয়ার পরেই ইউজারের ব্যালেন্সে টাকা যায়।
     """
+    if _ru_idle_skip("mail_otp"):   # চালু মেইল-অর্ডার নেই → ফাঁকা query নয়
+        return
     try:
         rows = await asyncio.to_thread(_mail_waiting)
     except Exception:
         return
+    if not rows:
+        # চালু অর্ডার নেই → ৩ মিনিট কোনো ফাঁকা query নয়। ইউজার নতুন মেইল
+        # নিলেই `mail_order_new` cooldown মুছে দেয় → পরের টিকেই চেক শুরু
+        _ru_mark_idle("mail_otp", 180)
+        return
+    _ru_mark_active("mail_otp")
     for o in rows:
         _oid = int(o.get("id") or 0)
         _uid = int(o.get("user_id") or 0)
@@ -12762,8 +14478,10 @@ async def job_mail_otp(context):
             _code = (str(_d.get("code") or "").strip()
                      if str(_d.get("status")) == "1" else "")
             if _code:
+                # ⚠️ শর্তসাপেক্ষ সেভ — এর মধ্যে ইউজার বাতিল করলে কোড আর বসবে না
+                if not await asyncio.to_thread(mail_order_set_code, _oid, _code):
+                    continue
                 try:
-                    await asyncio.to_thread(mail_order_set, _oid, code=_code, status="code")
                     await asyncio.to_thread(_mail_api, "/api/mail/setStatus",
                                             id=o.get("mail_id"), status=3)
                 except Exception:
@@ -22535,10 +24253,11 @@ async def show_profile(update, ctx):
     except Exception:
         _rate = 125.0
     _total_usd = float(bal or 0) + (_dep_bal / _rate)
+    _otp_w = await asyncio.to_thread(otp_wallet, uid)
     _name = _md_esc(user.full_name or user.username or "—")
     if user.username and user.full_name:
         _name += f" (@{_md_esc(user.username)})"
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         f"{T(uid,'profile_title')}\n\n"
         f"{T(uid,'pf_tg_id')} `{uid}`\n"
         f"{T(uid,'pf_name')} {_name}\n\n"
@@ -22550,9 +24269,13 @@ async def show_profile(update, ctx):
         f"💳 {('ডিপোজিট ব্যালেন্স' if str(_lang or 'bn') != 'en' else 'Deposit balance')}: "
         f"`{_shop_money(_dep_bal)}`\n"
         f"{T(uid,'pf_available')} `{_shop_money(_total_usd * _rate)}`\n"
-        f"{T(uid,'pf_on_hold')} `{_shop_money(float(st['hold'] or 0) * _rate)}`\n\n"
+        f"{T(uid,'pf_on_hold')} `{_shop_money(float(st['hold'] or 0) * _rate)}`\n"
+        f"🎁 OTP Earn: `{_otp_money(_otp_w['bal'])}` "
+        f"({'🔒 locked' if not _otp_w['wd_on'] else '✅ withdrawable'})\n\n"
         f"{T(uid,'status_active')}",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            "🎁 OTP Earn", callback_data="otp:home")]])
     )
 
 async def show_balance(update, ctx):
@@ -26445,6 +28168,19 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🔙 পণ্যে ফিরুন", callback_data=f"shopa:p:{pid}")]]))
         return
 
+    # ── Admin: OTP নাম্বার স্টক (.txt) আপলোড ──
+    if st == "otp_txt" and await asyncio.to_thread(is_admin, uid):
+        doc = update.message.document
+        try:
+            tf = await ctx.bot.get_file(doc.file_id)
+            raw = await tf.download_as_bytearray()
+            text = bytes(raw).decode("utf-8", "ignore")
+        except Exception as e:
+            await update.message.reply_text(f"❌ ফাইল পড়া যায়নি: {e}")
+            return
+        await _otp_add_got_numbers(update, ctx, text)
+        return
+
     if st == "adm_restore_db" and await asyncio.to_thread(is_admin, uid):
         # PostgreSQL mode — file restore দরকার নেই
         ctx.user_data.pop("state", None)
@@ -27548,6 +29284,10 @@ def _gate(fn, kind="cmd"):
                     return None
             if not await _rate_allowed(u.id, f"{kind}:{sub}"):
                 return None
+            # 🚫 বট বন্ধ = শুধু অ্যাডমিনের জন্য চালু; বাকিরা "বট বন্ধ" দেখে
+            if not await _bot_accessible(u.id):
+                await bot_off_reply(update, u.id)
+                return None
         _t0 = _time.monotonic()
         try:
             return await fn(update, ctx)
@@ -27576,6 +29316,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _rate_allowed(uid, f"cb:{d}"):
         try: await q.answer("⏳ একটু অপেক্ষা করুন!", show_alert=False)
         except Exception: pass
+        return
+    # ── 🚫 বট বন্ধ → শুধু অ্যাডমিন চলবে (বাকিরা "বট বন্ধ" দেখবে) ──
+    if not await _bot_accessible(uid):
+        await bot_off_reply(update, uid)
         return
     # ── verify না হওয়া পর্যন্ত শুধু /start, ভাষা ও verify বাটন কাজ করে ──
     if d not in ("vrf_check", "lang_bn", "lang_en") and await asyncio.to_thread(vrf_silent, uid):
@@ -28004,6 +29748,40 @@ async def _on_callback_inner(update, ctx, q, uid, d):
             log.warning(f"task_submit error: {e}")
             await q.message.reply_text("❌ সমস্যা হয়েছে!" if _tsubl == 'bn' else "❌ Something went wrong!")
         return
+
+    # ── OTP Earn — আলাদা ব্যালেন্স / withdraw ───────────────────
+    if d in ("otp:home", "otp:back"):
+        if not await _bot_accessible(uid):
+            await bot_off_reply(update, uid); return
+        if d == "otp:back":
+            if not await guard(update, ctx): return
+            await show_profile(update, ctx); return
+        await otp_earn_show(update, ctx); return
+
+    if d == "otp:gn":
+        if not await _bot_accessible(uid):
+            await bot_off_reply(update, uid); return
+        await otp_gn_show(update, ctx); return
+
+    if d.startswith("otp:gn:"):
+        if not await _bot_accessible(uid):
+            await bot_off_reply(update, uid); return
+        await otp_gn_issue(update, ctx, d.split(":")[2]); return
+
+    if d == "otp:wd":
+        if not await _bot_accessible(uid):
+            await bot_off_reply(update, uid); return
+        if not await guard(update, ctx): return
+        await otp_wd_start(update, ctx); return
+
+    if d == "otp:wdok":
+        if ctx.user_data.get("state") != "otp_wd_confirm":
+            lang0 = await asyncio.to_thread(get_lang, uid)
+            await q.message.reply_text(
+                "⚠️ Session expired. Start again." if lang0 == 'en' else
+                "⚠️ Session শেষ। আবার শুরু করুন।")
+            return
+        await do_otp_wd_submit(update, ctx); return
 
     # ── Withdraw ──────────────────────────────────────────────────
     if d == "wd_go":
@@ -31132,6 +32910,10 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
     uid  = user.id
+    # 🚫 বট বন্ধ → শুধু অ্যাডমিনের মেসেজ প্রসেস হবে
+    if not await _bot_accessible(uid):
+        await bot_off_reply(update, uid)
+        return
     txt  = update.message.text or ""
     # স্প্যাম-গেট: একই টেক্সট দ্রুত বারবার বা খুব বেশি এলে নীরবে বাদ
     if not await _rate_allowed(uid, "tx:" + txt.strip().casefold()):
@@ -32596,6 +34378,29 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"✅ *Min Withdraw আপডেট:* `{val}$ USDT`", parse_mode="Markdown", reply_markup=await asyncio.to_thread(main_kb, uid))
             except Exception: await update.message.reply_text("❌ সঠিক সংখ্যা দিন।", parse_mode="Markdown")
             ctx.user_data.pop("state", None); return
+        if st in ("otp_txt", "otp_svc", "otp_rate") and await asyncio.to_thread(is_admin, uid):
+            if st == "otp_txt":
+                await _otp_add_got_numbers(update, ctx, txt)
+                return
+            if st == "otp_svc":
+                _v = txt.strip()
+                ctx.user_data["otp_service"] = ("" if _v in ("-", "—", "/skip", "skip")
+                                               else _v[:40])
+                ctx.user_data["state"] = "otp_rate"
+                await update.message.reply_text(
+                    "💰 প্রতি OTP-তে ইউজার কত `$` পাবে? (যেমন `0.01`) — খালি রাখতে `-`",
+                    parse_mode="Markdown")
+                return
+            _v = txt.strip().replace("$", "").replace(",", ".")
+            try:
+                _rate = 0.0 if _v in ("-", "—", "") else max(float(_v), 0.0)
+            except Exception:
+                await update.message.reply_text(
+                    "❌ সঠিক সংখ্যা দিন, যেমন `0.01`", parse_mode="Markdown")
+                return
+            await _otp_add_finish(update, ctx, _rate,
+                                  await asyncio.to_thread(get_lang, uid))
+            return
         if st == "adm_set_wd_fee":
             try:
                 val = float(txt.strip())
@@ -33551,6 +35356,20 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(hint, parse_mode="Markdown")
         await show_wd_confirmation(update.message, ctx, uid); return
 
+    # ── OTP Earn — আলাদা ইনকাম / আলাদা withdraw ──────────────────
+    if st == "otp_wd_addr":
+        if not await guard(update, ctx): ctx.user_data.pop("state", None); return
+        await receive_otp_wd_addr(update, ctx); return
+    if st == "otp_wd_amt":
+        if not await guard(update, ctx): ctx.user_data.pop("state", None); return
+        await receive_otp_wd_amt(update, ctx); return
+    if st == "otp_wd_confirm":
+        lang = await asyncio.to_thread(get_lang, uid)
+        await update.message.reply_text(
+            "👆 Press *Confirm* above." if lang == 'en' else
+            "👆 উপরের *Confirm* বাটন চাপুন।", parse_mode="Markdown")
+        return
+
     # ── Menu buttons ──────────────────────────────────────────────
     # guard + get_lang parallel — sequential await নেই
     # send_chat_action background-এ (fire & forget) — main path block করে না
@@ -33575,7 +35394,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif txt == btns['refer']:    await show_refer(update, ctx)
     elif txt == btns['support']:  await show_support(update, ctx)
     elif txt == btns['withdraw']: await show_withdraw(update, ctx)
-    elif txt == btns['getnum']:    await show_getnum(update, ctx)
+    elif txt == btns['getnum']:    await show_getnum_menu(update, ctx)
     elif txt == btns['shop']:          await show_shop(update, ctx)
     elif txt == btns['language']:      await show_language(update, ctx)
     else:
@@ -35631,6 +37450,8 @@ async def job_bio_realtime_monitor(context: ContextTypes.DEFAULT_TYPE):
          • Bio আছে → tracking active রাখো, last_warned_at clear করো
          • Bio নেই → tracking clear (আজ payment নেই), task list এ আবার দেখাবে
     """
+    if _jobs_paused():
+        return
     if _bio_monitor_lock.locked():
         log.info("[BIO-MONITOR] আগের cycle এখনো চলছে — এই cycle skip।")
         return
@@ -38848,6 +40669,8 @@ async def fb_task_start(q, uid, tid, pw=None, _allow_only_task_ids=None):
 async def fb_on_text(update, ctx):
     """ইউজারের উত্তর নাও — এক ফিল্ড করে।"""
     uid = update.effective_user.id
+    if not await _bot_accessible(uid):        # বট বন্ধ → শুধু অ্যাডমিন
+        return
     st = _FB_STATE.get(uid)
     if not st:
         return
@@ -39378,11 +41201,19 @@ async def _notify_text_broadcast(bot, text):
 
 async def job_task_notify_queue(ctx):
     """ওয়েব প্যানেলের নোটিফিকেশন — 📢 টাস্ক আপডেট, সাধারণ ব্রডকাস্ট, এক ইউজারের DM (৬০s পর পর)।"""
+    if _jobs_paused():
+        return
+    if _ru_idle_skip("notify_q"):
+        return
     try:
         rows = await asyncio.to_thread(_notify_queue_take)
     except Exception as e:
         log.debug(f"[TASK-NOTIFY] queue ব্যর্থ: {e}")
         return
+    if not rows:
+        _ru_mark_idle("notify_q", 45)   # কার্যত প্রতি ~৪৫s-এ একবার
+        return
+    _ru_mark_active("notify_q")
     for it in rows:
         try:
             if it["kind"] in ("fb", "ig"):
@@ -39401,6 +41232,8 @@ async def job_task_notify_queue(ctx):
 
 async def job_task_timeout(ctx):
     """প্রতি ৩০ সেকেন্ডে চেক — deadline পার হলে বাতিল, মেসেজ ডিলিট, ইউজারকে জানাও।"""
+    if _jobs_paused():
+        return
     now = _time.time()
     for _uid, _s in list(_TASK_SESS.items()):
         try:
@@ -40900,6 +42733,8 @@ async def ig_done(q, uid):
 async def ig_on_text(update, ctx):
     """ইউজারের উত্তর নাও — এক ফিল্ড করে (Username/Password বট আগেই দিয়ে দিয়েছে)।"""
     uid = update.effective_user.id
+    if not await _bot_accessible(uid):        # বট বন্ধ → শুধু অ্যাডমিন
+        return
     st = _IG_STATE.get(uid)
     if not st:
         return
@@ -41579,8 +43414,14 @@ def main():
             await asyncio.sleep(8)
             while True:
                 try:
-                    for _u in await asyncio.to_thread(_vrf_pending_signals):
-                        await _vrf_after_web_verify(_u, application.bot)
+                    if not _ru_idle_skip("vrf_sig"):
+                        _us = await asyncio.to_thread(_vrf_pending_signals)
+                        if not _us:
+                            _ru_mark_idle("vrf_sig", 25)   # ফাঁকা → প্রতি ~৩০s
+                        else:
+                            _ru_mark_active("vrf_sig")
+                            for _u in _us:
+                                await _vrf_after_web_verify(_u, application.bot)
                 except Exception as _e2:
                     log.debug(f"[VRF] signal watcher: {_e2}")
                 await asyncio.sleep(5)
@@ -41644,7 +43485,7 @@ def main():
             # 📱 নাম্বারের OTP — প্রতি ২০ সেকেন্ডে চেক
             application.job_queue.run_repeating(
                 job_getnum_otp, interval=5, first=3, name="getnum_otp")
-            # 🔄 লাইভ রেঞ্জ (৫ মিনিট) + সবার OTP ফিড (৪৫ সেকেন্ড)
+            # 🔄 লাইভ রেঞ্জ (৫ মিনিট) + সবার OTP ফিড (৯০ সেকেন্ড)
             application.job_queue.run_repeating(
                 job_getnum_sync, interval=600, first=60, name="getnum_sync")
             application.job_queue.run_repeating(
@@ -41682,7 +43523,7 @@ def main():
             )
             application.job_queue.run_repeating(
                 job_web_sync,
-                interval=20,        # ৫s → ২০s — ফাঁকা সময়ে RU খরচ ৪ গুণ কম
+                interval=30,        # ৫s → ৩০s — শুধু fallback সিগন্যাল, hook থাকলে সাথে সাথে
                 first=8,
                 name="web_sync"
             )
@@ -41791,7 +43632,7 @@ def main():
                 asyncio.create_task(_run_periodically(job_fb_password_rotate, 60, first_sec=45)),
                 asyncio.create_task(_run_periodically(job_fb_export,          60, first_sec=75)),
                 asyncio.create_task(_run_periodically(job_task_notify_queue,  15, first_sec=8)),
-                asyncio.create_task(_run_periodically(job_web_sync,            20, first_sec=8)),
+                asyncio.create_task(_run_periodically(job_web_sync,            30, first_sec=8)),
                 asyncio.create_task(_run_periodically(job_db_keepalive,      300, first_sec=20)),
                 asyncio.create_task(_run_periodically(job_task_timeout,       30, first_sec=20)),
                 asyncio.create_task(_run_periodically(job_history_sync,     1800, first_sec=120)),
@@ -41857,6 +43698,7 @@ def main():
     app.add_handler(CommandHandler("start",       _gate(cmd_start)))
     app.add_handler(CommandHandler("depchk",      cmd_depchk))
     app.add_handler(CommandHandler("otpdiag",     cmd_otpdiag))
+    app.add_handler(CommandHandler("otpadd",      _gate(cmd_otpadd)))
     app.add_handler(CommandHandler("earnchk",     cmd_earnchk))
     app.add_handler(CommandHandler("mail",        cmd_mail))
     app.add_handler(CommandHandler("setproxy",    cmd_setproxy))
@@ -41888,7 +43730,7 @@ def main():
     app.add_handler(CallbackQueryHandler(_handle_promo_callbacks, pattern=r"^adm_promo_(req_anyone|req_tasks|post_news|save_only)$"))
     app.add_handler(CallbackQueryHandler(cleanup_callback, pattern=r"^cleanup_(junk|logs7|logs30|close)$"))
     app.add_handler(CallbackQueryHandler(sec_callback, pattern=r"^sec_(unban|ignore)_\d+$"))
-    app.add_handler(CallbackQueryHandler(shop_callback, pattern=r"^(shop:|shopa:|shopao:|shopar:|mail:|adm_shop$|smm|pxchk$)"))
+    app.add_handler(CallbackQueryHandler(shop_callback, pattern=r"^(shop:|shopa:|shopao:|shopar:|mail:|mailb|otpbuy|adm_shop$|smm|pxchk$)"))
     app.add_handler(CallbackQueryHandler(dep_callback, pattern=r"^(dep:|depa:|depadm:|depok:|depno:|depname:|depchk|depdiag|adm_dep$)"))
     app.add_handler(CallbackQueryHandler(moneyreq_callback, pattern=r"^mreq:(ok|no):\d+$"))
     app.add_handler(CallbackQueryHandler(on_resetall_cb, pattern=r"^resetall_(yes|no)$"))
@@ -42892,13 +44734,19 @@ async def _smm_wait_admin_note(bot, o, need=0.0):
 
 async def job_smm_wait_orders(context):
     """প্রতি ৩০ সেকেন্ডে: টাকা যোগ হলে অপেক্ষমাণ SMM অর্ডার নিজে থেকে চালু হয়।"""
+    if _jobs_paused():
+        return
+    if _ru_idle_skip("smm_wait"):
+        return
     try:
         rows = await asyncio.to_thread(smm_wait_orders, 25)
     except Exception as e:
         log.warning(f"[SMM-WAIT] তালিকা আনা যায়নি: {e}")
         return
     if not rows:
+        _ru_mark_idle("smm_wait", 120)   # কার্যত প্রতি ২ মিনিটে একবার
         return
+    _ru_mark_active("smm_wait")
     _bot = getattr(context, "bot", None)
     for o in rows:
         _oid = int(dict(o).get("id") or 0)

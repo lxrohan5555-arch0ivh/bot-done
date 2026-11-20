@@ -637,8 +637,8 @@ def _gn_page_html():
                       + _feed_html + "</div>")
     else:
         _diag_html = ("<div class='mut' style='font-size:12px;margin-top:12px'>"
-                      "⛔ লাইভ OTP ফিড সেকশন বন্ধ — কোনো ডাটাবেজ সেভ বা চ্যানেলে পোস্ট হচ্ছে না। "
-                      "শুধু বটের দেশের পাশের কাউন্টের জন্য ফিডটা পড়া হয় (কোনো সেভ নেই)।</div>")
+                      "⛔ লাইভ OTP ফিড বন্ধ — ফিড API কল হবে না, ডাটাবেজে কিছু "
+                      "সেভ হবে না, OTP চ্যানেলেও কিছু পোস্ট হবে না।</div>")
     getnumcard = "".join([
         "<div class='card'><b>📱 নাম্বার নিন (OTP)</b>",
         "<div class='mut' style='font-size:12px;margin:6px 0'>বটের কীবোর্ডে “📱 নাম্বার নিন” → "
@@ -907,6 +907,121 @@ def shop_proxy_save():
     return redirect("/admin/shop/proxy?ok=" + _q("🔍 Proxy Checker সেভ হয়েছে"))
 
 
+def _lamix_admin_html():
+    """☎️ Lamix SMS API — টোকেন + প্যানেল ঠিকানা (শুধু API সেটিংস)।"""
+    _onoff, _key, _base = "on", "", "https://panel.lamix.org"
+    try:
+        import bot as _b
+        _onoff = str(_b.get_setting("lamix_on") or "on").strip().lower()
+        _key = str(getattr(_b, "lamix_key", lambda: "")() or "")
+        _base = str(getattr(_b, "lamix_base", lambda: "")() or "")
+    except Exception:
+        pass
+    _sel = ("<option value='on' selected>চালু</option><option value='off'>বন্ধ</option>"
+            if _onoff != "off" else
+            "<option value='on'>চালু</option><option value='off' selected>বন্ধ</option>")
+    _mask = ((_key[:6] + "…" + _key[-4:]) if len(_key) > 12 else _key)
+    return (
+        "<div class='card'><a class='btn gray sm' href='/admin/'>‹ Dashboard</a>"
+        "<h3 style='margin:8px 0 4px'>☎️ Lamix SMS API</h3>"
+        "<div class='mut' style='font-size:12px;margin:0 0 10px'>"
+        "Lamix panel-এর REST API (v1) — Bearer token। रেট লিমিট ১/সেকেন্ড, "
+        "৪০/মিনিট (প্রতি endpoint-এ আলাদা)। এই পেজ শুধু <b>API সংযোগ</b> সেট করে; "
+        "ইউজারকে নাম্বার দেখানো/নেওয়ার ফ্লো এখনো যোগ হয়নি।</div>"
+        "<form method='post' action='/admin/lamix/save'>"
+        "<div class='field'><label>অপশন</label><select name='lamix_on'>" + _sel + "</select></div>"
+        "<div class='field'><label>API Token — সেভ আছে; বদলাতে চাইলে পুরোটা মুছে নতুনটা দিন</label>"
+        f"<input name='lamix_key' value='{esc(_mask)}' autocomplete='off' "
+        "placeholder='প্যানেল → REST API পেজের টোকেন'></div>"
+        "<div class='field'><label>Panel Base URL</label>"
+        f"<input name='lamix_api' value='{esc(_base)}' "
+        "placeholder='https://panel.lamix.org'></div>"
+        "<div class='mut' style='font-size:12px;margin:0 0 10px'>"
+        "⚠️ টোকেন কোথাও শেয়ার করবেন না — আপনার লগইনের সমান ক্ষমতা দেয়।</div>"
+        "<button class='ok sm' type='submit'>💾 সেভ করুন</button>"
+        "<a class='btn gray sm' href='/admin/lamix/test' style='margin-left:6px'>🔎 সংযোগ পরীক্ষা</a>"
+        "</form></div>")
+
+
+@wadm.route("/admin/lamix", methods=["GET"])
+def shop_lamix_page():
+    """☎️ Lamix SMS API — আলাদা (Shop-এর ভিতরে নয়) সেটিংস পেজ।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    return page("☎️ Lamix SMS API", _lamix_admin_html(), "shoplamix")
+
+
+@wadm.route("/admin/lamix/save", methods=["POST"])
+def shop_lamix_save():
+    """Lamix API সেটিং — চালু/বন্ধ · টোকেন · প্যানেল ঠিকানা।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    form = request.form
+    vals = {
+        "lamix_on": ("off" if (form.get("lamix_on") or "on").strip().lower() == "off"
+                    else "on"),
+    }
+    _b = (form.get("lamix_api") or "").strip().rstrip("/")[:300]
+    if _b:
+        vals["lamix_api"] = _b
+    _k = "".join((form.get("lamix_key") or "").split())[:300]
+    if _k and "…" not in _k and "*" not in _k:     # মাস্ক করা পুরোনো ভ্যালু নয়
+        vals["lamix_key"] = _k
+    try:
+        import bot as _bs
+        for k, v in vals.items():
+            _bs.set_setting(k, v)
+        _bs._LAMIX_RANGES.update({"ts": 0.0, "rows": []})
+    except Exception:
+        for k, v in vals.items():
+            _x("INSERT INTO settings (key,value) VALUES (%s,%s) "
+               "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k, v))
+    log_admin("shop_lamix", 0, "saved")
+    return redirect("/admin/lamix?ok=" + _q("☎️ Lamix API সেভ হয়েছে"))
+
+
+@wadm.route("/admin/lamix/test", methods=["GET"])
+def shop_lamix_test():
+    """🔎 Lamix-এ সংযোগ/টোকেন ঠিক কি না + রেঞ্জ/নাম্বার পড়া যায় কি না।"""
+    g = guard()
+    if g:
+        return g
+    _init()
+    _rows = []
+    try:
+        import bot as _bx
+        _err = str(_bx.lamix_ping() or "")
+        _rows.append("<tr><td>সংযোগ</td><td>" + (
+            "<b style='color:#0a0'>✅ ঠিক আছে</b>" if not _err else
+            "<b style='color:#c00'>❌</b> " + esc(_err[:180])) + "</td></tr>")
+        _rg = _bx.lamix_ranges(force=True)
+        _rows.append("<tr><td>রেঞ্জ</td><td>" + esc(str(len(_rg))) + "টি</td></tr>")
+        _nm = _bx.lamix_numbers(limit=1)
+        if _nm.get("error"):
+            _rows.append("<tr><td>নাম্বার</td><td><span style='color:#c00'>"
+                         + esc(str(_nm.get("message") or _nm.get("error"))[:180])
+                         + "</span></td></tr>")
+        else:
+            _rows.append("<tr><td>নাম্বার</td><td>" + esc(str(_nm.get("count") or 0))
+                         + "টি (মোট)</td></tr>")
+    except Exception as e:
+        _rows.append("<tr><td colspan='2'>ত্রুটি: " + esc(str(e)[:160]) + "</td></tr>")
+    _body = ("<div class='card'><a class='btn gray sm' href='/admin/lamix'>"
+             "‹ Lamix API</a>"
+             "<h3 style='margin:8px 0 4px'>🔎 Lamix সংযোগ পরীক্ষা</h3>"
+             "<table style='width:100%;font-size:13px;border-collapse:collapse'>"
+             "<tr><th align='left'>কী</th><th align='left'>ফল</th></tr>"
+             + "".join(_rows) + "</table>"
+             "<div class='mut' style='font-size:12px;margin-top:10px'>"
+             "রেঞ্জ/নাম্বার পড়তে Extended API লাগে — `403 extended_api_disabled` এলে "
+             "আপনার অ্যাকাউন্টে সেটি চালু করাতে হবে।</div></div>")
+    return page("🔎 Lamix পরীক্ষা", _body, "shoplamix")
+
+
 @wadm.route("/admin/shop", methods=["GET"])
 def shop_home():
     g = guard()
@@ -1125,6 +1240,7 @@ def shop_home():
         + _btn("⚙️ সেটিং খুলুন", "/admin/shop/proxy", "btn ok sm")
         + "</div><div class='mut' style='font-size:12px;margin-top:6px'>"
         "প্রতি প্রোভাইডারের নিজের API এক জায়গায় · চালু/বন্ধ।</div></div>")
+
 
     body = (
         head + switch_card + msg_card + mailcard + getnum_link + proxy_link + tools
@@ -2176,3 +2292,302 @@ def admin_smm():
     )
     return page("SMM প্যানেল", body, "smm",
                 toast=request.args.get("ok") or None, err=request.args.get("err") or None)
+
+
+# ═══════ 🎁 OTP Earn — নাম্বার স্টক (.txt) · সার্ভিস · রেট · withdraw ═══════
+def _otp_s(k, d=""):
+    try:
+        import bot as _b
+        return str(_b.get_setting(k) or d)
+    except Exception:
+        return d
+
+
+@wadm.route("/admin/otp", methods=["GET"])
+def otp_earn_page():
+    """নাম্বার আপলোড + সার্ভিস/রেট + OTP withdraw কন্ট্রোল — এক পেজ।"""
+    g = guard()
+    if g:
+        return g
+    try:
+        import bot as _b
+    except Exception as e:
+        return page("OTP Earn", f"<div class='card'>bot লোড হয়নি: {esc(str(e)[:180])}</div>", "otp")
+    _earn_on = _otp_s("otp_earn_on", "on") != "off"
+    _wd_on = _otp_s("otp_wd_on", "off") == "on"
+    _cap = _otp_s("otp_wd_cap", "0")
+    _mn = _otp_s("otp_wd_min", "0.05")
+    _total, _stats = _b.otp_stock_stats()
+    _tot = _b.otp_admin_totals()
+    _pend = _b.otp_wd_list("pending", 100)
+    _done = _b.otp_wd_list("all", 15)
+    _recent = _b.otp_numbers_recent(80)
+    _svcs = _b.otp_services()
+
+    _svc_opts = "".join(f"<option value='{esc(s)}'>" for s in _svcs)
+    _svc_opts += "".join(f"<option value='{esc(s)}'>" for s in
+                         ("facebook", "whatsapp", "telegram", "instagram",
+                          "google", "tiktok", "twitter", "discord"))
+
+    _stat_rows = []
+    for s in _stats:
+        _stat_rows.append([
+            f"{s['flag']} {esc(s['country'])}" if s["country"] else "🏳 অজানা",
+            f"<b class='mono'>{num(s['n'])}</b>",
+            esc(f"${s['rate']:.4f}"),
+        ])
+    _num_rows = []
+    for r in _recent:
+        _nm, _iso, _fl = _b.otp_country(r["number"])
+        _num_rows.append([
+            f"<span class='mono'>{esc(str(r['number']))}</span>",
+            f"{(esc(str(r['country'])) or '—')}",
+            esc(str(r["service"] or "—")),
+            f"${float(r['rate'] or 0):.4f}",
+            badge({"free": "🟢 free", "used": "🔴 used"}.get(
+                str(r["status"] or ""), str(r["status"] or "")),
+                "ok" if str(r["status"]) == "free" else "err"),
+            esc(str(r["added_at"] or "")[:16]),
+            ("" if str(r["status"]) != "free" else
+             f"<form method='post' action='/admin/otp/num/{int(r['id'])}/delete' "
+             f"style='display:inline' onsubmit=\"return confirm('ডিলিট করবেন?')\">"
+             f"<button class='gray sm' type='submit'>🗑</button></form>"),
+        ])
+    _pend_rows = []
+    for w in _pend:
+        _pend_rows.append([
+            f"#{int(w['id'])}",
+            f"<a class='mono' href='/admin/user/{int(w['user_id'] or 0)}'>"
+            f"{int(w['user_id'] or 0)}</a>",
+            f"<b>${float(w['amount'] or 0):.4f}</b>",
+            f"<span class='mono' style='word-break:break-all'>"
+            f"{esc(str(w['address'] or '')[:60])}</span>",
+            esc(str(w["requested_at"] or "")[:16]),
+            (f"<form method='post' action='/admin/otp/wd/{int(w['id'])}/approve' "
+             f"style='display:inline'><button class='ok sm' type='submit'>✅ Approve</button></form> "
+             f"<form method='post' action='/admin/otp/wd/{int(w['id'])}/reject' "
+             f"style='display:inline'><button class='err sm' type='submit'>❌ Reject</button></form>"),
+        ])
+    _done_rows = []
+    for w in _done:
+        _st = str(w["status"] or "")
+        _done_rows.append([
+            f"#{int(w['id'])}",
+            f"<a class='mono' href='/admin/user/{int(w['user_id'] or 0)}'>"
+            f"{int(w['user_id'] or 0)}</a>",
+            f"${float(w['amount'] or 0):.4f}",
+            badge(_st, "ok" if _st == "approved" else "err"),
+            esc(str(w["decided_at"] or "—")[:16]),
+        ])
+
+    body = (
+        "<div class='grid g-kpi'>"
+        + _kpi("ফ্রি নাম্বার", num(_total), "" if _total else "warn")
+        + _kpi("দেশ", num(len(_stats)))
+        + _kpi("OTP আয় (মোট)", esc(f"${_tot['earned']:.4f}"))
+        + _kpi("পেন্ডিং withdraw", esc(f"${_tot['pending_usd']:.4f}")
+               + f" <span class='mut'>({num(_tot['pending_n'])})</span>",
+               "warn" if _tot["pending_n"] else "")
+        + "</div>"
+
+        # ── সেটিংস ──
+        + "<div class='card'><b>⚙️ OTP Earn সেটিংস</b>"
+          "<div class='mut' style='font-size:12px;margin:4px 0 10px'>"
+          "ইউজারের OTP আয় আলাদা ওয়ালেটে জমা হয় (মেইন balance-এ যায় না)। "
+          "Withdraw বন্ধ থাকলে টাকা লক — চালু করলেই ইউজার তুলতে পারবে।</div>"
+          "<form method='post' action='/admin/otp/save'>"
+          "<div class='field'><label>OTP ইনকাম</label><select name='otp_earn_on'>"
+          + ("<option value='on' selected>চালু</option><option value='off'>বন্ধ</option>"
+             if _earn_on else
+             "<option value='on'>চালু</option><option value='off' selected>বন্ধ</option>") +
+          "</select></div>"
+          "<div class='field'><label>OTP Withdraw <span class='mut'>— চালু করলে বট নিজেই "
+          "অটো USDT-BEP20 পেমেন্ট করবে; বন্ধ = টাকা লক</span></label>"
+          "<select name='otp_wd_on'>"
+          + ("<option value='on' selected>চালু (টাকা তোলা যাবে)</option>"
+             "<option value='off'>বন্ধ (লকড)</option>"
+             if _wd_on else
+             "<option value='on'>চালু (টাকা তোলা যাবে)</option>"
+             "<option value='off' selected>বন্ধ (লকড)</option>") +
+          "</select></div>"
+          "<div class='field'><label>প্রতি ইউজার সর্বোচ্চ OTP withdraw (USD)"
+          " <span class='mut'>— 0 = লিমিট নেই। যেমন 1 দিলে একজন ইউজার মোট "
+          "সর্বোচ্চ $1 তুলতে পারবে</span></label>"
+          f"<input name='otp_wd_cap' value='{esc(str(_cap))}' placeholder='0'></div>"
+          "<div class='field'><label>মিনি withdraw — সর্বনিম্ন OTP withdraw (USD)</label>"
+          f"<input name='otp_wd_min' value='{esc(str(_mn))}' placeholder='0.05'></div>"
+          "<button class='ok' type='submit'>💾 সেভ করুন</button></form></div>"
+
+        # ── আপলোড ──
+        + "<div class='card'><b>📥 নাম্বার আপলোড (.txt)</b>"
+          "<div class='mut' style='font-size:12px;margin:4px 0 10px'>"
+          "প্রতি লাইনে একটা নাম্বার। চাইলে <span class='mono'>নাম্বার|রেট</span> "
+          "বা <span class='mono'>নাম্বার|রেট|সার্ভিস</span> দিতে পারেন। "
+          "দেশ বট নিজেই ডায়ালিং কোড দেখে বসিয়ে দেয়। সার্ভিস না দিলে এখানে যা "
+          "লিখবেন সেটাই সব নাম্বারে বসবে (অথবা Lamix API থেকে অটো)।</div>"
+          "<form method='post' action='/admin/otp/upload' enctype='multipart/form-data'>"
+          "<div class='field'><label>সার্ভিস (কিসের নাম্বার — facebook / whatsapp …)</label>"
+          f"<input name='service' list='otpsvc' placeholder='facebook'>"
+          f"<datalist id='otpsvc'>{_svc_opts}</datalist></div>"
+          "<div class='field'><label>প্রতি OTP-তে ইউজার পাবে (USD $)</label>"
+          "<input name='rate' type='number' step='0.0001' min='0' value='0.01'></div>"
+          "<div class='field'><label><input type='checkbox' name='auto_service' value='on'> "
+          "Lamix API থেকে সার্ভিস/দেশ অটো নিন (ম্যানুয়াল সার্ভিস না দিলে)</label></div>"
+          "<div class='field'><label>নাম্বার লিখুন (প্রতি লাইনে ১টা)</label>"
+          "<textarea name='numbers' rows='7' placeholder='+8801XXXXXXXXX&#10;+2348XXXXXXXXX|0.02|whatsapp'></textarea></div>"
+          "<div class='field'><label>অথবা .txt ফাইল</label>"
+          "<input type='file' name='txtfile' accept='.txt,text/plain'></div>"
+          "<button class='ok' type='submit'>➕ আপলোড করুন</button>"
+          "<span class='mut' style='font-size:12px;margin-left:10px'>"
+          "একই নাম্বার দুইবার যোগ হবে না।</span></form></div>"
+
+        # ── স্টক ──
+        + "<div class='card'><b>🌍 স্টক — দেশ অনুযায়ী</b>"
+        + table(["দেশ", "ফ্রি নাম্বার", "গড় রেট"], _stat_rows,
+                "এখনো কোনো নাম্বার আপলোড হয়নি")
+        + "</div>"
+        + "<div class='card'><b>📱 সর্বশেষ নাম্বার</b>"
+        + table(["নাম্বার", "দেশ", "সার্ভিস", "রেট", "স্টেটাস", "সময়", ""],
+                _num_rows, "নাম্বার নেই")
+        + "</div>"
+
+        # ── withdraw ──
+        + "<div class='card'><b>💸 OTP Withdraw রিকোয়েস্ট (পেন্ডিং)</b>"
+        + table(["ID", "ইউজার", "পরিমাণ", "Wallet", "সময়", "অ্যাকশন"],
+                _pend_rows, "কোনো পেন্ডিং রিকোয়েস্ট নেই")
+        + "</div>"
+        + "<div class='card'><b>📜 সর্বশেষ সিদ্ধান্ত</b>"
+        + table(["ID", "ইউজার", "পরিমাণ", "স্টেটাস", "সময়"],
+                _done_rows, "এখনো কিছু নেই")
+        + "</div>"
+    )
+    return page("🎁 OTP Earn", body, "otp",
+                toast=request.args.get("ok") or None,
+                err=request.args.get("err") or None)
+
+
+@wadm.route("/admin/otp/save", methods=["POST"])
+def otp_earn_save():
+    g = guard()
+    if g:
+        return g
+    form = request.form
+    def _fnum(k, d, lo=0.0):
+        try:
+            return str(max(float(str(form.get(k) or d).replace(",", ".")), lo))
+        except Exception:
+            return str(d)
+    vals = {
+        "otp_earn_on": "off" if (form.get("otp_earn_on") or "on") == "off" else "on",
+        "otp_wd_on": "on" if (form.get("otp_wd_on") or "") == "on" else "off",
+        "otp_wd_cap": _fnum("otp_wd_cap", 0),
+        "otp_wd_min": _fnum("otp_wd_min", 0.05),
+    }
+    try:
+        import bot as _b
+        for k, v in vals.items():
+            _b.set_setting(k, v)
+    except Exception:
+        for k, v in vals.items():
+            _x("INSERT INTO settings (key,value) VALUES (%s,%s) "
+               "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k, v))
+    log_admin("otp_settings", 0, "saved")
+    return redirect("/admin/otp?ok=" + _q("🎁 OTP Earn সেটিংস সেভ হয়েছে"))
+
+
+@wadm.route("/admin/otp/upload", methods=["POST"])
+def otp_earn_upload():
+    g = guard()
+    if g:
+        return g
+    try:
+        import bot as _b
+    except Exception as e:
+        return redirect("/admin/otp?err=" + _q(f"bot লোড হয়নি: {e}"))
+    form = request.form
+    text = form.get("numbers") or ""
+    fname = ""
+    f = request.files.get("txtfile")
+    if f and f.filename:
+        fname = str(f.filename)[:80]
+        try:
+            text = (text or "") + "\n" + f.read().decode("utf-8", "ignore")
+        except Exception as e:
+            return redirect("/admin/otp?err=" + _q(f"ফাইল পড়া যায়নি: {e}"))
+    service = (form.get("service") or "").strip()[:40]
+    try:
+        rate = float(str(form.get("rate") or 0).replace(",", "."))
+    except Exception:
+        rate = 0.0
+    if not (text or "").strip():
+        return redirect("/admin/otp?err=" + _q("নাম্বার বা .txt ফাইল দিন"))
+    meta, _api_err = None, ""
+    if (form.get("auto_service") or "") == "on":
+        try:
+            meta, _api_err = _b.otp_service_auto()
+        except Exception as e:
+            _api_err = str(e)[:120]
+    try:
+        added, dup, bad = _b.otp_numbers_add(text, service, rate, fname or "upload", meta=meta)
+    except Exception as e:
+        return redirect("/admin/otp?err=" + _q(f"যোগ হয়নি: {e}"))
+    if not added:
+        _why = "সব লাইনই আগে থেকে আছে বা ভুল ফরম্যাট"
+        if _api_err:
+            _why += f" · Lamix: {_api_err}"
+        return redirect("/admin/otp?err=" + _q(_why))
+    log_admin("otp_upload", 0, f"{added} numbers ({dup} dup, {bad} bad) service={service or '-'} rate={rate}")
+    _tail = f" · {dup} ডুপ্লিকেট বাদ" if dup else ""
+    if bad:
+        _tail += f" · {bad} লাইন বাদ"
+    return redirect("/admin/otp?ok=" + _q(f"✅ {added} টা নাম্বার যোগ হয়েছে{_tail}"))
+
+
+@wadm.route("/admin/otp/num/<int:nid>/delete", methods=["POST"])
+def otp_earn_num_delete(nid):
+    g = guard()
+    if g:
+        return g
+    try:
+        import bot as _b
+        _b.otp_number_delete(nid)
+    except Exception as e:
+        return redirect("/admin/otp?err=" + _q(str(e)[:150]))
+    log_admin("otp_num_del", nid, "number removed")
+    return redirect("/admin/otp?ok=" + _q("নাম্বার ডিলিট হয়েছে"))
+
+
+@wadm.route("/admin/otp/wd/<int:wid>/approve", methods=["POST"])
+def otp_earn_wd_approve(wid):
+    return _otp_wd_decide_web(wid, True)
+
+
+@wadm.route("/admin/otp/wd/<int:wid>/reject", methods=["POST"])
+def otp_earn_wd_reject(wid):
+    return _otp_wd_decide_web(wid, False)
+
+
+def _otp_wd_decide_web(wid, ok):
+    g = guard()
+    if g:
+        return g
+    try:
+        import bot as _b
+        row = _b.otp_wd_decide(wid, ok, "web admin")
+    except Exception as e:
+        return redirect("/admin/otp?err=" + _q(str(e)[:150]))
+    if not row:
+        return redirect("/admin/otp?err=" + _q("রিকোয়েস্ট পাওয়া যায়নি / আগেই সিদ্ধান্ত হয়েছে"))
+    _amt = float(row.get("amount") or 0)
+    _u = int(row.get("user_id") or 0)
+    try:
+        queue_user_msg(
+            _u,
+            (f"✅ আপনার OTP withdraw `${_amt:.4f}` অ্যাপ্রুভ হয়েছে। পেমেন্ট শিগগিরই পাবেন।"
+             if ok else
+             f"❌ আপনার OTP withdraw `${_amt:.4f}` রিজেক্ট হয়েছে — টাকা OTP ব্যালেন্সে ফেরত দেওয়া হয়েছে।"))
+    except Exception:
+        pass
+    log_admin("otp_wd_%s" % ("approve" if ok else "reject"), wid, f"uid={_u} ${_amt:.4f}")
+    return redirect("/admin/otp?ok=" + _q(
+        ("✅ Approved" if ok else "❌ Rejected ও টাকা ফেরত") + f" — #{wid}"))
