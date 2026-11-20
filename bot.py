@@ -9147,6 +9147,24 @@ def getnum_sms_all():
     return rows
 
 
+def _gn_same_num(a, b):
+    """একই নাম্বার কি না — ফরম্যাট আলাদা হলেও (+, ০০, দেশকোড বাদ, লাস্ট ৯ ডিজিট)।
+
+    ⚠️ Lamix কখনো `93703231343` কখনো `0703231343`/`703231343` দেয় — আগে
+    সরাসরি endswith-এ মিলিয়ে দেখা হতো, তাই OTP প্যানেলে এলেও বটে/চ্যানেলে
+    পৌঁছাত না। এখন শেষ ৯ ডিজিট মিললে একই নাম্বার ধরা হয়।
+    """
+    _a, _b = _gn_norm_num(a), _gn_norm_num(b)
+    if not _a or not _b:
+        return False
+    if _a == _b:
+        return True
+    if len(_a) < 7 or len(_b) < 7:
+        return False
+    _n = min(9, len(_a), len(_b))
+    return _a[-_n:] == _b[-_n:]
+
+
 def gn_find_otp(o, rows=None):
     """এই নাম্বারের নতুন (আগে না দেখা) OTP — না পেলে None।"""
     rows = rows if rows is not None else getnum_sms_all()
@@ -9155,22 +9173,18 @@ def gn_find_otp(o, rows=None):
         return None
     last = str(o.get("last_nid") or "")
     _seen_txt = str(o.get("otp") or "").strip()
-    # ⚠️ শুধু নয়-নতুন nid বাদ দিলে পুরোনো কোড আবার "নতুন" হয়ে চলে যেত।
-    #    তাই শেষ দেওয়া nid-এর *পরের* সারিগুলোই দেখা হয়; nid লিস্টে না
-    #    থাকলে একই কোড-লেখা আবার পাঠানো হয় না।
-    _start = 0
-    if last:
-        for _i, _it in enumerate(rows):
-            if str(_it.get("nid") or "") == last:
-                _start = _i + 1
-                break
-    for it in rows[_start:]:
-        if last and not _start and str(it.get("nid") or "") == last:
+    # ⚠️ লিস্টের ক্রম সোর্সভেদে আলাদা (Lamix নতুন-আগে, অন্য সোর্স পুরোনো-আগে)।
+    #    তাই আগের মতো ক্রম ধরে স্লাইস করা হয় না — সব মিলে যাওয়া সারি জোগাড়
+    #    করে শেষ দেওয়া nid বাদ দিই, তারপর **সবচেয়ে নতুন** সারিটা নিই।
+    #    (আগের কোডে নতুন মেসেজ বাদ পড়ে বটে/চ্যানেলে যেত না)
+    _cand = []
+    for it in rows:
+        if last and str(it.get("nid") or "") == last:
             continue
         otn = _gn_norm_num(it.get("number"))
         if not otn or len(otn) < 7:
             continue
-        if not (otn == mine or otn.endswith(mine) or mine.endswith(otn)):
+        if not _gn_same_num(otn, mine):
             continue
         _otp_txt = str(it.get("otp") or "").strip()
         # nid থাকলে ডুপ্লিকেট ছাঁকা হয় otp_hits-এ (nid ইউনিক) — তাই একই কোড
@@ -9179,8 +9193,15 @@ def gn_find_otp(o, rows=None):
         if (not str(it.get("nid") or "")) and _seen_txt and _otp_txt \
                 and _otp_txt == _seen_txt:
             continue
-        return it
-    return None
+        _cand.append(it)
+    if not _cand:
+        return None
+    if len(_cand) > 1:
+        try:
+            _cand.sort(key=lambda r: _gn_feed_item_ts(r), reverse=True)
+        except Exception:
+            pass
+    return _cand[0]
 
 def _gn_log(uid, rng, number, status, detail=""):
     try:
@@ -9258,6 +9279,7 @@ _GN_FEED_SEEN = {}             # ext_id → সময় (মেমরিতে�
 #    ইউজারের নিজের OTP সবসময় সাথে সাথে যায় — এই গ্যাপ ওটাতে খাটে না।
 _GN_RL_GAP = 180               # দুই পোস্টের মাঝে কমপক্ষে ৩ মিনিট (ফিডের জন্য)
 _GN_CH_LAST = {"ts": 0.0}     # ফিডের শেষ পোস্ট কখন গেল
+_GN_CH_SEEN = {}              # একই কোড দুইবার পোস্ট না হতে
 
 
 def _gn_ch_feed_ready():
@@ -9573,13 +9595,22 @@ def gn_open_order(uid):
 
 
 def gn_wait_orders(limit=25):
-    """OTP এখনো না আসা + সদ্য এসেছে এমন নাম্বার (resend কোডও ধরার জন্য)।"""
+    """OTP এখনো না আসা + সদ্য এসেছে এমন নাম্বার (resend কোডও ধরার জন্য)।
+
+    🕒 `changed` অর্ডারও ধরা হয় — নাম্বার পরিবর্তনের পর ৫ মিনিটের ভিতর OTP এলে
+    সেটাও ইনবক্স + চ্যানেলে যাবে এবং টাকা যোগ হবে (আগে ওটা বাদ পড়ে যেত)।
+    """
     try:
+        _hold_cut = (datetime.now(pytz.timezone("Asia/Dhaka"))
+                     - timedelta(minutes=OTP_HOLD_MIN)).strftime("%Y-%m-%d %H:%M")
         with _c() as c:
             return c.execute(
-                "SELECT * FROM getnum_orders WHERE status IN ('waiting','received') "
-                "AND ts >= %s ORDER BY id LIMIT %s",
-                (_time.time() - GN_WAIT_MIN * 60, int(limit))).fetchall() or []
+                "SELECT * FROM getnum_orders WHERE "
+                "(status IN ('waiting','received') AND ts >= %s) "
+                "OR (status='changed' AND COALESCE(updated_at,'') >= %s) "
+                "ORDER BY id LIMIT %s",
+                (_time.time() - GN_WAIT_MIN * 60, _hold_cut,
+                 int(limit))).fetchall() or []
     except Exception:
         return []
 
@@ -9769,8 +9800,13 @@ def _gn_ch_text(o):
     # ⚡ কোন ধরনের OTP — হাই রেট (Lamix) নাকি নরমাল (Zenex/ওয়েব)
     _is_hr = str(o.get("src") or "").strip().lower() == "lamix"
     _type_s = "🔥 <b>High rate</b>" if _is_hr else "🟢 <b>Normal (low rate)</b>"
+    # 🏷 কোনটা কার কোড — প্যানেল/লাইভ নাকি ইউজারের নিজের OTP
+    _is_panel = str(o.get("kind") or "").strip().lower() == "panel"
+    _src_s = ("📊 <b>Panel / Live code</b>" if _is_panel
+              else "👤 <b>User OTP</b>")
     _out = (
         f"{_head}\n\n"
+        f"🏷 <b>Code :</b> {_src_s}\n"
         f"📱 <b>Service :</b> {_e(_svc)}\n"
         f"⚡ <b>Type :</b> {_type_s}\n"
         f"🌍 <b>Country :</b> {_e(_loc or (_flag + ' ' + _cty).strip() or '—')}\n"
@@ -10663,7 +10699,7 @@ def _gn_feed_once():
                             _fresh.append({"service": svc, "range_val": rng,
                                            "country": _c3 or cty, "flag": _f3,
                                            "otp": _cd3, "sms": msg,
-                                           "number": "",
+                                           "number": "", "kind": "panel",
                                            # 🏷 প্যানেলের দাম (রেঞ্জ মিললে) — নাহলে ০ → ডিফল্ট রেট
                                            "price": _prices.get(_gn_rng_key(rng), 0),
                                            "paid_usd": 0, "resend": 0})
@@ -10684,14 +10720,15 @@ def _gn_feed_once():
     # 📢 নতুন কোডগুলো OTP চ্যানেলে (আগে যাওয়া id আবার নয়, ঘণ্টায় ক্যাপ)
     _GN_FEED_DIAG["fresh"] = len(_fresh)
     _GN_FEED_DIAG["sent"] = 0
+    # 📢 Zenex লাইভ কোড — ৩ মিনিটে একটাই (এক দেশ এক সার্ভিস)।
+    #    ⛔ জমিয়ে রাখা হয় না: গ্যাপের সময় আসা কোড বাদ, ৩ মিনিট শেষে নতুনটাই যাবে।
+    _GN_FEED_DIAG["sent"] = 0
     if _fresh and _gn_ch_feed_ready():
-        # 📢 ৩ মিনিট পেরেছে → এখনই **নতুন** OTP-টা যাবে (একটাই, জমাবে না)
-        _it = _fresh[0]
         try:
-            if _gn_ch_send(_gn_ch_text(_it)):
+            if _gn_ch_send(_gn_ch_text(_fresh[0])):
                 _gn_ch_feed_posted()
                 _GN_FEED_DIAG["sent"] = 1
-                log.info("[GETNUM-FEED] ১টা OTP চ্যানেলে গেছে (৩ মিনিটের গ্যাপ)")
+                log.info("[GETNUM-FEED] ১টা লাইভ কোড চ্যানেলে গেছে (৩ মিনিটের গ্যাপ)")
         except Exception as _ce:
             log.debug(f"[GETNUM-FEED] চ্যানেল পোস্ট ব্যর্থ: {str(_ce)[:90]}")
     if pairs:
@@ -10776,9 +10813,12 @@ async def _gn_check_and_notify(bot_obj, o, quiet=False, rows=None):
     except Exception:
         return False
     st = str(o.get("status") or "")
-    if oid <= 0 or st not in ("waiting", "received"):
+    # 'changed' = নাম্বার বদলানোর পর ৫ মিনিটের হোল্ড — এই সময়ের OTP-ও
+    # ইনবক্স + চ্যানেলে যাবে আর টাকা যোগ হবে
+    if oid <= 0 or st not in ("waiting", "received", "changed"):
         return False
-    if _gn_left_min(o) <= 0:
+    # 'changed' অর্ডারের সময় গোনা হয় হোল্ড (৫ মিনিট) দিয়ে — পুরোনো ts দিয়ে নয়
+    if st != "changed" and _gn_left_min(o) <= 0:
         if st == "waiting":
             # 🔇 ইউজারকে কোনো "সময় শেষ" মেসেজ যাবে না — শুধু DB-তে expired হবে।
             #    (আগে প্রতি ২০ সেকেন্ডের চেকে একবার করে যেত)
@@ -10791,12 +10831,13 @@ async def _gn_check_and_notify(bot_obj, o, quiet=False, rows=None):
     code = _gn_otp_code(full)
     nid = str(hit.get("nid") or "")
     first = (st == "waiting")
-    if first:
-        if not await asyncio.to_thread(gn_order_claim, oid):
-            return False
-        await asyncio.to_thread(gn_order_set, oid, "received", code, full, nid)
-    else:
-        await asyncio.to_thread(gn_order_set, oid, "received", code, full, nid)
+    if first and not await asyncio.to_thread(gn_order_claim, oid):
+        return False
+    # 'changed' = নাম্বার বদলানোর পরের ৫ মিনিট — আগে OTP পেয়ে থাকলেও
+    # (notified=1) এই নতুন কোডটাও ইনবক্স + চ্যানেলে যাবে, টাকাও যোগ হবে
+    await asyncio.to_thread(gn_order_set, oid, "received", code, full, nid)
+    if st == "changed":
+        first = True
     row = await asyncio.to_thread(gn_order_get, oid) or o
     row = dict(row)
     row["otp"], row["sms"], row["status"] = code, full, "received"
@@ -10826,8 +10867,11 @@ async def _gn_check_and_notify(bot_obj, o, quiet=False, rows=None):
     _is_new = await asyncio.to_thread(
         otp_hit_new, oid, _hit_key, code, full, max(_usd, 0.0),
         row.get("number"), _uid_r, cost=_cost_ovr)
-    if not _is_new:
+    if not _is_new and not first:
         return False                  # এই SMS আগেই দেওয়া/গোনা হয়েছে
+    # প্রথম OTP: notified claim আগেই একবার-only করে দিয়েছে, তাই otp_hits-এ
+    # ইনসার্ট ব্যর্থ হলেও (পুরোনো DB/নতুন কলাম) কোডটা বটে+চ্যানেলে যেতে হবে —
+    # নাহলে OTP প্যানেলে দেখাত অথচ কোথাও যেত না।
     if not first:
         row["resend"] = True
     try:
@@ -10865,6 +10909,12 @@ async def _gn_check_and_notify(bot_obj, o, quiet=False, rows=None):
     try:
         # ✅ ইউজারের নিজের OTP সবসময় সাথে সাথে — কোনো লাইন/গ্যাপ নেই
         if await asyncio.to_thread(_gn_ch_send, _gn_ch_text(row)):
+            # 🔁 একই কোড প্যানেল/লাইভ লাইনে আবার না যায়
+            try:
+                _GN_CH_SEEN[str(row.get("service") or "") + "|"
+                            + str(row.get("otp") or "")] = _time.time()
+            except Exception:
+                pass
             log.debug(f"[GETNUM] uid={_uid_r} OTP চ্যানেলে গেছে")
     except Exception as _pc:
         log.debug(f"[GETNUM-FEED] চ্যানেল পোস্ট: {str(_pc)[:90]}")
@@ -10964,6 +11014,11 @@ async def getnum_callback(update, ctx):
         _en = await _shop_is_en(uid)
         si, ii = await asyncio.to_thread(_gn_find, o.get("service"), o.get("range_val"))
         await asyncio.to_thread(gn_order_set, oid, "changed")
+        # 🔁 পুরোনো নাম্বার ৫ মিনিট হোল্ডে — OTP এলে used, না এলে আবার স্টকে
+        try:
+            await asyncio.to_thread(otp_hold_number, o.get("number"), uid)
+        except Exception:
+            pass
         if si >= 0:
             return await _gn_issue(update, ctx, si, ii)
         return await _gn_place(update, ctx, str(o.get("service") or ""),
@@ -10984,7 +11039,16 @@ async def getnum_callback(update, ctx):
             return await show_getnum(update, ctx)
         _en = await _shop_is_en(uid)
         await _gn_say(update, _bi("🔄 OTP চেক করা হচ্ছে...", "🔄 Checking OTP...", _en))
-        got = await _gn_check_and_notify(ctx.bot if ctx else None, o, quiet=True)
+        # ☎️ Lamix (হাই রেট) অর্ডার হলে Zenex-এর বদলে Lamix থেকেই দেখতে হবে
+        _ck_rows = None
+        if str(o.get("src") or "").strip().lower() == "lamix":
+            try:
+                _ck_rows = await asyncio.to_thread(otp_lamix_rows,
+                                                   [o.get("number")])
+            except Exception:
+                _ck_rows = []
+        got = await _gn_check_and_notify(ctx.bot if ctx else None, o,
+                                        quiet=True, rows=_ck_rows)
         row = await asyncio.to_thread(gn_order_get, oid) or o
         if not got:
             return await _gn_say(update, _gn_order_text(row, _en), _gn_order_kb(row, _en))
@@ -11007,7 +11071,7 @@ async def job_getnum_otp(context):
     try:
         if not (getnum_on() or lamix_on()):
             return
-        _orders = await asyncio.to_thread(gn_wait_orders)
+        _orders = await asyncio.to_thread(gn_wait_orders, 60)
         if not _orders:
             # কাজ নেই → ৬০s DB পোল বন্ধ। নতুন নাম্বার নিলেই
             # `gn_order_new` idle-Cooldown মুছে দেয়, তাই ওটি দেরিও হয় না
@@ -12898,6 +12962,60 @@ def otp_release_number(number, uid=0):
         return False
 
 
+OTP_HOLD_MIN = 5          # নাম্বার পরিবর্তনের পর কত মিনিট হোল্ডে থাকে
+_OTP_HOLD = {"ts": 0.0}
+
+
+def otp_hold_number(number, uid=0):
+    """ইউজার নাম্বার পরিবর্তন করলে পুরোনো নাম্বার ৫ মিনিটের হোল্ডে যায়।
+
+    · এই ৫ মিনিটের ভিতর OTP এলে নাম্বারটা `used` হয়ে যায় — কাউকে দেওয়া হয় না
+      (`otp_hit_new` নাম্বার ধরে status='used' করে দেয়)
+    · না এলে `otp_release_holds` আবার `free` করে — অন্য ইউজার পাবে
+    """
+    _otp_init()
+    try:
+        with _c() as c:
+            cur = c.execute(
+                "UPDATE otp_numbers SET status='hold', used_by=%s, used_at=%s "
+                "WHERE number=%s AND status IN ('taken','hold')",
+                (int(uid or 0), now(), str(number or "")))
+        _mark_dirty()
+        return bool(getattr(cur, "rowcount", 0))
+    except Exception as e:
+        log.debug(f"[OTP] hold {number}: {str(e)[:100]}")
+        return False
+
+
+def otp_release_holds(minutes=None):
+    """হোল্ডে থাকা নাম্বার (OTP আসেনি) আবার স্টকে ফেরত — ফ্রি কাউন্ট কমে থাকে না।"""
+    _otp_init()
+    _mins = float(minutes or OTP_HOLD_MIN)
+    _cut_s = (datetime.now(pytz.timezone("Asia/Dhaka"))
+              - timedelta(minutes=_mins)).strftime("%Y-%m-%d %H:%M")
+    try:
+        with _c() as c:
+            cur = c.execute(
+                "UPDATE otp_numbers SET status='free', used_by=0, used_at='' "
+                "WHERE status='hold' AND COALESCE(used_at,'') <> '' "
+                "AND used_at <= %s", (_cut_s,))
+            _n = int(getattr(cur, "rowcount", 0) or 0)
+        if _n:
+            _mark_dirty()
+            try:
+                _OTP_STATS_CACHE["ts"] = 0.0
+            except Exception:
+                pass
+            try:
+                _STOCK_ALERT["empty"].clear()
+            except Exception:
+                pass
+        return _n
+    except Exception as e:
+        log.debug(f"[OTP] release holds: {str(e)[:120]}")
+        return 0
+
+
 def otp_release_expired(wait_min=None):
     """মেয়াদ শেষ — OTP Earn অর্ডারের নাম্বার আবার স্টকে ফেরত।"""
     _otp_init()
@@ -12936,7 +13054,17 @@ def _otp_sweep_maybe():
     if _t - float(_OTP_SWEEP.get("ts") or 0) < 60:
         return 0
     _OTP_SWEEP["ts"] = _t
+    try:
+        otp_release_holds()      # ৫ মিনিটের হোল্ড শেষ → আবার স্টকে
+    except Exception:
+        pass
     return otp_release_expired()
+
+
+def _otp_mask_num(v):
+    """নাম্বার ডাটা ওয়েবে সেভ না হয় — শুধু শেষ ৪ ডিজিট রাখা হয়।"""
+    _d = _re.sub(r"\D", "", str(v or ""))
+    return ("\u2022\u2022\u2022\u2022" + _d[-4:]) if len(_d) >= 4 else ""
 
 
 def otp_hit_new(oid, nid, code="", sms="", paid=0.0, number="", uid=0, cost=None):
@@ -12962,7 +13090,7 @@ def otp_hit_new(oid, nid, code="", sms="", paid=0.0, number="", uid=0, cost=None
                 "INSERT INTO otp_hits (oid,user_id,nid,number,code,sms,paid,cost,ts) "
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (oid,nid) DO NOTHING",
-                (int(oid), int(uid or 0), _k, str(number or "")[:32],
+                (int(oid), int(uid or 0), _k, _otp_mask_num(number)[:32],
                  str(code or "")[:32], str(sms or "")[:1200],
                  float(paid or 0), float(cost or 0), now()))
             _new = bool(cur.rowcount)
@@ -12995,6 +13123,8 @@ def gn_order_otp_add(oid, usd=0.0):
 
 
 _OTP_MSG_CACHE = {"ts": 0.0, "rows": []}
+# number → {ts, rows} — একই নাম্বার বারবার না টানার ক্যাশ (Lamix ৪০/মিনিট)
+_LAMIX_NUM_CACHE = {}
 
 
 def _lamix_msg_rows(msgs):
@@ -13004,15 +13134,19 @@ def _lamix_msg_rows(msgs):
         # ⚠️ প্যানেলভেদে ফিল্ডের নাম বদলায় (`number`/`to`/`msisdn`,
         #    `content`/`message`/`text`) — একটাই নাম ধরে খুঁজলে Lamix OTP
         #    চুপচাপ হারিয়ে যেত, তাই সব কয়টা নামই দেখা হয়।
-        _num = otp_norm_number(m.get("number") or m.get("to") or m.get("msisdn")
-                               or m.get("phone") or m.get("destination") or "")
+        _num = otp_norm_number(
+            m.get("number") or m.get("to") or m.get("msisdn") or m.get("phone")
+            or m.get("destination") or m.get("recipient") or m.get("dest")
+            or m.get("msisdnTo") or m.get("receiver") or "")
         if not _num:
             continue
         _content = str(m.get("content") or m.get("message") or m.get("text")
-                       or m.get("sms") or m.get("body") or "")[:1200]
+                       or m.get("sms") or m.get("body") or m.get("msg")
+                       or m.get("textContent") or m.get("otp") or "")[:1200]
         if not _content:
             continue
-        _nid = str(m.get("id") or m.get("messageId") or m.get("uuid") or "")
+        _nid = str(m.get("id") or m.get("messageId") or m.get("uuid")
+                   or m.get("msgId") or m.get("_id") or m.get("message_id") or "")
         if not _nid:
             _nid = (_num + "|" + str(m.get("time") or "") + "|" + _content)[:120]
         out.append({"nid": _nid[:120], "number": _num, "otp": _content,
@@ -13033,21 +13167,34 @@ def otp_lamix_rows(numbers=None):
         return []
     _t = _time.time()
     _want = [otp_norm_number(n) for n in (numbers or [])]
-    _want = [n for n in _want if n][:4]
+    _want = [n for n in _want if n][:6]
     if not _want and _OTP_MSG_CACHE["rows"] \
             and _t - float(_OTP_MSG_CACHE["ts"] or 0) < 5:
         return _OTP_MSG_CACHE["rows"]
     out = _lamix_msg_rows(lamix_messages(limit=100))
+    if not out:
+        # 🛟 messages ফাঁকা/এরর হলে CDR থেকেও দেখা হয় — একই OTP অন্য
+        #    endpoint-এ থাকলে যেন হারিয়ে না যায়
+        try:
+            out = _lamix_msg_rows(lamix_cdrs(from_ts=int(_t) - 900, limit=100))
+        except Exception:
+            out = []
     if _want:
-        _have = {str(r.get("number") or "") for r in out}
+        _have = [str(r.get("number") or "") for r in out]
         for _n in _want:
-            if _n in _have:
+            if any(_gn_same_num(_n, _h) for _h in _have):
                 continue
-            try:
-                _one = _lamix_msg_rows(
-                    lamix_messages(number=_n.lstrip("+"), limit=20))
-            except Exception:
-                _one = []
+            # ⏱ একই নাম্বার ১০s-এ একবারই (রেট লিমিট ৪০/মিনিটের ভিতরে থাকতে)
+            _c = _LAMIX_NUM_CACHE.get(_n)
+            if _c and _t - float(_c.get("ts") or 0) < 10:
+                _one = list(_c.get("rows") or [])
+            else:
+                try:
+                    _one = _lamix_msg_rows(
+                        lamix_messages(number=_n.lstrip("+"), limit=20))
+                except Exception:
+                    _one = []
+                _LAMIX_NUM_CACHE[_n] = {"ts": _t, "rows": _one}
             if _one:
                 out = _one + out
     if not _want:
@@ -13083,7 +13230,7 @@ def _gn_lamix_feed_once(limit=60):
             try:
                 for _r in c.execute(
                         "SELECT number FROM getnum_orders WHERE status IN "
-                        "('waiting','received') AND ts >= %s",
+                        "('waiting','received','changed') AND ts >= %s",
                         (_time.time() - GN_WAIT_MIN * 60,)).fetchall() or []:
                     _o9 = _gn_norm_num(_r.get("number"))
                     if _o9:
@@ -13127,20 +13274,22 @@ def _gn_lamix_feed_once(limit=60):
                     for _k9 in list(_GN_FEED_SEEN)[:700]:
                         _GN_FEED_SEEN.pop(_k9, None)
                 _GN_FEED_SEEN[_ext] = _time.time()
-                if getattr(_cur, "rowcount", 0) and _gn_norm_num(_num) not in _own:
+                if getattr(_cur, "rowcount", 0) and not any(
+                        _gn_same_num(_num, _x) for _x in _own):
                     _fresh.append({"service": _svc, "range_val": _rng,
                                    "country": _cty, "flag": _f, "otp": _code,
                                    "sms": _sms, "number": "", "src": "lamix",
+                                   "kind": "panel",
                                    "price": 0, "paid_usd": 0, "resend": 0})
     except Exception as e:
         _GN_LAMIX_FEED["err"] = str(e)[:140]
         log.debug(f"[GETNUM-FEED] lamix save: {str(e)[:120]}")
+    # 📢 Lamix লাইভ কোডও ৩ মিনিটে একটা — জমা হয় না, নতুনটাই যায়
     if _fresh and _gn_ch_feed_ready():
-        _it = _fresh[0]
         try:
-            if _gn_ch_send(_gn_ch_text(_it)):
+            if _gn_ch_send(_gn_ch_text(_fresh[0])):
                 _gn_ch_feed_posted()
-                log.info("[GETNUM-FEED] Lamix OTP চ্যানেলে গেছে (৩ মিনিটের গ্যাপ)")
+                log.info("[GETNUM-FEED] Lamix লাইভ কোড চ্যানেলে গেছে (৩ মিনিটের গ্যাপ)")
         except Exception as _ce:
             log.debug(f"[GETNUM-FEED] lamix চ্যানেল পোস্ট: {str(_ce)[:90]}")
     return len(_fresh)
@@ -13479,15 +13628,20 @@ def _otp_hist_lines(uid, en=False, limit=5):
     for _i, r in enumerate(_rows, 1):
         _t = str(r.get("ts") or "")[5:16].replace("T", " ")
         _num = str(r.get("number") or "")
-        _lbl = ("•••• " + _num[-4:]) if len(_num) >= 4 else (_num or "OTP")
+        # নাম্বার এখন ডাটাবেজে মাস্ক করা থাকে (শুধু শেষ ৪ ডিজিট)
+        _lbl = _num if _num.startswith("\u2022") else (
+            ("\u2022\u2022\u2022\u2022" + _num[-4:]) if len(_num) >= 4 else (_num or "OTP"))
         _out.append(f"{_i}) 📱 `{_lbl}` · `+{_otp_money(r['amt'])}` · {_t}")
     return "\n".join(_out)
 
 
 def otp_earn_text(uid, lang="bn"):
-    """OTP Earn কার্ড + নিচে হিস্টোরি।"""
-    _en = (lang == "en")
-    return (_otp_earn_body(uid, lang) + "\n" + _otp_hist_lines(uid, _en))
+    """OTP Earn কার্ড — নিচের হিস্টোরি ব্লক নেই (ইউজারের অনুরোধে সরানো)।
+
+    আগে কার্ডের নিচে “📜 হিস্টোরি — এখনো কোনো OTP আয় হয়নি” লেখা আসত,
+    সেটা এখন আর দেখানো হয় না।
+    """
+    return _otp_earn_body(uid, lang)
 
 
 def _otp_earn_body(uid, lang="bn"):
@@ -13906,6 +14060,7 @@ LAMIX_API_DEF = "https://panel.lamix.org"
 LAMIX_RATE_BURST = 1.0        # সেকেন্ডে ১টি (ডকের burst limit)
 LAMIX_RATE_MIN = 40           # মিনিটে ৪০টি (sustained limit)
 _LAMIX_RL = {"times": [], "last": 0.0, "blocked": 0.0}
+_LAMIX_LAST = {"ts": 0.0, "err": ""}      # শেষ API এরর (ডায়াগনস্টিক/লগ)
 _LAMIX_RANGES = {"ts": 0.0, "rows": []}
 _LAMIX_RANGES_TTL = 120.0     # রেঞ্জ/রেট খুব কম বদলায় — ২ মিনিট ক্যাশ
 
@@ -14126,8 +14281,28 @@ def lamix_messages(from_ts=None, to_ts=None, number=None, cli=None, limit=50):
     _d = _lamix_api("messages", {"from": from_ts, "to": to_ts, "number": number,
                                  "cli": cli, "limit": max(1, min(1000, int(limit or 10)))})
     if "error" in _d:
+        # ⚠️ আগে এরর চুপচাপ হারিয়ে যেত — OTP প্যানেলে এলেও বটে/চ্যানেলে না
+        #    আসার কারণ জানা যেত না। এখন ২ মিনিটে একবার লগে + `/otpdiag`-এ।
+        _nw = _time.time()
+        if _nw - float(_LAMIX_LAST.get("ts") or 0) > 120:
+            _LAMIX_LAST.update({"ts": _nw, "err": str(_d.get("error") or "")})
+            log.warning(f"[LAMIX] messages API: {_d.get('error')} — "
+                        f"{str(_d.get('message') or '')[:160]}")
         return []
-    _r = _d.get("records")
+    # 🛟 প্যানেলভেদে লিস্টের চাবি আলাদা — `records` ছাড়াও বাকিগুলোও দেখা হয়
+    _r = None
+    for _k in ("records", "data", "messages", "items", "list", "result"):
+        _v = _d.get(_k)
+        if isinstance(_v, list):
+            _r = _v
+            break
+        if isinstance(_v, dict):
+            for _k2 in ("records", "items", "messages", "list"):
+                if isinstance(_v.get(_k2), list):
+                    _r = _v[_k2]
+                    break
+        if _r is not None:
+            break
     return [dict(x) for x in _r if isinstance(x, dict)] if isinstance(_r, list) else []
 
 
@@ -29560,6 +29735,41 @@ async def cmd_otpdiag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 % (_d.get("rows"), _d.get("fresh"), _d.get("sent")))
     if _d.get("err"):
         _out.append("ফিড error: `" + str(_d["err"])[:220] + "`")
+    # ☎️ Lamix (হাই রেট) — টোকেন/মেসেজ/এরর/চলমান অর্ডার এক নজরে
+    try:
+        _lx_on = lamix_on()
+    except Exception:
+        _lx_on = False
+    _out.append("Lamix: " + ("✅ চালু" if _lx_on else "❌ বন্ধ/টোকেন নেই"))
+    if _lx_on:
+        try:
+            _lx_msgs = await asyncio.to_thread(
+                lamix_messages, None, None, None, None, 5)
+        except Exception as _lxm:
+            _lx_msgs = []
+            _out.append("Lamix কল ব্যর্থ: " + str(_lxm)[:160])
+        _out.append("Lamix messages: " + str(len(_lx_msgs)))
+        if _lx_msgs:
+            _out.append("Lamix ফিল্ড: " + ", ".join(list(_lx_msgs[0])[:10]))
+        _lxerr = str(_LAMIX_LAST.get("err") or "")
+        if _lxerr:
+            _out.append("Lamix error: `" + _lxerr[:200] + "`")
+        try:
+            _lx_all = await asyncio.to_thread(gn_wait_orders, 200)
+            _lxord = [x for x in (_lx_all or [])
+                      if str(x.get("src") or "") == "lamix"]
+        except Exception:
+            _lxord = []
+        _out.append("Lamix চলমান অর্ডার: " + str(len(_lxord)))
+        if _lxord:
+            _out.append("Lamix নাম্বার: `" + str(_lxord[0].get("number") or "")
+                        + "`")
+            try:
+                _lxrows = await asyncio.to_thread(
+                    otp_lamix_rows, [x.get("number") for x in _lxord])
+            except Exception:
+                _lxrows = []
+            _out.append("Lamix ম্যাচ হওয়া row: " + str(len(_lxrows)))
     if _a == "send":
         _ok = await asyncio.to_thread(_gn_ch_send, _gn_ch_text({
             "service": "OTP Test", "range_val": "23767XXX", "country": "CAMEROON",
