@@ -704,7 +704,7 @@ def _gn_page_html():
         "<div style='margin-top:16px;padding-top:12px;border-top:1px solid #ddd'>"
         "<b>✉️ মেইল কিনুন (SmsBower mails API)</b>"
         "<div class='mut' style='font-size:12px;margin:4px 0 8px'>"
-        "বটের 🔑 OTP Buy → ✉️ Mail Account — মেইল কেনা, কোড পড়া (প্রোভাইডারে নাম্বার "
+        "বটের 🔑 OTP → ✉️ OTP Mail Account — মেইল কেনা, কোড পড়া (প্রোভাইডারে নাম্বার "
         "২৫ মিনিট থাকে, বটও ততক্ষণ কোড দেখে)। ২৫ মিনিটে কোড না এলে অর্ডার "
         "অটো বাতিল হয় — প্রোভাইডারের রিফান্ড নিশ্চিত হওয়ার পরেই ইউজারের "
         "ব্যালেন্সে টাকা ফেরত যায়। চাইলে ২৫ মিনিটের আগেই ইউজার নিজে Cancel "
