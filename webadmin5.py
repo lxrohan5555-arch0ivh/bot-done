@@ -2413,7 +2413,8 @@ def otp_earn_page():
         _cty_g = str(s.get("country_raw", s.get("country")) or "")
         _svc_g = str(s.get("service") or "")
         _stat_rows.append([
-            f"{s['flag']} {esc(str(s.get('country') or 'অজানা'))}",
+            f"{s['flag']} {esc(str(s.get('country') or 'অজানা'))}"
+            f" <span class='mono mut'>({num(s['n'])})</span>",
             esc(_svc_g or "—"),
             f"<b class='mono'>{num(s['n'])}</b>",
             esc(f"${s['rate']:.4f}"),
@@ -2549,6 +2550,31 @@ def otp_earn_page():
           "নাম্বার স্টক ও ডাটাবেজ — দুটো থেকেই মুছে যাবে।</div>"
         + table(["দেশ", "সার্ভিস", "ফ্রি নাম্বার", "গড় রেট", ""], _stat_rows,
                 "এখনো কোনো নাম্বার আপলোড হয়নি")
+        # ── ➕ সরাসরি স্টক এড (ফাইল ছাড়াই) ──
+        + "<div style='margin-top:14px;padding-top:12px;border-top:1px solid #ddd'>"
+          "<b>➕ স্টক এড করুন</b>"
+          "<div class='mut' style='font-size:12px;margin:4px 0 8px'>"
+          "দেশ + সার্ভিস + রেট দিয়ে নিচে নাম্বার বসান (প্রতি লাইনে একটা) — "
+          "সাথে সাথে স্টকে যোগ হবে, ফাইল আপলোড লাগবে না।</div>"
+          "<form method='post' action='/admin/otp/add'>"
+          "<div class='field'><label>দেশ (নাম বা ISO — যেমন Sri Lanka / LK)</label>"
+          "<input name='country' placeholder='Sri Lanka' required></div>"
+          "<div class='field'><label>সার্ভিস</label>"
+          "<input name='service' placeholder='facebook'></div>"
+          "<div class='field'><label>প্রতি OTP-তে ইউজার পাবে (USD $)</label>"
+          "<input name='rate' type='number' step='0.0001' min='0' value='0.01'></div>"
+          "<div class='field'><label>প্রতি OTP-তে আমি পাব (USD $)"
+          " <span class='mut'>— শুধু লাভের হিসাব</span></label>"
+          "<input name='my_cost' type='number' step='0.0001' min='0' value='0'></div>"
+          "<div class='field'><label>নাম্বার (প্রতি লাইনে একটা)</label>"
+          "<textarea name='numbers' rows='5' placeholder='94771234567' required "
+          "oninput=\"document.getElementById('otp_cnt').textContent = 'কয়টা নাম্বার: ' "
+          "+ this.value.split(String.fromCharCode(10))"
+          ".filter(function(x){return x.trim();}).length\">"
+          "</textarea>"
+          "<div class='mut mono' style='font-size:12px' id='otp_cnt'>"
+          "কয়টা নাম্বার: 0</div></div>"
+          "<button class='ok' type='submit'>➕ স্টক এড করুন</button></form></div>"
         + "</div>"
         # ── withdraw ──
         + "<div class='card'><b>💸 OTP Withdraw রিকোয়েস্ট (পেন্ডিং)</b>"
@@ -2641,6 +2667,68 @@ def otp_earn_upload():
     if bad:
         _tail += f" · {bad} লাইন বাদ"
     return redirect("/admin/otp?ok=" + _q(f"✅ {added} টা নাম্বার যোগ হয়েছে{_tail}"))
+
+
+@wadm.route("/admin/otp/add", methods=["POST"])
+def otp_earn_stock_add():
+    """➕ স্টক টেবিল থেকে সরাসরি নাম্বার এড (দেশ + সার্ভিস + রেট)।"""
+    g = guard()
+    if g:
+        return g
+    try:
+        import bot as _b
+    except Exception as e:
+        return redirect("/admin/otp?err=" + _q(f"bot লোড হয়নি: {e}"))
+    form = request.form
+    _cty = (form.get("country") or "").strip()[:80]
+    _svc = (form.get("service") or "").strip()[:40]
+    try:
+        _rate = round(max(float(str(form.get("rate") or 0).replace(",", ".")), 0.0), 4)
+    except Exception:
+        _rate = 0.0
+    try:
+        _myc = max(float(str(form.get("my_cost") or 0).replace(",", ".")), 0.0)
+    except Exception:
+        _myc = 0.0
+    _text = (form.get("numbers") or "").strip()
+    if not _text:
+        return redirect("/admin/otp?err=" + _q("নাম্বার লিখুন (প্রতি লাইনে একটা)"))
+    if not _cty:
+        return redirect("/admin/otp?err=" + _q("দেশ লিখুন"))
+    # দেশের নাম/ISO → ওই দেশের নাম+ISO সব নাম্বারে বসবে
+    _iso, _nm = "", ""
+    _up = _cty.upper()
+    if 2 <= len(_up) <= 3 and _up.isalpha():
+        try:
+            _nm0, _cc0 = _b.otp_iso_name(_up)
+        except Exception:
+            _nm0, _cc0 = "", ""
+        if _nm0:
+            _iso, _nm = _up[:3], _nm0
+        else:
+            _nm = _cty
+    else:
+        _nm = _cty
+    _meta = {}
+    for _ln in _text.replace("\r", "").split("\n"):
+        try:
+            _n = _b.otp_norm_number(_ln.strip())
+        except Exception:
+            _n = ""
+        if _n:
+            _meta[_n] = (_svc, _nm, _iso)
+    try:
+        _a, _d, _bad = _b.otp_numbers_add(_text, _svc, _rate, "manual",
+                                          meta=_meta, flat_cost=_myc)
+    except Exception as e:
+        return redirect("/admin/otp?err=" + _q(f"যোগ হয়নি: {str(e)[:140]}"))
+    if not _a:
+        return redirect("/admin/otp?err=" + _q("সব নাম্বারই আগে থেকে আছে বা ভুল"))
+    log_admin("otp_stock_add", 0, f"+{_a} numbers {_cty} svc={_svc or '-'} rate={_rate}")
+    _tail = f" · {_d} ডুপ্লিকেট" if _d else ""
+    if _bad:
+        _tail += f" · {_bad} বাদ"
+    return redirect("/admin/otp?ok=" + _q(f"✅ {_a}টি নাম্বার স্টকে যোগ হয়েছে{_tail}"))
 
 
 @wadm.route("/admin/otp/sync", methods=["POST"])

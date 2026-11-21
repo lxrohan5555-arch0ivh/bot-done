@@ -8429,13 +8429,12 @@ GETNUM_SMS_DEF  = "https://api.zenexnetwork.com/v1/numsuccess/info"
 GETNUM_LIST_DEF = "https://api.zenexnetwork.com/v1/active-ranges"
 GETNUM_FEED_DEF = "https://www.zenexnetwork.com/api/v1/global-broadcast"
 GETNUM_CH_DEF   = "-1003728636195"
-GN_WAIT_MIN = 20          # নাম্বার কত মিনিট লাইভ
+GN_WAIT_MIN = 10          # নাম্বার কত মিনিট লাইভ (১০ মিনিটে OTP না এলে স্টকে ফেরত)
 GN_MAX_SERVICES = 20      # লাইভ ফিড থেকে নতুন সার্ভিসও শেখা যায়
 GN_MAX_ITEMS = 150        # প্রতি সার্ভিসে রেঞ্জ (আগে ৬০ — নতুন দেশ আর ঢুকত না)
 _GN_MAX_SHOWN = 90        # এক স্ক্রিনে সর্বোচ্চ বাটন (Telegram-এর সীমার নিচে)
 GN_FEED_ON = True         # ✅ লাইভ OTP ফিড (নতুন দেশ শেখা + OTP গ্রুপে পোস্ট) চালু —
                           #    বন্ধ করলে গ্রুপে একটাও OTP যাবে না
-GN_MAX_OPEN = 3           # একসাথে কতগুলো নাম্বার চলতে পারে
 GN_FEED_POST_MAX = 10     # প্রতি চেকে সর্বোচ্চ কতটি লাইভ OTP চ্যানেলে যাবে
 GN_SMS_TTL = 3            # OTP লিস্ট ক্যাশ (সেকেন্ড)
 _GN_SMS_CACHE = {"ts": 0.0, "rows": []}
@@ -9280,16 +9279,102 @@ _GN_FEED_SEEN = {}             # ext_id → সময় (মেমরিতে�
 _GN_RL_GAP = 180               # দুই পোস্টের মাঝে কমপক্ষে ৩ মিনিট (ফিডের জন্য)
 _GN_CH_LAST = {"ts": 0.0}     # ফিডের শেষ পোস্ট কখন গেল
 _GN_CH_SEEN = {}              # একই কোড দুইবার পোস্ট না হতে
+_GN_CH_SEEN_TTL = 1800        # একই কোড ৩০ মিনিটে আর পোস্ট হবে না
+_GN_CH_SVC = {}               # service → শেষ পোস্টের সময় (সার্ভিস ঘুরানোর জন্য)
+_GN_SVC_TTL = 600             # একই সার্ভিস ১০ মিনিটে একবার — তারপর অন্য সার্ভিস
+
+
+def _gn_ch_seen_has(key):
+    """৩০ মিনিটের ভিতর এই কোডটা আগেই চ্যানেলে গেছে কি?"""
+    _ts = _GN_CH_SEEN.get(key)
+    return bool(_ts) and (_time.time() - float(_ts)) < _GN_CH_SEEN_TTL
+
+
+def _gn_ch_seen_add(key):
+    """পোস্ট হওয়া কোড মনে রাখো (মেমরি বাড়তে না দিয়ে)।"""
+    if len(_GN_CH_SEEN) > 2000:
+        for _k in [k for k, v in _GN_CH_SEEN.items()
+                   if _time.time() - float(v or 0) > _GN_CH_SEEN_TTL]:
+            _GN_CH_SEEN.pop(_k, None)
+    _GN_CH_SEEN[str(key)] = _time.time()
+
+
+def _gn_pick_fresh(cands):
+    """💡 কোন কোডটা চ্যানেলে যাবে — এক দেশ এক সার্ভিস, ঘুরিয়ে ঘুরিয়ে।
+
+    • গ্রুপ = সার্ভিস + দেশ: একই সার্ভিসের **অন্য দেশ** আলাদা → সাথে সাথেই যাবে
+    • আগে যায় যেই গ্রুপ ১০ মিনিটে যায়নি (নতুন কোড, আগে পোস্ট হয়নি)
+    • সব গ্রুপই সদ্য গেলে → যেটার পোস্ট সবচেয়ে পুরোনো, সেটাই
+    • কিছু না মিললে (None, "") — এই চেকে কিছু যাবে না
+    """
+    _now = _time.time()
+    _wait = []
+    for c in cands or []:
+        _svc = str(c.get("service") or "")
+        _grp = _svc + "|" + str(c.get("country") or c.get("range_val") or "")
+        _key = _svc + "|" + str(c.get("otp") or c.get("sms") or "")[:40]
+        if _gn_ch_seen_has(_key):
+            continue
+        _last = float(_GN_CH_SVC.get(_grp) or 0)
+        if (_now - _last) >= _GN_SVC_TTL:
+            return c, _key           # এই সার্ভিস+দেশ অনেকক্ষণ যায়নি — এটাই
+        _wait.append((_last, c, _key))
+    if _wait:                        # সবাই সদ্য গেছে → সবচেয়ে পুরোনোটার ধারেকাছে
+        _wait.sort(key=lambda x: x[0])
+        return _wait[0][1], _wait[0][2]
+    return None, ""
+
+
+def _gn_mark_posted(cand, key):
+    """পোস্ট সফল — কোড আর সার্ভিস+দেশ দুটোই মনে রাখো।"""
+    _gn_ch_seen_add(key)
+    try:
+        _grp = (str(cand.get("service") or "") + "|"
+                + str(cand.get("country") or cand.get("range_val") or ""))
+        _GN_CH_SVC[_grp] = _time.time()
+    except Exception:
+        pass
+
+
+def _gn_ch_last_saved():
+    """শেষ ফিড-পোস্টের সময় DB থেকে (cache ছাড়া)।
+
+    ⚠️ আগে টাইমারটা শুধু মেমরিতে ছিল — বট restart/নতুন ডিপ্লয় হলেই
+    শূন্য হয়ে যেত, আর সাথে সাথে আরেকটা পোস্ট চলে যেত (৩ মিনিটের গ্যাপ
+    ভেঙে পড়ত)। এখন DB-তে থাকে, তাই restart হলেও গ্যাপ ঠিক থাকে।
+    """
+    try:
+        with _c() as c:
+            r = c.execute("SELECT value FROM settings "
+                          "WHERE key='getnum_ch_last'").fetchone()
+    except Exception:
+        return 0.0
+    if not r:
+        return 0.0
+    try:
+        return float((r.get("value") if hasattr(r, "get") else r["value"]) or 0)
+    except Exception:
+        return 0.0
 
 
 def _gn_ch_feed_ready():
     """ফিডের ৩ মিনিটের গ্যাপ শেষ হয়েছে কি? — পুরোনো জমে থাকলে কিছুই হয় না।"""
-    return (_time.time() - float(_GN_CH_LAST.get("ts") or 0)) >= _GN_RL_GAP
+    _last = max(float(_GN_CH_LAST.get("ts") or 0), _gn_ch_last_saved())
+    return (_time.time() - _last) >= _GN_RL_GAP
 
 
 def _gn_ch_feed_posted():
-    """ফিডের একটা পোস্ট সত্যিই গেছে — এখন থেকে ৩ মিনিট গোনা হবে।"""
-    _GN_CH_LAST["ts"] = _time.time()                                   # ⏱
+    """ফিডের একটা পোস্ট সত্যিই গেছে — এখন থেকে ৩ মিনিট গোনা হবে।
+
+    মেমরি + DB দুটোতেই লিখি — DB-তে থাকলে বট restart হলেও গ্যাপ থাকে,
+    আর 여러 worker চললেও একই টাইমার দেখে (ডুপ্লিকেট পোস্ট হয় না)।
+    """
+    _t = _time.time()
+    _GN_CH_LAST["ts"] = _t                                            # ⏱
+    try:
+        set_setting("getnum_ch_last", "%.0f" % _t)
+    except Exception as _e:
+        log.debug(f"[GETNUM-FEED] ch_last সেভ: {str(_e)[:100]}")
 
 
 def _gn_flag_of_name(name):
@@ -9563,33 +9648,22 @@ def _gn_live_counts(mins=10, service=None):
 
 
 def gn_open_orders(uid):
-    """এই ইউজারের এখনো OTP না আসা সব নাম্বার (সর্বোচ্চ GN_MAX_OPEN, নতুন আগে)।"""
+    """এই ইউজারের এখনো OTP না আসা সব নাম্বার (নতুন আগে)।"""
     try:
         with _c() as c:
             return c.execute(
                 "SELECT * FROM getnum_orders WHERE user_id=%s AND status='waiting' "
                 "AND ts >= %s ORDER BY id DESC LIMIT %s",
                 (int(uid), _time.time() - GN_WAIT_MIN * 60,
-                 int(GN_MAX_OPEN))).fetchall() or []
+                 10)).fetchall() or []
     except Exception:
         return []
 
 
-def gn_active_count(uid):
-    """এই ইউজারের চলমান (OTP-রত বা সদ্য পাওয়া) নাম্বার — ৩টির সীমা এটাই।"""
-    try:
-        with _c() as c:
-            r = c.execute(
-                "SELECT COUNT(*) AS n FROM getnum_orders WHERE user_id=%s "
-                "AND status IN ('waiting','received') AND ts >= %s",
-                (int(uid), _time.time() - GN_WAIT_MIN * 60)).fetchone()
-        return int((r or {}).get("n") or 0)
-    except Exception:
-        return 0
 
 
 def gn_open_order(uid):
-    """এই ইউজারের সবচেয়ে নতুন চলমান নাম্বার (２０ মিনিটের ভিতরে)।"""
+    """এই ইউজারের সবচেয়ে নতুন চলমান নাম্বার (১০ মিনিটের ভিতরে)।"""
     rows = gn_open_orders(uid)
     return rows[0] if rows else None
 
@@ -9770,6 +9844,36 @@ def _gn_ch_probe():
             return str(e)[:200]
 
 
+def _gn_svc_of_range(rng, raw=""):
+    """🌍 ওয়েব প্যানেলে যোগ করা **সার্ভিসের নাম** (রেঞ্জ/নাম মিলিয়ে)।
+
+    Lamix/Zenex ফিডে ``service`` ঘরে অনেক সময় রেঞ্জের লেখা (যেমন
+    "Sri Lanka (Fresh) 11Oct") আসে — চ্যানেলে সেটা নয়, প্যানেলে যোগ করা
+    সার্ভিস (Imo/Facebook…) দেখানো হবে। না মিললে raw-ই ফেরত।
+    """
+    _raw = str(raw or "").strip()
+    try:
+        _k = _gn_rng_key(rng) if rng else ""
+        _raw_l = _raw.lower()
+        for sv in getnum_services():
+            _nm = str(sv.get("name") or "").strip()
+            _nm_l = _nm.lower()
+            if _raw_l and _nm and _raw_l == _nm_l:
+                return _nm
+            for it in (sv.get("items") or []):
+                if _k and _gn_rng_key(it.get("range")) == _k:
+                    return _nm or _raw
+                _in_l = str(it.get("name") or "").strip().lower()
+                if _raw_l and _in_l and _raw_l == _in_l:
+                    return _nm or _raw
+            # \u0986\u09b0\u09cd\u099f\u09cd\u09b8\u09c7 \u09ae\u09bf\u09b2\u09bf\u09af\u09bc\u09c7 \u09a8\u09be\u09ae \u09b8\u09cd\u09aa\u09b7\u09cd\u099f \u09b9\u09b2\u09c7\u0993 \u099a\u09b2\u09ac\u09c7 (\u0989\u09a6\u09be\u0970 "Imo")
+            if _raw_l and len(_nm_l) >= 3 and _nm_l in _raw_l:
+                return _nm
+    except Exception:
+        pass
+    return _raw
+
+
 def _gn_ch_text(o):
     """OTP চ্যানেলের নোটিশ — বটের ইনবক্স কার্ডের মতোই পরিষ্কার।"""
     _e = lambda v: html.escape(str(v or ""), quote=False)
@@ -9790,19 +9894,18 @@ def _gn_ch_text(o):
     _loc = " ".join(x for x in (_flag, _cty) if x).strip()
     _num = str(o.get("number") or "").strip()
     _code = str(o.get("otp") or "").strip() or "—"
-    _svc = str(o.get("service") or "").strip() or "OTP"
+    _svc = _gn_svc_of_range(_rng, o.get("service")).strip() or "OTP"
     _paid = float(o.get("paid_usd") or 0)
     _pay_s = (f"💰 <b>Paid :</b> {_e(getnum_money2(_paid))}\n") if _paid > 0 else ""
     # পতাকা সবসময় দেশের নামের **আগে** বসে (`_loc` = "🇨🇲 Cameroon")
-    _meta = " · ".join(x for x in (_svc, _loc, ("🔢 " + _rng) if _rng else "") if x)
     _head = ("♻️ <b>New Otp receive (Resend)</b>" if o.get("resend")
              else "🆕 <b>New Otp receive</b>")
     # ⚡ কোন ধরনের OTP — হাই রেট (Lamix) নাকি নরমাল (Zenex/ওয়েব)
     _is_hr = str(o.get("src") or "").strip().lower() == "lamix"
     _type_s = "🔥 <b>High rate</b>" if _is_hr else "🟢 <b>Normal (low rate)</b>"
-    # 🏷 কোনটা কার কোড — প্যানেল/লাইভ নাকি ইউজারের নিজের OTP
+    # 🏷 কোনটা কার কোড — Lamix-এর সিস্টেমে শুধু ইউজারের, নাহলে প্যানেল/লাইভ
     _is_panel = str(o.get("kind") or "").strip().lower() == "panel"
-    _src_s = ("📊 <b>Panel / Live code</b>" if _is_panel
+    _src_s = ("📊 <b>Panel / Live code</b>" if (_is_panel and not _is_hr)
               else "👤 <b>User OTP</b>")
     _out = (
         f"{_head}\n\n"
@@ -9810,7 +9913,6 @@ def _gn_ch_text(o):
         f"📱 <b>Service :</b> {_e(_svc)}\n"
         f"⚡ <b>Type :</b> {_type_s}\n"
         f"🌍 <b>Country :</b> {_e(_loc or (_flag + ' ' + _cty).strip() or '—')}\n"
-        f"🔢 <b>Range :</b> {_e(_rng or '—')}\n"
         f"🔑 <b>Otp :</b> <b>{_e(_code)}</b>\n"
         f"{_pay_s}"
         f"💬 <b>Full Message :</b>\n"
@@ -10002,16 +10104,9 @@ def _gn_order_kb(o, en=False):
                                        callback_data=f"gn:n:{_id}")])
         _b.append([InlineKeyboardButton(_bi("🌐 দেশ বদলান", "🌐 Change Country", en),
                                         callback_data=(f"gn:cc:{_id}" if _id else "gn:home"))])
-    try:
-        _n = gn_active_count(int(o.get("user_id") or 0))
-    except Exception:
-        _n = 1
-    # 🔙 মেনুতে ফেরার পথ সবসময় থাকবে — নাম্বার লিমিট পূরণ হলেও,
-    #    না হলে ইউজারকে /start চাপতে হতো (মেনু হারিয়ে যেত)
+    # 🔙 মেনুতে ফেরার পথ সবসময় থাকবে — না হলে ইউজারকে /start চাপতে হতো
     _b.append([InlineKeyboardButton(
-        _bi(f"➕ আরেকটা নাম্বার ({_n}/{GN_MAX_OPEN})",
-            f"➕ Another number ({_n}/{GN_MAX_OPEN})", en)
-        if _n < GN_MAX_OPEN else _bi("📱 নাম্বার নিন", "📱 Get Number", en),
+        _bi("➕ আরেকটা নাম্বার", "➕ Another number", en),
         callback_data="gn:home")])
     _u = getnum_group_url()
     if _u:
@@ -10166,8 +10261,9 @@ async def otp_gn_show(update, ctx):
     _one = []
     for i, g in enumerate(groups[:16]):
         _sv = g["service"] or "OTP"
-        _lbl = (f"{g['flag']} {g['country']} · {_sv} · {g['n']} · "
-                f"${g['rate']:.3f}")
+        # 🌍 আগে সার্ভিস (প্যানেলে যেটা যোগ করা হয়েছে), তারপর দেশ/স্টক/রেট
+        _lbl = (f"{_gn_svc_icon(_sv)} {_sv} · {g['flag']} {g['country']} · "
+                f"{g['n']} · ${g['rate']:.3f}")
         _one.append(InlineKeyboardButton(_lbl[:62], callback_data=f"otp:gn:{i}"))
     rows = _pair_rows(_one)
     rows.append([InlineKeyboardButton(_bi("🔙 ফিরে যান", "🔙 Back", en),
@@ -10192,16 +10288,6 @@ async def otp_gn_issue(update, ctx, idx):
         g = dict(groups[int(idx)])
     except Exception:
         return await otp_gn_show(update, ctx)
-    _active = await asyncio.to_thread(gn_active_count, uid)
-    if _active >= GN_MAX_OPEN:
-        return await _gn_say(update, _bi(
-            f"📱 *একসাথে সর্বোচ্চ {GN_MAX_OPEN}টি নাম্বার চলতে পারে*\n\n"
-            "আগের কোনওটা OTP পেলে বা সময় শেষ হলে আবার নতুন নিতে পারবেন।",
-            f"📱 *Up to {GN_MAX_OPEN} numbers at a time*\n\n"
-            "Get a new one after an OTP arrives or the time runs out.", en),
-            InlineKeyboardMarkup([[InlineKeyboardButton(
-                _bi("📱 চলমান নাম্বার", "📱 Current numbers", en),
-                callback_data="gn:cur")]]))
     await _gn_say(update, _bi("⏳ নাম্বার নেওয়া হচ্ছে...",
                               "⏳ Taking a number...", en))
     row, err = await asyncio.to_thread(otp_take, uid, g.get("iso") or "",
@@ -10360,18 +10446,6 @@ async def _gn_place(update, ctx, service, item, en=False, retry_cb="gn:home"):
         return await _gn_say(update, _bi(
             "⚠️ *নাম্বার সার্ভিস এখনো সেট করা হয়নি*\n\nসাহায্য: @gmail4gg",
             "⚠️ *Number service is not set up yet*\n\nHelp: @gmail4gg", en))
-    _open = await asyncio.to_thread(gn_open_orders, uid)
-    _active = await asyncio.to_thread(gn_active_count, uid)
-    if _active >= GN_MAX_OPEN:
-        _list = "\n".join("`" + str(x.get("number") or "") + "`" for x in _open)
-        return await _gn_say(update, _bi(
-            f"📱 *একসাথে সর্বোচ্চ {GN_MAX_OPEN}টি নাম্বার চলতে পারে*\n\n{_list}\n\n"
-            "আগের কোনওটা OTP পেলে বা সময় শেষ হলে আবার নতুন নিতে পারবেন।",
-            f"📱 *Up to {GN_MAX_OPEN} numbers at a time*\n\n{_list}\n\n"
-            "Get a new one after an OTP arrives or the time runs out.", en),
-            InlineKeyboardMarkup([[InlineKeyboardButton(
-                _bi("📱 চলমান নাম্বার", "📱 Current numbers", en),
-                callback_data="gn:cur")]]))
     rate = _gn_rate_of(it)
     await _gn_say(update, _bi("⏳ নাম্বার আনা হচ্ছে...", "⏳ Getting a number...", en))
     ok, val, info, raw = await asyncio.to_thread(getnum_fetch, it["range"])
@@ -10405,21 +10479,9 @@ async def _gn_place(update, ctx, service, item, en=False, retry_cb="gn:home"):
                "country": (info or {}).get("country") or "",
                "iso": (info or {}).get("iso") or "",
                "operator": (info or {}).get("operator") or ""}
-    # একসাথে ২টি নাম্বার (প্রথম ছবির মতো) — জায়গা/লিমিট থাকলে
+    # এক চাপে ১টা নাম্বার — নেওয়ার কোনো লিমিট নেই, দরকার হলে
+    # আবার "➕ আরেকটা নাম্বার" চাপলেই হবে (স্টক নষ্ট হয় না)।
     _rows_g = [dict(row)]
-    try:
-        if oid and (_active + 1) < GN_MAX_OPEN:
-            _ok2, _val2, _info2, _raw2 = await asyncio.to_thread(
-                getnum_fetch, it["range"])
-            if _ok2 and _val2:
-                _oid2 = await asyncio.to_thread(gn_order_new, uid, service, it,
-                                                _val2, rate, _info2)
-                _row2 = (await asyncio.to_thread(gn_order_get, _oid2))
-                if _row2:
-                    _rows_g.append(dict(_row2))
-                    await asyncio.to_thread(_gn_log, uid, it, _val2, "ok", "")
-    except Exception as _e2:
-        log.debug(f"[GETNUM] ২য় নাম্বার: {str(_e2)[:100]}")
     return await _gn_say(update, _gn_group_text(_rows_g, en),
                          _gn_group_kb(_rows_g, en), parse_mode="HTML")
 
@@ -10725,7 +10787,10 @@ def _gn_feed_once():
     _GN_FEED_DIAG["sent"] = 0
     if _fresh and _gn_ch_feed_ready():
         try:
-            if _gn_ch_send(_gn_ch_text(_fresh[0])):
+            # 🔁 একই কোড ৩০ মিনিটে নয় + একই সার্ভিস বারবার নয় (ঘুরিয়ে)
+            _pick, _key = _gn_pick_fresh(_fresh)
+            if _pick and _gn_ch_send(_gn_ch_text(_pick)):
+                _gn_mark_posted(_pick, _key)
                 _gn_ch_feed_posted()
                 _GN_FEED_DIAG["sent"] = 1
                 log.info("[GETNUM-FEED] ১টা লাইভ কোড চ্যানেলে গেছে (৩ মিনিটের গ্যাপ)")
@@ -13046,6 +13111,44 @@ def otp_release_expired(wait_min=None):
 
 
 _OTP_SWEEP = {"ts": 0.0}
+_OTP_PURGE = {"ts": 0.0}
+
+
+def otp_purge_used(hours=1):
+    """✅ OTP পাওয়া (used) নাম্বার ডাটাবেজ থেকে অটো মুছে ফেলে — ডাটা বাড়ে না।
+
+    নাম্বারটা একবার OTP এলে আর কখনো কাউকে দেওয়া হয় না, তাই এটা রাখার
+    দরকার নেই। ১ ঘণ্টা পরে নিজে থেকেই ডিলিট হয় (একই নাম্বার আবার আপলোড
+    হলেও আলাদা করে চিনতে সমস্যা হয় না)।
+    """
+    _otp_init()
+    _now_tz = datetime.now(pytz.timezone("Asia/Dhaka"))
+    _cut_s = (_now_tz - timedelta(hours=float(hours))).strftime("%Y-%m-%d %H:%M")
+    try:
+        with _c() as c:
+            cur = c.execute(
+                "DELETE FROM otp_numbers WHERE status='used' "
+                "AND COALESCE(used_at,'') <> '' AND used_at <= %s", (_cut_s,))
+            _n = int(getattr(cur, "rowcount", 0) or 0)
+            # 🧹 পুরোনো শেষ হওয়া অর্ডারও ছেঁটে ফেলা — ডাটা জমে থাকে না
+            try:
+                _cut7 = (_now_tz - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
+                c.execute("DELETE FROM getnum_orders WHERE status IN "
+                          "('expired','changed') AND COALESCE(updated_at,'') <> '' "
+                          "AND updated_at <= %s", (_cut7,))
+            except Exception:
+                pass
+        if _n:
+            _mark_dirty()
+            try:
+                _OTP_STATS_CACHE["ts"] = 0.0
+            except Exception:
+                pass
+            log.info(f"[OTP] {_n}টি used নাম্বার ডাটাবেজ থেকে মুছে ফেলা হয়েছে")
+        return _n
+    except Exception as e:
+        log.debug(f"[OTP] purge used: {str(e)[:120]}")
+        return 0
 
 
 def _otp_sweep_maybe():
@@ -13054,6 +13157,13 @@ def _otp_sweep_maybe():
     if _t - float(_OTP_SWEEP.get("ts") or 0) < 60:
         return 0
     _OTP_SWEEP["ts"] = _t
+    # 🧹 ১০ মিনিটে একবার: OTP পাওয়া নাম্বার ডাটাবেজ থেকে মুছে ফেলা
+    try:
+        if _t - float(_OTP_PURGE.get("ts") or 0) > 600:
+            _OTP_PURGE["ts"] = _t
+            otp_purge_used()
+    except Exception:
+        pass
     try:
         otp_release_holds()      # ৫ মিনিটের হোল্ড শেষ → আবার স্টকে
     except Exception:
@@ -13287,7 +13397,9 @@ def _gn_lamix_feed_once(limit=60):
     # 📢 Lamix লাইভ কোডও ৩ মিনিটে একটা — জমা হয় না, নতুনটাই যায়
     if _fresh and _gn_ch_feed_ready():
         try:
-            if _gn_ch_send(_gn_ch_text(_fresh[0])):
+            _pick, _key = _gn_pick_fresh(_fresh)
+            if _pick and _gn_ch_send(_gn_ch_text(_pick)):
+                _gn_mark_posted(_pick, _key)
                 _gn_ch_feed_posted()
                 log.info("[GETNUM-FEED] Lamix লাইভ কোড চ্যানেলে গেছে (৩ মিনিটের গ্যাপ)")
         except Exception as _ce:
