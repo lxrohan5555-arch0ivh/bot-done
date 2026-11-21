@@ -2436,7 +2436,6 @@ def otp_earn_page():
             f"{s['flag']} {esc(str(s.get('country') or 'অজানা'))}"
             f" <span class='mono mut'>({num(s['n'])})</span>",
             esc(_svc_g or "—"),
-            f"<b class='mono'>{num(s['n'])}</b>",
             esc(f"${s['rate']:.4f}"),
             "<form method='post' action='/admin/otp/stock/del' style='display:inline' "
             "onsubmit=\"return confirm('এই গ্রুপের সব ফ্রি নাম্বার স্টক ও ডাটাবেজ থেকে ডিলিট হবে — ঠিক আছে?')\">"
@@ -2568,10 +2567,14 @@ def otp_earn_page():
           "<div class='mut' style='font-size:12px;margin:4px 0 10px'>"
           "ফ্রি নাম্বার এই টেবিলেই দেখা যায়। 🗑 ডিলিট চাপলে ওই দেশ+সার্ভিসের সব ফ্রি "
           "নাম্বার স্টক ও ডাটাবেজ — দুটো থেকেই মুছে যাবে।</div>"
-        + table(["দেশ", "সার্ভিস", "ফ্রি নাম্বার", "গড় রেট", ""], _stat_rows,
+        + "<div style='display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start'>"
+          "<div style='flex:1 1 460px;min-width:280px'>"
+        + table(["দেশ", "সার্ভিস", "গড় রেট", ""], _stat_rows,
                 "এখনো কোনো নাম্বার আপলোড হয়নি")
-        # ── ➕ সরাসরি স্টক এড (ফাইল ছাড়াই) ──
-        + "<div style='margin-top:14px;padding-top:12px;border-top:1px solid #ddd'>"
+        + "</div>"
+        # ── ➕ সরাসরি স্টক এড — টেবিলের পাশেই (ডিলিট বাটনের লাইনে) ──
+        + "<div style='flex:1 1 300px;min-width:260px;padding-left:12px;"
+          "border-left:1px solid #ddd'>"
           "<b>➕ স্টক এড করুন</b>"
           "<div class='mut' style='font-size:12px;margin:4px 0 8px'>"
           "দেশ + সার্ভিস + রেট দিয়ে নিচে নাম্বার বসান (প্রতি লাইনে একটা) — "
@@ -2595,6 +2598,7 @@ def otp_earn_page():
           "<div class='mut mono' style='font-size:12px' id='otp_cnt'>"
           "কয়টা নাম্বার: 0</div></div>"
           "<button class='ok' type='submit'>➕ স্টক এড করুন</button></form></div>"
+        + "</div>"
         + "</div>"
         # ── withdraw ──
         + "<div class='card'><b>💸 OTP Withdraw রিকোয়েস্ট (পেন্ডিং)</b>"

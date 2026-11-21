@@ -8429,7 +8429,8 @@ GETNUM_SMS_DEF  = "https://api.zenexnetwork.com/v1/numsuccess/info"
 GETNUM_LIST_DEF = "https://api.zenexnetwork.com/v1/active-ranges"
 GETNUM_FEED_DEF = "https://www.zenexnetwork.com/api/v1/global-broadcast"
 GETNUM_CH_DEF   = "-1003728636195"
-GN_WAIT_MIN = 10          # নাম্বার কত মিনিট লাইভ (১০ মিনিটে OTP না এলে স্টকে ফেরত)
+GN_WAIT_MIN = 10          # নতুন নাম্বার কত মিনিট লাইভ (১০ মিনিটে OTP না এলে স্টকে ফেরত)
+GN_CHANGE_MIN = 5         # নাম্বার বদলালে পুরোনো নাম্বার ৫ মিনিট (বদলানোর সময় থেকে)
 GN_MAX_SERVICES = 20      # লাইভ ফিড থেকে নতুন সার্ভিসও শেখা যায়
 GN_MAX_ITEMS = 150        # প্রতি সার্ভিসে রেঞ্জ (আগে ৬০ — নতুন দেশ আর ঢুকত না)
 _GN_MAX_SHOWN = 90        # এক স্ক্রিনে সর্বোচ্চ বাটন (Telegram-এর সীমার নিচে)
@@ -8729,6 +8730,37 @@ _GN_SVC_ALIAS = {
     "xparibet": "🎲 Xparibet", "megapari": "🎲 Megapari", "manus": "🛒 Manus",
     "tripcom": "✈️ Trip.com", "trip.com": "✈️ Trip.com",
 }
+
+
+# SMS-এর ভেতরের লেখা → আসল সার্ভিস (প্যানেলের রেঞ্জ-নাম ভুল থাকলেও ঠিক দেখাবে)
+_GN_SMS_SVCS = (
+    ("whatsapp", "💬 WhatsApp"), ("whats app", "💬 WhatsApp"),
+    ("telegram", "✈️ Telegram"), ("facebook", "📘 Facebook"),
+    ("instagram", "📸 Instagram"), ("tiktok", "🎵 TikTok"),
+    ("twitter", "🐦 Twitter/X"), ("imo", "💬 Imo"), ("signal", "💬 Signal"),
+    ("snapchat", "👻 Snapchat"), ("discord", "🎮 Discord"),
+    ("linkedin", "💼 LinkedIn"), ("binance", "🟡 Binance"),
+    ("netflix", "🎬 Netflix"), ("amazon", "🛒 Amazon"),
+    ("microsoft", "🪟 Microsoft"), ("yahoo", "🟣 Yahoo"),
+    ("google", "🔎 Google"), ("gmail", "🔎 Gmail"),
+)
+
+
+def _gn_svc_from_sms(sms, fallback=""):
+    """SMS-এর ভেতরের লেখা থেকে আসল সার্ভিস — রেঞ্জের নাম মিথ্যা হলে এটাই সত্যি।
+
+    যেমন Full Message-এ "Code WhatsApp : 296-425" → `💬 WhatsApp`
+    (আগে রেঞ্জের নাম ধরে `📘 Facebook` দেখাত)। কিছু না মিললে আগের নামই থাকে।
+    """
+    try:
+        _s = str(sms or "").lower()
+        if _s:
+            for _k, _v in _GN_SMS_SVCS:
+                if _k in _s:
+                    return _v
+    except Exception:
+        pass
+    return str(fallback or "")
 
 
 def _gn_svc_label(name):
@@ -9281,7 +9313,7 @@ _GN_CH_LAST = {"ts": 0.0}     # ফিডের শেষ পোস্ট কখ
 _GN_CH_SEEN = {}              # একই কোড দুইবার পোস্ট না হতে
 _GN_CH_SEEN_TTL = 1800        # একই কোড ৩০ মিনিটে আর পোস্ট হবে না
 _GN_CH_SVC = {}               # service → শেষ পোস্টের সময় (সার্ভিস ঘুরানোর জন্য)
-_GN_SVC_TTL = 600             # একই সার্ভিস ১০ মিনিটে একবার — তারপর অন্য সার্ভিস
+_GN_SVC_TTL = 180             # একই সার্ভিস+দেশ ৩ মিনিটে একবার — তারপর অন্য গ্রুপ
 
 
 def _gn_ch_seen_has(key):
@@ -9303,7 +9335,7 @@ def _gn_pick_fresh(cands):
     """💡 কোন কোডটা চ্যানেলে যাবে — এক দেশ এক সার্ভিস, ঘুরিয়ে ঘুরিয়ে।
 
     • গ্রুপ = সার্ভিস + দেশ: একই সার্ভিসের **অন্য দেশ** আলাদা → সাথে সাথেই যাবে
-    • আগে যায় যেই গ্রুপ ১০ মিনিটে যায়নি (নতুন কোড, আগে পোস্ট হয়নি)
+    • আগে যায় যেই গ্রুপ ৩ মিনিটে যায়নি (নতুন কোড, আগে পোস্ট হয়নি)
     • সব গ্রুপই সদ্য গেলে → যেটার পোস্ট সবচেয়ে পুরোনো, সেটাই
     • কিছু না মিললে (None, "") — এই চেকে কিছু যাবে না
     """
@@ -9668,22 +9700,45 @@ def gn_open_order(uid):
     return rows[0] if rows else None
 
 
-def gn_wait_orders(limit=25):
+def _gn_local_str(ts):
+    """epoch → ঢাকার 'YYYY-MM-DD HH:MM' (DB-র updated_at/used_at ফরম্যাট)।"""
+    try:
+        return datetime.fromtimestamp(float(ts), pytz.timezone("Asia/Dhaka")
+                                      ).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def _gn_local_epoch(s):
+    """ঢাকার 'YYYY-MM-DD HH:MM' → epoch (পার্স না হলে 0)।"""
+    try:
+        _tz11 = pytz.timezone("Asia/Dhaka")
+        return _tz11.localize(datetime.strptime(
+            str(s or "").strip()[:16], "%Y-%m-%d %H:%M")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def gn_wait_orders(limit=200):
     """OTP এখনো না আসা + সদ্য এসেছে এমন নাম্বার (resend কোডও ধরার জন্য)।
 
-    🕒 `changed` অর্ডারও ধরা হয় — নাম্বার পরিবর্তনের পর ৫ মিনিটের ভিতর OTP এলে
-    সেটাও ইনবক্স + চ্যানেলে যাবে এবং টাকা যোগ হবে (আগে ওটা বাদ পড়ে যেত)।
+    🕒 `changed` অর্ডারও ধরা হয় — নাম্বার বদলালে পুরোনোটা বদলানোর সময়
+    (updated_at) থেকে ৫ মিনিট ওয়েট করে; এই সময়ের OTP এলে ইনবক্স +
+    চ্যানেলে যাবে এবং টাকা যোগ হবে, না এলে স্টকে ফিরবে।
     """
     try:
-        _hold_cut = (datetime.now(pytz.timezone("Asia/Dhaka"))
-                     - timedelta(minutes=OTP_HOLD_MIN)).strftime("%Y-%m-%d %H:%M")
         with _c() as c:
+            _now_t = _time.time()
             return c.execute(
                 "SELECT * FROM getnum_orders WHERE "
-                "(status IN ('waiting','received') AND ts >= %s) "
-                "OR (status='changed' AND COALESCE(updated_at,'') >= %s) "
-                "ORDER BY id LIMIT %s",
-                (_time.time() - GN_WAIT_MIN * 60, _hold_cut,
+                "(status IN ('waiting','received') AND ts >= %s) OR "
+                "(status='changed' AND COALESCE(updated_at,'') <> '' "
+                "AND updated_at >= %s) "
+                # 🆕 নতুন অর্ডার আগে — পুরোনো Waiting সারি লিমিট ভরিয়ে
+                # নতুন নাম্বারের OTP চেক আটকে না রাখে
+                "ORDER BY id DESC LIMIT %s",
+                (_now_t - GN_WAIT_MIN * 60,
+                 _gn_local_str(_now_t - GN_CHANGE_MIN * 60),
                  int(limit))).fetchall() or []
     except Exception:
         return []
@@ -9715,9 +9770,28 @@ def gn_order_claim(oid):
         return False
 
 
+def _gn_wait_min(o):
+    """নতুন নাম্বার (Lamix + Zenex) ১০ মিনিট, নাম্বার বদলালে পুরোনোটা ৫ মিনিট।"""
+    if str((o or {}).get("status") or "") == "changed":
+        return GN_CHANGE_MIN
+    return GN_WAIT_MIN
+
+
+def _gn_start_ts(o):
+    """গোনা শুরুর সময় — `changed` অর্ডারে বদলানোর সময় (updated_at), নাহলে ts।"""
+    try:
+        if str((o or {}).get("status") or "") == "changed":
+            _c9 = _gn_local_epoch((o or {}).get("updated_at"))
+            if _c9 > 0:
+                return _c9
+        return float((o or {}).get("ts") or 0)
+    except Exception:
+        return 0.0
+
+
 def _gn_left_min(o):
     try:
-        left = (float(o.get("ts") or 0) + GN_WAIT_MIN * 60 - _time.time()) / 60.0
+        left = (_gn_start_ts(o) + _gn_wait_min(o) * 60 - _time.time()) / 60.0
         return max(0, int(left + 0.5))
     except Exception:
         return 0
@@ -9895,6 +9969,8 @@ def _gn_ch_text(o):
     _num = str(o.get("number") or "").strip()
     _code = str(o.get("otp") or "").strip() or "—"
     _svc = _gn_svc_of_range(_rng, o.get("service")).strip() or "OTP"
+    # ✍️ SMS-এর লেখাতেই আসল সার্ভিস থাকে ("Code WhatsApp …") — রেঞ্জের নাম ভুল হলে এটাই
+    _svc = _gn_svc_from_sms(o.get("sms"), _svc) or _svc
     _paid = float(o.get("paid_usd") or 0)
     _pay_s = (f"💰 <b>Paid :</b> {_e(getnum_money2(_paid))}\n") if _paid > 0 else ""
     # পতাকা সবসময় দেশের নামের **আগে** বসে (`_loc` = "🇨🇲 Cameroon")
@@ -9955,6 +10031,8 @@ def _gn_group_text(rows, en=False):
     except Exception:
         _lft = 0
     _svc = str(o.get("service") or "").strip() or "OTP"
+    # ✍️ SMS-এর লেখা থেকে আসল সার্ভিস (রেঞ্জের নাম ভুল হলে) — যেমন WhatsApp
+    _svc = _gn_svc_from_sms(o.get("sms"), _svc) or _svc
     # 💵 ডলারের পাশে টাকা (৳) — হাই রেট (USD) আর লো রেট (৳) দুটোতেই একই দেখায়
     if str(o.get("src") or "") == "lamix":
         try:
@@ -10126,6 +10204,8 @@ def _gn_order_kb(o, en=False):
 
 def _gn_order_text(o, en=False):
     _num = str(o.get("number") or "")
+    # ✍️ সার্ভিসের নাম — SMS-এর লেখা মিললে সেটাই (রেঞ্জের ভুল নাম নয়)
+    _svc_o = _gn_svc_from_sms(o.get("sms"), o.get("service"))
     _head = _bi(f"📱 *আপনার নাম্বার*\n\n`{_num}`\n\n",
                 f"📱 *Your number*\n\n`{_num}`\n\n", en) + _gn_num_alt(_num, en)
     _rate = o.get("price") or getnum_rate()
@@ -10141,7 +10221,7 @@ def _gn_order_text(o, en=False):
             _rate_s = f"${_usd0:.4f}"
     else:
         _rate_s = getnum_money2(_rate)
-    _meta = (f"{str(o.get('service') or '')} · {_where}\n"
+    _meta = (f"{str(_svc_o or '')} · {_where}\n"
              f"💵 {'OTP রেট' if not en else 'OTP rate'}: {_rate_s}"
              f"{' · প্রতি OTP-তে' if (not en and _src == 'lamix') else (' · per OTP' if _src == 'lamix' else '')}\n")
     if str(o.get("otp") or "").strip() or str(o.get("sms") or "").strip():
@@ -10173,7 +10253,7 @@ def _gn_order_text(o, en=False):
                       f"📨 *OTPs on this number:* `{_cnt}`\n", en)
                   if _cnt > 1 else "")
         return (_head2 + "\n━━━━━━━━━━━━━━\n\n"
-                + f"📱 *Service:* {str(o.get('service') or '')}"
+                + f"📱 *Service:* {str(_svc_o or '')}"
                 + (f" · {_loc}" if _loc else "") + "\n"
                 + f"📞 *Number:* `{_num}`\n"
                 + _gn_num_alt(_num, en)
@@ -10260,21 +10340,23 @@ async def otp_gn_show(update, ctx):
     ctx.user_data["otp_gn_list"] = groups
     _one = []
     for i, g in enumerate(groups[:16]):
-        _sv = g["service"] or "OTP"
-        # 🌍 আগে সার্ভিস (প্যানেলে যেটা যোগ করা হয়েছে), তারপর দেশ/স্টক/রেট
-        _lbl = (f"{_gn_svc_icon(_sv)} {_sv} · {g['flag']} {g['country']} · "
-                f"{g['n']} · ${g['rate']:.3f}")
-        _one.append(InlineKeyboardButton(_lbl[:62], callback_data=f"otp:gn:{i}"))
+        _sv = str(g["service"] or "").strip()
+        # 🌍 আগে সার্ভিস (স্টক-অ্যাডে নিজে যেটা লিখেছেন, যেমন `Imo 1`), তারপর
+        #    দেশের পাশে ব্রাকেটে ওই পেয়ারের স্টক, শেষে রেট। সার্ভিস না দিলে
+        #    শুধু দেশের নামই দেখাবে।
+        _loc = f"{g['flag']} {g['country']} ({g['n']})"
+        if _sv:
+            _lbl = f"{_gn_svc_icon(_sv)} {_sv} · {_loc}"
+        else:
+            _lbl = f"📱 {_loc}"
+        _one.append(InlineKeyboardButton(_lbl[:64], callback_data=f"otp:gn:{i}"))
     rows = _pair_rows(_one)
     rows.append([InlineKeyboardButton(_bi("🔙 ফিরে যান", "🔙 Back", en),
                                      callback_data="gn:home")])
-    _tg = sum(int(g.get("n") or 0) for g in groups)
     return await _gn_say(update, _bi(
         "🔥 *হাই রেট OTP / OTP কাজ*\n\n"
-        f"📦 *স্টকে:* `{_tg}` নাম্বার · {len(groups)} গ্রুপ\n"
         "প্রতিটা OTP-তে দেখানো রেট যোগ হবে। দেশ/সার্ভিস বেছে নিন:",
         "🔥 *High rate OTP / OTP work*\n\n"
-        f"📦 *In stock:* `{_tg}` numbers · {len(groups)} groups\n"
         "You get the shown rate on every OTP. Pick a country/service:", en),
         InlineKeyboardMarkup(rows))
 
@@ -10878,13 +10960,13 @@ async def _gn_check_and_notify(bot_obj, o, quiet=False, rows=None):
     except Exception:
         return False
     st = str(o.get("status") or "")
-    # 'changed' = নাম্বার বদলানোর পর ৫ মিনিটের হোল্ড — এই সময়ের OTP-ও
-    # ইনবক্স + চ্যানেলে যাবে আর টাকা যোগ হবে
+    # 'changed' = নাম্বার বদলানোর পর পুরোনো নাম্বার ৫ মিনিটের হোল্ডে — এই
+    # সময়ের OTP-ও ইনবক্স + চ্যানেলে যাবে আর টাকা যোগ হবে
     if oid <= 0 or st not in ("waiting", "received", "changed"):
         return False
-    # 'changed' অর্ডারের সময় গোনা হয় হোল্ড (৫ মিনিট) দিয়ে — পুরোনো ts দিয়ে নয়
-    if st != "changed" and _gn_left_min(o) <= 0:
-        if st == "waiting":
+    # নতুন নাম্বার: নেওয়ার সময় (ts) থেকে ১০ মিনিট; changed: বদলানোর সময় থেকে ৫
+    if _gn_left_min(o) <= 0:
+        if st in ("waiting", "changed"):
             # 🔇 ইউজারকে কোনো "সময় শেষ" মেসেজ যাবে না — শুধু DB-তে expired হবে।
             #    (আগে প্রতি ২০ সেকেন্ডের চেকে একবার করে যেত)
             await asyncio.to_thread(gn_order_set, oid, "expired")
@@ -11136,7 +11218,7 @@ async def job_getnum_otp(context):
     try:
         if not (getnum_on() or lamix_on()):
             return
-        _orders = await asyncio.to_thread(gn_wait_orders, 60)
+        _orders = await asyncio.to_thread(gn_wait_orders, 200)
         if not _orders:
             # কাজ নেই → ৬০s DB পোল বন্ধ। নতুন নাম্বার নিলেই
             # `gn_order_new` idle-Cooldown মুছে দেয়, তাই ওটি দেরিও হয় না
@@ -11164,6 +11246,22 @@ async def job_getnum_otp(context):
                 await _gn_check_and_notify(_bot, o, rows=_lrows)
             except Exception as e:
                 log.debug(f"[GETNUM] lamix order #{o.get('id')}: {e}")
+        # 🩺 Lamix মেসেজ এল কিন্তু একটাও পার্স হয়নি = ফিল্ড-নামের সমস্যা।
+        #    ১৫ মিনিটে একবার অ্যাডমিনকে নিজে জানায় — কেউ কমান্ড চালাতে হবে না।
+        try:
+            _dn = _LX_DIAG
+            if (_lam and _bot and int(_dn.get("msgs") or 0) > 0
+                    and int(_dn.get("parsed") or 0) == 0
+                    and _time.time() - float(_dn.get("alert") or 0) > 900):
+                _dn["alert"] = _time.time()
+                await _bot.send_message(
+                    int(ADMIN_ID),
+                    "🩺 Lamix থেকে %dটা মেসেজ এসেছে কিন্তু ০টা পার্স হয়েছে — "
+                    "OTP বটে যাচ্ছে না।\nফিল্ড: %s\nএরর: %s\nআসল JSON: /otpdiag raw"
+                    % (int(_dn.get("msgs") or 0), (_dn.get("keys") or "—")[:200],
+                       (_dn.get("err") or "—")[:160]))
+        except Exception:
+            pass
     except Exception as e:
         log.warning(f"[GETNUM] job ব্যর্থ: {str(e)[:150]}")
 
@@ -13027,16 +13125,17 @@ def otp_release_number(number, uid=0):
         return False
 
 
-OTP_HOLD_MIN = 5          # নাম্বার পরিবর্তনের পর কত মিনিট হোল্ডে থাকে
+OTP_HOLD_MIN = GN_CHANGE_MIN   # নাম্বার বদলালে পুরোনোটা ৫ মিনিট হোল্ডে থাকে
 _OTP_HOLD = {"ts": 0.0}
 
 
 def otp_hold_number(number, uid=0):
-    """ইউজার নাম্বার পরিবর্তন করলে পুরোনো নাম্বার ৫ মিনিটের হোল্ডে যায়।
+    """ইউজার নাম্বার পরিবর্তন করলে পুরোনো নাম্বার ৫ মিনিটের হোল্ডে থাকে।
 
-    · এই ৫ মিনিটের ভিতর OTP এলে নাম্বারটা `used` হয়ে যায় — কাউকে দেওয়া হয় না
+    · এই সময়ের ভিতর OTP এলে নাম্বারটা `used` হয়ে যায় — কাউকে দেওয়া হয় না
       (`otp_hit_new` নাম্বার ধরে status='used' করে দেয়)
     · না এলে `otp_release_holds` আবার `free` করে — অন্য ইউজার পাবে
+    · ⏱ `used_at` এখনই সেট হয় — বদলানোর সময় থেকেই ৫ মিনিট গোনা হয়
     """
     _otp_init()
     try:
@@ -13053,7 +13152,7 @@ def otp_hold_number(number, uid=0):
 
 
 def otp_release_holds(minutes=None):
-    """হোল্ডে থাকা নাম্বার (OTP আসেনি) আবার স্টকে ফেরত — ফ্রি কাউন্ট কমে থাকে না।"""
+    """হোল্ডে থাকা নাম্বার (OTP আসেনি) ৫ মিনিট পর স্টকে ফেরত — ফ্রি কাউন্ট কমে থাকে না।"""
     _otp_init()
     _mins = float(minutes or OTP_HOLD_MIN)
     _cut_s = (datetime.now(pytz.timezone("Asia/Dhaka"))
@@ -13082,19 +13181,30 @@ def otp_release_holds(minutes=None):
 
 
 def otp_release_expired(wait_min=None):
-    """মেয়াদ শেষ — OTP Earn অর্ডারের নাম্বার আবার স্টকে ফেরত।"""
+    """মেয়াদ শেষ — OTP না-আসা অর্ডার বাতিল, নাম্বার আবার স্টকে ফেরত।
+
+    নতুন নাম্বার (Lamix + Zenex) ১০ মিনিট, আর নাম্বার বদলালে পুরোনোটা ৫ মিনিট;
+    OTP না এলে অর্ডার `expired` হয় আর নাম্বারটা `free` — অন্য ইউজার পাবে।
+    """
     _otp_init()
-    _cut = _time.time() - float(wait_min or GN_WAIT_MIN) * 60
+    _now_t = _time.time()
+    _cut = _now_t - float(wait_min or GN_WAIT_MIN) * 60
+    # changed অর্ডার: বদলানোর সময় (updated_at) থেকে ৫ মিনিট
+    _cut_c = _gn_local_str(_now_t - GN_CHANGE_MIN * 60)
     try:
         with _c() as c:
             rows = c.execute(
-                "SELECT id, number FROM getnum_orders WHERE src='lamix' "
-                "AND ts < %s AND status IN ('waiting','received')",
-                (_cut,)).fetchall() or []
+                "SELECT id, number FROM getnum_orders WHERE "
+                "(status='waiting' AND ts < %s) "
+                "OR (status='changed' AND COALESCE(updated_at,'') <> '' "
+                "AND updated_at < %s) "
+                "OR (status='received' AND src='lamix' AND ts < %s)",
+                (_cut, _cut_c, _cut)).fetchall() or []
             for r in rows:
                 c.execute("UPDATE otp_numbers SET status='free', used_by=0, "
-                          "used_at='' WHERE number=%s AND (status='taken' OR "
-                          "(status='used' AND COALESCE(otp,'')=''))",
+                          "used_at='' WHERE number=%s AND (status IN "
+                          "('taken','hold') OR (status='used' AND "
+                          "COALESCE(otp,'')=''))",
                           (str(r["number"] or ""),))
                 c.execute("UPDATE getnum_orders SET status='expired', "
                           "updated_at=%s WHERE id=%s", (now(), int(r["id"])))
@@ -13107,6 +13217,58 @@ def otp_release_expired(wait_min=None):
         return len(rows)
     except Exception as e:
         log.debug(f"[OTP] release_expired: {str(e)[:120]}")
+        return 0
+
+
+def otp_release_stale(wait_min=None):
+    """OTP না-আসা (`taken`/`hold`) নাম্বার মেয়াদ শেষে স্টকে ফেরত — বেল্ট+সাসপেন্ডার।
+
+    `otp_release_expired` অর্ডার-টেবিল ধরে কাজ করে; কোনো কারণে ওই রো না মিললে
+    নাম্বার `taken` পড়ে থাকত আর স্টকে আর ফিরত না। এখানে শুধু `used_at`
+    (নেওয়ার সময়) ধরে ফেরত দেওয়া হয় — কোড-আসা (`used`) নাম্বার ছোঁয়া হয় না।
+    """
+    _otp_init()
+    # ⏱️ নতুন নাম্বার ১০ মিনিটে, বদলানো পুরোনোটা ৫ মিনিটে স্টকে free
+    _mins = float(wait_min or GN_WAIT_MIN)
+    _cut_s = (datetime.now(pytz.timezone("Asia/Dhaka"))
+              - timedelta(minutes=_mins)).strftime("%Y-%m-%d %H:%M")
+    _hold_cut_s = (datetime.now(pytz.timezone("Asia/Dhaka"))
+                   - timedelta(minutes=OTP_HOLD_MIN)).strftime("%Y-%m-%d %H:%M")
+    try:
+        with _c() as c:
+            cur = c.execute(
+                "UPDATE otp_numbers SET status='free', used_by=0, used_at='' "
+                "WHERE status='taken' "
+                "AND COALESCE(used_at,'') <> '' AND used_at <= %s", (_cut_s,))
+            _n = int(getattr(cur, "rowcount", 0) or 0)
+            _cur2 = c.execute(
+                "UPDATE otp_numbers SET status='free', used_by=0, used_at='' "
+                "WHERE status='hold' "
+                "AND COALESCE(used_at,'') <> '' AND used_at <= %s",
+                (_hold_cut_s,))
+            _n += int(getattr(_cur2, "rowcount", 0) or 0)
+            # নাম্বারটা স্টকে ফিরল → ওই নাম্বারের চলমান OTP অর্ডারও শেষ,
+            # নাহলে নাম্বারটা অন্য ইউজার পেয়ে দুই অর্ডার একসাথে চলত
+            try:
+                c.execute(
+                    "UPDATE getnum_orders SET status='expired', updated_at=%s "
+                    "WHERE (status='waiting' AND ts < %s) "
+                    "OR (status='changed' AND COALESCE(updated_at,'') <> '' "
+                    "AND updated_at < %s)",
+                    (now(), _time.time() - _mins * 60, _hold_cut_s))
+            except Exception:
+                pass
+        if _n:
+            _mark_dirty()
+            try:
+                _OTP_STATS_CACHE["ts"] = 0.0
+                _STOCK_ALERT["empty"].clear()
+            except Exception:
+                pass
+            log.info(f"[OTP] {_n}টি OTP-না-আসা নাম্বার আবার স্টকে ফেরত")
+        return _n
+    except Exception as e:
+        log.debug(f"[OTP] release stale: {str(e)[:120]}")
         return 0
 
 
@@ -13168,7 +13330,14 @@ def _otp_sweep_maybe():
         otp_release_holds()      # ৫ মিনিটের হোল্ড শেষ → আবার স্টকে
     except Exception:
         pass
-    return otp_release_expired()
+    _n = otp_release_expired()
+    try:
+        # 🛟 অর্ডার-রো না মিললেও (পুরোনো/বন্ধ অর্ডার) OTP না-আসা নাম্বার
+        #    মেয়াদ শেষে অবশ্যই স্টকে ফিরবে — নাহলে স্টক কমতে কমতে শূন্য দেখায়
+        _n += otp_release_stale()
+    except Exception:
+        pass
+    return _n
 
 
 def _otp_mask_num(v):
@@ -13235,6 +13404,9 @@ def gn_order_otp_add(oid, usd=0.0):
 _OTP_MSG_CACHE = {"ts": 0.0, "rows": []}
 # number → {ts, rows} — একই নাম্বার বারবার না টানার ক্যাশ (Lamix ৪০/মিনিট)
 _LAMIX_NUM_CACHE = {}
+# 🩺 শেষ `/messages` কলের ফল — কত মেসেজ এল, কতটা পার্স হলো, কী ফিল্ড
+_LX_DIAG = {"ts": 0.0, "msgs": 0, "parsed": 0, "err": "", "keys": "",
+            "alert": 0.0}
 # number → শেষবার API-তে চাওয়ার সময় — কোনগুলো আগে ঘুরিয়ে চেক করা হবে
 _LAMIX_NUM_TRY = {}
 
@@ -13323,6 +13495,20 @@ def _lx_rec_fields(m):
     _c = _lx_txt(_low, _LX_K_TXT)
     if _c and _gn_norm_num(_c) != _gn_norm_num(_r["number"]):
         _r["content"] = _c[:1200]
+    if not _r["content"]:
+        # 🛟 শেষ চেষ্টা: চেনা নাম না পেলে এমন যেকোনো লেখা নেওয়া হয় যেখানে
+        #    ৪–৮ ডিজিটের কোড আছে (যেমন `preview`, `summary`, `msgText`)।
+        for _lk, _v in _low:
+            _sv = str(_v).strip()
+            if not (4 <= len(_sv) <= 1200):
+                continue
+            if any((_b in _lk) for _b in _LX_BAD_KEY):
+                continue
+            if _gn_norm_num(_sv) == _gn_norm_num(_r["number"]):
+                continue
+            if _re.search(r"\d{4,8}", _sv) and _re.search(r"[A-Za-z<>#:]", _sv):
+                _r["content"] = _sv[:1200]
+                break
     for _w in ("id", "uuid", "messageid", "msgid", "message_id", "_id"):
         if _r["nid"]:
             break
@@ -13401,13 +13587,23 @@ def otp_lamix_rows(numbers=None):
             and _t - float(_OTP_MSG_CACHE["ts"] or 0) < 5:
         return _OTP_MSG_CACHE["rows"]
     # 📥 একবারে বেশি মেসেজ — সব নাম্বারের কোড যেন এক কলেই ঢুকে পড়ে
-    out = _lamix_msg_rows(lamix_messages(limit=300))
-    if len(out) < 30:
-        # 🛟 messages কম/ফাঁকা/এরর হলে CDR-ও মেশানো হয় — একই OTP অন্য
-        #    endpoint-এ থাকলে যেন হারিয়ে যায় না
-        _cdr = _lamix_recent_cdrs()
-        if _cdr:
-            out = out + _cdr
+    #    (limit সর্বোচ্চ ১০০; বেশি দিলে প্যানেল invalid_request দেয়)
+    _msgs = lamix_messages(limit=100)
+    out = _lamix_msg_rows(_msgs)
+    try:      # 🩺 ডায়াগনস্টিক — API কী ফেরত দিল আর কতটা পার্স হলো
+        _LX_DIAG.update({"ts": _t, "msgs": len(_msgs), "parsed": len(out),
+                         "err": str(_LAMIX_LAST.get("err") or ""),
+                         "keys": ",".join(list(_msgs[0])[:10]) if _msgs else ""})
+    except Exception:
+        pass
+    # 🛟 messages ফাঁকা/কম হলেও CDR সবসময় মেশানো হয় — একই OTP অন্য
+    #    endpoint-এ থাকলে যেন হারিয়ে যায় না (nid ধরে ডুপ্লিকেট বাদ)
+    _have = {str(r.get("nid") or "") for r in out}
+    for _r in _lamix_recent_cdrs():
+        if str(_r.get("nid") or "") in _have:
+            continue
+        out.append(_r)
+        _have.add(str(_r.get("nid") or ""))
     if _want:
         _miss = [_n for _n in _want
                  if not any(_gn_same_num(_n, str(r.get("number") or ""))
@@ -14546,10 +14742,17 @@ def _lamix_api(path, params=None, method="GET", body=None, timeout=20):
 def lamix_messages(from_ts=None, to_ts=None, number=None, cli=None, limit=50):
     """সর্বশেষ রিসিভড মেসেজ (নতুন আগে) → list[dict]; ব্যর্থ হলে [].
 
-    ⚠️ ফিল্টার ছাড়া ডিফল্ট ১০টি; আমরা ৫০ চাই। `content`-এ OTP থাকতে পারে।
+    ⚠️ ফিল্টার ছাড়া ডিফল্ট ১০টি। `limit` প্যানেলে সর্বোচ্চ ১০০ (এর বেশি
+    দিলে `invalid_request` আসে — তখন ছোট limit-এ আবার চেষ্টা করা হয়, নাহলে
+    পুরো OTP-লিস্টই ফাঁকা হয়ে যেত)।
     """
-    _d = _lamix_api("messages", {"from": from_ts, "to": to_ts, "number": number,
-                                 "cli": cli, "limit": max(1, min(1000, int(limit or 10)))})
+    _lim = max(1, min(100, int(limit or 10)))
+    _p = {"from": from_ts, "to": to_ts, "number": number, "cli": cli,
+          "limit": _lim}
+    _d = _lamix_api("messages", _p)
+    if str(_d.get("error") or "") in ("invalid_request", "http_400"):
+        # 🛟 limit/ফিল্টার সাপোর্ট না করলে — টানা limit দিয়ে আবার
+        _d = _lamix_api("messages", {"limit": min(10, _lim)})
     if "error" in _d:
         # ⚠️ আগে এরর চুপচাপ হারিয়ে যেত — OTP প্যানেলে এলেও বটে/চ্যানেলে না
         #    আসার কারণ জানা যেত না। এখন ২ মিনিটে একবার লগে + `/otpdiag`-এ।
@@ -30019,6 +30222,19 @@ async def cmd_otpdiag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             _lx_msgs = []
             _out.append("Lamix কল ব্যর্থ: " + str(_lxm)[:160])
         _out.append("Lamix messages: " + str(len(_lx_msgs)))
+        try:
+            _npar = len(_lamix_msg_rows(_lx_msgs))
+        except Exception:
+            _npar = 0
+        try:
+            _ncdr = len(_lamix_recent_cdrs())
+        except Exception:
+            _ncdr = 0
+        _out.append("পার্স হওয়া row: %s · CDR: %s" % (_npar, _ncdr))
+        _out.append("শেষ কল: messages %s → পার্স %s%s" % (
+            _LX_DIAG.get("msgs"), _LX_DIAG.get("parsed"),
+            (" · ফিল্ড: `" + str(_LX_DIAG.get("keys"))[:120] + "`")
+            if _LX_DIAG.get("keys") else ""))
         if _lx_msgs:
             _out.append("Lamix ফিল্ড: " + ", ".join(list(_lx_msgs[0])[:10]))
             try:
