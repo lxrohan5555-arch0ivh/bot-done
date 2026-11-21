@@ -1040,6 +1040,26 @@ def shop_lamix_test():
         else:
             _rows.append("<tr><td>নাম্বার</td><td>" + esc(str(_nm.get("count") or 0))
                          + "টি (মোট)</td></tr>")
+        # 💬 কোড পড়া যাচ্ছে কি না — নয়া নাম্বার-টেক্সট দেখতে
+        try:
+            _ms = _bx.lamix_messages(limit=5)
+            _rows.append("<tr><td>SMS (messages)</td><td>"
+                         + esc(str(len(_ms))) + "টি</td></tr>")
+            if _ms:
+                _f0 = _bx._lx_rec_fields(_ms[0])
+                _rows.append("<tr><td>সর্বশেষ SMS</td><td>নাম্বার <span class='mono'>"
+                             + esc(str(_f0.get("number") or "❌"))
+                             + "</span> · টেক্সট "
+                             + ("✅" if _f0.get("content") else "❌")
+                             + "</td></tr>")
+                _rows.append("<tr><td>ফিল্ডের নাম</td><td class='mono'>"
+                             + esc(str(", ".join(list(_ms[0])[:10]))[:200])
+                             + "</td></tr>")
+            _cd = _bx.lamix_cdrs(limit=5)
+            _rows.append("<tr><td>SMS (cdrs)</td><td>"
+                         + esc(str(len(_cd))) + "টি</td></tr>")
+        except Exception as _mse:
+            _rows.append("<tr><td>SMS</td><td>" + esc(str(_mse)[:160]) + "</td></tr>")
     except Exception as e:
         _rows.append("<tr><td colspan='2'>ত্রুটি: " + esc(str(e)[:160]) + "</td></tr>")
     _body = ("<div class='card'><a class='btn gray sm' href='/admin/lamix'>"

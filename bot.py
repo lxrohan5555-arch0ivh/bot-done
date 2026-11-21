@@ -13235,35 +13235,153 @@ def gn_order_otp_add(oid, usd=0.0):
 _OTP_MSG_CACHE = {"ts": 0.0, "rows": []}
 # number → {ts, rows} — একই নাম্বার বারবার না টানার ক্যাশ (Lamix ৪০/মিনিট)
 _LAMIX_NUM_CACHE = {}
+# number → শেষবার API-তে চাওয়ার সময় — কোনগুলো আগে ঘুরিয়ে চেক করা হবে
+_LAMIX_NUM_TRY = {}
+
+
+def _lx_flat(d, out=None, depth=0):
+    """ডিকশনারি/লিস্ট → এক-স্তরের ``[(key, value), ...]``।
+
+    Lamix-এর রেকর্ড কখনো সমতল, কখনো ``{"to": {...}, "text": {...}}``-এর
+    মতো নেস্টেড আসে — তাই আগে ফ্ল্যাট করা হয়, পরে নাম ধরে খোঁজা হয়।
+    """
+    if out is None:
+        out = []
+    if depth > 3:
+        return out
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if isinstance(v, (dict, list, tuple)):
+                _lx_flat(v, out, depth + 1)
+            elif v is not None:
+                out.append((str(k), v))
+    elif isinstance(d, (list, tuple)):
+        for v in d[:40]:
+            if isinstance(v, (dict, list, tuple)):
+                _lx_flat(v, out, depth + 1)
+    return out
+
+
+# নামের তালিকা — হুবহু নাম আগে, তারপর নামের **ভেতরে** মিলিয়ে দেখা হয়
+_LX_K_NUM = ("number", "msisdn", "msisdnto", "destination", "recipient",
+             "receiver", "dest", "to", "phone", "num")
+_LX_K_TXT = ("content", "textcontent", "body", "text", "message", "sms",
+             "msg", "otp")
+_LX_BAD_KEY = ("id", "type", "count", "status", "time", "date", "payout",
+               "price", "rate", "range", "iso", "client", "name", "mcc",
+               "mnc")
+
+
+def _lx_txt(low, words, bad=True):
+    """নামের তালিকা ধরে একটা স্ট্রিং ফিল্ড বেছে নেয় (হুবহু নাম আগে)।"""
+    _best = ""
+    for _w in words:
+        for _lk, _v in low:
+            if _w not in _lk:
+                continue
+            if bad and any((_b in _lk) for _b in _LX_BAD_KEY if _b != _w):
+                continue
+            _sv = str(_v).strip()
+            if len(_sv) < 2:
+                continue
+            if _lk == _w:
+                return _sv
+            if len(_sv) > len(_best):
+                _best = _sv
+    return _best
+
+
+def _lx_num(low):
+    """রেকর্ড থেকে টেলিফোন নাম্বার (+দেশকোডসহ) — না পেলে ''।"""
+    for _exact in (True, False):
+        for _w in _LX_K_NUM:
+            for _lk, _v in low:
+                if _lk == "id" or "id" in _lk:
+                    continue
+                if not ((_lk == _w) if _exact else (_w in _lk)):
+                    continue
+                if any((_b in _lk) for _b in ("type", "count", "status",
+                                              "date", "time", "payout",
+                                              "price", "rate")):
+                    continue
+                _n = otp_norm_number(_v)
+                if _n and len(_gn_norm_num(_n)) >= 7:
+                    return _n
+    return ""
+
+
+def _lx_rec_fields(m):
+    """Lamix রেকর্ড (যেকোনো ফর্ম্যাট) → number/content/nid/time/range/country।
+
+    ⚠️ প্যানেলে ফিল্ডের নাম বদলায় (`sms_content`, `message_text`,
+    `textContent`, নেস্টেড `to`/`text`, ...)। আগে হাতে লেখা কয়েকটা নামেই
+    খোঁজা হতো, তাই নতুন নাম এলেই OTP প্যানেলে থাকত অথচ বটে/চ্যানেলে যেত না।
+    """
+    _low = [(str(_k).strip().lower(), _v) for _k, _v in _lx_flat(m)]
+    _r = {"number": _lx_num(_low), "content": "", "nid": "", "time": "",
+          "range": "", "country": ""}
+    _c = _lx_txt(_low, _LX_K_TXT)
+    if _c and _gn_norm_num(_c) != _gn_norm_num(_r["number"]):
+        _r["content"] = _c[:1200]
+    for _w in ("id", "uuid", "messageid", "msgid", "message_id", "_id"):
+        if _r["nid"]:
+            break
+        for _lk, _v in _low:
+            if _lk == _w and str(_v).strip():
+                _r["nid"] = str(_v).strip()[:120]
+                break
+    _r["time"] = _lx_txt(_low, ("time", "date", "createdat", "created_at",
+                                "created", "received_at", "receivedat",
+                                "received", "timestamp", "ts"), bad=False)[:24]
+    _r["range"] = _lx_txt(_low, ("range", "ranges", "rangename",
+                                 "range_name", "plan", "service"),
+                          bad=False)[:40]
+    _r["country"] = _lx_txt(_low, ("country", "countryname", "country_name"),
+                            bad=False)[:40]
+    return _r
 
 
 def _lamix_msg_rows(msgs):
     """Lamix `/messages` রেকর্ড → OTP-চেকের কমন রো।"""
     out = []
     for m in msgs or []:
-        # ⚠️ প্যানেলভেদে ফিল্ডের নাম বদলায় (`number`/`to`/`msisdn`,
-        #    `content`/`message`/`text`) — একটাই নাম ধরে খুঁজলে Lamix OTP
-        #    চুপচাপ হারিয়ে যেত, তাই সব কয়টা নামই দেখা হয়।
-        _num = otp_norm_number(
-            m.get("number") or m.get("to") or m.get("msisdn") or m.get("phone")
-            or m.get("destination") or m.get("recipient") or m.get("dest")
-            or m.get("msisdnTo") or m.get("receiver") or "")
-        if not _num:
+        if not isinstance(m, dict):
             continue
-        _content = str(m.get("content") or m.get("message") or m.get("text")
-                       or m.get("sms") or m.get("body") or m.get("msg")
-                       or m.get("textContent") or m.get("otp") or "")[:1200]
-        if not _content:
+        _f = _lx_rec_fields(m)
+        if not _f["number"] or not _f["content"]:
             continue
-        _nid = str(m.get("id") or m.get("messageId") or m.get("uuid")
-                   or m.get("msgId") or m.get("_id") or m.get("message_id") or "")
+        _nid = str(_f["nid"] or "").strip()[:120]
         if not _nid:
-            _nid = (_num + "|" + str(m.get("time") or "") + "|" + _content)[:120]
-        out.append({"nid": _nid[:120], "number": _num, "otp": _content,
-                    "country": str(m.get("country") or "")[:40],
-                    "operator": str(m.get("range") or "")[:40],
-                    "created_at": str(m.get("time") or "")[:24]})
+            _nid = (_f["number"] + "|" + str(_f["time"]) + "|"
+                    + _f["content"])[:120]
+        out.append({"nid": _nid, "number": _f["number"], "otp": _f["content"],
+                    "country": _f["country"][:40],
+                    "operator": _f["range"][:40],
+                    "created_at": _f["time"][:24]})
     return out
+
+
+_LAMIX_CDR_CACHE = {"ts": 0.0, "rows": []}
+
+
+def _lamix_recent_cdrs(max_age=1800):
+    """সাম্প্রতিক সব CDR (৬০s ক্যাশ) — টেক্সট থাকলে সেটাও OTP-রো হয়ে আসে।
+
+    পুরো লিস্ট একবারে আনার ফলে **প্রতিটা নাম্বারের** কোড কভার হয় —
+    এক-একটা নাম্বার ধরে আলাদা কল করতে হয় না (৪০/মিনিট কোটা বাঁচে)।
+    """
+    _t = _time.time()
+    if _LAMIX_CDR_CACHE["rows"] and \
+            _t - float(_LAMIX_CDR_CACHE["ts"] or 0) < 60:
+        return _LAMIX_CDR_CACHE["rows"]
+    try:
+        _rows = _lamix_msg_rows(
+            lamix_cdrs(from_ts=int(_t) - int(max_age or 1800), limit=500))
+    except Exception:
+        _rows = []
+    if _rows:
+        _LAMIX_CDR_CACHE.update({"ts": _t, "rows": _rows})
+    return _rows
 
 
 def otp_lamix_rows(numbers=None):
@@ -13271,42 +13389,82 @@ def otp_lamix_rows(numbers=None):
 
     `numbers` দিলে (চলমান অর্ডারের নাম্বার) যেগুলো সাধারণ লিস্টে নেই সেগুলো
     নাম্বার ধরে আলাদা করে আনা হয় — নাহলে বেশি ট্রাফিকে নির্দিষ্ট নাম্বারের
-    OTP ১০০-র লিস্ট থেকে বেরিয়ে গিয়ে বটে/গ্রুপে পৌঁছাত না।
+    OTP লিস্ট থেকে বেরিয়ে গিয়ে বটে/গ্রুপে পৌঁছাত না। এখন **সব অপেক্ষমাণ
+    নাম্বার** কভার হয় (এক পালায় ১০টা করে ঘুরিয়ে, রেট লিমিট না ভেঙে)।
     """
     if not lamix_on():
         return []
     _t = _time.time()
     _want = [otp_norm_number(n) for n in (numbers or [])]
-    _want = [n for n in _want if n][:6]
+    _want = [n for n in _want if n]
     if not _want and _OTP_MSG_CACHE["rows"] \
             and _t - float(_OTP_MSG_CACHE["ts"] or 0) < 5:
         return _OTP_MSG_CACHE["rows"]
-    out = _lamix_msg_rows(lamix_messages(limit=100))
-    if not out:
-        # 🛟 messages ফাঁকা/এরর হলে CDR থেকেও দেখা হয় — একই OTP অন্য
-        #    endpoint-এ থাকলে যেন হারিয়ে না যায়
-        try:
-            out = _lamix_msg_rows(lamix_cdrs(from_ts=int(_t) - 900, limit=100))
-        except Exception:
-            out = []
+    # 📥 একবারে বেশি মেসেজ — সব নাম্বারের কোড যেন এক কলেই ঢুকে পড়ে
+    out = _lamix_msg_rows(lamix_messages(limit=300))
+    if len(out) < 30:
+        # 🛟 messages কম/ফাঁকা/এরর হলে CDR-ও মেশানো হয় — একই OTP অন্য
+        #    endpoint-এ থাকলে যেন হারিয়ে যায় না
+        _cdr = _lamix_recent_cdrs()
+        if _cdr:
+            out = out + _cdr
     if _want:
-        _have = [str(r.get("number") or "") for r in out]
-        for _n in _want:
-            if any(_gn_same_num(_n, _h) for _h in _have):
+        _miss = [_n for _n in _want
+                 if not any(_gn_same_num(_n, str(r.get("number") or ""))
+                            for r in out)]
+        if _miss:
+            for _r in _lamix_recent_cdrs():
+                if any(_gn_same_num(_r.get("number"), _m) for _m in _miss):
+                    out.append(_r)
+        _miss = [_n for _n in _miss
+                 if not any(_gn_same_num(_n, str(r.get("number") or ""))
+                            for r in out)]
+        # ⏱ এক পালায় সর্বোচ্চ ১০টা নাম্বার, সবচেয়ে পুরোনো-চেক আগে —
+        #    বাকিগুলো পরের ২০s চেকে (Lamix ৪০/মিনিট কোটা অটুট)
+        try:
+            _miss.sort(key=lambda x: float(_LAMIX_NUM_TRY.get(x) or 0))
+        except Exception:
+            pass
+        for _n in _miss[:10]:
+            if any(_gn_same_num(_n, str(r.get("number") or "")) for r in out):
                 continue
             # ⏱ একই নাম্বার ১০s-এ একবারই (রেট লিমিট ৪০/মিনিটের ভিতরে থাকতে)
             _c = _LAMIX_NUM_CACHE.get(_n)
             if _c and _t - float(_c.get("ts") or 0) < 10:
                 _one = list(_c.get("rows") or [])
             else:
-                try:
-                    _one = _lamix_msg_rows(
-                        lamix_messages(number=_n.lstrip("+"), limit=20))
-                except Exception:
-                    _one = []
+                _one = []
+                _d = _n.lstrip("+")
+                # 📞 নাম্বার ফরম্যাট প্যানেলভেদে আলাদা — তিন রকমই চেষ্টা
+                for _arg in (_d, "+" + _d, _d[-9:] if len(_d) > 9 else ""):
+                    if not _arg:
+                        continue
+                    try:
+                        _one = _lamix_msg_rows(
+                            lamix_messages(number=_arg, limit=20))
+                    except Exception:
+                        _one = []
+                    if _one:
+                        break
+                if not _one:
+                    # 🛟 messages-এ না পেলে CDR-ও দেখা হয় (কিছু প্যানেলে
+                    #    টেক্সট এক জায়গায়, নাম্বার-ফিল্টার আরেক জায়গায়)
+                    try:
+                        _one = _lamix_msg_rows(
+                            lamix_cdrs(from_ts=int(_t) - 1800, number=_d,
+                                       limit=20))
+                    except Exception:
+                        _one = []
                 _LAMIX_NUM_CACHE[_n] = {"ts": _t, "rows": _one}
+                _LAMIX_NUM_TRY[_n] = _t
             if _one:
                 out = _one + out
+        # ♻️ ক্যাশ বাড়তে থাকলে মাঝে মাঝে পুরোনো এন্ট্রি ফেলা হয়
+        if len(_LAMIX_NUM_TRY) > 400:
+            for _k9 in sorted(_LAMIX_NUM_TRY,
+                              key=lambda k: _LAMIX_NUM_TRY.get(k) or 0)[:200]:
+                _LAMIX_NUM_TRY.pop(_k9, None)
+                _LAMIX_NUM_CACHE.pop(_k9, None)
     if not _want:
         _OTP_MSG_CACHE.update({"ts": _t, "rows": out})
     return out
@@ -13326,10 +13484,13 @@ def _gn_lamix_feed_once(limit=60):
     if not lamix_on():
         return 0
     try:
-        _rows = lamix_messages(limit=max(10, min(1000, int(limit or 60))))
+        _rows = lamix_messages(limit=max(10, min(1000, int(limit or 200))))
     except Exception as _le:
         _GN_LAMIX_FEED["err"] = str(_le)[:140]
         return 0
+    if len(_rows) < 20:
+        # 🛟 messages কম এলে CDR-র রো-ও যোগ হয় (সব নাম্বার কভার)
+        _rows = list(_rows or []) + _lamix_recent_cdrs()
     if not _rows:
         return 0
     _fresh = []
@@ -13348,12 +13509,11 @@ def _gn_lamix_feed_once(limit=60):
             except Exception:
                 _own = set()
             for m in _rows:
-                _num = otp_norm_number(m.get("number") or m.get("to")
-                                       or m.get("msisdn") or m.get("phone") or "")
+                _fld = _lx_rec_fields(m) if isinstance(m, dict) else {}
+                _num = str(_fld.get("number") or "")
                 if not _num:
                     continue
-                _sms = str(m.get("content") or m.get("message") or m.get("text")
-                           or m.get("sms") or m.get("body") or "").strip()[:600]
+                _sms = str(_fld.get("content") or "").strip()[:600]
                 if not _sms:
                     continue
                 try:
@@ -13362,18 +13522,16 @@ def _gn_lamix_feed_once(limit=60):
                     _code = ""
                 if not _code:       # কোড নেই = OTP নয় — ফিডে দেওয়ার দরকার নেই
                     continue
-                _mid = str(m.get("id") or m.get("messageId") or m.get("uuid")
-                           or "").strip()[:60]
+                _mid = str(_fld.get("nid") or "").strip()[:60]
                 if not _mid:
                     _mid = "h" + hashlib.md5(
-                        (_num + "|" + str(m.get("time") or "") + "|" + _sms)
+                        (_num + "|" + str(_fld.get("time") or "") + "|" + _sms)
                         .encode("utf-8", "replace")).hexdigest()[:26]
                 _ext = "lx" + _mid
                 if _ext in _GN_FEED_SEEN:
                     continue
-                _svc = (_gn_svc_label(m.get("range") or m.get("service") or "")
-                        or "📩 OTP")
-                _rng = str(m.get("range") or "").strip()[:40]
+                _svc = (_gn_svc_label(_fld.get("range") or "") or "📩 OTP")
+                _rng = str(_fld.get("range") or "").strip()[:40]
                 _f, _cty = _gn_country_of(_num)
                 _cur = c.execute(
                     "INSERT INTO getnum_feed (ext_id,service,range_val,country,msg,"
@@ -29863,9 +30021,24 @@ async def cmd_otpdiag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _out.append("Lamix messages: " + str(len(_lx_msgs)))
         if _lx_msgs:
             _out.append("Lamix ফিল্ড: " + ", ".join(list(_lx_msgs[0])[:10]))
+            try:
+                _f0 = _lx_rec_fields(_lx_msgs[0])
+            except Exception:
+                _f0 = {}
+            _out.append("পার্স: `" + str(_f0.get("number") or "❌")
+                        + "` · টেক্সট " + ("✅" if _f0.get("content") else "❌"))
         _lxerr = str(_LAMIX_LAST.get("err") or "")
         if _lxerr:
             _out.append("Lamix error: `" + _lxerr[:200] + "`")
+        if _a == "raw":
+            # 🔍 `/otpdiag raw` — Lamix-এর আসল JSON (ফিল্ডের নাম দেখতে)
+            for _ep in ("messages", "cdrs"):
+                try:
+                    _rj = await asyncio.to_thread(_lamix_api, _ep, {"limit": 2})
+                except Exception as _rje:
+                    _rj = {"error": str(_rje)[:120]}
+                _txt = _json.dumps(_rj, ensure_ascii=False)[:600].replace("`", "'")
+                _out.append("`" + _ep + "`: `" + _txt + "`")
         try:
             _lx_all = await asyncio.to_thread(gn_wait_orders, 200)
             _lxord = [x for x in (_lx_all or [])
